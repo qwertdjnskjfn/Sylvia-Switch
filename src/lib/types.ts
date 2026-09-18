@@ -23,7 +23,10 @@ export interface AppStatus {
     email: string | null;
   } | null;
   appPath: string;
+  /** Sylvia Switch 自身版本（= 服务二进制版本） */
   version: string;
+  /** WorkBuddy 桌面客户端版本；读不到为 null */
+  workbuddyVersion?: string | null;
 }
 
 export interface OAuthStartResult {
@@ -138,33 +141,6 @@ export interface TravelStatus {
   arriveAt?: number | null;
 }
 
-export interface AutoRotateConfig {
-  enabled: boolean;
-  check_interval_minutes: number;
-  cooldown_minutes: number;
-  min_gap_hours: number;
-  min_urgency_hours: number;
-  active_guard_minutes: number;
-  min_remaining_credits: number;
-}
-
-export interface RotateLog {
-  ts: number;
-  action: string;
-  reason?: string | null;
-  from?: { id: string; name?: string | null } | null;
-  to?: { id: string; name?: string | null } | null;
-}
-
-export interface RotateStatus {
-  config: AutoRotateConfig;
-  cliConfigured: boolean;
-  activeAccountId: string | null;
-  activeAccountName: string | null;
-  lastCheckAt: number | null;
-  lastSwitchAt: number | null;
-}
-
 export interface CreditResource {
   packageCode: string | null;
   packageName: string | null;
@@ -190,6 +166,8 @@ export interface CreditExpiry {
   expiringSoon?: boolean;
   expired?: boolean;
   resources?: CreditResource[];
+  /** 即将过期积分（AutoClaw 平台账号，来自官方 expiring 接口） */
+  expiring?: { points: number; days: number | null } | null;
   error?: string;
 }
 
@@ -215,6 +193,8 @@ export interface CreditStatsDailyPoint {
 export interface CreditStatsAccount {
   accountId: string;
   accountName: string;
+  /** 所属签到平台："workbuddy" | "autoclaw" | "trae_work_cn"；历史快照账号缺省 */
+  platform?: string;
   isCurrent: boolean;
   currentRemaining: number | null;
   totalCapacity: number | null;
@@ -329,50 +309,8 @@ export interface CreditStatistics {
 
 export interface TokenStatsTotals { total: number; input: number; output: number; cacheRead: number; cacheWrite: number; uncachedInput: number; records: number; cacheHitRate: number | null; }
 export interface TokenStatsGroup extends TokenStatsTotals { key: string; title?: string | null; project?: string; sessionId?: string; }
-export interface TokenStatsSource { source: "workbuddy" | "codebuddy-cli" | "codebuddy-ide"; summary: TokenStatsTotals; models: TokenStatsGroup[]; projects: TokenStatsGroup[]; sessions: TokenStatsGroup[]; daily: TokenStatsGroup[]; /** Optional model-specific daily series for trend filtering. */ dailyByModel?: Record<string, TokenStatsGroup[]>; hours: TokenStatsGroup[]; filesScanned: number; parseErrors: number; coverageStartAt?: number | null; coverageEndAt?: number | null; }
+export interface TokenStatsSource { source: "workbuddy" | "autoclaw"; summary: TokenStatsTotals; models: TokenStatsGroup[]; projects: TokenStatsGroup[]; sessions: TokenStatsGroup[]; daily: TokenStatsGroup[]; /** Optional model-specific daily series for trend filtering. */ dailyByModel?: Record<string, TokenStatsGroup[]>; hours: TokenStatsGroup[]; filesScanned: number; parseErrors: number; coverageStartAt?: number | null; coverageEndAt?: number | null; }
 export interface TokenStatistics { generatedAt: number; rangeDays?: number | null; sources: TokenStatsSource[]; }
-
-export interface CodeBuddyCliStatus {
-  configured: boolean;
-  authMode?: "settings-env" | "api-key-helper";
-  environmentOverride?: boolean;
-  settingsPresent: boolean;
-  helperPresent: boolean;
-  helperSupportsAccountIds: boolean;
-  helperCurrent?: boolean;
-  migrationRequired?: boolean;
-  syncPending?: boolean;
-  activeIndex: number | null;
-  activeAccountId: string | null;
-  activeAccountName: string | null;
-  accountCount: number;
-  statePath: string;
-}
-
-export interface CodeBuddyCliSwitchResult {
-  ok: boolean;
-  configured: boolean;
-  synced: boolean;
-  verified?: boolean;
-  authMode?: "settings-env" | "api-key-helper";
-  activeIndex?: number;
-  activeAccountId?: string;
-  source?: string;
-  skipped?: boolean;
-  message?: string;
-  error?: string;
-}
-
-export interface CodeBuddyCliInstallResult {
-  ok: boolean;
-  configured: boolean;
-  helperPresent: boolean;
-  helperSupportsAccountIds: boolean;
-  verified?: boolean;
-  authMode?: "settings-env" | "api-key-helper";
-  message?: string;
-  error?: string;
-}
 
 export interface GithubConfig {
   owner?: string;
@@ -393,26 +331,511 @@ export interface UpdateInfo {
   message?: string;
 }
 
-/** CodeBuddy CN IDE（桌面客户端）状态；与 CodeBuddy CLI 独立。 */
-export interface CodeBuddyCnIdeStatus {
-  installed: boolean;
-  running: boolean;
-  dataDir: string | null;
-  dbPath: string | null;
-  dbExists: boolean;
-  appPath: string | null;
-  activeAccountId: string | null;
-  activeAccountName: string | null;
-  detectedFrom?: string;
-  statePath?: string;
+export type PlatformCheckinItem = {
+  accountId: string;
+  email: string;
+  platform: string;
+  ok: boolean;
+  todayCheckedIn: boolean;
+  /** 该条目是否为本机客户端当前登录的账号（一键切换时用于标注「当前」） */
+  localLogin?: boolean;
+  error?: string;
+  /** 积分/额度，结构与 WorkBuddy 的 CreditExpiry 一致 */
+  credit?: CreditExpiry;
+};
+
+export interface GlmProxyModelInfo {
+  id: string;
+  alias: string;
+  routeId: string;
+  /** 消耗等级：低 / 中 / 高 */
+  consumption?: string | null;
+  contextWindow?: number | null;
+  maxTokens?: number | null;
+  /** 支持的输入模态，如 ["text","image"] */
+  inputs?: string[] | null;
+  reasoning?: boolean | null;
+  tooltip?: string | null;
+  /** Auto 系背后的真实模型名 */
+  autoModel?: string | null;
 }
 
-export interface CodeBuddyCnIdeSwitchResult {
+export interface GlmProxyConfigInfo {
+  enabled: boolean;
+  apiKey: string;
+  endpoint: string;
+  autoclawReady: boolean;
+  /** 速度优先：把慢模型改投到更快的目标模型 */
+  speedFirst: boolean;
+  speedFirstTarget: string;
+  /** 会被改投的模型列表 */
+  speedFirstSources: string[];
+  /** 账号策略：round_robin（轮询）/ local_first（本机优先）/ local_only（只用本机）/ pinned（固定账号） */
+  accountMode: string;
+  /** pinned 策略使用的账号 id */
+  pinnedAccountId: string;
+  /** 全部合法策略取值 */
+  accountModes?: string[];
+  models: GlmProxyModelInfo[];
+}
+
+export interface GlmProxyStatus {
+  tokenReady: boolean;
+  gatewayOk: boolean;
+  latencyMs: number;
+  error?: string | null;
+  models: number;
+  checkedAt: number;
+  proxy?: {
+    enabled: boolean;
+    endpoint: string;
+    models: { id: string }[];
+  };
+}
+
+export interface GlmUsageBucket {
+  calls: number;
+  failedCalls?: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  credits: number;
+  creditsPendingCount: number;
+  cachedTokens?: number;
+  uncachedPromptTokens?: number;
+  cacheHitCalls?: number;
+  cacheHitRate?: number;
+  savedTokens?: number;
+  savedCredits?: number;
+}
+
+export interface GlmUsageWindow {
+  total: GlmUsageBucket;
+  models: Record<string, GlmUsageBucket>;
+}
+
+/** 模型监控：窗口内单个模型的汇总（successRate / share 均为 0~1 的小数）。 */
+export interface ModelMonitorItem {
+  model: string;
+  calls: number;
+  okCalls: number;
+  failedCalls: number;
+  successRate: number;
+  /** 该模型调用次数占窗口内总调用次数的比例（调用率） */
+  share: number;
+  avgLatencyMs: number;
+  maxLatencyMs: number;
+  /** 首字延迟（预填充+排队耗时） */
+  avgTtfbMs: number;
+  maxTtfbMs: number;
+  /** 出字阶段耗时（总延迟 - 首字延迟），近似「思考+生成」 */
+  avgStreamMs: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  cachedTokens?: number;
+  cacheHitRate?: number;
+  savedTokens?: number;
+  credits: number;
+  lastTs: number | null;
+}
+
+/** 趋势序列上的一个时间桶。 */
+export interface ModelMonitorPoint {
+  ts: number;
+  total: number;
+  failed: number;
+  /** 模型名 -> 该桶内调用次数（无调用的模型不出现） */
+  byModel: Record<string, number>;
+}
+
+export interface ModelMonitorSummary {
+  calls: number;
+  okCalls: number;
+  failedCalls: number;
+  successRate: number;
+  avgLatencyMs: number;
+  avgTtfbMs: number;
+  maxTtfbMs: number;
+  avgStreamMs: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  cachedTokens?: number;
+  cacheHitRate?: number;
+  savedTokens?: number;
+  credits: number;
+  modelCount: number;
+}
+
+export interface ModelMonitor {
+  generatedAt: number;
+  from: number;
+  to: number;
+  windowHours: number;
+  bucketMs: number;
+  provider?: string;
+  summary: ModelMonitorSummary;
+  models: ModelMonitorItem[];
+  /** 序列中出现过的模型（按调用次数降序） */
+  seriesModels: string[];
+  series: ModelMonitorPoint[];
+}
+
+export interface AccountUsageOverview {
+  provider: "autoclaw" | "loomy" | "trae_work_cn" | string;
+  name: string;
+  label: string;
+  balance?: number | null;
+  balanceUnit: string;
+  calls: number;
+  okCalls: number;
+  failedCalls: number;
+  successRate: number;
+  avgLatencyMs: number;
+  avgTtfbMs: number;
+  promptTokens: number;
+  completionTokens: number;
+  cachedTokens: number;
+  uncachedPromptTokens: number;
+  cacheHitCalls: number;
+  cacheHitRate: number;
+  totalTokens: number;
+  credits: number;
+  lastTs?: number | null;
+  modelsCount: number;
+  status: "active" | "idle";
+}
+
+export interface AccountsOverviewResponse {
   ok: boolean;
-  account: string;
+  generatedAt: number;
+  accounts: AccountUsageOverview[];
+}
+
+export interface GlmUsageStatistics {
+  generatedAt: number;
+  reconcileMatched: number;
+  balance: {
+    current: number | null;
+    dailyAvg7d: number;
+    daysRemaining: number | null;
+  };
+  windows: {
+    today: GlmUsageWindow;
+    sevenDays: GlmUsageWindow;
+    all: GlmUsageWindow;
+  };
+}
+
+export interface GlmUsageRecord {
+  id: string;
+  ts: number;
+  model: string;
+  routeId: string;
+  accountId?: string | null;
+  accountLabel?: string | null;
+  ledgerId?: string | null;
+  promptTokens: number;
+  completionTokens: number;
+  reasoningTokens?: number | null;
+  totalTokens: number;
+  cachedTokens?: number;
+  uncachedPromptTokens?: number;
+  cacheHit?: boolean;
+  credits?: number | null;
+  creditsPending?: boolean;
+  latencyMs: number;
+  /** 首字延迟（预填充时间），仅流式调用记录 */
+  ttfbMs?: number | null;
+  /** 速度优先改投时，客户端原始请求的模型名 */
+  requestedModel?: string | null;
+  /** 是否被速度优先改投 */
+  substituted?: boolean;
+  /** 命中慢模型但请求是多模态时的跳过原因（如 "multimodal"） */
+  substitutionSkipped?: string | null;
+  ok?: boolean;
+  error?: string | null;
+}
+
+export interface AutoclawAccountInfo {
+  id: string;
+  label: string;
+  source: string;
+  status: string;
+  lastError?: string | null;
+  addedAt?: number | null;
+  updatedAt?: number | null;
+  tokenPreview?: string;
+}
+
+export interface GatewayApiKey {
+  id: string;
+  name: string;
+  keyPreview: string;
+  createdAt: number | null;
+  lastUsedAt: number | null;
+  requestCount: number;
+  enabled: boolean;
+  /** 仅创建响应里返回完整密钥 */
+  key?: string;
+}
+
+export interface GatewayLogEntry {
+  ts: number;
+  gateway: string;
+  keyId: string | null;
+  model: string;
+  ok: boolean;
+  latencyMs: number;
+  error?: string | null;
+}
+
+export interface GatewayOverview {
+  requests24h: number;
+  ok24h: number;
+  err24h: number;
+  byGateway: Record<string, number>;
+  keyCount: number;
+  accountPools: { qoder: number; kimi: number };
+}
+
+export interface KimiAccountInfo {
+  id: string;
+  name: string;
+  tokenType: string;
+  tokenPreview: string;
+  enabled: boolean;
+  maxConcurrency: number;
+  minIntervalSeconds: number;
+  hasCachedAccess: boolean;
+  accessExpiresAt: number | null;
+  status: string;
+  error?: string | null;
+  cooldownSeconds: number;
+}
+
+export interface QoderAccountInfo {
+  uid: string | null;
+  name?: string | null;
+  email?: string | null;
+  userTag?: string | null;
+  quota?: number | null;
+  isQuotaExceeded?: boolean | null;
+  source?: string | null;
+  status?: string | null;
+  enabled?: boolean;
+  error?: string | null;
+}
+
+export interface TraeAccountInfo {
+  id: string;
+  label: string;
+  userId?: string | null;
+  status: string;
+  error?: string | null;
+  expiredAt?: string | null;
+  tokenPreview?: string | null;
+  updatedAt?: number | null;
+  /** 该账号正是客户端当前登录账号（由实时代管，不重复参与签到） */
+  localLogin?: boolean;
+  /** 快照 access token 已到期（TRAE 池无法跨客户端切换续期，需重新导入） */
+  expired?: boolean;
+}
+
+export interface TraeCheckinResult {
+  id: string;
+  label: string;
+  result: string;
+  error?: string | null;
+}
+
+export interface LoomyCreditInfo {
+  ok: boolean;
+  balance?: number;
+  dailyBalance?: number;
+  error?: string;
+  recentRecords?: { ledgerId: string; description: string; direction: string; createdAt: number; points: number; source: string }[];
+}
+
+export interface LoomyAccountInfo {
+  id: string;
+  label: string;
+  source?: string;
+  status: string;
+  lastError?: string | null;
+  addedAt?: number | null;
+  updatedAt?: number | null;
+  /** session 有效期（天）与剩余天数（本机实时账号才带） */
+  sessionDays?: number;
+  expiresDays?: number;
+  expiresAt?: number | null;
+  credit?: LoomyCreditInfo;
+}
+
+export interface LoomyCheckinResult {
+  id: string;
+  label: string;
+  result: string;
+  error?: string | null;
+}
+
+export interface LoomyProxyStatus {
+  enabled: boolean;
+  upstream: string;
+  poolSize: number;
+  models: { ok: boolean; count?: number; error?: string };
+  lastError?: { ts: number; error: string } | null;
+}
+
+export interface LoomyProxyConfigInfo {
+  enabled: boolean;
+  apiKey: string;
+  endpoint: string;
+  modelsEndpoint: string;
+}
+
+export interface LoomyModelCapabilities {
+  reasoning?: boolean;
+  vision?: boolean;
+  function_calling?: boolean;
+  streaming?: boolean;
+  system_message?: boolean;
+  input_modalities?: string[];
+}
+
+export interface LoomyModel {
+  id: string;
+  name?: string;
+  type?: string;
+  protocol?: string;
+  context_length?: number | null;
+  max_output_tokens?: number | null;
+  reasoning_efforts?: string[] | null;
+  default_reasoning_effort?: string | null;
+  capabilities?: LoomyModelCapabilities;
+  /** 从名称里解析的积分倍率（如 "x3.0" → 3） */
+  multiplier?: number | null;
+  free?: boolean;
+}
+
+export interface AutoclawCheckinResult {
+  id: string;
+  label: string;
+  result: string;
+  error?: string;
+}
+
+export interface AccountProtectionConfigInfo {
+  enabled: boolean;
+  keepaliveEnabled: boolean;
+  keepaliveIntervalMinutes: number;
+  maxConcurrencyPerAccount: number;
+  cooldownMinutes: number;
+  jwtRefreshAheadMinutes: number;
+}
+
+export interface CoolingAccountInfo {
   accountId: string;
-  dbPath?: string;
-  restarted?: boolean;
-  message?: string;
+  label: string;
+  cooledAt: number;
+  cooldownUntil: number;
+  remainingSeconds: number;
+  reason: string;
+}
+
+export interface ProtectionLogEntry {
+  ts: number;
+  accountId: string;
+  label: string;
+  action: string;
+  detail: string;
+}
+
+export interface AccountProtectionStatusInfo {
+  config: AccountProtectionConfigInfo;
+  status: "active" | "disabled";
+  lastKeepaliveAt: number;
+  nextKeepaliveAt: number;
+  coolingAccounts: CoolingAccountInfo[];
+  activeConcurrency: Record<string, number>;
+  poolAccountCount: number;
+  simulatedUserAgent: string;
+  recentLogs: ProtectionLogEntry[];
+}
+
+export interface GrokAccountInfo {
+  id: string;
+  name: string;
+  provider: "web" | "build" | "console" | string;
+  tokenMasked?: string;
+  tier?: string;
+  enabled: boolean;
+  status: "ok" | "error" | "cooldown" | string;
+  error?: string | null;
+  cooldownUntil?: number;
+  isCooling?: boolean;
+  lastUsedAt?: number | null;
+  addedAt?: number;
+  updatedAt?: number;
+}
+
+export interface GrokPoolAccount {
+  id: string;
+  name: string;
+  provider: string;
+  status: string;
+  healthScore: number;
+  riskLevel: "low" | "medium" | "high" | string;
+  consecutiveFailures: number;
+  rateLimitCount: number;
+  lastSuccessAt?: number | null;
+  lastCheckAt?: number | null;
+  lastErrorKind?: string | null;
+  cooldownUntil?: number;
+}
+
+export interface GrokPoolPolicy {
+  autoCheckEnabled: boolean;
+  checkIntervalMinutes: number;
+  batchSize: number;
+  riskLowThreshold: number;
+  riskHighThreshold: number;
+  pauseHighRisk: boolean;
+  successDelta: number;
+  rateLimitPenalty: number;
+  timeoutPenalty: number;
+  fatalPenalty: number;
+}
+
+export interface GrokPoolSnapshot {
+  at: number;
+  total: number;
+  ok: number;
+  errored: number;
+  cooling: number;
+  avgHealth: number;
+  risk: { low: number; medium: number; high: number };
+}
+
+export interface GrokPoolOverview {
+  total: number;
+  ok: number;
+  errored: number;
+  cooling: number;
+  risk: { low: number; medium: number; high: number };
+  policy: Partial<GrokPoolPolicy>;
+  accounts: GrokPoolAccount[];
+}
+
+export interface GrokTestResult {
+  ok: boolean;
+  reply: string;
+  model: string;
+  provider: string;
+  accountId: string;
+  accountName: string;
+  durationMs: number;
+  tokens?: number;
 }
 

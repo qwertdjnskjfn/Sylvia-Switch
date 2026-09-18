@@ -11,10 +11,14 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use crate::modules::account::{account_display_name, build_auth_headers, load_accounts};
+use crate::modules::account::{account_display_name, build_auth_headers};
 use crate::modules::config::{
     add_checkin_log, http_request, load_checkin_config, load_checkin_logs, now_ms, RunFlagGuard,
     CHECKIN_API_PREFIX, WORKBUDDY_API_ENDPOINT,
+};
+use crate::modules::platform_checkin::{
+    account_platform, all_checkin_accounts, checkin_platform_account, get_platform_status,
+    PLATFORM_WORKBUDDY,
 };
 use crate::modules::refresh::{ensure_fresh_token, refresh_account_token};
 
@@ -167,6 +171,16 @@ pub async fn perform_checkin(account: &Value) -> Value {
     json!({"ok": false, "error": msg})
 }
 
+/// 签到状态查询（按平台路由）：WorkBuddy 走计费接口，平台账号走各自
+/// 的客户端签到接口。返回结构统一为 ok / todayCheckedIn / raw。
+pub async fn get_checkin_status_for(account: &Value) -> Value {
+    if account_platform(account) == PLATFORM_WORKBUDDY {
+        get_checkin_status(account).await
+    } else {
+        get_platform_status(account).await
+    }
+}
+
 fn decide_from_status(status: &Value) -> StatusDecision {
     if status.get("ok").and_then(Value::as_bool) != Some(true) {
         return StatusDecision::Error(
@@ -185,23 +199,80 @@ fn decide_from_status(status: &Value) -> StatusDecision {
 }
 
 /// 对单个账号执行完整签到流程：惰性刷新 → 查状态 → 未签到时提交 → 写提交日志。
+/// WorkBuddy 以外的平台账号（AutoClaw / TRAE Work CN）由 platform_checkin 处理。
 pub async fn checkin_account(account: &Value) -> Value {
     let Some(_account_guard) = AccountRunGuard::try_acquire(account) else {
         return json!({"result": "error", "error": "该账号正在签到，请稍后再试"});
     };
+    if let Some(store_id) = account.get("autoclawStoreId").and_then(Value::as_str) {
+        // AutoClaw 账号池账号：用自身 token 签到（401 自动续期重试）。
+        let res = crate::modules::autoclaw_accounts::checkin_stored(store_id).await;
+        let result = res
+            .get("result")
+            .and_then(Value::as_str)
+            .unwrap_or("error")
+            .to_string();
+        let error = res.get("error").and_then(Value::as_str).map(String::from);
+        let mut entry = json!({
+            "result": result,
+            "ts": now_ms(),
+            "accountId": account.get("id").cloned().unwrap_or(Value::Null),
+            "email": account_display_name(account),
+        });
+        if let Some(e) = error.clone() {
+            entry["error"] = json!(e);
+        }
+        add_checkin_log(&entry);
+        return res;
+    }
+    if account_platform(account) != PLATFORM_WORKBUDDY {
+        let res = checkin_platform_account(account).await;
+        let result = res
+            .get("result")
+            .and_then(Value::as_str)
+            .unwrap_or("error")
+            .to_string();
+        let error = res.get("error").and_then(Value::as_str).map(String::from);
+        let mut entry = json!({
+            "result": result,
+            "ts": now_ms(),
+            "accountId": account.get("id").cloned().unwrap_or(Value::Null),
+            "email": account_display_name(account),
+        });
+        if let Some(e) = error.clone() {
+            entry["error"] = json!(e);
+        }
+        add_checkin_log(&entry);
+        return res;
+    }
     let cfg = load_checkin_config();
     let acc = ensure_fresh_token(account.clone(), &cfg).await;
     let status = get_checkin_status(&acc).await;
     match decide_from_status(&status) {
-        StatusDecision::Already => return json!({"result": "already"}),
+        StatusDecision::Already => {
+            let entry = json!({
+                "result": "already",
+                "ts": now_ms(),
+                "accountId": acc.get("id").cloned().unwrap_or(Value::Null),
+                "email": account_display_name(&acc),
+            });
+            add_checkin_log(&entry);
+            return json!({"result": "already"});
+        }
         StatusDecision::Error(error) => {
+            let entry = json!({
+                "result": "error",
+                "ts": now_ms(),
+                "accountId": acc.get("id").cloned().unwrap_or(Value::Null),
+                "email": account_display_name(&acc),
+                "error": error.clone(),
+            });
+            add_checkin_log(&entry);
             return json!({"result": "error", "error": error});
         }
         StatusDecision::Submit => {}
     }
 
-    // Only this branch submits daily-checkin, so only its outcome is eligible
-    // for the sign-in log.
     let entry = json!({
         "ts": now_ms(),
         "accountId": acc.get("id").cloned().unwrap_or(Value::Null),
@@ -249,6 +320,53 @@ pub fn date_str(ts_ms: Option<i64>) -> String {
     }
 }
 
+/// 计算当前本地时间距离下一个午夜（次日 00:00:05）的等待时长。
+/// 额外保留 5 秒等待外部平台跨天日切完成。最小为 5 秒。
+pub fn duration_until_next_midnight() -> Duration {
+    let now = Local::now();
+    let tomorrow = (now.date_naive() + chrono::Days::new(1))
+        .and_hms_opt(0, 0, 5)
+        .and_then(|naive| naive.and_local_timezone(Local).single())
+        .unwrap_or_else(|| now + chrono::Duration::hours(24));
+    let diff = tomorrow.signed_duration_since(now);
+    let secs = diff.num_seconds().max(5);
+    Duration::from_secs(secs as u64)
+}
+
+/// 获取当前本地日期字符串（YYYY-MM-DD）。
+pub fn current_local_date() -> String {
+    date_str(None)
+}
+
+/// 账号库丢失本机 WorkBuddy 账号时自动补导。
+///
+/// 2026-09-14 实测：账号库当天不含本机 WorkBuddy 账号（平台账号池照常），
+/// 自动签到全天静默跳过 WorkBuddy，用户只能手动签到。账号库会被导入 /
+/// 切换 / 轮换等流程改写，一旦丢了本机账号就没有任何环节会补回来；而本机
+/// 登录（auth.json）仍在，说明账号只是“掉库”而不是被注销，因此每轮开始
+/// 核对一次，缺了就立即补导。本机未登录 WorkBuddy 时属正常情况，静默跳过。
+/// 返回是否发生了补导。
+fn heal_missing_local_account(accounts: &mut Vec<Value>) -> bool {
+    if accounts
+        .iter()
+        .any(|acc| account_platform(acc) == PLATFORM_WORKBUDDY)
+    {
+        return false;
+    }
+    let Ok(meta) = crate::modules::account::import_local() else {
+        return false;
+    };
+    eprintln!(
+        "[自动签到] 账号库缺少本机 WorkBuddy 账号，已自动补导：{}",
+        meta.get("nickname")
+            .or_else(|| meta.get("email"))
+            .and_then(Value::as_str)
+            .unwrap_or("未知")
+    );
+    *accounts = all_checkin_accounts();
+    true
+}
+
 /// 执行一轮自动签到。启动与周期轮次均逐账号查询服务端状态。
 ///
 /// 并发锁防止与手动签到/上一轮重复运行。
@@ -258,21 +376,69 @@ pub async fn run_checkin_cycle(_mode: CheckinCycleMode) -> Value {
     };
     let cfg = load_checkin_config();
     if cfg.get("enabled").and_then(|v| v.as_bool()) != Some(true) {
+        eprintln!("[自动签到] 本轮跳过：自动签到未启用");
         return json!({"status": "disabled"});
     }
-    let accounts = load_accounts();
+    // 自愈：此前因瞬时网络错误被标记失效的 AutoClaw 池账号，先尝试续期复活。
+    crate::modules::autoclaw_accounts::recover_invalid_accounts().await;
+    let mut accounts = all_checkin_accounts();
+    let healed_local_account = heal_missing_local_account(&mut accounts);
     if accounts.is_empty() {
+        eprintln!("[自动签到] 本轮跳过：没有任何可签到的账号");
         return json!({"status": "no_accounts"});
     }
-    let mut summary = json!({"status": "ok", "accounts": []});
+    let total = accounts.len();
+    let mut summary = json!({
+        "status": "ok",
+        "healedLocalAccount": healed_local_account,
+        "accounts": [],
+    });
+    let mut failures: Vec<String> = Vec::new();
+    let mut succeeded = 0usize;
+    let mut already = 0usize;
     for acc in accounts {
         let result = checkin_account(&acc).await;
+        match result.get("result").and_then(Value::as_str) {
+            Some("success") => succeeded += 1,
+            Some("already") => already += 1,
+            _ => {}
+        }
+        if result.get("result").and_then(Value::as_str) == Some("error") {
+            failures.push(format!(
+                "{}（{}）",
+                account_display_name(&acc),
+                result
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("未知错误")
+            ));
+        }
         summary["accounts"].as_array_mut().unwrap().push(json!({
             "email": account_display_name(&acc),
             "result": result.get("result").cloned().unwrap_or(Value::Null),
             "error": result.get("error").cloned().unwrap_or(Value::Null),
         }));
     }
+    // 有账号签到失败时推送桌面通知（同类 10 分钟节流，避免刷屏）。
+    if !failures.is_empty() {
+        crate::modules::notify::notify(
+            "checkin-failure",
+            "自动签到异常",
+            &format!("{} 个账号签到失败：{}", failures.len(), failures.join("；")),
+        );
+    }
+    eprintln!(
+        "[自动签到] 本轮 {} 个账号：成功 {}，已签 {}，失败 {}{}",
+        total,
+        succeeded,
+        already,
+        failures.len(),
+        if healed_local_account {
+            "（已自动补导本机账号）"
+        } else {
+            ""
+        }
+    );
     summary
 }
 
@@ -280,7 +446,11 @@ pub async fn run_checkin_cycle(_mode: CheckinCycleMode) -> Value {
 ///
 /// Empty account list is false so the tray keeps offering 一键签到.
 pub fn all_accounts_checked_in_today() -> bool {
-    accounts_checked_in_today(&load_accounts(), &load_checkin_logs(), &date_str(None))
+    accounts_checked_in_today(
+        &all_checkin_accounts(),
+        &load_checkin_logs(),
+        &date_str(None),
+    )
 }
 
 pub fn accounts_checked_in_today(accounts: &[Value], logs: &[Value], today: &str) -> bool {
@@ -307,12 +477,13 @@ fn latest_today_result<'a>(logs: &'a [Value], account_id: &str, today: &str) -> 
         .and_then(|entry| entry.get("result").and_then(Value::as_str))
 }
 
-/// 对全部账号立即签到（前端一键签到）。
+/// 对全部账号立即签到（前端一键签到），含本机发现的平台账号。
 pub async fn run_checkin_all() -> Value {
     let Some(_guard) = RunFlagGuard::try_acquire(&CHECKIN_RUNNING) else {
         return json!({"accounts": [], "status": "skipped", "reason": "already_running"});
     };
-    let accounts = load_accounts();
+    let mut accounts = all_checkin_accounts();
+    heal_missing_local_account(&mut accounts);
     let mut results: Vec<Value> = Vec::new();
     for acc in accounts {
         let r = checkin_account(&acc).await;
@@ -408,5 +579,14 @@ mod tests {
         assert!(!accounts_checked_in_today(&[], &[], "2026-08-19"));
         let accounts = vec![json!({"id": "a"})];
         assert!(!accounts_checked_in_today(&accounts, &[], "2026-08-19"));
+    }
+
+    #[test]
+    fn test_duration_until_next_midnight_is_reasonable() {
+        let dur = duration_until_next_midnight();
+        assert!(dur.as_secs() >= 5);
+        assert!(dur.as_secs() <= 86405);
+        let cur_date = current_local_date();
+        assert_eq!(cur_date.len(), 10);
     }
 }

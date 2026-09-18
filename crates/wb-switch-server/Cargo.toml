@@ -1,6 +1,6 @@
 [package]
 name = "wb-switch-server"
-version = "0.1.37"
+version = "0.1.58"
 edition = "2021"
 description = "wb-switch HTTP server + CLI（npm 安装形态：wb-switch 命令启动本地 webui）"
 
@@ -14,3 +14,5 @@ axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 serde_json = "1"
 rust-embed = "8"
+# 流式转发（Grok / Kimi / Qoder 的 SSE 桥接用 futures_util::stream::unfold）
+futures-util = { version = "0.3", default-features = false, features = ["std"] }

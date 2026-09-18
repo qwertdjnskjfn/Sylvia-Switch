@@ -1,0 +1,15 @@
+<!doctype html>
+<html>
+  <head><meta charset="utf-8" /><title>seed</title></head>
+  <body>
+    <script>
+      var p = new URLSearchParams(location.search);
+      if (p.get("accent")) localStorage.setItem("wb-switch.accent", p.get("accent"));
+      if (p.get("theme")) localStorage.setItem("wb-switch.theme", p.get("theme"));
+      if (p.get("custom")) localStorage.setItem("wb-switch.accent.custom", p.get("custom"));
+      if (p.get("privacy")) localStorage.setItem("wb-switch.privacy-mask", p.get("privacy"));
+      if (p.get("notes")) localStorage.setItem("wb-switch.account-notes", p.get("notes"));
+      location.replace(p.get("to") || "/settings");
+    </script>
+  </body>
+</html>

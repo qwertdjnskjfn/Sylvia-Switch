@@ -3,12 +3,6 @@ import type {
   AccountMeta,
   AccountRecord,
   AppStatus,
-  AutoRotateConfig,
-  CodeBuddyCliInstallResult,
-  CodeBuddyCliStatus,
-  CodeBuddyCliSwitchResult,
-  CodeBuddyCnIdeStatus,
-  CodeBuddyCnIdeSwitchResult,
   CheckinConfig,
   CheckinLog,
   CheckinResult,
@@ -21,13 +15,40 @@ import type {
   ImportResult,
   OAuthPollResult,
   OAuthStartResult,
-  RotateLog,
-  RotateStatus,
   Session,
   SwitchResult,
   TravelConfig,
   TravelStatus,
   UpdateInfo,
+  PlatformCheckinItem,
+  GlmProxyConfigInfo,
+  GlmProxyStatus,
+  GlmUsageStatistics,
+  GlmUsageRecord,
+  ModelMonitor,
+  AutoclawAccountInfo,
+  AutoclawCheckinResult,
+  GatewayApiKey,
+  GatewayLogEntry,
+  GatewayOverview,
+  KimiAccountInfo,
+  QoderAccountInfo,
+  TraeAccountInfo,
+  TraeCheckinResult,
+  LoomyAccountInfo,
+  LoomyCheckinResult,
+  LoomyCreditInfo,
+  LoomyProxyConfigInfo,
+  LoomyProxyStatus,
+  LoomyModel,
+  AccountProtectionConfigInfo,
+  AccountProtectionStatusInfo,
+  AccountsOverviewResponse,
+  GrokAccountInfo,
+  GrokTestResult,
+  GrokPoolOverview,
+  GrokPoolPolicy,
+  GrokPoolSnapshot,
 } from "./types";
 import { DEMO_UNAVAILABLE_MESSAGE, demoModeEnabled } from "./demo-mode";
 import { screenshotDemoResponse } from "./screenshot-demo";
@@ -35,15 +56,18 @@ import { screenshotDemoResponse } from "./screenshot-demo";
 /**
  * 双通道适配层：
  * - 桌面 App（Tauri）：`invoke` 调用 Rust commands
- * - webui（浏览器）：HTTP fetch 调用本地 workbuddy-switch 服务（127.0.0.1）
+ * - webui（浏览器）：HTTP fetch 调用本地服务（127.0.0.1）
+ *
+ * 注：改为同源相对路径。改版 webui 由本地启动器托管，启动器把 /api 反向代理到
+ * wb-switch 后端（默认 127.0.0.1:57890），从而避免跨域（后端未开启 CORS）。
  */
-const API_BASE = "http://127.0.0.1:57890";
+const API_BASE = "";
 
 const DEMO_READ_COMMANDS = new Set([
-  "get_status", "get_accounts", "get_codebuddy_cli_status", "get_codebuddy_cn_ide_status", "get_checkin_status",
+  "get_status", "get_accounts", "get_checkin_status",
   "get_credit_expiry", "get_credit_statistics", "get_auto_checkin_config",
   "get_token_statistics",
-  "get_checkin_logs", "get_auto_rotate_config", "rotate_status", "get_rotate_logs",
+  "get_checkin_logs",
   "get_github_config", "check_update", "get_launch_at_login_enabled", "switch_progress",
   "get_travel_status", "get_auto_travel_config",
 ]);
@@ -77,12 +101,7 @@ type Route = { method: "GET" | "POST"; path: string };
 const ROUTES: Record<string, Route> = {
   get_status: { method: "GET", path: "/api/status" },
   get_accounts: { method: "GET", path: "/api/accounts" },
-  get_codebuddy_cli_status: { method: "GET", path: "/api/codebuddy-cli/status" },
-  install_codebuddy_cli_helper: { method: "POST", path: "/api/codebuddy-cli/install-helper" },
-  switch_codebuddy_cli_account: { method: "POST", path: "/api/codebuddy-cli/switch" },
-  get_codebuddy_cn_ide_status: { method: "GET", path: "/api/codebuddy-cn-ide/status" },
-  switch_codebuddy_cn_ide_account: { method: "POST", path: "/api/codebuddy-cn-ide/switch" },
-  detect_codebuddy_cn_ide_account: { method: "POST", path: "/api/codebuddy-cn-ide/detect" },
+  get_gateways_overview: { method: "GET", path: "/api/gateways/overview" },
   delete_account: { method: "POST", path: "/api/delete" },
   oauth_start: { method: "POST", path: "/api/oauth/start" },
   oauth_status: { method: "POST", path: "/api/oauth/status" },
@@ -92,9 +111,87 @@ const ROUTES: Record<string, Route> = {
   preview_import_accounts: { method: "POST", path: "/api/import/preview" },
   import_accounts: { method: "POST", path: "/api/import" },
   switch_account: { method: "POST", path: "/api/switch" },
+  /** 平台账号一键切换（AutoClaw / TRAE Work CN）：关客户端 → 写登录态 → 重启 */
+  platform_account_switch: { method: "POST", path: "/api/platform/switch" },
   list_sessions: { method: "GET", path: "/api/sessions" },
   copy_sessions: { method: "POST", path: "/api/sessions/copy" },
   get_checkin_status: { method: "GET", path: "/api/checkin/status" },
+  platform_accounts: { method: "GET", path: "/api/platform/accounts" },
+  get_glm_proxy_config: { method: "GET", path: "/api/glm-proxy/config" },
+  get_glm_proxy_status: { method: "GET", path: "/api/glm-proxy/status" },
+  get_glm_usage_summary: { method: "GET", path: "/api/glm-usage/summary" },
+  get_glm_usage_records: { method: "GET", path: "/api/glm-usage/records" },
+  get_glm_usage_monitor: { method: "GET", path: "/api/glm-usage/monitor" },
+  get_accounts_usage_overview: { method: "GET", path: "/api/glm-usage/accounts-overview" },
+  get_autoclaw_accounts: { method: "GET", path: "/api/autoclaw/accounts" },
+  add_autoclaw_account: { method: "POST", path: "/api/autoclaw/accounts" },
+  import_autoclaw_local: { method: "POST", path: "/api/autoclaw/accounts/import-local" },
+  remove_autoclaw_account: { method: "POST", path: "/api/autoclaw/accounts/remove" },
+  refresh_autoclaw_account: { method: "POST", path: "/api/autoclaw/accounts/refresh" },
+  autoclaw_checkin_all: { method: "POST", path: "/api/autoclaw/checkin-all" },
+  autoclaw_checkin_one: { method: "POST", path: "/api/autoclaw/checkin-one" },
+  get_trae_accounts: { method: "GET", path: "/api/trae/accounts" },
+  import_trae_local: { method: "POST", path: "/api/trae/accounts/import-local" },
+  remove_trae_account: { method: "POST", path: "/api/trae/accounts/remove" },
+  refresh_trae_account: { method: "POST", path: "/api/trae/accounts/refresh" },
+  trae_checkin_all: { method: "POST", path: "/api/trae/checkin-all" },
+  get_qoder_accounts: { method: "GET", path: "/api/qoder/accounts" },
+  qoder_import_local: { method: "POST", path: "/api/qoder/accounts/import-local" },
+  qoder_remove_account: { method: "POST", path: "/api/qoder/accounts/remove" },
+  qoder_refresh_account: { method: "POST", path: "/api/qoder/accounts/refresh" },
+  qoder_device_flow_start: { method: "POST", path: "/api/qoder/device-flow/start" },
+  qoder_device_flow_complete: { method: "POST", path: "/api/qoder/device-flow/complete" },
+  qoder_test_completion: { method: "POST", path: "/api/qoder/test" },
+  get_kimi_accounts: { method: "GET", path: "/api/kimi/accounts" },
+  kimi_add_account: { method: "POST", path: "/api/kimi/accounts/add" },
+  kimi_remove_account: { method: "POST", path: "/api/kimi/accounts/remove" },
+  kimi_enable_account: { method: "POST", path: "/api/kimi/accounts/enable" },
+  kimi_verify_account: { method: "POST", path: "/api/kimi/accounts/verify" },
+  kimi_test_completion: { method: "POST", path: "/api/kimi/test" },
+  get_grok_accounts: { method: "GET", path: "/api/grok/accounts" },
+  grok_add_account: { method: "POST", path: "/api/grok/accounts/add" },
+  grok_remove_account: { method: "POST", path: "/api/grok/accounts/remove" },
+  grok_enable_account: { method: "POST", path: "/api/grok/accounts/enable" },
+  grok_test: { method: "POST", path: "/api/grok/test" },
+  get_grok_pool_overview: { method: "GET", path: "/api/grok/pool/overview" },
+  grok_pool_check: { method: "POST", path: "/api/grok/pool/check" },
+  get_grok_pool_policy: { method: "GET", path: "/api/grok/pool/policy" },
+  set_grok_pool_policy: { method: "POST", path: "/api/grok/pool/policy" },
+  get_grok_pool_history: { method: "GET", path: "/api/grok/pool/history" },
+  get_grok_sso_status: { method: "GET", path: "/api/grok-sso/status" },
+  sync_grok_sso: { method: "POST", path: "/api/grok-sso/sync" },
+  open_grok_sso_login: { method: "POST", path: "/api/grok-sso/open-login" },
+  get_gateway_keys: { method: "GET", path: "/api/gateway/keys" },
+  create_gateway_key: { method: "POST", path: "/api/gateway/keys" },
+  delete_gateway_key: { method: "POST", path: "/api/gateway/keys/delete" },
+  get_gateway_logs: { method: "GET", path: "/api/gateway/logs" },
+  get_gateway_overview: { method: "GET", path: "/api/gateway/overview" },
+  qoder_import_manual: { method: "POST", path: "/api/qoder/accounts/import-manual" },
+  get_glmweb_tokens: { method: "GET", path: "/api/glmweb/tokens" },
+  glmweb_add_token: { method: "POST", path: "/api/glmweb/tokens" },
+  glmweb_remove_token: { method: "POST", path: "/api/glmweb/tokens/remove" },
+  // v0.1.46：浏览器同步工具的幂等写回（校验 + upsert + 池健康快照）
+  glmweb_sync_token: { method: "POST", path: "/api/glmweb/tokens/sync" },
+  glmweb_test_completion: { method: "POST", path: "/api/glmweb/test" },
+  get_loomy_status: { method: "GET", path: "/api/loomy/status" },
+  get_loomy_accounts: { method: "GET", path: "/api/loomy/accounts" },
+  add_loomy_account: { method: "POST", path: "/api/loomy/accounts" },
+  import_loomy_local: { method: "POST", path: "/api/loomy/accounts/import-local" },
+  remove_loomy_account: { method: "POST", path: "/api/loomy/accounts/remove" },
+  get_loomy_credits: { method: "GET", path: "/api/loomy/credits" },
+  loomy_checkin_all: { method: "POST", path: "/api/loomy/checkin-all" },
+  loomy_checkin_one: { method: "POST", path: "/api/loomy/checkin-one" },
+  get_loomy_proxy_config: { method: "GET", path: "/api/loomy-proxy/config" },
+  save_loomy_proxy_config: { method: "POST", path: "/api/loomy-proxy/config" },
+  get_loomy_proxy_status: { method: "GET", path: "/api/loomy-proxy/status" },
+  get_loomy_models_catalog: { method: "GET", path: "/api/loomy/models" },
+  get_trae_proxy_status: { method: "GET", path: "/api/trae-proxy/status" },
+  get_trae_proxy_models: { method: "GET", path: "/api/trae-proxy/models" },
+  get_workbuddy_proxy_status: { method: "GET", path: "/api/workbuddy-proxy/status" },
+  get_workbuddy_proxy_models: { method: "GET", path: "/api/workbuddy-proxy/models" },
+  trae_checkin_one: { method: "POST", path: "/api/trae/checkin-one" },
+  test_glm_proxy: { method: "POST", path: "/api/glm-proxy/test" },
+  save_glm_proxy_config: { method: "POST", path: "/api/glm-proxy/config" },
   get_credit_expiry: { method: "POST", path: "/api/credits" },
   get_credit_statistics: { method: "GET", path: "/api/credits/stats" },
   get_token_statistics: { method: "GET", path: "/api/token-stats" },
@@ -106,16 +203,19 @@ const ROUTES: Record<string, Route> = {
   get_travel_status: { method: "GET", path: "/api/travel/status" },
   get_auto_travel_config: { method: "GET", path: "/api/travel/config" },
   save_auto_travel_config: { method: "POST", path: "/api/travel/config" },
-  get_auto_rotate_config: { method: "GET", path: "/api/rotate/config" },
-  save_auto_rotate_config: { method: "POST", path: "/api/rotate/config" },
-  rotate_status: { method: "GET", path: "/api/rotate/status" },
-  run_rotate: { method: "POST", path: "/api/rotate/run" },
-  get_rotate_logs: { method: "GET", path: "/api/rotate/logs" },
   refresh_account_token: { method: "POST", path: "/api/refresh-token" },
   get_github_config: { method: "GET", path: "/api/update/config" },
   save_github_config: { method: "POST", path: "/api/update/config" },
   check_update: { method: "GET", path: "/api/update/check" },
   switch_progress: { method: "GET", path: "/api/switch/progress" },
+  get_protection_status: { method: "GET", path: "/api/protection/status" },
+  get_protection_config: { method: "GET", path: "/api/protection/config" },
+  save_protection_config: { method: "POST", path: "/api/protection/config" },
+  protection_keepalive_now: { method: "POST", path: "/api/protection/keepalive-now" },
+  protection_clear_cooldown: { method: "POST", path: "/api/protection/cooldown/clear" },
+  get_loomy_protection_status: { method: "GET", path: "/api/loomy/protection/status" },
+  loomy_protection_keepalive_now: { method: "POST", path: "/api/loomy/protection/keepalive-now" },
+  loomy_protection_clear_cooldown: { method: "POST", path: "/api/loomy/protection/cooldown/clear" },
 };
 
 function queryString(args?: Record<string, unknown>): string {
@@ -144,7 +244,7 @@ async function httpCall<T>(cmd: string, args?: Record<string, unknown>): Promise
       body: route.method === "POST" ? JSON.stringify(args ?? {}) : undefined,
     });
   } catch {
-    throw new Error(`无法连接 workbuddy-switch 服务（${API_BASE}），请先运行 \`workbuddy-switch\``);
+    throw new Error("无法连接 Sylvia Switch 服务，请先启动 Sylvia Switch");
   }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
@@ -177,50 +277,10 @@ export function getAccounts(): Promise<{ accounts: AccountMeta[] }> {
   return call("get_accounts");
 }
 
-export function getCodebuddyCliStatus(): Promise<CodeBuddyCliStatus> {
-  return call("get_codebuddy_cli_status");
+/** 所有模型网关的聚合总览（统一网关下拉菜单用）。 */
+export function getGatewaysOverview(): Promise<GatewaysOverview> {
+  return call("get_gateways_overview");
 }
-
-export function installCodebuddyCliHelper(): Promise<CodeBuddyCliInstallResult> {
-  return call("install_codebuddy_cli_helper");
-}
-
-export function switchCodebuddyCliAccount(accountId: string): Promise<CodeBuddyCliSwitchResult> {
-  if (demoModeEnabled) {
-    return new Promise((resolve, reject) => {
-      window.setTimeout(() => {
-        try {
-          resolve(screenshotDemoResponse("switch_codebuddy_cli_account", { accountId }) as CodeBuddyCliSwitchResult);
-        } catch (error) {
-          reject(error);
-        }
-      }, 1200);
-    });
-  }
-  return call("switch_codebuddy_cli_account", { accountId });
-}
-
-export function getCodebuddyCnIdeStatus(): Promise<CodeBuddyCnIdeStatus> {
-  return call("get_codebuddy_cn_ide_status");
-}
-
-export function switchCodebuddyCnIdeAccount(
-  accountId: string,
-  restart = true,
-): Promise<CodeBuddyCnIdeSwitchResult> {
-  return call("switch_codebuddy_cn_ide_account", { accountId, restart });
-}
-
-export function detectCodebuddyCnIdeAccount(): Promise<{
-  ok: boolean;
-  found: boolean;
-  matched?: boolean;
-  accountId?: string;
-  message?: string;
-}> {
-  return call("detect_codebuddy_cn_ide_account");
-}
-
 
 export function deleteAccount(accountId: string): Promise<{ ok: boolean }> {
   return call("delete_account", { accountId });
@@ -272,6 +332,31 @@ export function switchAccount(args: {
 /** 切换进度（webui 轮询用；桌面端走事件，此函数无副作用）。 */
 export function switchProgress(): Promise<{ running: boolean; progress: string | null }> {
   return call("switch_progress");
+}
+
+/** 平台账号一键切换结果摘要。 */
+export interface PlatformSwitchResult {
+  ok: boolean;
+  platform: string;
+  id: string;
+  label?: string | null;
+  /** 关闭的客户端进程数（0 = 客户端本来没在跑） */
+  closedProcesses: number;
+  /** 登录态文件备份路径 */
+  backup?: string | null;
+  /** 是否已自动拉起客户端 */
+  launched: boolean;
+  /** 未能自动拉起时的说明 */
+  note?: string;
+}
+
+/** 平台账号一键切换：AutoClaw / TRAE Work CN。 */
+export function switchPlatformAccount(
+  platform: "autoclaw" | "trae_work_cn",
+  id: string,
+  restart = true,
+): Promise<PlatformSwitchResult> {
+  return call("platform_account_switch", { platform, id, restart });
 }
 
 export function listSessions(): Promise<{
@@ -361,6 +446,461 @@ export async function getCheckinStatus(accountId: string): Promise<{
   return call("get_checkin_status", { accountId });
 }
 
+/** 平台账号（AutoClaw / TRAE Work CN）签到状态；仅 webui 后端支持，桌面端返回空列表。 */
+export async function getPlatformCheckinItems(): Promise<PlatformCheckinItem[]> {
+  if (demoModeEnabled || !isWebui()) return [];
+  const all = await httpCall<{
+    accounts: (PlatformCheckinItem & { raw?: unknown })[];
+  }>("platform_accounts");
+  return all.accounts.filter((item) => Boolean(item.platform) && item.platform !== "workbuddy");
+}
+
+/** GLM 代理配置（仅 webui 后端支持）。 */
+export async function getGlmProxyConfig(): Promise<GlmProxyConfigInfo> {
+  return call("get_glm_proxy_config");
+}
+
+/** GLM 代理试调：服务端转发一条测试对话。 */
+export async function testGlmProxy(model: string, prompt: string): Promise<{
+  ok: boolean;
+  content: string;
+  model: string;
+  latencyMs: number;
+  usage?: unknown;
+}> {
+  return call("test_glm_proxy", { model, prompt });
+}
+
+/** 模型用量统计汇总（今日/近7天/全部，按模型分列）。 */
+export async function getGlmUsageSummary(): Promise<GlmUsageStatistics> {
+  return call("get_glm_usage_summary");
+}
+
+export async function getGlmUsageRecords(limit = 100): Promise<{ records: GlmUsageRecord[] }> {
+  return call("get_glm_usage_records", { limit });
+}
+
+/**
+ * 模型监控数据：窗口内按模型汇总 + 按时间分桶的调用趋势。
+ * @param hours 统计窗口（小时）；0 表示全部历史
+ * @param bucketMinutes 可选，时间桶宽度（分钟）；不传则后端按窗口自动选择
+ * @param provider 可选，平台/账号过滤（autoclaw, loomy, trae_work_cn, all）
+ */
+export async function getGlmUsageMonitor(
+  hours = 24,
+  bucketMinutes?: number,
+  provider?: string,
+): Promise<ModelMonitor> {
+  const params: Record<string, unknown> = { hours };
+  if (bucketMinutes) params.bucketMinutes = bucketMinutes;
+  if (provider && provider !== "all") params.provider = provider;
+  return call("get_glm_usage_monitor", params);
+}
+
+/** 多账号（AutoClaw, Loomy, TRAE Work CN）模型用量概览指标 */
+export async function getAccountsUsageOverview(): Promise<AccountsOverviewResponse> {
+  return call("get_accounts_usage_overview");
+}
+
+// ---- AutoClaw 多账号池（仅 webui 后端支持）----
+
+export async function getAutoclawAccounts(): Promise<{ accounts: AutoclawAccountInfo[] }> {
+  return call("get_autoclaw_accounts");
+}
+
+export async function addAutoclawAccount(input: {
+  label?: string;
+  accessToken: string;
+  refreshToken: string;
+  deviceId?: string;
+}): Promise<{ ok: boolean; account: AutoclawAccountInfo }> {
+  return call("add_autoclaw_account", input as unknown as Record<string, unknown>);
+}
+
+export async function importAutoclawLocal(): Promise<{ ok: boolean; account: AutoclawAccountInfo }> {
+  return call("import_autoclaw_local");
+}
+
+export async function removeAutoclawAccount(id: string): Promise<{ ok: boolean }> {
+  return call("remove_autoclaw_account", { id });
+}
+
+export async function refreshAutoclawAccount(id: string): Promise<{ ok: boolean }> {
+  return call("refresh_autoclaw_account", { id });
+}
+
+export async function autoclawCheckinAll(): Promise<{ accounts: AutoclawCheckinResult[] }> {
+  return call("autoclaw_checkin_all");
+}
+
+export async function autoclawCheckinOne(id: string): Promise<AutoclawCheckinResult> {
+  return call("autoclaw_checkin_one", { id });
+}
+
+// ---- TRAE Work CN 多账号池（仅 webui 后端支持）----
+
+export async function getTraeAccounts(): Promise<{ accounts: TraeAccountInfo[] }> {
+  return call("get_trae_accounts");
+}
+
+export async function importTraeLocal(): Promise<{ ok: boolean; account: TraeAccountInfo }> {
+  return call("import_trae_local");
+}
+
+export async function removeTraeAccount(id: string): Promise<{ ok: boolean }> {
+  return call("remove_trae_account", { id });
+}
+
+export async function refreshTraeAccount(id: string): Promise<{ ok: boolean }> {
+  return call("refresh_trae_account", { id });
+}
+
+export async function traeCheckinAll(): Promise<{ accounts: TraeCheckinResult[] }> {
+  return call("trae_checkin_all");
+}
+
+export async function traeCheckinOne(id: string): Promise<TraeCheckinResult> {
+  return call("trae_checkin_one", { id });
+}
+
+// ---- Qoder 融合网关（仅 webui 后端支持）----
+
+// ---- Kimi 融合网关（仅 webui 后端支持）----
+
+export async function getKimiAccounts(): Promise<{ accounts: KimiAccountInfo[] }> {
+  return call("get_kimi_accounts");
+}
+
+export async function kimiAddAccount(name: string | undefined, rawToken: string): Promise<{ ok: boolean; account: unknown }> {
+  return call("kimi_add_account", { name, raw_token: rawToken });
+}
+
+export async function kimiRemoveAccount(id: string): Promise<{ ok: boolean }> {
+  return call("kimi_remove_account", { id });
+}
+
+export async function kimiEnableAccount(id: string, enabled: boolean): Promise<{ ok: boolean }> {
+  return call("kimi_enable_account", { id, enabled });
+}
+
+export async function kimiVerifyAccount(id: string): Promise<{ ok: boolean }> {
+  return call("kimi_verify_account", { id });
+}
+
+// ---- 网关管理（Qoder/Kimi 共用 API Keys 与日志）----
+
+export async function getGatewayKeys(): Promise<{ keys: GatewayApiKey[] }> {
+  return call("get_gateway_keys");
+}
+
+export async function createGatewayKey(name: string): Promise<{ ok: boolean; key: GatewayApiKey }> {
+  return call("create_gateway_key", { name });
+}
+
+export async function deleteGatewayKey(id: string): Promise<{ ok: boolean }> {
+  return call("delete_gateway_key", { id });
+}
+
+export async function getGatewayLogs(gateway?: string, limit = 50): Promise<{ logs: GatewayLogEntry[] }> {
+  const args: Record<string, unknown> = { limit };
+  if (gateway) args.gateway = gateway;
+  return call("get_gateway_logs", args);
+}
+
+export async function getGatewayOverview(): Promise<GatewayOverview> {
+  return call("get_gateway_overview");
+}
+
+// ---- ChatGLM 网页协议网关（仅 webui 后端支持）----
+
+export async function getGlmwebTokens(): Promise<{ tokens: { index: number; type: string; preview: string; hasCachedAccess: boolean; accessExpiresAt: number | null }[]; pool: { accounts: number; guestSlots: number; refreshAccounts: number; withCachedAccess: number } }> {
+  return call("get_glmweb_tokens");
+}
+
+export async function glmwebAddToken(token: string): Promise<{ ok: boolean; count: number; guestSlots: number }> {
+  return call("glmweb_add_token", { token });
+}
+
+export async function glmwebRemoveToken(index: number): Promise<{ ok: boolean }> {
+  return call("glmweb_remove_token", { index });
+}
+
+/** v0.1.46：幂等写回 chatglm refresh token（浏览器同步工具调用）。 */
+export async function glmwebSyncToken(input: {
+  token: string;
+  validate?: boolean;
+  source?: string;
+}): Promise<{
+  ok: boolean;
+  added: boolean;
+  rotated: boolean;
+  validated: boolean;
+  account?: { preview?: string; accessExpiresAt?: number | null; needRenew?: boolean };
+  pool?: {
+    accounts: number;
+    guestSlots: number;
+    refreshAccounts: number;
+    withCachedAccess: number;
+    needRenew: number;
+    defaultModel: string;
+    degraded: boolean;
+  };
+}> {
+  return call("glmweb_sync_token", input as unknown as Record<string, unknown>);
+}
+
+export async function glmwebTestCompletion(model: string, prompt: string): Promise<{ ok: boolean; model: string; content: string; latencyMs: number }> {
+  return call("glmweb_test_completion", { model, prompt });
+}
+
+export async function qoderImportManual(input: { uid?: string; accessToken: string; refreshToken?: string }): Promise<{ ok: boolean; account: QoderAccountInfo }> {
+  return call("qoder_import_manual", input);
+}
+
+export async function kimiTestCompletion(model: string, prompt: string): Promise<{ ok: boolean; model: string; content: string; latencyMs: number }> {
+  return call("kimi_test_completion", { model, prompt });
+}
+
+export async function getGrokAccounts(): Promise<{ accounts: GrokAccountInfo[] }> {
+  return call("get_grok_accounts");
+}
+
+// ---- Grok 账号池管理 ----
+
+export async function getGrokPoolOverview(): Promise<GrokPoolOverview> {
+  return call("get_grok_pool_overview");
+}
+
+export async function grokPoolCheck(): Promise<{ status: string; checked: unknown[]; webAccounts: number }> {
+  return call("grok_pool_check");
+}
+
+export async function getGrokPoolPolicy(): Promise<GrokPoolPolicy> {
+  return call("get_grok_pool_policy");
+}
+
+export async function setGrokPoolPolicy(policy: Partial<GrokPoolPolicy>): Promise<{ ok: boolean }> {
+  return call("set_grok_pool_policy", policy as Record<string, unknown>);
+}
+
+export async function getGrokPoolHistory(): Promise<{ snapshots: GrokPoolSnapshot[] }> {
+  return call("get_grok_pool_history");
+}
+
+// ---- Grok SSO 自动同步（专用浏览器 + CDP）----
+
+export async function getGrokSsoStatus(): Promise<Record<string, unknown>> {
+  return call("get_grok_sso_status");
+}
+
+export async function syncGrokSso(): Promise<{
+  status: string;
+  ssoPresent?: boolean;
+  ssoRwPresent?: boolean;
+  cookieCount?: number;
+  written?: boolean;
+  error?: string;
+  attempt?: number;
+}> {
+  return call("sync_grok_sso");
+}
+
+export async function openGrokSsoLogin(): Promise<{ ok: boolean; port?: number; message?: string; error?: string }> {
+  return call("open_grok_sso_login");
+}
+
+export async function grokAddAccount(input: {
+  name: string;
+  provider: string;
+  token: string;
+  tier?: string;
+}): Promise<{ ok: boolean; account: GrokAccountInfo }> {
+  return call("grok_add_account", input);
+}
+
+export async function grokRemoveAccount(id: string): Promise<{ ok: boolean }> {
+  return call("grok_remove_account", { id });
+}
+
+export async function grokEnableAccount(id: string, enabled: boolean): Promise<{ ok: boolean }> {
+  return call("grok_enable_account", { id, enabled });
+}
+
+export async function grokTest(input: {
+  model: string;
+  prompt: string;
+  enableThinking?: boolean;
+  accountId?: string;
+}): Promise<GrokTestResult> {
+  return call("grok_test", input);
+}
+
+export async function getQoderAccounts(): Promise<{ accounts: QoderAccountInfo[] }> {
+  return call("get_qoder_accounts");
+}
+
+export async function qoderImportLocal(): Promise<{ ok: boolean; account: QoderAccountInfo }> {
+  return call("qoder_import_local");
+}
+
+export async function qoderRemoveAccount(uid: string): Promise<{ ok: boolean }> {
+  return call("qoder_remove_account", { uid });
+}
+
+export async function qoderRefreshAccount(uid: string): Promise<{ ok: boolean }> {
+  return call("qoder_refresh_account", { uid });
+}
+
+export async function qoderDeviceFlowStart(): Promise<{ ok: boolean; session: { authorizationUrl: string; nonce: string; verifier: string; startedAt: number } }> {
+  return call("qoder_device_flow_start");
+}
+
+export async function qoderDeviceFlowComplete(session: { authorizationUrl: string; nonce: string; verifier: string; startedAt: number }): Promise<{ ok: boolean; account: QoderAccountInfo }> {
+  return call("qoder_device_flow_complete", { session });
+}
+
+export async function qoderTestCompletion(model: string, prompt: string): Promise<{ ok: boolean; model: string; content: string; latencyMs: number }> {
+  return call("qoder_test_completion", { model, prompt });
+}
+
+// ---- Loomy（讯飞）账号池与代理（仅 webui 后端支持）----
+
+export async function getLoomyStatus(): Promise<{
+  localLogin: boolean;
+  dataDir?: string | null;
+  apiHost: string;
+}> {
+  return call("get_loomy_status");
+}
+
+export async function getLoomyAccounts(): Promise<{ accounts: LoomyAccountInfo[] }> {
+  return call("get_loomy_accounts");
+}
+
+export async function addLoomyAccount(input: {
+  session: string;
+  label?: string;
+}): Promise<{ ok: boolean; account: LoomyAccountInfo }> {
+  return call("add_loomy_account", input as unknown as Record<string, unknown>);
+}
+
+export async function importLoomyLocal(): Promise<{ ok: boolean; account: LoomyAccountInfo }> {
+  return call("import_loomy_local");
+}
+
+export async function removeLoomyAccount(id: string): Promise<{ ok: boolean }> {
+  return call("remove_loomy_account", { id });
+}
+
+export async function getLoomyCredits(pool = false): Promise<{
+  ok: boolean;
+  balance?: number;
+  dailyBalance?: number;
+  error?: string;
+  accounts?: { id: string; label: string; credit: LoomyCreditInfo }[];
+}> {
+  return httpCall("get_loomy_credits", pool ? { pool: "true" } : undefined);
+}
+
+export async function loomyCheckinAll(): Promise<{ accounts: LoomyCheckinResult[] }> {
+  return call("loomy_checkin_all");
+}
+
+export async function loomyCheckinOne(id: string): Promise<LoomyCheckinResult> {
+  return call("loomy_checkin_one", { id });
+}
+
+export async function getLoomyProxyConfig(): Promise<LoomyProxyConfigInfo> {
+  return call("get_loomy_proxy_config");
+}
+
+export async function saveLoomyProxyConfig(patch: {
+  enabled?: boolean;
+  api_key?: string;
+}): Promise<{ ok: boolean }> {
+  return call("save_loomy_proxy_config", patch as unknown as Record<string, unknown>);
+}
+
+export async function getLoomyProxyStatus(): Promise<LoomyProxyStatus> {
+  return call("get_loomy_proxy_status");
+}
+
+export async function getLoomyModelsCatalog(): Promise<{ object: string; data: LoomyModel[] }> {
+  return httpCall("get_loomy_models_catalog");
+}
+
+// ---- TRAE / WorkBuddy 模型代理（仅 webui 后端支持）----
+
+export interface TraeProxyStatus {
+  credential: { ok: boolean; user?: string; host?: string; error?: string };
+  models: { count: number };
+  chatForwarding: boolean;
+}
+
+export interface TraeProxyModel {
+  id: string;
+  display_name?: string | null;
+  scene?: string;
+  model_type?: string;
+  rate?: number | null;
+  reasoning?: boolean;
+  multimodal?: boolean;
+  context_max?: number | null;
+  status?: boolean;
+}
+
+export interface WorkbuddyProxyStatus {
+  enabled: boolean;
+  server: { ok: boolean; port?: number; error?: string };
+  providers?: { id: string; name?: string | null; models: { id: string; name?: string | null; reasoning?: boolean; context?: number | null }[] }[];
+  modelCount?: number;
+}
+
+export async function getTraeProxyStatus(): Promise<TraeProxyStatus> {
+  return httpCall("get_trae_proxy_status");
+}
+
+export async function getTraeProxyModels(): Promise<{
+  ok: boolean;
+  count?: number;
+  models?: TraeProxyModel[];
+  error?: string;
+}> {
+  return httpCall("get_trae_proxy_models");
+}
+
+export async function getWorkbuddyProxyStatus(): Promise<WorkbuddyProxyStatus> {
+  return httpCall("get_workbuddy_proxy_status");
+}
+
+export async function getWorkbuddyProxyModels(): Promise<{
+  ok: boolean;
+  providers?: WorkbuddyProxyStatus["providers"];
+  error?: string;
+}> {
+  return httpCall("get_workbuddy_proxy_models");
+}
+
+/** AutoClaw 网关状态探测（仅 webui 后端支持）。 */
+export async function getGlmProxyStatus(): Promise<GlmProxyStatus> {
+  return call("get_glm_proxy_status");
+}
+
+export async function saveGlmProxyConfig(patch: {
+  enabled?: boolean;
+  apiKey?: string;
+  regenerateKey?: boolean;
+  /** 速度优先：慢模型改投到更快的目标模型 */
+  speedFirst?: boolean;
+  speedFirstTarget?: string;
+  /** 账号策略：round_robin / local_first / local_only / pinned */
+  accountMode?: string;
+  /** pinned 策略使用的账号 id */
+  pinnedAccountId?: string;
+}): Promise<GlmProxyConfigInfo> {
+  return call("save_glm_proxy_config", patch as unknown as Record<string, unknown>);
+}
+
 export function getCreditExpiry(accountId: string): Promise<CreditExpiry> {
   return call("get_credit_expiry", { accountId });
 }
@@ -424,28 +964,6 @@ export function saveAutoTravelConfig(config: TravelConfig): Promise<TravelConfig
   });
 }
 
-export function getAutoRotateConfig(): Promise<AutoRotateConfig> {
-  return call("get_auto_rotate_config");
-}
-
-export function saveAutoRotateConfig(config: AutoRotateConfig): Promise<AutoRotateConfig> {
-  return call("save_auto_rotate_config", {
-    config: config as unknown as Record<string, unknown>,
-  });
-}
-
-export function getRotateStatus(): Promise<RotateStatus> {
-  return call("rotate_status");
-}
-
-export function runRotate(): Promise<{ status: string; reason?: string; error?: string; to?: string }> {
-  return call("run_rotate");
-}
-
-export function getRotateLogs(): Promise<{ logs: RotateLog[] }> {
-  return call("get_rotate_logs");
-}
-
 export function refreshAccountToken(accountId: string): Promise<AccountMeta> {
   return call("refresh_account_token", { accountId });
 }
@@ -490,9 +1008,79 @@ export function setLaunchAtLoginEnabled(enabled: boolean): Promise<boolean> {
   return call("set_launch_at_login_enabled", { enabled });
 }
 
+// ---------------------------------------------------------------------------
+// 账号保护与保活
+// ---------------------------------------------------------------------------
+
+export function getProtectionStatus(): Promise<AccountProtectionStatusInfo> {
+  return call("get_protection_status");
+}
+
+export function getProtectionConfig(): Promise<AccountProtectionConfigInfo> {
+  return call("get_protection_config");
+}
+
+export function saveProtectionConfig(
+  config: Partial<AccountProtectionConfigInfo>,
+): Promise<{ ok: boolean; config: AccountProtectionConfigInfo }> {
+  return call("save_protection_config", config as Record<string, unknown>);
+}
+
+export function triggerProtectionKeepalive(): Promise<{ ok: boolean; report: unknown }> {
+  return call("protection_keepalive_now");
+}
+
+export function clearProtectionCooldown(
+  accountId: string,
+): Promise<{ ok: boolean; cleared: boolean }> {
+  return call("protection_clear_cooldown", { accountId });
+}
+
+export function getLoomyProtectionStatus(): Promise<AccountProtectionStatusInfo> {
+  return call("get_loomy_protection_status");
+}
+
+export function triggerLoomyProtectionKeepalive(): Promise<{ ok: boolean; report: unknown }> {
+  return call("loomy_protection_keepalive_now");
+}
+
+export function clearLoomyProtectionCooldown(
+  accountId: string,
+): Promise<{ ok: boolean; cleared: boolean }> {
+  return call("loomy_protection_clear_cooldown", { accountId });
+}
+
 /** 把 Tauri command / HTTP 抛出的错误统一为 Error。 */
 export function asError(e: unknown): string {
   if (typeof e === "string") return e;
   if (e instanceof Error) return e.message;
   return JSON.stringify(e ?? "未知错误");
 }
+
+/** 统一网关总览（/api/gateways/overview 的返回结构）。 */
+export type GatewayModelInfo = {
+  id: string | null;
+  name: string | null;
+  capabilities: string[];
+};
+
+export type GatewayInfo = {
+  id: string;
+  name: string;
+  /** 前端管理页路由 */
+  page: string;
+  /** OpenAI 兼容调用基址 */
+  base: string;
+  enabled: boolean;
+  /** ok | cooling | disabled | error */
+  health: string;
+  error?: string;
+  accountCount: number;
+  healthyAccounts: number;
+  modelCount: number;
+  capabilities: string[];
+  models: GatewayModelInfo[];
+};
+
+export type GatewaysOverview = { gateways: GatewayInfo[] };
+

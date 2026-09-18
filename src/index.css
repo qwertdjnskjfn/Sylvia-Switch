@@ -21,8 +21,8 @@
   --accent-foreground: oklch(0.24 0.01 264);
   --destructive: oklch(0.577 0.245 27.325);
   --destructive-foreground: oklch(0.99 0.002 270);
-  --border: oklch(0.91 0.006 264);
-  --input: oklch(0.91 0.006 264);
+  --border: oklch(0.925 0.004 264);
+  --input: oklch(0.925 0.004 264);
   --ring: oklch(0.725 0.133 163.03);
   --brand: oklch(0.725 0.133 163.03);
   --brand-foreground: oklch(0.985 0.002 247.839);
@@ -31,14 +31,14 @@
   --chart-3: oklch(0.398 0.07 227.392);
   --chart-4: oklch(0.828 0.189 84.429);
   --chart-5: oklch(0.769 0.188 70.08);
-  --radius: 0.75rem;
-  --sidebar: oklch(0.973 0.003 264);
+  --radius: 1rem;
+  --sidebar: oklch(0.982 0.002 264);
   --sidebar-foreground: oklch(0.24 0.01 264);
   --sidebar-primary: oklch(0.725 0.133 163.03);
   --sidebar-primary-foreground: oklch(0.99 0.002 247.839);
-  --sidebar-accent: oklch(0.93 0.004 264);
+  --sidebar-accent: oklch(0.945 0.004 264);
   --sidebar-accent-foreground: oklch(0.21 0.01 264);
-  --sidebar-border: oklch(0.91 0.006 264);
+  --sidebar-border: oklch(0.925 0.004 264);
   --sidebar-ring: oklch(0.725 0.133 163.03);
   --data-series-emerald: oklch(0.62 0.13 163);
   --data-series-teal: oklch(0.66 0.1 190);
@@ -48,6 +48,9 @@
   --data-series-rose: oklch(0.64 0.12 20);
   --data-series-sky: oklch(0.63 0.1 235);
   --data-series-lime: oklch(0.67 0.11 125);
+  /* 图表语义色（原先未定义，导致积分/Token 图表缺色） */
+  --color-total: var(--data-series-emerald);
+  --color-records: var(--data-series-indigo);
 }
 
 .dark {
@@ -167,3 +170,23 @@
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 }
+
+/* ------------------------------------------------------------------ */
+/* 主题色切换动效                                                       */
+/* View Transitions 默认是整屏交叉淡入淡出，这里禁用它，               */
+/* 改为由 JS 在 ::view-transition-new(root) 上驱动 clip-path 圆形揭示。 */
+/* ------------------------------------------------------------------ */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
+
+::view-transition-old(root) {
+  z-index: 1;
+}
+
+::view-transition-new(root) {
+  z-index: 2;
+}
+

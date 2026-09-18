@@ -1,7 +1,7 @@
 import type {
-  AccountMeta, AppStatus, AutoRotateConfig, CheckinConfig, CheckinLog,
-  CodeBuddyCliStatus, CodeBuddyCliSwitchResult, CreditExpiry, CreditOfficialUsageModel, CreditStatistics,
-  GithubConfig, RotateLog, RotateStatus, TokenStatistics, TokenStatsGroup, TokenStatsSource, TokenStatsTotals,
+  AccountMeta, AppStatus, CheckinConfig, CheckinLog,
+  CreditExpiry, CreditOfficialUsageModel, CreditStatistics,
+  GithubConfig, TokenStatistics, TokenStatsGroup, TokenStatsSource, TokenStatsTotals,
   TravelConfig, TravelStatus,
 } from "./types";
 import { demoModeEnabled } from "./demo-mode";
@@ -26,9 +26,6 @@ const accounts: AccountMeta[] = [
   { id: "demo-account-b", uid: "demo-user-002", email: "test-b@example.com", nickname: "测试 B", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null },
   { id: "demo-account-c", uid: "demo-user-003", email: "test-c@example.com", nickname: "测试 C", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null },
 ];
-
-/** 演示模式中的临时 CLI 当前账号，仅存在于本次页面会话。 */
-let demoActiveCliAccountId = accounts[0].id;
 
 // Counts and relative model roles follow anonymous aggregates from the sanitized local cache.
 // No upstream request row or identifier is copied into this fixture.
@@ -61,25 +58,25 @@ const usageSeeds: AccountUsageSeed[] = [
 
 const creditPackages = [
   [
-    ["CodeBuddy 个人版国内运营裂变包", 5000, 3186.4, 36],
-    ["CodeBuddy 个人版积分包", 2400, 1180.75, 18],
-    ["CodeBuddy 新用户体验包", 800, 386.4, 5],
-    ["CodeBuddy 签到赠送积分", 300, 196.25, 11],
-    ["CodeBuddy 活动奖励积分", 600, 428.6, 27],
+    ["WorkBuddy 个人版国内运营裂变包", 5000, 3186.4, 36],
+    ["WorkBuddy 个人版积分包", 2400, 1180.75, 18],
+    ["WorkBuddy 新用户体验包", 800, 386.4, 5],
+    ["WorkBuddy 签到赠送积分", 300, 196.25, 11],
+    ["WorkBuddy 活动奖励积分", 600, 428.6, 27],
   ],
   [
-    ["CodeBuddy 个人版国内运营裂变包", 3600, 2468.2, 24],
-    ["CodeBuddy 个人版积分包", 1800, 905.5, 42],
-    ["CodeBuddy 新用户体验包", 500, 128.2, 7],
-    ["CodeBuddy 签到赠送积分", 240, 174.35, 15],
-    ["CodeBuddy 活动奖励积分", 400, 286.8, 31],
+    ["WorkBuddy 个人版国内运营裂变包", 3600, 2468.2, 24],
+    ["WorkBuddy 个人版积分包", 1800, 905.5, 42],
+    ["WorkBuddy 新用户体验包", 500, 128.2, 7],
+    ["WorkBuddy 签到赠送积分", 240, 174.35, 15],
+    ["WorkBuddy 活动奖励积分", 400, 286.8, 31],
   ],
   [
-    ["CodeBuddy 个人版国内运营裂变包", 2400, 1680.4, 29],
-    ["CodeBuddy 个人版积分包", 1200, 748.6, 55],
-    ["CodeBuddy 新用户体验包", 360, 214.5, 14],
-    ["CodeBuddy 签到赠送积分", 180, 96.75, 21],
-    ["CodeBuddy 活动奖励积分", 300, 207.9, 38],
+    ["WorkBuddy 个人版国内运营裂变包", 2400, 1680.4, 29],
+    ["WorkBuddy 个人版积分包", 1200, 748.6, 55],
+    ["WorkBuddy 新用户体验包", 360, 214.5, 14],
+    ["WorkBuddy 签到赠送积分", 180, 96.75, 21],
+    ["WorkBuddy 活动奖励积分", 300, 207.9, 38],
   ],
 ] as const;
 
@@ -237,7 +234,7 @@ function visibleRequests(accountIndex: number) {
       requestId: `demo-request-${String(accountIndex + 1).padStart(2, "0")}-${String(rowIndex + 1).padStart(4, "0")}`,
       credit,
       model,
-      client: rowIndex % 50 === 0 ? "CodeBuddyIDE" : "CLI",
+      client: rowIndex % 50 === 0 ? "WEB" : "CLI",
       requestTime: `${localDate(daysAgo)} ${String(ts.getHours()).padStart(2, "0")}:${String(ts.getMinutes()).padStart(2, "0")}:00`,
     };
   });
@@ -339,19 +336,8 @@ function travelStatus(accountId: string): TravelStatus {
   return { label: "no-buddy", rewardCredit: null, locationName: null };
 }
 
-function rotateConfig(): AutoRotateConfig {
-  return { enabled: true, check_interval_minutes: 15, cooldown_minutes: 120, min_gap_hours: 24, min_urgency_hours: 72, active_guard_minutes: 30, min_remaining_credits: 50 };
-}
-
 function checkinLogs(): CheckinLog[] {
   return hydratedAccounts().flatMap((account, accountIndex) => [0, 1, 2].map((daysAgo) => ({ ts: atLocalTime(daysAgo, 8, 6 + accountIndex * 9), accountId: account.id, email: account.nickname ?? account.email ?? account.id, result: accountIndex === 1 && daysAgo === 0 ? "already" : "success" })));
-}
-
-function rotateLogs(): RotateLog[] {
-  return [
-    { ts: atLocalTime(0, 9, 30), action: "skipped", reason: "当前账号仍是积分到期最紧迫的可用账号", from: { id: accounts[0].id, name: accounts[0].nickname }, to: null },
-    { ts: atLocalTime(1, 16, 20), action: "switched", reason: "目标账号积分将在 5 天内到期", from: { id: accounts[1].id, name: accounts[1].nickname }, to: { id: accounts[0].id, name: accounts[0].nickname } },
-  ];
 }
 
 function demoTokenTotals(input: number, output: number, cacheRead: number, cacheWrite: number, records: number): TokenStatsTotals {
@@ -395,33 +381,21 @@ function demoTokenSource(source: TokenStatsSource["source"], scale: number): Tok
     demoTokenSession("wb-switch-rust · account-card-redesign", "统一账号卡片视觉和交互", "wb-switch-rust", 6_300_000 * scale, 410_000 * scale, 5_400_000 * scale, 50_000 * scale, Math.round(29 * scale)),
   ];
   const now = Date.now();
-  return { source, summary, models, projects, sessions, daily, hours, filesScanned: source === "workbuddy" ? 63 : source === "codebuddy-ide" ? 17 : 41, parseErrors: 0, coverageStartAt: now - 13 * 86_400_000, coverageEndAt: now };
+  return { source, summary, models, projects, sessions, daily, hours, filesScanned: source === "workbuddy" ? 63 : 41, parseErrors: 0, coverageStartAt: now - 13 * 86_400_000, coverageEndAt: now };
 }
 
 function demoTokenStatistics(days?: number): TokenStatistics {
-  return { generatedAt: Date.now(), rangeDays: days ?? null, sources: [demoTokenSource("workbuddy", 1), demoTokenSource("codebuddy-cli", 0.58), demoTokenSource("codebuddy-ide", 0.36)] };
+  return { generatedAt: Date.now(), rangeDays: days ?? null, sources: [demoTokenSource("workbuddy", 1)] };
 }
 
 /** Read-only demo response provider. It never reads or mutates real user data. */
 export function screenshotDemoResponse(command: string, args?: Record<string, unknown>): unknown {
   const demoAccounts = hydratedAccounts();
   const appStatus: AppStatus = { running: true, authFile: "/demo/workbuddy/auth.json", current: { uid: demoAccounts[0].uid, nickname: demoAccounts[0].nickname, email: demoAccounts[0].email }, appPath: "/demo/WorkBuddy.app", version: "0.1.24" };
-  const activeIndex = Math.max(0, demoAccounts.findIndex((account) => account.id === demoActiveCliAccountId));
-  const activeAccount = demoAccounts[activeIndex] ?? demoAccounts[0];
-  const cliStatus: CodeBuddyCliStatus = { configured: true, settingsPresent: true, helperPresent: true, helperSupportsAccountIds: true, activeIndex, activeAccountId: activeAccount.id, activeAccountName: activeAccount.nickname, accountCount: demoAccounts.length, statePath: "/demo/codebuddy-cli-state.json" };
-  const config = rotateConfig();
-  const rotateStatus: RotateStatus = { config, cliConfigured: true, activeAccountId: demoAccounts[0].id, activeAccountName: demoAccounts[0].nickname, lastCheckAt: atLocalTime(0, 9, 30), lastSwitchAt: atLocalTime(1, 16, 20) };
   const githubConfig: GithubConfig = { owner: "zhangjia", repo: "wb-switch", proxy: "" };
   switch (command) {
     case "get_status": return appStatus;
     case "get_accounts": return { accounts: demoAccounts };
-    case "get_codebuddy_cli_status": return cliStatus;
-    case "switch_codebuddy_cli_account": {
-      const target = demoAccounts.find((account) => account.id === args?.accountId);
-      if (!target) throw new Error("账号不存在");
-      demoActiveCliAccountId = target.id;
-      return { ok: true, configured: true, synced: true, verified: true, activeIndex: demoAccounts.indexOf(target), activeAccountId: target.id, message: "演示切换已完成" } satisfies CodeBuddyCliSwitchResult;
-    }
     case "get_checkin_status": return { ok: true, todayCheckedIn: true };
     case "get_credit_expiry": return creditExpiry(String(args?.accountId ?? ""));
     case "get_credit_statistics": return buildStatistics();
@@ -430,9 +404,6 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
     case "get_checkin_logs": return { logs: checkinLogs() };
     case "get_travel_status": return travelStatus(String(args?.accountId ?? ""));
     case "get_auto_travel_config": return travelConfig();
-    case "get_auto_rotate_config": return config;
-    case "rotate_status": return rotateStatus;
-    case "get_rotate_logs": return { logs: rotateLogs() };
     case "get_github_config": return githubConfig;
     case "check_update": return { ok: true, current: "0.1.24", latest: "0.1.25", latestTag: "v0.1.25", hasUpdate: true, releaseName: "更新提示演示", releaseUrl: "https://github.com/changexbc/workbuddy-switch/releases/tag/v0.1.25" };
     case "get_launch_at_login_enabled": return true;

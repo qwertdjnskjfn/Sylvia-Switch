@@ -50,22 +50,7 @@ fn spawn_background_loops() {
 
     tauri::async_runtime::spawn(async move {
         let mut last_keepalive_day = String::new();
-        let mut last_rotate_at: i64 = 0;
         loop {
-            // 自动轮换（CodeBuddy CLI）：按配置间隔执行
-            let rotate_cfg = modules::config::load_auto_rotate_config();
-            if rotate_cfg.get("enabled").and_then(|v| v.as_bool()) == Some(true) {
-                let interval_minutes = rotate_cfg
-                    .get("check_interval_minutes")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(5)
-                    .max(1);
-                let now = modules::config::now_ms();
-                if now - last_rotate_at >= interval_minutes * 60_000 {
-                    last_rotate_at = now;
-                    let _ = modules::rotate::run_rotate_cycle().await;
-                }
-            }
             let today = modules::checkin::date_str(None);
             if today != last_keepalive_day {
                 last_keepalive_day = today;
@@ -114,12 +99,6 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_status,
             commands::get_accounts,
-            commands::get_codebuddy_cli_status,
-            commands::install_codebuddy_cli_helper,
-            commands::switch_codebuddy_cli_account,
-            commands::get_codebuddy_cn_ide_status,
-            commands::switch_codebuddy_cn_ide_account,
-            commands::detect_codebuddy_cn_ide_account,
             commands::delete_account,
             commands::oauth_start,
             commands::oauth_status,
@@ -147,11 +126,6 @@ pub fn run() {
             commands::get_auto_travel_config,
             commands::save_auto_travel_config,
             commands::refresh_account_token,
-            commands::get_auto_rotate_config,
-            commands::save_auto_rotate_config,
-            commands::rotate_status,
-            commands::run_rotate,
-            commands::get_rotate_logs,
             commands::get_github_config,
             commands::save_github_config,
             commands::check_update,

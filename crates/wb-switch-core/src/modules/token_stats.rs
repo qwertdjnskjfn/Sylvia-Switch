@@ -1,17 +1,16 @@
-//! 本地 WorkBuddy / CodeBuddy CLI / CodeBuddy IDE Token 统计。
+//! 本地 WorkBuddy / AutoClaw Token 统计。
 //!
 //! 这个模块是统计数据的唯一归属：日志只在这里解码、去重和按时间聚合，
 //! Tauri 与 HTTP 层只负责转发结果。响应只包含聚合数字和脱敏标识，不返回
 //! 消息正文、arguments 或认证信息。
-//!
-//! CodeBuddy IDE 不写 JSONL，用量在 `CodeBuddyExtension/Data/**/history/**/index.json`
-//! 的 `requests[].usage` 中；消息正文文件（`messages/`）不会被扫描。
 
 use chrono::{Datelike, Local, Timelike};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+
+use crate::modules::stats::{units, window};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Usage {
@@ -46,22 +45,22 @@ impl Totals {
     }
 
     fn value(&self) -> Value {
-        let cache_hit_rate = (self.usage.input > 0)
-            .then(|| self.usage.read as f64 / self.usage.input as f64);
-        // `input` already includes cache reads; expose the same headline total
-        // used by the dashboard without double-counting the cached portion.
-        let total = self
-            .usage
-            .input
-            .saturating_add(self.usage.output)
-            .saturating_add(self.usage.write);
+        // 口径统一到 stats::units：部分平台（如 AutoClaw 某些接口）input 字段仅
+        // 记录未缓存输入，此时 read > input。统一函数先规整再相除，保证
+        // cacheHitRate 落在 0.0~1.0，且 uncachedInput 与总数统计准确。
+        // 注意：总输入为 0 时本模块历史上输出 null（而非 0），此处保留该语义。
+        let (input, uncached_input) =
+            units::normalize_input_tokens_u64(self.usage.input, self.usage.read);
+        let cache_hit_rate = (input > 0)
+            .then(|| units::cache_hit_rate_u64(self.usage.input, self.usage.read));
+        let total = units::total_tokens_u64(input, self.usage.output, self.usage.write);
         json!({
             "total": total,
-            "input": self.usage.input,
+            "input": input,
             "output": self.usage.output,
             "cacheRead": self.usage.read,
             "cacheWrite": self.usage.write,
-            "uncachedInput": self.usage.input.saturating_sub(self.usage.read),
+            "uncachedInput": uncached_input,
             "records": self.records,
             "cacheHitRate": cache_hit_rate,
         })
@@ -99,6 +98,7 @@ fn cached_input_field(object: &Map<String, Value>) -> u64 {
         &[
             "cache_read_input_tokens",
             "cacheReadInputTokens",
+            "cacheRead",
             "prompt_cache_hit_tokens",
             "cached_tokens",
         ],
@@ -127,16 +127,26 @@ fn cached_input_field(object: &Map<String, Value>) -> u64 {
 const CACHE_WRITE_KEYS: &[&str] = &[
     "cache_write_input_tokens",
     "cacheWriteInputTokens",
+    "cacheWrite",
     "cache_creation_input_tokens",
     "prompt_cache_write_tokens",
 ];
 
 fn usage_fields(object: &Map<String, Value>) -> Usage {
     Usage {
-        input: field(object, &["input_tokens", "inputTokens", "prompt_tokens"]).unwrap_or(0),
+        input: field(
+            object,
+            &["input", "input_tokens", "inputTokens", "prompt_tokens"],
+        )
+        .unwrap_or(0),
         output: field(
             object,
-            &["output_tokens", "outputTokens", "completion_tokens"],
+            &[
+                "output",
+                "output_tokens",
+                "outputTokens",
+                "completion_tokens",
+            ],
         )
         .unwrap_or(0),
         read: cached_input_field(object),
@@ -149,7 +159,11 @@ fn usage_object(value: Option<&Value>) -> Option<&Map<String, Value>> {
         // Input is the required anchor for a usage record. It may legitimately
         // be zero (for example a provider reports output-only retries), so do
         // not use `input > 0` as the validity check.
-        field(object, &["input_tokens", "inputTokens", "prompt_tokens"]).is_some()
+        field(
+            object,
+            &["input", "input_tokens", "inputTokens", "prompt_tokens"],
+        )
+        .is_some()
     })
 }
 
@@ -182,28 +196,47 @@ fn usage(value: &Value) -> Option<Usage> {
     }
 
     // prompt_cache_miss_tokens is deliberately not a write alias: current
-    // WorkBuddy/CodeBuddy logs use it for newly computed (uncached) input,
+    // WorkBuddy logs use it for newly computed (uncached) input,
     // while their explicit cache-write fields may legitimately remain zero.
 
     Some(result)
 }
 
 fn timestamp(value: &Value) -> Option<i64> {
+    let parse_raw = |raw: &Value| -> Option<i64> {
+        if let Some(n) = raw.as_i64() {
+            return Some(n);
+        }
+        if let Some(n) = raw.as_u64().and_then(|n| i64::try_from(n).ok()) {
+            return Some(n);
+        }
+        if let Some(s) = raw.as_str() {
+            let trimmed = s.trim();
+            if let Ok(n) = trimmed.parse::<i64>() {
+                return Some(n);
+            }
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+                return Some(dt.timestamp_millis());
+            }
+        }
+        None
+    };
+
     value
-        .get("timestamp")
-        .or_else(|| value.get("ts"))
-        .and_then(|timestamp| {
-            timestamp
-                .as_i64()
-                .or_else(|| timestamp.as_u64().and_then(|n| i64::try_from(n).ok()))
-                .or_else(|| timestamp.as_str()?.trim().parse::<i64>().ok())
+        .get("message")
+        .and_then(|m| m.get("timestamp").or_else(|| m.get("ts")))
+        .and_then(parse_raw)
+        .or_else(|| {
+            value
+                .get("timestamp")
+                .or_else(|| value.get("ts"))
+                .and_then(parse_raw)
         })
 }
 
 fn date(value: &Value) -> Option<String> {
-    let timestamp = timestamp(value)?;
-    chrono::DateTime::from_timestamp_millis(timestamp)
-        .map(|date| date.with_timezone(&Local).format("%Y-%m-%d").to_string())
+    // 日归属统一走 stats::window（与其它统计模块同一套本地日定义）。
+    window::local_day_key(timestamp(value)?)
 }
 
 fn hour(value: &Value) -> Option<String> {
@@ -218,6 +251,7 @@ fn model(value: &Value) -> String {
     value
         .get("providerData")
         .and_then(|data| data.get("model"))
+        .or_else(|| value.get("message").and_then(|m| m.get("model")))
         .or_else(|| value.get("model"))
         .and_then(Value::as_str)
         .map(str::trim)
@@ -434,21 +468,67 @@ impl SourceCollector {
     }
 }
 
-fn source(root: PathBuf, name: &str, cutoff: Option<i64>) -> Value {
-    let mut paths = Vec::new();
-    files(&root, &mut paths);
-    let mut collector = SourceCollector::default();
+fn extract_autoclaw_prompt(content: &str) -> Option<String> {
+    const START_TAG: &str = "<<<AUTOCLAW_USER_AUTHORED_REQUEST_START>>>";
+    const END_TAG: &str = "<<<AUTOCLAW_USER_AUTHORED_REQUEST_END>>>";
+    if let Some(start_idx) = content.find(START_TAG) {
+        let after_start = &content[start_idx + START_TAG.len()..];
+        let prompt_body = if let Some(end_idx) = after_start.find(END_TAG) {
+            &after_start[..end_idx]
+        } else {
+            after_start
+        };
+        let first_line = prompt_body
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())?;
+        if !first_line.is_empty() {
+            let mut title = first_line.to_string();
+            if title.chars().count() > 60 {
+                title = title.chars().take(60).collect::<String>() + "…";
+            }
+            return Some(title);
+        }
+    }
+    None
+}
 
-    paths.sort();
-    for path in &paths {
+fn source_from_roots(roots: Vec<PathBuf>, name: &str, cutoff: Option<i64>) -> Value {
+    let mut root_and_paths = Vec::new();
+    let mut seen_session_ids = std::collections::HashSet::new();
+
+    for root in &roots {
+        if !root.exists() {
+            continue;
+        }
+        let mut paths = Vec::new();
+        files(root, &mut paths);
+        paths.sort();
+        for path in paths {
+            let session_id = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("")
+                .to_string();
+            if !session_id.is_empty() && !seen_session_ids.insert(session_id.clone()) {
+                continue;
+            }
+            root_and_paths.push((root.clone(), path));
+        }
+    }
+
+    let mut collector = SourceCollector::default();
+    let files_scanned = root_and_paths.len();
+
+    for (root, path) in root_and_paths {
         let session_id = path
             .file_stem()
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty())
+            .and_then(|stem| stem.to_str())
+            .filter(|stem| !stem.is_empty())
             .unwrap_or("未知会话")
             .to_string();
-        let fallback_project = project_name(&root, path);
-        let Ok(file) = std::fs::File::open(path) else {
+        let fallback_project = project_name(&root, &path);
+        let Ok(file) = std::fs::File::open(&path) else {
             collector.note_parse_error();
             continue;
         };
@@ -467,6 +547,21 @@ fn source(root: PathBuf, name: &str, cutoff: Option<i64>) -> Value {
                 collector.note_parse_error();
                 continue;
             };
+
+            // 如果文件首行包含 cwd，提取为会话所属项目
+            if session_project.is_none() {
+                if let Some(cwd) = value.get("cwd").and_then(Value::as_str) {
+                    let clean = Path::new(cwd)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(str::trim)
+                        .filter(|n| !n.is_empty() && n.len() <= 120);
+                    if let Some(proj) = clean {
+                        session_project = Some(proj.to_string());
+                    }
+                }
+            }
+
             // Title metadata belongs to the whole JSONL session file. Read it
             // before applying the usage cutoff so an older title can still
             // label usage that falls inside the selected range. aiTitle has
@@ -477,6 +572,19 @@ fn source(root: PathBuf, name: &str, cutoff: Option<i64>) -> Value {
             if let Some(value) = non_empty_text(value.get("summary")) {
                 summary = Some(value);
             }
+            // AutoClaw 用户提问提取
+            if ai_title.is_none() && summary.is_none() {
+                if let Some(msg) = value.get("message") {
+                    if msg.get("role").and_then(Value::as_str) == Some("user") {
+                        if let Some(content) = msg.get("content").and_then(Value::as_str) {
+                            if let Some(extracted) = extract_autoclaw_prompt(content) {
+                                ai_title = Some(extracted);
+                            }
+                        }
+                    }
+                }
+            }
+
             // Records with a missing timestamp are excluded from a bounded
             // range rather than guessed from file mtime or browser time.
             if cutoff.is_some_and(|minimum| timestamp(&value).is_none_or(|ts| ts < minimum)) {
@@ -485,7 +593,10 @@ fn source(root: PathBuf, name: &str, cutoff: Option<i64>) -> Value {
             let Some(usage) = usage(&value) else {
                 continue;
             };
-            let project = record_project(&value, &fallback_project);
+            let project = record_project(
+                &value,
+                session_project.as_deref().unwrap_or(&fallback_project),
+            );
             if session_project.is_none() {
                 session_project = Some(project.clone());
             }
@@ -501,262 +612,22 @@ fn source(root: PathBuf, name: &str, cutoff: Option<i64>) -> Value {
         );
     }
 
-    collector.into_value(name, paths.len())
+    collector.into_value(name, files_scanned)
 }
 
-fn codebuddy_extension_data_dir() -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("CodeBuddyExtension")
-        .join("Data")
+fn source(root: PathBuf, name: &str, cutoff: Option<i64>) -> Value {
+    source_from_roots(vec![root], name, cutoff)
 }
 
-fn is_ide_conversation_index(path: &Path) -> bool {
-    path.file_name().and_then(|name| name.to_str()) == Some("index.json")
-        && path
-            .parent()
-            .and_then(|parent| parent.parent())
-            .and_then(|parent| parent.parent())
-            .and_then(|parent| parent.file_name())
-            .and_then(|name| name.to_str())
-            == Some("history")
+fn autoclaw_source(home: &Path, cutoff: Option<i64>) -> Value {
+    let roots = vec![
+        home.join(".openclaw-autoclaw/agents"),
+        home.join(".openclaw/agents"),
+    ];
+    source_from_roots(roots, "autoclaw", cutoff)
 }
 
-fn ide_index_files(root: &Path, output: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            let name = path.file_name().and_then(|name| name.to_str());
-            // Message bodies contain chat content and must not be scanned.
-            // Checkpoints and the shared Public bucket are unrelated to usage.
-            if !matches!(name, Some("messages" | "check-point" | "backups" | "Public")) {
-                ide_index_files(&path, output);
-            }
-        } else if is_ide_conversation_index(&path) {
-            output.push(path);
-        }
-    }
-}
-
-fn decode_genie_workspace(name: &str) -> Option<String> {
-    use base64::Engine;
-    let engine = base64::engine::general_purpose::STANDARD;
-    let try_decode = |value: &str| -> Option<String> {
-        let padded = match value.len() % 4 {
-            0 => value.to_string(),
-            remainder => format!("{value}{}", "=".repeat(4 - remainder)),
-        };
-        let bytes = engine.decode(padded).ok()?;
-        let text = String::from_utf8(bytes).ok()?;
-        let trimmed = text.trim();
-        if trimmed.is_empty() || trimmed.contains('\0') {
-            return None;
-        }
-        Some(trimmed.to_string())
-    };
-    try_decode(name)
-        .or_else(|| try_decode(&name.replace('_', "/")))
-        .or_else(|| try_decode(&name.replace('_', "+")))
-}
-
-fn ide_project_by_session() -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    let Some(root) = crate::modules::vscode_cn_inject::codebuddy_cn_data_dir().map(|dir| {
-        dir.join("User")
-            .join("globalStorage")
-            .join("tencent-cloud.coding-copilot")
-            .join("genie-history")
-    }) else {
-        return map;
-    };
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return map;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let folder = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("");
-        let project = decode_genie_workspace(folder)
-            .as_deref()
-            .map(Path::new)
-            .and_then(Path::file_name)
-            .and_then(|name| name.to_str())
-            .map(str::trim)
-            .filter(|name| !name.is_empty() && name.len() <= 120)
-            .unwrap_or("未知项目")
-            .to_string();
-        let Ok(conversations) = std::fs::read_dir(path.join("conversations")) else {
-            continue;
-        };
-        for conversation in conversations.flatten() {
-            if let Some(id) = conversation.file_name().to_str() {
-                if !id.is_empty() {
-                    map.insert(id.to_string(), project.clone());
-                }
-            }
-        }
-    }
-    map
-}
-
-fn ide_workspace_meta(conv_index: &Path, conv_id: &str) -> (Option<String>, String) {
-    let Some(ws_index) = conv_index
-        .parent()
-        .and_then(|parent| parent.parent())
-        .map(|parent| parent.join("index.json"))
-    else {
-        return (None, "未知模型".to_string());
-    };
-    let Ok(text) = std::fs::read_to_string(ws_index) else {
-        return (None, "未知模型".to_string());
-    };
-    let Ok(value) = serde_json::from_str::<Value>(&text) else {
-        return (None, "未知模型".to_string());
-    };
-    let Some(conversations) = value.get("conversations").and_then(Value::as_array) else {
-        return (None, "未知模型".to_string());
-    };
-    for conversation in conversations {
-        if conversation.get("id").and_then(Value::as_str) != Some(conv_id) {
-            continue;
-        }
-        let title = non_empty_text(conversation.get("name"))
-            .or_else(|| non_empty_text(conversation.get("title")));
-        let model = non_empty_text(conversation.get("selectedModelId"))
-            .or_else(|| non_empty_text(conversation.get("modelId")))
-            .or_else(|| non_empty_text(conversation.get("model")))
-            .unwrap_or_else(|| "未知模型".to_string());
-        return (title, model);
-    }
-    (None, "未知模型".to_string())
-}
-
-fn ide_request_usage(request: &Value) -> Option<Usage> {
-    let object = request.get("usage")?.as_object()?;
-    if field(object, &["inputTokens", "input_tokens", "prompt_tokens"]).is_none() {
-        return None;
-    }
-    Some(Usage {
-        input: field(object, &["inputTokens", "input_tokens", "prompt_tokens"]).unwrap_or(0),
-        output: field(
-            object,
-            &["outputTokens", "output_tokens", "completion_tokens"],
-        )
-        .unwrap_or(0),
-        read: field(
-            object,
-            &[
-                "cacheTokens",
-                "cacheReadInputTokens",
-                "cache_read_input_tokens",
-            ],
-        )
-        .unwrap_or(0),
-        write: positive_field(
-            object,
-            &[
-                "cachedWriteTokens",
-                "cacheWriteInputTokens",
-                "cache_write_input_tokens",
-                "cache_creation_input_tokens",
-            ],
-        )
-        .unwrap_or(0),
-    })
-}
-
-fn ide_request_timestamp(request: &Value) -> Option<i64> {
-    timestamp(request).or_else(|| {
-        request.get("startedAt").and_then(|value| {
-            value
-                .as_i64()
-                .or_else(|| value.as_u64().and_then(|n| i64::try_from(n).ok()))
-                .or_else(|| value.as_str()?.trim().parse::<i64>().ok())
-        })
-    })
-}
-
-fn ide_source(
-    root: PathBuf,
-    name: &str,
-    cutoff: Option<i64>,
-    project_by_session: &HashMap<String, String>,
-) -> Value {
-    let mut paths = Vec::new();
-    ide_index_files(&root, &mut paths);
-    paths.sort();
-    let mut collector = SourceCollector::default();
-
-    for path in &paths {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            collector.note_parse_error();
-            continue;
-        };
-        let Ok(value) = serde_json::from_str::<Value>(&text) else {
-            collector.note_parse_error();
-            continue;
-        };
-        let Some(requests) = value.get("requests").and_then(Value::as_array) else {
-            continue;
-        };
-        let session_id = path
-            .parent()
-            .and_then(|parent| parent.file_name())
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty())
-            .unwrap_or("未知会话")
-            .to_string();
-        let (title, model_name) = ide_workspace_meta(path, &session_id);
-        let fallback_project = project_by_session
-            .get(&session_id)
-            .cloned()
-            .unwrap_or_else(|| "未知项目".to_string());
-        let mut session_totals = Totals::default();
-        let mut session_project: Option<String> = None;
-
-        for request in requests {
-            let ts = ide_request_timestamp(request);
-            if cutoff.is_some_and(|minimum| ts.is_none_or(|value| value < minimum)) {
-                continue;
-            }
-            let Some(usage) = ide_request_usage(request) else {
-                continue;
-            };
-            let project = fallback_project.clone();
-            if session_project.is_none() {
-                session_project = Some(project.clone());
-            }
-            session_totals.add(usage);
-            collector.add(
-                usage,
-                &json!({
-                    "timestamp": ts,
-                    "providerData": { "model": model_name },
-                }),
-                &project,
-            );
-        }
-
-        collector.push_session(
-            session_id,
-            title,
-            session_project.unwrap_or(fallback_project),
-            session_totals,
-        );
-    }
-
-    collector.into_value(name, paths.len())
-}
-
-/// Return independent WorkBuddy, CodeBuddy CLI, and CodeBuddy IDE aggregates.
+/// Return WorkBuddy and AutoClaw aggregates.
 /// `days` is interpreted in Rust using the same millisecond clock for every source.
 pub fn get_statistics(days: Option<i64>) -> Value {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
@@ -768,21 +639,37 @@ pub fn get_statistics(days: Option<i64>) -> Value {
         _ => None,
     };
     let cutoff = range_days.map(|value| generated_at - value * 86_400_000);
-    let ide_projects = ide_project_by_session();
     json!({
         "generatedAt": generated_at,
         "rangeDays": range_days,
         "sources": [
             source(home.join(".workbuddy/projects"), "workbuddy", cutoff),
-            source(home.join(".codebuddy/projects"), "codebuddy-cli", cutoff),
-            ide_source(
-                codebuddy_extension_data_dir(),
-                "codebuddy-ide",
-                cutoff,
-                &ide_projects,
-            ),
+            // AutoClaw（OpenClaw 内核）的 agent 会话：
+            // 优先扫描 ~/.openclaw-autoclaw/agents，并兼容 ~/.openclaw/agents
+            autoclaw_source(&home, cutoff),
         ],
     })
+}
+
+/// 测试专用：用给定 usage 走一遍真实的 [`Totals`] 口径并返回其 JSON 输出。
+///
+/// 供 `stats::units` 的契约测试比对 —— 一旦有人改动本模块或统一函数任一侧的
+/// 边界处理，该测试会立即失败，避免两处口径再次漂移。
+#[cfg(test)]
+pub(crate) fn totals_from_usage_for_test(
+    input: u64,
+    cached: u64,
+    output: u64,
+    write: u64,
+) -> Value {
+    let mut totals = Totals::default();
+    totals.add(Usage {
+        input,
+        output,
+        read: cached,
+        write,
+    });
+    totals.value()
 }
 
 #[cfg(test)]
@@ -1055,131 +942,87 @@ mod tests {
     }
 
     #[test]
-    fn ide_source_reads_request_usage_and_skips_message_bodies() {
-        let now = crate::modules::config::now_ms();
-        let root = std::env::temp_dir().join(format!(
-            "wb-switch-token-stats-ide-{}-{now}",
-            std::process::id()
-        ));
-        let history = root
-            .join("uid")
-            .join("CodeBuddyIDE")
-            .join("uid")
-            .join("history")
-            .join("workspace-hash");
-        let conv_a = history.join("conv-a");
-        let conv_b = history.join("conv-b");
-        let messages = conv_a.join("messages");
-        fs::create_dir_all(&messages).expect("create ide fixture dirs");
-        fs::create_dir_all(&conv_b).expect("create second conversation");
-
-        fs::write(
-            history.join("index.json"),
-            json!({
-                "conversations": [
-                    {
-                        "id": "conv-a",
-                        "name": "IDE 会话标题",
-                        "selectedModelId": "deepseek-v4-flash"
-                    },
-                    {
-                        "id": "conv-b",
-                        "name": "范围外会话",
-                        "selectedModelId": "hy4-preview"
-                    }
-                ]
-            })
-            .to_string(),
-        )
-        .expect("write workspace index");
-        fs::write(
-            conv_a.join("index.json"),
-            json!({
-                "messages": [{ "id": "m1", "role": "assistant", "isComplete": true }],
-                "requests": [{
-                    "id": "req-1",
-                    "state": "complete",
-                    "startedAt": now,
-                    "usage": {
-                        "inputTokens": 100,
-                        "outputTokens": 20,
-                        "cacheTokens": 40,
-                        "cachedWriteTokens": 5
-                    }
-                }]
-            })
-            .to_string(),
-        )
-        .expect("write conversation index");
-        fs::write(
-            conv_b.join("index.json"),
-            json!({
-                "requests": [{
-                    "id": "req-old",
-                    "state": "complete",
-                    "startedAt": now - 100_000,
-                    "usage": {
-                        "inputTokens": 999,
-                        "outputTokens": 9,
-                        "cacheTokens": 1,
-                        "cachedWriteTokens": 0
-                    }
-                }]
-            })
-            .to_string(),
-        )
-        .expect("write out-of-range conversation");
-        fs::write(
-            messages.join("ignored.json"),
-            json!({
-                "role": "assistant",
-                "usage": { "inputTokens": 10_000, "outputTokens": 10_000 }
-            })
-            .to_string(),
-        )
-        .expect("write ignored message body");
-
-        let mut projects = HashMap::new();
-        projects.insert("conv-a".to_string(), "example-project".to_string());
-        let result = ide_source(root.clone(), "codebuddy-ide", Some(now - 50_000), &projects);
-
-        assert_eq!(result["source"], "codebuddy-ide");
-        assert_eq!(result["filesScanned"], 2);
-        assert_eq!(result["summary"]["records"], 1);
-        assert_eq!(result["summary"]["input"], 100);
-        assert_eq!(result["summary"]["output"], 20);
-        assert_eq!(result["summary"]["cacheRead"], 40);
-        assert_eq!(result["summary"]["cacheWrite"], 5);
-        assert_eq!(result["summary"]["total"], 125);
-        assert_eq!(result["summary"]["uncachedInput"], 60);
-        assert_eq!(result["models"][0]["key"], "deepseek-v4-flash");
-        assert_eq!(result["projects"][0]["key"], "example-project");
-        assert_eq!(result["sessions"][0]["sessionId"], "conv-a");
-        assert_eq!(result["sessions"][0]["title"], "IDE 会话标题");
-        assert_eq!(result["sessions"].as_array().map(Vec::len), Some(1));
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        assert_eq!(result["dailyByModel"]["deepseek-v4-flash"][0]["key"], today);
-
-        fs::remove_dir_all(root).expect("remove fixture");
-    }
-
-    #[test]
-    fn decode_genie_workspace_recovers_unix_project_path() {
-        assert_eq!(
-            decode_genie_workspace("L1VzZXJzL2FwcGxlL0RvY3VtZW50cy9Qcm9qZWN0L215LWFnZW50")
-                .as_deref(),
-            Some("/Users/apple/Documents/Project/my-agent")
-        );
-    }
-
-    #[test]
-    fn get_statistics_returns_three_isolated_sources() {
+    fn get_statistics_returns_workbuddy_and_autoclaw_sources() {
         let value = get_statistics(None);
         let sources = value["sources"].as_array().expect("sources");
         let names: Vec<_> = sources
             .iter()
             .map(|source| source["source"].as_str().unwrap_or_default())
             .collect();
-        assert_eq!(names, ["workbuddy", "codebuddy-cli", "codebuddy-ide"]);
+        assert_eq!(
+            names,
+            ["workbuddy", "autoclaw"]
+        );
+    }
+
+    #[test]
+    fn autoclaw_session_parsing_and_prompt_extraction() {
+        let now = crate::modules::config::now_ms();
+        let root = std::env::temp_dir().join(format!(
+            "wb-switch-token-stats-autoclaw-{}-{now}",
+            std::process::id()
+        ));
+        let session_dir = root.join("agents").join("main").join("sessions");
+        fs::create_dir_all(&session_dir).expect("create fixture dirs");
+
+        let session_header = json!({
+            "type": "session",
+            "version": 3,
+            "id": "e3d875e9-b33d-4b47-a36c-cb69417f0863",
+            "timestamp": "2026-08-30T14:38:43.406Z",
+            "cwd": "C:\\Users\\test\\test-workspace"
+        });
+
+        let user_message = json!({
+            "type": "message",
+            "id": "user-msg-1",
+            "timestamp": "2026-08-30T14:38:43.938Z",
+            "message": {
+                "role": "user",
+                "content": "<system-reminder>\nsome rules\n</system-reminder>\n\n<<<AUTOCLAW_USER_AUTHORED_REQUEST_START>>>\n这是测试项目分析提问\n<<<AUTOCLAW_USER_AUTHORED_REQUEST_END>>>\n"
+            }
+        });
+
+        let assistant_message = json!({
+            "type": "message",
+            "id": "asst-msg-1",
+            "timestamp": "2026-08-30T14:39:22.520Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "回复"}],
+                "model": "zai_glm-5.3-flash",
+                "usage": {
+                    "input": 27791,
+                    "output": 522,
+                    "cacheRead": 6976,
+                    "cacheWrite": 0,
+                    "reasoningTokens": 412,
+                    "totalTokens": 35289
+                },
+                "timestamp": now
+            }
+        });
+
+        let session_file = session_dir.join("e3d875e9-b33d-4b47-a36c-cb69417f0863.jsonl");
+        fs::write(
+            &session_file,
+            format!("{}\n{}\n{}\n", session_header, user_message, assistant_message),
+        )
+        .expect("write fixture");
+
+        let result = source_from_roots(vec![root.join("agents")], "autoclaw", None);
+        assert_eq!(result["source"], "autoclaw");
+        assert_eq!(result["filesScanned"], 1);
+        assert_eq!(result["summary"]["records"], 1);
+        assert_eq!(result["summary"]["input"], 27791);
+        assert_eq!(result["summary"]["output"], 522);
+        assert_eq!(result["summary"]["cacheRead"], 6976);
+        assert_eq!(result["summary"]["total"], 28313);
+        assert_eq!(result["models"][0]["key"], "zai_glm-5.3-flash");
+        assert_eq!(result["projects"][0]["key"], "test-workspace");
+        assert_eq!(result["sessions"][0]["sessionId"], "e3d875e9-b33d-4b47-a36c-cb69417f0863");
+        assert_eq!(result["sessions"][0]["title"], "这是测试项目分析提问");
+
+        fs::remove_dir_all(root).expect("remove fixture");
     }
 }

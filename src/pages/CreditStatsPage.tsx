@@ -1,18 +1,14 @@
 import { useCallback, useEffect, useState, type ComponentProps } from "react";
 import { Bar, BarChart, CartesianGrid, Rectangle, XAxis, YAxis } from "recharts";
 import {
-  CalendarDays,
-  CalendarRange,
   Check,
   CircleAlert,
   CircleCheck,
   Loader2,
-  Sparkles,
   RefreshCw,
-  TrendingDown,
   Users,
   // XCircle, // 最近事件卡片隐藏后未使用
-  type LucideIcon,
+  // TrendingDown, // 最近事件卡片隐藏后未使用
 } from "lucide-react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -69,36 +65,31 @@ function dateDaysAgo(days: number): string {
   return dateKey(date);
 }
 
-function formatCredits(value: number | null | undefined): string {
-  if (value === null || value === undefined || !Number.isFinite(value)) return "—";
-  return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(value);
-}
-
-function formatDateTime(ts: number | null | undefined): string {
-  if (ts === null || ts === undefined) return "—";
-  return new Date(ts).toLocaleString("zh-CN", {
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
-
-function formatDate(ts: number | null | undefined): string {
-  if (ts === null || ts === undefined) return "—";
-  return new Date(ts).toLocaleDateString("zh-CN", {
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  });
-}
-
-function formatChartDate(date: string): string {
-  return date.slice(5).replace("-", "/");
-}
+// 展示格式化统一到 lib/stats-format（别名保持调用点不变）。
+import {
+  formatCredits,
+  formatDateCn as formatDate,
+  formatDateTimeShort as formatDateTime,
+  formatMonthDay as formatChartDate,
+} from "@/lib/stats-format";
 
 function accountLabel(account: { accountName?: string | null; accountId: string }): string {
   return account.accountName || account.accountId;
+}
+
+const PLATFORM_LABELS: Record<string, string> = {
+  workbuddy: "WorkBuddy",
+  autoclaw: "AutoClaw",
+  trae_work_cn: "TRAE Work CN",
+};
+
+function platformLabel(platform?: string | null): string | null {
+  if (!platform) return null;
+  return PLATFORM_LABELS[platform] ?? platform;
+}
+
+function isPlatformAccount(account?: { platform?: string } | null): boolean {
+  return Boolean(account?.platform && account.platform !== "workbuddy");
 }
 
 function AccountFilterMenu({
@@ -240,31 +231,89 @@ function resourceName(resource: CreditResource): string {
   return resource.packageName || resource.packageCode || "未命名资源包";
 }
 
-function StatMetric({
-  icon: Icon,
-  label,
-  value,
-  divided = false,
+/**
+ * 积分总览：每个当前账号单独一行、单独计算，不跨账号合并。
+ * WorkBuddy 账号优先使用官方请求用量；平台账号与官方失败账号回退到
+ * 本账号自己的快照推导数据。
+ */
+function AccountUsageSummary({
+  stats,
+  officialUsage,
 }: {
-  icon: LucideIcon;
-  label: string;
-  value: string;
-  divided?: boolean;
+  stats: CreditStatistics;
+  officialUsage?: CreditOfficialUsage;
 }) {
+  const official = isOfficialUsageAvailable(officialUsage) ? officialUsage : undefined;
+  const rows = stats.accounts.filter((account) => account.isCurrent);
+
   return (
-    <div
-      className={`flex min-w-0 flex-col items-center justify-center px-4 py-5 text-center sm:py-3 ${
-        divided ? "sm:border-l sm:border-border/60" : ""
-      }`}
-    >
-      <div className="flex max-w-full items-center justify-center gap-2 text-[13px] font-medium leading-5 text-muted-foreground">
-        <Icon className="size-4 shrink-0 stroke-[1.75]" aria-hidden="true" />
-        <span className="truncate">{label}</span>
+    <Card className="min-w-0 gap-0 overflow-hidden rounded-2xl bg-card/70 py-0 shadow-none" aria-label="积分总览">
+      <div className="border-b px-4 py-3 sm:px-5">
+        <CardDescription className="text-xs">
+          每个账号单独统计，不跨账号合并；消耗一律以官方数据为准：WorkBuddy
+          用逐请求明细、AutoClaw 用积分流水、TRAE Work CN 用额度快照（已剔除包到期/发放干扰）。
+        </CardDescription>
       </div>
-      <div className="mt-3 max-w-full truncate text-[26px] font-semibold leading-8 tracking-[-0.025em] text-foreground tabular-nums" style={{ fontFamily: '"Bricolage Grotesque Variable", "SF Pro Display", ui-sans-serif, sans-serif' }}>
-        {value}
-      </div>
-    </div>
+      {rows.length === 0 ? (
+        <div className="px-4 py-8 text-center text-sm text-muted-foreground sm:px-5">暂无当前账号。</div>
+      ) : (
+        <div className="min-w-0 overflow-x-auto">
+          <table className="w-full min-w-[640px] text-left text-xs">
+            <thead className="bg-muted/45 text-muted-foreground">
+              <tr>
+                <th className="px-4 py-2.5 font-medium sm:px-5">账号</th>
+                <th className="px-3 py-2.5 text-right font-medium">剩余</th>
+                <th className="px-3 py-2.5 text-right font-medium">今日消耗</th>
+                <th className="px-3 py-2.5 text-right font-medium">近 7 天</th>
+                <th className="px-4 py-2.5 text-right font-medium sm:px-5">本月消耗</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((account) => {
+                const officialAccount = officialAccountFor(official, account.accountId);
+                const officialReady = officialAccount?.ok === true;
+                // 数值已由后端按平台选择最可信来源（WorkBuddy=官方逐请求
+                // 明细、AutoClaw=官方流水、TRAE=快照差值），这里只标注口径。
+                const usageSource = officialReady
+                  ? { label: "官方", variant: "success" as const }
+                  : isPlatformAccount(account)
+                    ? {
+                        label: account.platform === "autoclaw" ? "流水" : "快照",
+                        variant: "outline" as const,
+                      }
+                    : { label: "无官方数据", variant: "warning" as const };
+                const label = platformLabel(account.platform);
+                return (
+                  <tr key={account.accountId} className="border-t border-border/60">
+                    <td className="max-w-[280px] px-4 py-3 sm:px-5">
+                      <span className="flex min-w-0 items-center gap-2">
+                        <span className="min-w-0 truncate font-medium" title={accountLabel(account)}>
+                          {accountLabel(account)}
+                        </span>
+                        {label && (
+                          <Badge variant="outline" className="shrink-0 px-1.5 py-0 text-[10px]">
+                            {label}
+                          </Badge>
+                        )}
+                        <Badge variant={usageSource.variant} className="shrink-0 px-1.5 py-0 text-[10px]">
+                          {usageSource.label}
+                        </Badge>
+                      </span>
+                    </td>
+                    <td className="px-3 py-3 text-right font-medium">
+                      {formatCredits(account.currentRemaining)}
+                    </td>
+                    <td className="px-3 py-3 text-right">{formatCredits(account.usageToday)}</td>
+                    <td className="px-3 py-3 text-right">{formatCredits(account.usage7Days)}</td>
+                    <td className="px-4 py-3 text-right sm:px-5">{formatCredits(account.usageThisMonth)}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </Card>
   );
 }
 
@@ -373,47 +422,44 @@ function TrendChart({
   stats: CreditStatistics;
   officialUsage?: CreditOfficialUsage;
 }) {
-  /** null = 所有账号汇总；本卡片独立，不影响其他卡片 */
+  /** 本卡片独立选中的账号；null = 未选择，回退到第一个账号 */
   const [accountFilter, setAccountFilter] = useState<string | null>(null);
   /** 本卡片独立的时间范围，不影响其他卡片 */
   const [range, setRange] = useState<RangeKey>("30d");
   const official = isOfficialUsageAvailable(officialUsage) ? officialUsage : undefined;
-  const officialAvailable = Boolean(official);
-  const filterAccounts = official ? official.accounts : stats.accounts;
+  // 每个账号单独计算：账号列表取当前账号全集，默认选中第一个，不提供跨账号聚合
+  const filterAccounts = stats.accounts.filter((account) => account.isCurrent);
   const activeFilterAccount =
     accountFilter && filterAccounts.some((account) => account.accountId === accountFilter)
       ? filterAccounts.find((account) => account.accountId === accountFilter)
       : undefined;
-  const effectiveFilter = activeFilterAccount?.accountId ?? null;
+  const effectiveFilter = activeFilterAccount?.accountId ?? filterAccounts[0]?.accountId ?? null;
   const officialAccount = effectiveFilter ? officialAccountFor(official, effectiveFilter) : undefined;
   const localAccount = effectiveFilter
     ? stats.accounts.find((account) => account.accountId === effectiveFilter)
     : undefined;
-  // 选中账号时切到该账号的逐日数据与汇总；否则用全部账号的聚合
-  const daily = official
-    ? (officialAccount ? officialAccount.daily ?? [] : official.daily)
-    : (localAccount ? localAccount.daily ?? [] : stats.daily);
-  const summary = official
-    ? (officialAccount
-        ? {
-            usageToday: officialAccount.usageToday ?? 0,
-            usage7Days: officialAccount.usage7Days ?? 0,
-            usageThisMonth: officialAccount.usageThisMonth ?? 0,
-          }
-        : official.summary)
-    : (localAccount
-        ? {
-            usageToday: localAccount.usageToday,
-            usage7Days: localAccount.usage7Days,
-            usageThisMonth: localAccount.usageThisMonth,
-          }
-        : stats.summary);
+  // 选中账号优先官方口径；平台账号与官方失败的账号用该账号自己的本地观察数据
+  const usingOfficial = officialAccount?.ok === true;
+  const daily = usingOfficial
+    ? officialAccount.daily ?? []
+    : localAccount?.daily ?? [];
+  const summary = usingOfficial
+    ? {
+        usageToday: officialAccount.usageToday ?? 0,
+        usage7Days: officialAccount.usage7Days ?? 0,
+        usageThisMonth: officialAccount.usageThisMonth ?? 0,
+      }
+    : {
+        usageToday: localAccount?.usageToday ?? 0,
+        usage7Days: localAccount?.usage7Days ?? 0,
+        usageThisMonth: localAccount?.usageThisMonth ?? 0,
+      };
   const basePoints = chartPoints(daily, range);
-  const hasDataSource = officialAvailable || Boolean(stats.coverageStartAt);
+  const hasDataSource = usingOfficial || Boolean(stats.coverageStartAt);
 
   // 官方 daily 带全量模型聚合 → 层叠柱（按模型）；否则单层「本地观察」柱
-  const hasModelDetail = (official?.daily ?? []).some((point) => (point.models?.length ?? 0) > 0);
-  const stacked = official && hasModelDetail ? buildStackedChart(basePoints) : null;
+  const hasModelDetail = daily.some((point) => (point.models?.length ?? 0) > 0);
+  const stacked = usingOfficial && hasModelDetail ? buildStackedChart(basePoints) : null;
   const chartData: ModelChartPoint[] = stacked
     ? stacked.points
     : basePoints.map((point) => ({ date: point.date, total: point.usage }));
@@ -435,16 +481,32 @@ function TrendChart({
     <section className="min-w-0 space-y-2.5" aria-labelledby="trend-chart-title">
       <div className="px-1">
         <h2 id="trend-chart-title" className="text-[13px] font-medium leading-5">
-          {officialAvailable ? "官方积分消耗" : "本地观察积分消耗"}
+          {usingOfficial
+            ? "官方积分消耗"
+            : localAccount?.platform === "autoclaw"
+              ? "积分消耗（官方流水）"
+              : localAccount?.platform === "trae_work_cn"
+                ? "积分消耗（快照推导）"
+                : "积分消耗（官方暂不可用）"}
         </h2>
       </div>
       <Card className="min-w-0 gap-0 overflow-hidden rounded-xl py-0 shadow-none">
         <CardHeader className="gap-0 px-4 pt-3 pb-0 sm:px-5">
           <div className="flex min-w-0 flex-wrap items-center justify-between gap-3">
             <CardDescription className="min-w-0 text-xs">
-              {officialAvailable
-                ? `来自 WorkBuddy 官方请求用量 · ${official?.rangeStart} 至 ${official?.rangeEnd}`
-                : "只统计连续快照中余额下降的正差值；官方用量暂不可用时保留此口径。"}
+              {usingOfficial
+                ? `${accountLabel(officialAccount)} · 来自 WorkBuddy 官方请求用量 · ${official?.rangeStart} 至 ${official?.rangeEnd}`
+                : `${
+                    effectiveFilter
+                      ? accountLabel(localAccount ?? { accountId: effectiveFilter })
+                      : ""
+                  } · ${
+                    localAccount?.platform === "autoclaw"
+                      ? "来自 AutoClaw 官方积分流水（每笔模型消耗扣费）。"
+                      : localAccount?.platform === "trae_work_cn"
+                        ? "由该账号额度快照差值推导（已剔除包到期/发放窗口）。"
+                        : "该账号官方请求明细暂不可用，消耗暂以 0 计，恢复后自动同步。"
+                  }`}
             </CardDescription>
             <div className="flex max-w-full flex-wrap items-center gap-1.5">
               <AccountFilterMenu
@@ -452,6 +514,7 @@ function TrendChart({
                 accountFilter={effectiveFilter}
                 onAccountFilterChange={setAccountFilter}
                 ariaLabel="按账号筛选趋势"
+                allowAll={false}
               />
               <div className="flex max-w-full flex-wrap gap-1 rounded-lg bg-muted p-1" aria-label="趋势范围">
                 {RANGE_OPTIONS.map((option) => (
@@ -534,12 +597,12 @@ function TrendChart({
             <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
               <span>
                 {hasObservedUsage
-                  ? `当前口径合计 ${formatCredits(rangeUsage(summary, daily, range))} 积分`
-                  : officialAvailable
+                  ? `当前账号合计 ${formatCredits(rangeUsage(summary, daily, range))} 积分`
+                  : usingOfficial
                     ? "官方已返回明细，当前范围暂无积分消耗"
                     : "已采集快照，暂未观察到余额下降"}
               </span>
-              <span>{officialAvailable ? `数据更新于 ${formatDateTime(official?.collectedAt ?? stats.generatedAt)}` : `数据覆盖至 ${formatDate(stats.generatedAt)}`}</span>
+              <span>{usingOfficial ? `数据更新于 ${formatDateTime(official?.collectedAt ?? stats.generatedAt)}` : `数据覆盖至 ${formatDate(stats.generatedAt)}`}</span>
             </div>
             <p className="sr-only">
               {chartData.map((point) => `${point.date} 消耗 ${formatCredits(point.total)} 积分`).join("；")}
@@ -740,25 +803,30 @@ function ModelBreakdownRows({ models }: { models: CreditOfficialUsageModel[] }) 
 }
 
 function ModelBreakdown({
+  stats,
   officialUsage,
 }: {
+  stats: CreditStatistics;
   officialUsage: CreditOfficialUsage;
 }) {
-  /** null = 所有账号汇总；本卡片独立，不影响其他卡片 */
+  /** 本卡片独立选中的账号；null = 未选择，回退到第一个账号 */
   const [accountFilter, setAccountFilter] = useState<string | null>(null);
   /** 本卡片独立的时间范围，不影响其他卡片 */
   const [range, setRange] = useState<RangeKey>("30d");
-  const filterAccounts = officialUsage.accounts;
+  // 每个账号单独计算：默认选中第一个账号，不提供跨账号聚合
+  const filterAccounts = stats.accounts.filter((account) => account.isCurrent);
   const activeFilterAccount =
     accountFilter && filterAccounts.some((account) => account.accountId === accountFilter)
       ? filterAccounts.find((account) => account.accountId === accountFilter)
       : undefined;
-  const effectiveFilter = activeFilterAccount?.accountId ?? null;
-  // 按选中账号 + 时间范围，从逐日模型聚合求和（全量，不受明细条数上限影响）
-  const basePoints = chartPoints(
-    effectiveFilter ? activeFilterAccount?.daily ?? [] : officialUsage.daily,
-    range,
-  );
+  const effectiveFilter = activeFilterAccount?.accountId ?? filterAccounts[0]?.accountId ?? null;
+  const selectedAccount = effectiveFilter
+    ? filterAccounts.find((account) => account.accountId === effectiveFilter)
+    : undefined;
+  const officialAccount = effectiveFilter ? officialAccountFor(officialUsage, effectiveFilter) : undefined;
+  // 模型明细只来自官方逐日聚合；平台账号与官方失败账号没有该口径
+  const usingOfficial = officialAccount?.ok === true;
+  const basePoints = usingOfficial ? chartPoints(officialAccount.daily ?? [], range) : [];
   const rangeModelMap = new Map<string, { requestCount: number; credit: number }>();
   for (const point of basePoints) {
     for (const item of point.models ?? []) {
@@ -796,6 +864,7 @@ function ModelBreakdown({
                 accountFilter={effectiveFilter}
                 onAccountFilterChange={setAccountFilter}
                 ariaLabel="按账号筛选模型分类"
+                allowAll={false}
               />
               <div className="flex max-w-full flex-wrap gap-1 rounded-lg bg-muted p-1" aria-label="模型分类时间范围">
                 {RANGE_OPTIONS.map((option) => (
@@ -819,7 +888,11 @@ function ModelBreakdown({
         </CardHeader>
         {models.length === 0 ? (
         <CardContent className="px-4 py-8 text-center text-sm text-muted-foreground sm:px-5">
-          {activeFilterAccount && !activeFilterAccount.ok ? "该账号官方用量暂不可用。" : "官方暂无可用的模型消耗明细。"}
+          {isPlatformAccount(selectedAccount)
+            ? `${platformLabel(selectedAccount?.platform)}账号不在官方请求用量统计范围，暂无模型明细。`
+            : officialAccount && !officialAccount.ok
+              ? officialAccount.error || "该账号官方用量暂不可用。"
+              : "该账号暂无可用的模型消耗明细。"}
         </CardContent>
       ) : (
         <CardContent className="px-4 pt-3 pb-4 sm:px-5">
@@ -870,9 +943,11 @@ function OfficialRequestRow({
 function OfficialUsageBreakdown({
   officialUsage,
   accountId,
+  platform,
 }: {
   officialUsage?: CreditOfficialUsage;
   accountId: string | null;
+  platform?: string | null;
 }) {
   const officialAvailable = isOfficialUsageAvailable(officialUsage);
   const account = accountId ? officialAccountFor(officialUsage, accountId) : undefined;
@@ -887,7 +962,13 @@ function OfficialUsageBreakdown({
   }
 
   if (accountId && !account) {
-    return <div className="px-4 py-8 text-center text-sm text-muted-foreground sm:px-5">该账号暂无官方用量记录。</div>;
+    return (
+      <div className="px-4 py-8 text-center text-sm text-muted-foreground sm:px-5">
+        {platform && platform !== "workbuddy"
+          ? `${platformLabel(platform)}账号不在官方请求用量统计范围；其用量以资源包额度与快照变化为准。`
+          : "该账号暂无官方用量记录。"}
+      </div>
+    );
   }
 
   if (account && !account.ok) {
@@ -1039,8 +1120,8 @@ function SelectedAccountDetails({
   creditLoadingMap: Record<string, boolean>;
 }) {
   const [detailTab, setDetailTab] = useState<"credits" | "requests">("credits");
-  const official = isOfficialUsageAvailable(officialUsage) ? officialUsage : undefined;
-  const filterAccounts = official ? official.accounts : stats.accounts;
+  // 每个账号单独计算：账号列表取当前账号全集（含平台账号），默认第一个账号
+  const filterAccounts = stats.accounts.filter((account) => account.isCurrent);
   /** 本卡片仅允许选择单个账号，默认第一个账号 */
   const [accountFilter, setAccountFilter] = useState<string | null>(
     () => filterAccounts[0]?.accountId ?? null,
@@ -1054,6 +1135,7 @@ function SelectedAccountDetails({
   const visibleAccounts = effectiveFilter
     ? stats.accounts.filter((account) => account.accountId === effectiveFilter)
     : stats.accounts;
+  const selectedAccount = filterAccounts.find((account) => account.accountId === effectiveFilter);
   // 最近事件卡片已隐藏，events 不再使用。恢复时取消本注释。
   // const events = (effectiveFilter
   //   ? stats.events.filter((event) => event.accountId === effectiveFilter)
@@ -1118,7 +1200,11 @@ function SelectedAccountDetails({
               <ResourcesByAccount accounts={visibleAccounts} creditMap={creditMap} creditLoadingMap={creditLoadingMap} />
             </div>
           ) : (
-            <OfficialUsageBreakdown officialUsage={officialUsage} accountId={effectiveFilter} />
+            <OfficialUsageBreakdown
+              officialUsage={officialUsage}
+              accountId={effectiveFilter}
+              platform={selectedAccount?.platform}
+            />
           )}
         </Card>
       </section>
@@ -1176,16 +1262,26 @@ let statisticsInflight: Promise<CreditStatistics> | null = null;
 /** 进入统计页时距上次刷新超过此时长（ms）则自动触发一次刷新统计 */
 const STATISTICS_AUTO_REFRESH_MS = 30 * 60 * 1000;
 
-/** 最近一次「刷新统计」完成的时刻（会话级，0 = 从未刷新过） */
-let lastStatisticsRefreshAt = 0;
+/** 会话内缓存的最长复用时长：超过后即使不点刷新也会重新取一次后端统计。
+ *  没有这条限制时，长时间停留在应用里会一直读内存里的旧快照，
+ *  「今日消耗」不会随实际使用滚动更新。 */
+const STATISTICS_CACHE_MAX_AGE_MS = 5 * 60 * 1000;
+
+/** 最近一次写入会话缓存的时刻（会话级，0 = 无缓存） */
+let cachedStatisticsAt = 0;
 
 function rememberStatistics(next: CreditStatistics): CreditStatistics {
   cachedStatistics = next;
+  cachedStatisticsAt = Date.now();
   return next;
 }
 
+function hasUsableStatisticsCache(): boolean {
+  return cachedStatistics !== null && Date.now() - cachedStatisticsAt < STATISTICS_CACHE_MAX_AGE_MS;
+}
+
 function loadCachedStatistics(refresh: boolean): Promise<CreditStatistics> {
-  if (!refresh && cachedStatistics) return Promise.resolve(cachedStatistics);
+  if (!refresh && hasUsableStatisticsCache()) return Promise.resolve(cachedStatistics!);
   if (!refresh && statisticsInflight) return statisticsInflight;
   const pending = api.getCreditStatistics(refresh).then(rememberStatistics);
   statisticsInflight = pending;
@@ -1208,7 +1304,7 @@ export default function CreditStatsPage() {
 
   const load = useCallback(
     async (refresh = false) => {
-      if (!refresh && cachedStatistics) {
+      if (!refresh && hasUsableStatisticsCache()) {
         setStats(cachedStatistics);
         setLoading(false);
         setError(null);
@@ -1228,7 +1324,6 @@ export default function CreditStatsPage() {
           await refreshCredits(ids);
         }
         setStats(await loadCachedStatistics(refresh));
-        if (refresh) lastStatisticsRefreshAt = Date.now();
       } catch (cause) {
         setError(api.asError(cause));
       } finally {
@@ -1239,11 +1334,13 @@ export default function CreditStatsPage() {
   );
 
   useEffect(() => {
-    // 已有会话缓存且距上次刷新超过 30 分钟时，进入页面自动刷新一次统计
+    // 已有会话缓存且缓存超过 30 分钟时，进入页面自动强制刷新一次统计。
+    // 首次加载（无会话缓存）只走普通读取：后端投影自带时效，过期会自动重采，
+    // 因此不需要每次打开页面都强制打一次官方接口。
     const autoRefresh =
       !api.isDemoMode() &&
       cachedStatistics !== null &&
-      Date.now() - lastStatisticsRefreshAt >= STATISTICS_AUTO_REFRESH_MS;
+      Date.now() - cachedStatisticsAt >= STATISTICS_AUTO_REFRESH_MS;
     void load(autoRefresh);
   }, [load]);
 
@@ -1257,6 +1354,8 @@ export default function CreditStatsPage() {
           <h1 className="text-[28px] font-semibold tracking-tight">积分统计</h1>
           <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
             当前数据更新于 {stats ? formatDateTime(official?.collectedAt ?? stats.generatedAt) : "—"}
+            。统计按账号单独计算、不跨账号合并，消耗一律采用官方口径：
+            WorkBuddy 逐请求明细、AutoClaw 积分流水、TRAE Work CN 额度快照。
           </p>
         </div>
         <DemoAction>
@@ -1310,7 +1409,7 @@ export default function CreditStatsPage() {
               <AlertDescription>
                 {officialUsage.status === "partial"
                   ? `已同步 ${officialUsage.accounts.filter((account) => account.ok).length}/${officialUsage.accounts.length} 个当前账号；失败账号的官方数值显示为“—”。`
-                  : "今日、近 7 天和本月消耗将使用本地观察口径；官方接口恢复后刷新即可重新同步。"}
+                  : "该账号的消耗数值暂以 0 计（不再使用会失真的余额差口径）；官方接口恢复后刷新即可重新同步。"}
                 {officialUsage.errors.length > 0 && (
                   <span className="text-xs text-amber-900/75">
                     {officialUsage.errors.map((item) => `${item.accountName}: ${item.error}`).join("；")}
@@ -1320,33 +1419,7 @@ export default function CreditStatsPage() {
             </Alert>
           )}
 
-          <Card className="min-w-0 gap-0 overflow-hidden rounded-2xl bg-card/70 py-0 shadow-none" aria-label="积分总览">
-            <CardContent className="grid min-w-0 grid-cols-1 divide-y divide-border/60 p-0 sm:grid-cols-4 sm:divide-y-0 sm:py-5">
-              <StatMetric
-                icon={Sparkles}
-                label="剩余积分"
-                value={formatCredits(stats.summary.currentRemaining)}
-              />
-              <StatMetric
-                icon={TrendingDown}
-                label="今日消耗"
-                value={formatCredits(official ? official.summary.usageToday : stats.summary.usageToday)}
-                divided
-              />
-              <StatMetric
-                icon={CalendarDays}
-                label="近 7 天消耗"
-                value={formatCredits(official ? official.summary.usage7Days : stats.summary.usage7Days)}
-                divided
-              />
-              <StatMetric
-                icon={CalendarRange}
-                label="本月消耗"
-                value={formatCredits(official ? official.summary.usageThisMonth : stats.summary.usageThisMonth)}
-                divided
-              />
-            </CardContent>
-          </Card>
+          <AccountUsageSummary stats={stats} officialUsage={officialUsage} />
 
           {!official && !stats.coverageStartAt && stats.events.some((event) => event.kind === "checkin") && (
             <Alert>
@@ -1363,6 +1436,7 @@ export default function CreditStatsPage() {
 
           {official && (
             <ModelBreakdown
+              stats={stats}
               officialUsage={official}
             />
           )}

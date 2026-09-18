@@ -12,43 +12,55 @@ mod api;
 use serde_json::json;
 
 use wb_switch_core::modules::{
-    account, auth_file, checkin, config, process, rotate, travel, update,
+    account, account_protection, auth_file, checkin, config, official_usage, process, travel, update,
 };
 
 fn default_port() -> u16 {
     57890
 }
 
-/// 后台任务：自动签到启动即核验、每 30 分钟补签；自动轮换按配置间隔执行。
+/// 后台任务：自动签到启动即核验、每 30 分钟补签。
 fn spawn_background_loops() {
     tokio::spawn(async move {
         if let Err(error) = config::compact_checkin_logs() {
             eprintln!("[签到] 历史日志整理失败: {error}");
         }
         let _ = checkin::run_checkin_cycle(checkin::CheckinCycleMode::StartupVerify).await;
-        loop {
-            tokio::time::sleep(checkin::CHECKIN_RECOVERY_INTERVAL).await;
-            let _ = checkin::run_checkin_cycle(checkin::CheckinCycleMode::PeriodicRecovery).await;
-        }
-    });
 
-    tokio::spawn(async move {
-        let mut last_cycle_at: i64 = 0;
+        let mut last_date = checkin::current_local_date();
         loop {
-            let cfg = config::load_auto_rotate_config();
-            if cfg.get("enabled").and_then(|v| v.as_bool()) == Some(true) {
-                let interval_minutes = cfg
-                    .get("check_interval_minutes")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(5)
-                    .max(1);
-                let now = config::now_ms();
-                if now - last_cycle_at >= interval_minutes * 60_000 {
-                    last_cycle_at = now;
-                    let _ = rotate::run_rotate_cycle().await;
+            // 计算距离下一个零点（00:00:05）的时长
+            let midnight_dur = checkin::duration_until_next_midnight();
+            // 常规巡检间隔：当天有未签到账号时 5 分钟积极重试，全部已签到时 30 分钟兜底巡检
+            let all_done = checkin::all_accounts_checked_in_today();
+            let check_interval = if all_done {
+                checkin::CHECKIN_RECOVERY_INTERVAL
+            } else {
+                std::time::Duration::from_secs(5 * 60)
+            };
+
+            // 睡眠等待：取两者较小值（若零点更近则在零点准时醒来）
+            let sleep_dur = midnight_dur.min(check_interval);
+
+            // 每 15 秒检查一次是否发生系统时间跳变或跨天（完美应对笔记本休眠唤醒）
+            let sleep_deadline = tokio::time::Instant::now() + sleep_dur;
+            while tokio::time::Instant::now() < sleep_deadline {
+                let step = std::time::Duration::from_secs(15)
+                    .min(sleep_deadline.saturating_duration_since(tokio::time::Instant::now()));
+                tokio::time::sleep(step).await;
+                let today = checkin::current_local_date();
+                if today != last_date {
+                    break;
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+
+            let today = checkin::current_local_date();
+            if today != last_date {
+                last_date = today;
+                println!("[签到] 跨天唤醒，立即执行新一天全账号自动签到");
+            }
+
+            let _ = checkin::run_checkin_cycle(checkin::CheckinCycleMode::PeriodicRecovery).await;
         }
     });
 
@@ -69,6 +81,19 @@ fn spawn_background_loops() {
             let _ = travel::run_travel_claim_cycle().await;
         }
     });
+
+    // 官方用量投影：启动即同步（覆盖跨天后的第一屏），之后每 10 分钟滚动刷新。
+    // 没有这条周期任务时，官方投影只在用户点击「刷新统计」时才会重采，
+    // 导致「今日消耗」长期停留在上一次采集的数字上（跨天更会整天错位）。
+    tokio::spawn(async move {
+        loop {
+            official_usage::background_sync_once().await;
+            tokio::time::sleep(official_usage::OFFICIAL_USAGE_SYNC_INTERVAL).await;
+        }
+    });
+
+    // 账号保护与 AutoClaw 反代主动保活：启动巡检、周期心跳与前瞻式静默续期。
+    account_protection::spawn_protection_loop();
 }
 
 fn print_status() {
@@ -119,15 +144,35 @@ async fn serve(args: &[String]) {
         }
     }
 
+    api::set_bound_port(port);
     let app = api::router();
     let addr = format!("127.0.0.1:{port}");
-    let listener = match tokio::net::TcpListener::bind(&addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("启动失败: 端口 {port} 被占用或不可用（{e}）。可用 --port 指定其他端口。");
-            std::process::exit(1);
+    // 端口可能被上一个实例短暂占用（部署换 exe、重复双击启动的窗口期）：
+    // 重试 ~30 秒再放弃，避免"新进程起太早 → 直接退出 → 只能等看门狗下一轮"。
+    // 8 秒曾经不够：旧进程刚退出时端口未必已可重新 bind，过早 exit(1) 会把停机窗口
+    // 放大到一整个看门狗周期（实测 2026-09-14 出现过 94 秒窗口）。
+    const BIND_ATTEMPTS: u32 = 75;
+    const BIND_INTERVAL_MS: u64 = 400;
+    let mut bound = None;
+    for attempt in 0..BIND_ATTEMPTS {
+        match tokio::net::TcpListener::bind(&addr).await {
+            Ok(l) => {
+                bound = Some(l);
+                break;
+            }
+            Err(e) => {
+                if attempt + 1 == BIND_ATTEMPTS {
+                    eprintln!(
+                        "启动失败: 端口 {port} 等待 {} 秒后仍被占用或不可用（{e}）。可用 --port 指定其他端口。",
+                        BIND_ATTEMPTS as u64 * BIND_INTERVAL_MS / 1000
+                    );
+                    std::process::exit(1);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(BIND_INTERVAL_MS)).await;
+            }
         }
-    };
+    }
+    let listener = bound.expect("listener bound");
 
     println!("workbuddy-switch v{}", update::APP_VERSION);
     println!("webui: http://{addr}");
@@ -139,6 +184,12 @@ async fn serve(args: &[String]) {
     }
 
     spawn_background_loops();
+    // Grok SSO 同步循环（30 分钟；专用 Chrome 实例未启动时该轮静默失败不刷屏）。
+    wb_switch_core::modules::grok_sso::spawn_sync_loop();
+    // v1.5.0：冷账号保活续签循环（每 6 小时；仅对长期未活跃的 web 账号）。
+    wb_switch_core::modules::grok_sso::spawn_keepalive_loop();
+    // v1.5.0：账号池健康体检循环（默认每 2 小时轮转 1 个账号，策略可调）。
+    wb_switch_core::modules::grok_pool::spawn_health_check_loop();
 
     axum::serve(listener, app).await.unwrap();
 }

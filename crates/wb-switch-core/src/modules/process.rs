@@ -1052,6 +1052,55 @@ pub fn is_workbuddy_running() -> bool {
     }
 }
 
+/// WorkBuddy 桌面客户端版本：优先读注册表卸载信息的 `DisplayVersion`
+/// （随客户端升级自动变化），读不到返回 `None`。
+///
+/// 该客户端存在双名（WorkBuddy / CodeBuddy，见 `auth_file` 的数据目录约定），
+/// 两种 `DisplayName` 都接受。取不到时由调用方决定展示方式，
+/// 绝不因读不到版本而让界面/接口报错。
+pub fn workbuddy_client_version() -> Option<String> {
+    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            #[cfg(target_os = "windows")]
+            {
+                use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+                use winreg::RegKey;
+                const SUBKEYS: [&str; 2] = [
+                    r"Software\Microsoft\Windows\CurrentVersion\Uninstall",
+                    r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+                ];
+                for hive in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
+                    for subkey in SUBKEYS {
+                        let Ok(uninstall) = RegKey::predef(hive).open_subkey(subkey) else {
+                            continue;
+                        };
+                        for key in uninstall.enum_keys().flatten() {
+                            let Ok(sub) = uninstall.open_subkey(&key) else {
+                                continue;
+                            };
+                            let name: String = sub.get_value("DisplayName").unwrap_or_default();
+                            if !(name.contains("WorkBuddy") || name.contains("CodeBuddy")) {
+                                continue;
+                            }
+                            let version: String =
+                                sub.get_value("DisplayVersion").unwrap_or_default();
+                            if !version.trim().is_empty() {
+                                return Some(version.trim().to_string());
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                None
+            }
+        })
+        .clone()
+}
+
 /// 轮询等待 WorkBuddy 进程全部退出，返回是否已退出。对照 `_wait_process_gone`。
 pub fn wait_process_gone(timeout_secs: f64) -> bool {
     let deadline = Instant::now() + Duration::from_secs_f64(timeout_secs);

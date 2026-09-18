@@ -10,7 +10,7 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use crate::modules::account::{account_display_name, load_accounts};
+use crate::modules::account::account_display_name;
 use crate::modules::config::{
     atomic_write, credit_usage_snapshots_file, load_checkin_logs, now_ms, store_dir,
     CHECKIN_LOG_KEEP_DAYS,
@@ -39,6 +39,17 @@ struct UsageEvent {
     date: String,
     account_id: String,
     amount: f64,
+}
+
+impl UsageEvent {
+    fn new(ts: i64, account_id: String, amount: f64) -> Self {
+        Self {
+            ts,
+            date: local_date_string(ts).unwrap_or_default(),
+            account_id,
+            amount,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -286,6 +297,8 @@ fn build_statistics(
     checkin_values: &[Value],
     accounts: &[Value],
     at_ms: i64,
+    official_events: &[UsageEvent],
+    official_windows: &HashMap<String, (f64, f64, f64)>,
 ) -> Value {
     let snapshots = parse_snapshots(snapshot_values, at_ms);
     let today = local_date(at_ms).unwrap_or_else(|| Local::now().date_naive());
@@ -299,6 +312,7 @@ fn build_statistics(
     let mut account_ids = Vec::new();
     let mut current_account_ids = Vec::new();
     let mut account_names = HashMap::new();
+    let mut account_platforms = HashMap::new();
     for account in accounts {
         if let Some(id) = non_empty_string(account.get("id")) {
             if !current_account_ids.contains(&id) {
@@ -307,8 +321,12 @@ fn build_statistics(
             add_account_name(
                 &mut account_ids,
                 &mut account_names,
-                id,
+                id.clone(),
                 account_display_name(account),
+            );
+            account_platforms.insert(
+                id,
+                crate::modules::platform_checkin::account_platform(account).to_string(),
             );
         }
     }
@@ -352,11 +370,25 @@ fn build_statistics(
         if let Some(latest) = snapshots.last() {
             latest_snapshots.insert(account_id.clone(), latest.clone());
         }
+        // 消耗口径分平台（见 get_statistics 文档）：
+        // - WorkBuddy / AutoClaw 的消耗来自官方逐请求明细与流水账（已在
+        //   `official_events` 注入），余额差会把包到期、积分发放、资源包
+        //   重组统统误判为消耗，彻底弃用；
+        // - TRAE 没有逐请求官方接口，保留快照差值，但剔除总额度变动的
+        //   窗口（包到期/新包发放时的余额变化不是消耗）。
+        // 无平台信息的快照账号历史上就是 WorkBuddy 账号，同样不适用余额差。
+        if account_platforms.get(&account_id).map(String::as_str) != Some("trae_work_cn") {
+            continue;
+        }
         for pair in snapshots.windows(2) {
             let previous = &pair[0];
             let current = &pair[1];
             let amount = previous.remaining - current.remaining;
             if amount <= f64::EPSILON {
+                continue;
+            }
+            // 总额度变了 = 包到期/发放/调整窗口，余额变化≠消耗，整窗剔除。
+            if (previous.total - current.total).abs() > f64::EPSILON {
                 continue;
             }
             let Some(date) = local_date_string(current.ts) else {
@@ -385,6 +417,53 @@ fn build_statistics(
                 amount,
             });
         }
+    }
+
+    // WorkBuddy（官方逐请求明细）与 AutoClaw（官方流水 debit）的消耗事件：
+    // 时间、金额、账号全部来自官方数据。
+    for event in official_events {
+        let entry = usage_totals.entry(event.account_id.clone()).or_default();
+        let (today_usage, week_usage, month_usage) = usage_in_windows(&event.date, today);
+        if today_usage {
+            entry.0 += event.amount;
+        }
+        if week_usage {
+            entry.1 += event.amount;
+        }
+        if month_usage {
+            entry.2 += event.amount;
+        }
+        *daily_usage
+            .entry(event.account_id.clone())
+            .or_default()
+            .entry(event.date.clone())
+            .or_default() += event.amount;
+        usage_events.push(event.clone());
+        add_account_name(
+            &mut account_ids,
+            &mut account_names,
+            event.account_id.clone(),
+            event.account_id.clone(),
+        );
+    }
+
+    // WorkBuddy 账号的窗口合计改用官方账号行（全量聚合）覆盖。
+    //
+    // 事件流来自官方「请求明细」，而官方每账号只返回最近 100 条明细；用它反推
+    // 近 7 天 / 本月会把超过 100 条的历史请求漏掉，表现为同一页面上「积分总览」
+    // 与「按模型分类」两个口径对不上。官方账号行的 usageToday / usage7Days /
+    // usageThisMonth 是不受明细条数限制的全量聚合，因此以它为准。
+    for (account_id, (today_usage, week_usage, month_usage)) in official_windows {
+        add_account_name(
+            &mut account_ids,
+            &mut account_names,
+            account_id.clone(),
+            account_id.clone(),
+        );
+        usage_totals.insert(
+            account_id.clone(),
+            (*today_usage, *week_usage, *month_usage),
+        );
     }
 
     let mut checkin_today_latest: HashMap<String, (i64, String)> = HashMap::new();
@@ -467,6 +546,7 @@ fn build_statistics(
             json!({
                 "accountId": account_id,
                 "accountName": account_names.get(account_id).cloned().unwrap_or_else(|| "unknown".to_string()),
+                "platform": account_platforms.get(account_id).map(String::as_str),
                 "isCurrent": is_current,
                 "currentRemaining": is_current.then(|| latest.map(|snapshot| snapshot.remaining)).flatten(),
                 "totalCapacity": is_current.then(|| latest.map(|snapshot| snapshot.total)).flatten(),
@@ -555,16 +635,120 @@ fn build_statistics(
 
 /// 返回本地快照、账号列表、签到日志与官方请求用量的统一统计投影。
 ///
-/// `refresh = false` 时官方用量读本地缓存，不打用量接口；
+/// 消耗口径（每个平台用最可信的官方数据，不再用余额差猜）：
+/// - WorkBuddy：官方逐请求明细（get-user-request-usage，精确到每次调用）；
+/// - AutoClaw：官方流水账"模型消耗积分" debit 条目（按账号 token 查账）；
+/// - TRAE：无逐请求官方数据，保留快照差值（剔除总额度变动的窗口）。
+///
+/// `refresh = false` 时官方数据读本地缓存，不打官方接口；
 /// 只有统计页「刷新统计」传入 `refresh = true` 才会重新采集。
 pub async fn get_statistics(refresh: bool) -> Value {
     let at_ms = now_ms();
-    let accounts = load_accounts();
-    let mut statistics =
-        build_statistics(&load_snapshots(), &load_checkin_logs(), &accounts, at_ms);
-    statistics["officialUsage"] =
-        official_usage::official_usage_for_statistics(&accounts, at_ms, refresh).await;
+    let accounts = crate::modules::platform_checkin::all_checkin_accounts();
+    // 平台账号（AutoClaw / TRAE Work CN）的积分/额度也纳入统计：
+    // 查询过程本身会写快照（用于"剩余"展示与 TRAE 的消耗推导）。
+    for account in &accounts {
+        if crate::modules::platform_checkin::account_platform(account)
+            != crate::modules::platform_checkin::PLATFORM_WORKBUDDY
+        {
+            let _ = crate::modules::platform_checkin::get_platform_credits(account).await;
+        }
+    }
+    // 官方请求用量先取（缓存或按 refresh 重采），供 WorkBuddy 消耗事件使用。
+    let official = official_usage::official_usage_for_statistics(&accounts, at_ms, refresh).await;
+    let mut official_events: Vec<UsageEvent> = Vec::new();
+    // WorkBuddy：逐请求明细 → 消耗事件（替代会被包到期/发放污染的余额差）。
+    official_events.extend(official_workbuddy_events(&official));
+    // AutoClaw：官方流水账"模型消耗积分" debit（按账号 token 各自查账）。
+    // 读取实现已统一到 stats::source::ledger（与模型用量的流水对账共用同一套解析）。
+    for account in crate::modules::autoclaw_accounts::pool_accounts() {
+        for entry in crate::modules::stats::source::ledger::model_consumption(
+            &account,
+            at_ms - 31 * 24 * 3600 * 1000,
+        )
+        .await
+        {
+            official_events.push(UsageEvent::new(
+                entry.ts,
+                account.id.clone(),
+                entry.amount,
+            ));
+        }
+    }
+    let mut statistics = build_statistics(
+        &load_snapshots(),
+        &load_checkin_logs(),
+        &accounts,
+        at_ms,
+        &official_events,
+        &official_window_totals(&official),
+    );
+    statistics["officialUsage"] = official;
     statistics
+}
+
+/// 把官方账号行里的窗口合计抽成 `accountId → (今日, 近 7 天, 本月)`。
+///
+/// 只接受 `ok = true` 的账号：官方失败时对应数值是 null，回退到本地事件流口径，
+/// 不能用 0 覆盖掉已有的观察数据。
+fn official_window_totals(official: &Value) -> HashMap<String, (f64, f64, f64)> {
+    let mut totals = HashMap::new();
+    let Some(accounts) = official.get("accounts").and_then(Value::as_array) else {
+        return totals;
+    };
+    for row in accounts {
+        if row.get("ok").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        let Some(account_id) = non_empty_string(row.get("accountId")) else {
+            continue;
+        };
+        let read = |key: &str| number(row.get(key)).unwrap_or(0.0);
+        totals.insert(
+            account_id,
+            (read("usageToday"), read("usage7Days"), read("usageThisMonth")),
+        );
+    }
+    totals
+}
+
+/// 把官方请求明细（WorkBuddy 账号）转换成消耗事件。
+/// 每次 API 调用一条（credit > 0），时间取官方 requestTime。
+fn official_workbuddy_events(official: &Value) -> Vec<UsageEvent> {
+    let mut events = Vec::new();
+    let Some(accounts) = official.get("accounts").and_then(Value::as_array) else {
+        return events;
+    };
+    let Some(requests) = official.get("requests").and_then(Value::as_array) else {
+        return events;
+    };
+    for row in accounts {
+        if row.get("ok").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        let Some(account_id) = row.get("accountId").and_then(Value::as_str) else {
+            continue;
+        };
+        for request in requests {
+            if request.get("accountId").and_then(Value::as_str) != Some(account_id) {
+                continue;
+            }
+            let Some((_, ts, _)) =
+                official_usage::parse_request_time(request.get("requestTime"))
+            else {
+                continue;
+            };
+            let amount = request
+                .get("credit")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            if amount <= 0.0 {
+                continue;
+            }
+            events.push(UsageEvent::new(ts, account_id.to_string(), amount));
+        }
+    }
+    events
 }
 
 #[cfg(test)]
@@ -580,14 +764,59 @@ mod tests {
             .timestamp_millis()
     }
 
+    fn trae_account() -> Value {
+        json!({"id": "account-1", "email": "one@example.com", "platform": "trae_work_cn"})
+    }
+
     fn snap(ts: i64, remaining: f64) -> Value {
         snapshot_value(ts, "account-1", "one@example.com", 100.0, remaining)
+    }
+
+    fn no_official_windows() -> HashMap<String, (f64, f64, f64)> {
+        HashMap::new()
+    }
+
+    #[test]
+    fn official_account_windows_override_detail_limited_events() {
+        // 官方每账号只返回 100 条请求明细，用它反推近 7 天 / 本月会漏掉更早的请求；
+        // 官方账号行的全量聚合值必须覆盖事件流口径，否则总览与按模型分类对不上。
+        let now = at_local_date(0, 12);
+        let accounts = vec![json!({"id": "account-1", "email": "one@example.com"})];
+        let event = UsageEvent::new(now - 60_000, "account-1".to_string(), 4.06);
+        let mut windows = HashMap::new();
+        windows.insert("account-1".to_string(), (179.58, 948.07, 3144.36));
+
+        let stats = build_statistics(&[], &[], &accounts, now, &[event], &windows);
+
+        assert_eq!(stats["summary"]["usageToday"], 179.58);
+        assert_eq!(stats["summary"]["usage7Days"], 948.07);
+        assert_eq!(stats["summary"]["usageThisMonth"], 3144.36);
+        let account = &stats["accounts"].as_array().unwrap()[0];
+        assert_eq!(account["usageToday"], 179.58);
+        assert_eq!(account["usage7Days"], 948.07);
+        // 事件流仍保留（明细用于曲线），只是不再反推窗口合计。
+        assert_eq!(stats["events"][0]["kind"], "usage");
+    }
+
+    #[test]
+    fn failed_official_accounts_do_not_zero_out_observed_usage() {
+        let official = json!({
+            "accounts": [
+                {"accountId": "account-1", "ok": false, "usageToday": null},
+                {"accountId": "account-2", "ok": true, "usageToday": 12.5,
+                 "usage7Days": 20.0, "usageThisMonth": 20.0}
+            ]
+        });
+        let windows = official_window_totals(&official);
+
+        assert!(!windows.contains_key("account-1"));
+        assert_eq!(windows["account-2"], (12.5, 20.0, 20.0));
     }
 
     #[test]
     fn first_observation_does_not_create_usage() {
         let now = at_local_date(0, 12);
-        let stats = build_statistics(&[snap(now, 100.0)], &[], &[], now);
+        let stats = build_statistics(&[snap(now, 100.0)], &[], &[], now, &[], &no_official_windows());
 
         assert_eq!(stats["summary"]["usageToday"], 0.0);
         assert_eq!(stats["daily"][0]["usage"], 0.0);
@@ -595,9 +824,17 @@ mod tests {
 
     #[test]
     fn positive_decreases_are_assigned_to_the_newer_local_day() {
+        // 快照差值口径现在只用于 TRAE（无逐请求官方数据的平台）。
         let now = at_local_date(0, 12);
         let yesterday = at_local_date(1, 12);
-        let stats = build_statistics(&[snap(yesterday, 100.0), snap(now, 70.0)], &[], &[], now);
+        let stats = build_statistics(
+            &[snap(yesterday, 100.0), snap(now, 70.0)],
+            &[],
+            &[trae_account()],
+            now,
+            &[],
+            &no_official_windows(),
+        );
 
         assert_eq!(stats["summary"]["usageToday"], 30.0);
         assert_eq!(stats["summary"]["usage7Days"], 30.0);
@@ -621,8 +858,10 @@ mod tests {
                 snap(now, 115.0),
             ],
             &[],
-            &[],
+            &[trae_account()],
             now,
+            &[],
+            &no_official_windows(),
         );
 
         assert_eq!(stats["summary"]["usageToday"], 10.0);
@@ -634,7 +873,7 @@ mod tests {
     fn retention_and_month_windows_use_local_calendar_dates() {
         let now = at_local_date(0, 12);
         let old = at_local_date(CREDIT_SNAPSHOT_RETENTION_DAYS + 1, 12);
-        let stats = build_statistics(&[snap(old, 100.0), snap(now, 80.0)], &[], &[], now);
+        let stats = build_statistics(&[snap(old, 100.0), snap(now, 80.0)], &[], &[], now, &[], &no_official_windows());
 
         assert_eq!(stats["summary"]["usage7Days"], 0.0);
         assert_eq!(stats["summary"]["usageThisMonth"], 0.0);
@@ -653,8 +892,10 @@ mod tests {
         let stats = build_statistics(
             &[snap(now - 60_000, 100.0), snap(now, 90.0)],
             &logs,
-            &[],
+            &[trae_account()],
             now,
+            &[],
+            &no_official_windows(),
         );
 
         assert_eq!(stats["summary"]["usageToday"], 10.0);
@@ -677,7 +918,7 @@ mod tests {
             "ts": now,
             "result": "success",
         })];
-        let stats = build_statistics(&[], &logs, &[], now);
+        let stats = build_statistics(&[], &logs, &[], now, &[], &no_official_windows());
 
         assert_eq!(stats["summary"]["todayCheckedInAccounts"], 0);
         assert_eq!(stats["events"][0]["kind"], "checkin");
@@ -691,6 +932,8 @@ mod tests {
             &[],
             &[json!({"id": "current-account"})],
             now,
+            &[],
+            &no_official_windows(),
         );
 
         assert_eq!(stats["summary"]["currentRemaining"], 0.0);
@@ -730,6 +973,60 @@ mod tests {
                 })
                 .unwrap_or(false)
         }));
+    }
+
+    #[test]
+    fn workbuddy_usage_comes_from_official_requests_not_snapshot_deltas() {
+        // 用户实测场景：快照差值算出 5.06（被包变动污染），官方逐请求
+        // 明细是 4.06——统计必须以官方明细为准。
+        let now = at_local_date(0, 12);
+        let snapshots = vec![snap(now - 3_600_000, 100.0), snap(now, 94.94)];
+        let official_event = UsageEvent::new(now - 60_000, "account-1".to_string(), 4.06);
+        let accounts = vec![json!({"id": "account-1", "email": "one@example.com"})];
+        let stats = build_statistics(&snapshots, &[], &accounts, now, &[official_event], &no_official_windows());
+
+        assert_eq!(stats["summary"]["usageToday"], 4.06);
+        let account = &stats["accounts"].as_array().unwrap()[0];
+        assert_eq!(account["usageToday"], 4.06);
+        assert_eq!(account["currentRemaining"], 94.94);
+        // 快照差值（5.06）不得混入事件流。
+        let usage_events: Vec<&Value> = stats["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["kind"] == "usage")
+            .collect();
+        assert_eq!(usage_events.len(), 1);
+        assert_eq!(usage_events[0]["amount"], 4.06);
+    }
+
+    #[test]
+    fn workbuddy_usage_without_official_data_is_zero_not_snapshot_noise() {
+        let now = at_local_date(0, 12);
+        let snapshots = vec![snap(now - 3_600_000, 100.0), snap(now, 94.94)];
+        let accounts = vec![json!({"id": "account-1", "email": "one@example.com"})];
+        let stats = build_statistics(&snapshots, &[], &accounts, now, &[], &no_official_windows());
+
+        assert_eq!(stats["summary"]["usageToday"], 0.0);
+        let account = &stats["accounts"].as_array().unwrap()[0];
+        assert_eq!(account["usageToday"], 0.0);
+    }
+
+    #[test]
+    fn trae_usage_skips_windows_where_capacity_changed() {
+        // 总额度变化（包到期/发放）窗口的余额下降不是消耗。
+        let now = at_local_date(0, 12);
+        let earlier = at_local_date(0, 8);
+        let snapshots = vec![
+            snapshot_value(earlier, "account-1", "one@example.com", 100.0, 100.0),
+            // 总额度 100→60：包到期窗口，余额下降 40 不算消耗。
+            snapshot_value(now - 1_800_000, "account-1", "one@example.com", 60.0, 60.0),
+            // 总额度不变：真实消耗窗口。
+            snapshot_value(now, "account-1", "one@example.com", 60.0, 55.0),
+        ];
+        let stats = build_statistics(&snapshots, &[], &[trae_account()], now, &[], &no_official_windows());
+
+        assert_eq!(stats["summary"]["usageToday"], 5.0);
     }
 
     #[test]

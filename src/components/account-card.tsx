@@ -1,4 +1,4 @@
-import { ArrowRight, Check, CircleCheck, Clock3, Coins, Ellipsis, Loader2, PlaneTakeoff, RefreshCw, Sparkles, Star, Trash2 } from "lucide-react";
+import { ArrowRight, Check, CircleCheck, Clock3, Coins, Ellipsis, Loader2, Pencil, PlaneTakeoff, RefreshCw, Sparkles, Star, Trash2, TriangleAlert } from "lucide-react";
 import { useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
@@ -13,9 +13,11 @@ import {
 } from "@/components/ui/dialog";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { CodeBuddyCnIdeMark, CodeBuddyMark, WorkBuddyMark } from "@/components/product-marks";
+import { WorkBuddyMark } from "@/components/product-marks";
+import { QuickSwitchMenu } from "@/components/quick-switch-menu";
 import { cn } from "@/lib/utils";
 import { demoModeEnabled } from "@/lib/demo-mode";
+import { maskEmail, maskIdentity } from "@/lib/account-extras";
 import type { AccountMeta, CreditExpiry, CreditResource, TravelStatus } from "@/lib/types";
 
 const AVATAR_TONES = [
@@ -172,31 +174,37 @@ interface Props {
   creditUpdatedAt?: number;
   creditPriority?: boolean;
   workbuddyActive?: boolean;
-  codebuddyCliConfigured?: boolean;
-  codebuddyCliActive?: boolean;
-  /** 任一 CodeBuddy CLI 账号切换正在进行，用于阻止并发切换。 */
-  codebuddyCliBusy?: boolean;
-  onSwitchCodebuddyCli?: (a: AccountMeta) => void;
-  /** 当前卡片是否为正在切换的目标账号。 */
-  codebuddyCliLoading?: boolean;
-  /** CodeBuddy CN IDE 是否已安装（可切换）。 */
-  codebuddyCnIdeAvailable?: boolean;
-  codebuddyCnIdeActive?: boolean;
-  codebuddyCnIdeBusy?: boolean;
-  codebuddyCnIdeLoading?: boolean;
-  onSwitchCodebuddyCnIde?: (a: AccountMeta) => void;
   featuresDisabled?: boolean;
+  /** 平台账号标识（autoclaw / trae_work_cn）；设置后卡片隐藏切换按钮与删除等本地账号操作 */
+  platform?: string;
   /** 紧凑模式：头部缩成一条、按钮图标化、无 footer */
   compact?: boolean;
+  /** 自定义别名/备注名 */
+  note?: string;
+  /** 是否开启隐私脱敏 */
+  privacyMask?: boolean;
+  /** 点击修改备注回调 */
+  onEditNote?: (a: AccountMeta) => void;
+  /** 本地 WorkBuddy 账号的一键切换（切换后重启 WorkBuddy） */
+  onQuickSwitch?: {
+    accounts: AccountMeta[];
+    current?: { uid?: string | null; email?: string | null } | null | undefined;
+    done?: () => void;
+  };
+  /** 平台账号（AutoClaw / TRAE Work CN）的一键切换：写该平台客户端登录态并重启客户端 */
+  onQuickSwitchPlatform?: {
+    platform: string;
+    /** 本平台的全部账号（含自身） */
+    accounts: AccountMeta[];
+    /** 当前登录的平台账号池 id */
+    currentId?: string | null;
+    /** 切换成功后刷新 */
+    done?: () => void;
+  };
 }
 
-function ProductCurrentState({ product, compact = false }: { product: "workbuddy" | "codebuddy" | "codebuddy-cn"; compact?: boolean }) {
-  const title =
-    product === "workbuddy"
-      ? "WorkBuddy 当前账号"
-      : product === "codebuddy-cn"
-        ? "CodeBuddy IDE 当前账号"
-        : "CodeBuddy CLI 当前账号";
+function ProductCurrentState({ compact = false }: { compact?: boolean }) {
+  const title = "WorkBuddy 当前账号";
   return (
     <span
       role="status"
@@ -207,23 +215,46 @@ function ProductCurrentState({ product, compact = false }: { product: "workbuddy
         compact ? "h-7 text-xs" : "h-9",
       )}
     >
-      {product === "workbuddy" ? (
-        <WorkBuddyMark size={compact ? 18 : 22} />
-      ) : product === "codebuddy-cn" ? (
-        <CodeBuddyCnIdeMark size={compact ? 18 : 22} />
-      ) : (
-        <CodeBuddyMark size={compact ? 18 : 22} />
-      )}
+      <WorkBuddyMark size={compact ? 18 : 22} />
       <Check className={compact ? "size-3.5" : "size-4"} strokeWidth={2.25} />
     </span>
   );
 }
 
-export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch, todayCheckedIn, travelStatus, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, featuresDisabled = true, compact = false }: Props) {
+export function AccountCard({
+  account,
+  onDelete,
+  onCheckin,
+  onRefresh,
+  onSwitch,
+  todayCheckedIn,
+  travelStatus,
+  credit,
+  creditLoading,
+  creditUpdatedAt,
+  creditPriority,
+  workbuddyActive,
+  featuresDisabled = true,
+  compact = false,
+  note,
+  privacyMask = false,
+  onEditNote,
+  onQuickSwitch,
+  onQuickSwitchPlatform,
+  platform,
+}: Props) {
   const [resourcesOpen, setResourcesOpen] = useState(false);
-  const name = account.nickname || account.uid || "未命名账号";
+  const quickSwitchAccounts = onQuickSwitch?.accounts;
+  const currentAccount = onQuickSwitch?.current;
+  const onQuickSwitchDone = onQuickSwitch?.done;
+  const platformName = platform === "autoclaw" ? "AutoClaw" : platform === "trae_work_cn" ? "TRAE Work CN" : platform;
+  const rawName = account.nickname || account.uid || "未命名账号";
+  const name = note ? note : privacyMask ? maskIdentity(rawName) : rawName;
+  const secondaryIdentity = note
+    ? (privacyMask ? maskEmail(account.email || "") || maskIdentity(account.uid || "") : (account.email || account.uid ? `${account.nickname ? `${account.nickname} · ` : ""}${account.email || account.uid}` : ""))
+    : (privacyMask ? maskEmail(account.email || "") || maskIdentity(account.uid || "") : accountIdentity(account));
   const expired = typeof account.expiresAt === "number" && account.expiresAt < Date.now();
-  const avatarClass = avatarTone(name);
+  const avatarClass = avatarTone(rawName);
   const resources = creditResources(credit);
   const visibleResources = resources.slice(0, 2);
   const expiringAmount = credit?.ok ? credit.expiringSoonRemaining ?? 0 : 0;
@@ -238,12 +269,15 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
     })
     .map(({ resource }) => resource);
 
-  const activeProductCount = [workbuddyActive, codebuddyCliActive, codebuddyCnIdeActive].filter(Boolean).length;
+  const activeProductCount = workbuddyActive ? 1 : 0;
 
   const statusChips = (
     <>
       {todayCheckedIn !== undefined && (
         <Badge variant={todayCheckedIn ? "success" : "secondary"} className={cn(chipClass, !todayCheckedIn && "text-muted-foreground")}><CircleCheck /> {todayCheckedIn ? "已签到" : "未签到"}</Badge>
+      )}
+      {platformName && (
+        <Badge variant="secondary" className={cn(chipClass, "text-muted-foreground")}>{platformName}</Badge>
       )}
       {travelChip(travelStatus)}
       {(account.needsRelogin || expired) && <Badge variant="warning" className={chipClass}>{account.needsRelogin ? "需重新登录" : "Token 已过期"}</Badge>}
@@ -268,7 +302,7 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
         className={cn(
           "relative flex items-center border-b border-border",
           compact ? "min-h-[52px] px-3.5 py-1.5" : "min-h-[104px] px-5 py-3",
-          workbuddyActive ? "bg-primary/5" : codebuddyCliActive ? "bg-muted/60" : "bg-muted/30",
+          workbuddyActive ? "bg-primary/5" : "bg-muted/30",
         )}
       >
         <div className="pointer-events-none absolute inset-0 overflow-hidden">
@@ -276,17 +310,12 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
             className={cn(
               "absolute -right-10 -top-16 rounded-full blur-2xl",
               compact ? "size-20" : "size-24",
-              workbuddyActive ? "bg-primary/15" : codebuddyCliActive ? "bg-muted/50" : "bg-muted/30",
+              workbuddyActive ? "bg-primary/15" : "bg-muted/30",
             )}
           />
           {workbuddyActive && (
-            <div className={cn("absolute top-[64%] -translate-y-1/2 opacity-[0.075] saturate-50 grayscale-[10%]", codebuddyCliActive ? "right-[68px] rotate-[8deg]" : "right-5 rotate-[7deg]")}>
+            <div className="absolute top-[64%] right-5 -translate-y-1/2 rotate-[7deg] opacity-[0.075] saturate-50 grayscale-[10%]">
               <WorkBuddyMark size={compact ? 40 : 56} />
-            </div>
-          )}
-          {codebuddyCliActive && (
-            <div className={cn("absolute top-[63%] -translate-y-1/2 opacity-[0.065] saturate-50 grayscale-[18%]", workbuddyActive ? "right-1 -rotate-[8deg]" : "right-5 -rotate-[7deg]")}>
-              <CodeBuddyMark size={compact ? 38 : 54} />
             </div>
           )}
         </div>
@@ -306,18 +335,38 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="w-40">
-                <DropdownMenuItem disabled={featuresDisabled || !onRefresh} onSelect={() => onRefresh?.(account)}>
-                  <RefreshCw />刷新 Token
-                </DropdownMenuItem>
-                {todayCheckedIn === false && (
-                  <DropdownMenuItem disabled={featuresDisabled || !onCheckin} onSelect={() => onCheckin?.(account)}>
-                    <CircleCheck />手动签到
-                  </DropdownMenuItem>
+                {platform ? (
+                  <>
+                    {todayCheckedIn === false && (
+                      <DropdownMenuItem disabled={featuresDisabled || !onCheckin} onSelect={() => onCheckin?.(account)}>
+                        <CircleCheck />手动签到
+                      </DropdownMenuItem>
+                    )}
+                    <DropdownMenuItem disabled={featuresDisabled || !onRefresh} onSelect={() => onRefresh?.(account)}>
+                      <RefreshCw />刷新积分
+                    </DropdownMenuItem>
+                  </>
+                ) : (
+                  <>
+                    <DropdownMenuItem disabled={featuresDisabled || !onRefresh} onSelect={() => onRefresh?.(account)}>
+                      <RefreshCw />刷新 Token
+                    </DropdownMenuItem>
+                    {onEditNote && (
+                      <DropdownMenuItem onSelect={() => onEditNote(account)}>
+                        <Pencil />修改备注
+                      </DropdownMenuItem>
+                    )}
+                    {todayCheckedIn === false && (
+                      <DropdownMenuItem disabled={featuresDisabled || !onCheckin} onSelect={() => onCheckin?.(account)}>
+                        <CircleCheck />手动签到
+                      </DropdownMenuItem>
+                    )}
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem className="text-destructive focus:bg-destructive/5 focus:text-destructive" onSelect={() => onDelete(account)}>
+                      <Trash2 />删除账号
+                    </DropdownMenuItem>
+                  </>
                 )}
-                <DropdownMenuSeparator />
-                <DropdownMenuItem className="text-destructive focus:bg-destructive/5 focus:text-destructive" onSelect={() => onDelete(account)}>
-                  <Trash2 />删除账号
-                </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
           )}
@@ -325,7 +374,14 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
 
         {compact ? (
           <div className="relative z-10 flex w-full min-w-0 items-center gap-2 pr-10">
-            <h3 className="min-w-0 flex-1 truncate text-[13px] font-semibold leading-5" title={name}>{name}</h3>
+            <h3 className="min-w-0 flex-1 truncate text-[13px] font-semibold leading-5" title={name}>
+              {name}
+              {note && (
+                <span className="ml-1 text-[11px] font-normal text-muted-foreground">
+                  ({secondaryIdentity})
+                </span>
+              )}
+            </h3>
             <div className="hidden shrink-0 items-center gap-1 min-[420px]:flex">{statusChips}</div>
             <div className="ml-auto flex shrink-0 items-center gap-1">
               {workbuddyActive ? (
@@ -340,74 +396,31 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
                   </TooltipTrigger>
                   <TooltipContent side="top">WorkBuddy 当前账号</TooltipContent>
                 </Tooltip>
-              ) : demoModeEnabled ? (
-                <DemoAction>
-                  <Button variant="outline" size="icon" className="size-7 rounded-lg" aria-label="设为 WorkBuddy 当前账号">
-                    <WorkBuddyMark size={15} />
-                  </Button>
-                </DemoAction>
               ) : (
                 <Tooltip>
                   <TooltipTrigger asChild>
-                    <Button variant="outline" size="icon" className="size-7 rounded-lg" disabled={featuresDisabled || !onSwitch} onClick={() => onSwitch?.(account)} aria-label="设为 WorkBuddy 当前账号">
+                    <Button variant="outline" size="icon" className="size-7 rounded-lg" disabled={featuresDisabled || !onSwitch} onClick={() => onSwitch?.(account)} aria-label="切换为 WorkBuddy 当前账号">
                       <WorkBuddyMark size={15} />
                     </Button>
                   </TooltipTrigger>
-                  <TooltipContent side="top">设为 WorkBuddy 当前账号（会重启 WorkBuddy）</TooltipContent>
-                </Tooltip>
-              )}
-              {codebuddyCnIdeActive ? (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <span className="relative inline-flex size-7 items-center justify-center rounded-lg border border-primary/25 bg-primary/10 text-primary">
-                      <CodeBuddyCnIdeMark size={15} />
-                      <span className="absolute -right-1 -top-1 flex size-3.5 items-center justify-center rounded-full bg-primary text-primary-foreground">
-                        <Check className="size-2.5" strokeWidth={3} />
-                      </span>
-                    </span>
-                  </TooltipTrigger>
-                  <TooltipContent side="top">CodeBuddy IDE 当前账号</TooltipContent>
-                </Tooltip>
-              ) : (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button variant="outline" size="icon" className="relative size-7 rounded-lg" disabled={featuresDisabled || !codebuddyCnIdeAvailable || !onSwitchCodebuddyCnIde || codebuddyCnIdeBusy} onClick={() => onSwitchCodebuddyCnIde?.(account)} aria-label={codebuddyCnIdeLoading ? "正在切换 CodeBuddy IDE" : "切换到 CodeBuddy IDE"} aria-busy={codebuddyCnIdeLoading}>
-                      {codebuddyCnIdeLoading ? <Loader2 className="size-3.5 animate-spin" /> : <CodeBuddyCnIdeMark size={15} />}
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent side="top">{codebuddyCnIdeAvailable ? "切换到 CodeBuddy IDE（会重启 IDE）" : "未检测到 CodeBuddy IDE"}</TooltipContent>
-                </Tooltip>
-              )}
-              {codebuddyCliActive ? (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <span className="relative inline-flex size-7 items-center justify-center rounded-lg border border-primary/25 bg-primary/10 text-primary">
-                      <CodeBuddyMark size={15} />
-                      <span className="absolute -right-1 -top-1 flex size-3.5 items-center justify-center rounded-full bg-primary text-primary-foreground">
-                        <Check className="size-2.5" strokeWidth={3} />
-                      </span>
-                    </span>
-                  </TooltipTrigger>
-                  <TooltipContent side="top">CodeBuddy CLI 当前账号</TooltipContent>
-                </Tooltip>
-              ) : (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button variant="outline" size="icon" className="size-7 rounded-lg" disabled={featuresDisabled || !codebuddyCliConfigured || !onSwitchCodebuddyCli || codebuddyCliBusy} onClick={() => onSwitchCodebuddyCli?.(account)} aria-label={codebuddyCliLoading ? "正在切换 CodeBuddy CLI 当前账号" : "设为 CodeBuddy CLI 当前账号"} aria-busy={codebuddyCliLoading}>
-                      {codebuddyCliLoading ? <Loader2 className="size-3.5 animate-spin" /> : <CodeBuddyMark size={15} />}
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent side="top">{codebuddyCliConfigured ? "设为 CodeBuddy CLI 当前账号" : "请先接入 CodeBuddy CLI"}</TooltipContent>
+                  <TooltipContent side="top">切换为 WorkBuddy 当前账号</TooltipContent>
                 </Tooltip>
               )}
             </div>
           </div>
         ) : (
-          <div className={cn("relative z-10 flex w-full min-w-0 items-center gap-3", workbuddyActive || codebuddyCliActive ? "pr-[112px]" : "pr-10")}>
+          <div className={cn("relative z-10 flex w-full min-w-0 items-center gap-3", workbuddyActive ? "pr-[112px]" : "pr-10")}>
             <div className={cn("flex size-12 shrink-0 items-center justify-center rounded-full text-base font-semibold ring-4 ring-white/65", avatarClass)}>{name.charAt(0).toUpperCase()}</div>
             <div className="min-w-0 flex-1">
-              <h3 className="truncate text-sm font-semibold leading-5" title={name}>{name}</h3>
-              <p className="mt-0.5 truncate text-xs leading-5 text-muted-foreground" title={account.email || account.uid || account.id}>{accountIdentity(account)}</p>
+              <div className="flex items-center gap-1.5">
+                <h3 className="truncate text-sm font-semibold leading-5" title={name}>{name}</h3>
+                {note && (
+                  <Badge variant="secondary" className="h-4 px-1.5 text-[10px] font-normal text-muted-foreground">
+                    备注
+                  </Badge>
+                )}
+              </div>
+              <p className="mt-0.5 truncate text-xs leading-5 text-muted-foreground" title={secondaryIdentity}>{secondaryIdentity}</p>
               <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-1.5">{statusChips}</div>
             </div>
           </div>
@@ -437,6 +450,23 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
                 <span className="whitespace-nowrap tabular-nums">{creditUpdatedAt ? `${formatCreditUpdatedAt(creditUpdatedAt)} 更新` : "—"}</span>
               </div>
             </div>
+
+            {platform && credit.expiring && credit.expiring.points > 0 ? (
+              <div
+                className={cn(
+                  "flex items-center gap-1.5 rounded-lg bg-amber-500/10 px-2.5 py-1.5 text-amber-700",
+                  compact ? "mt-2 text-[11px]" : "mt-3 text-xs",
+                )}
+                role="status"
+              >
+                <TriangleAlert className="size-3.5 shrink-0" />
+                <span className="min-w-0 truncate">
+                  {formatCredits(credit.expiring.points)} 积分将在{" "}
+                  {credit.expiring.days != null ? `${Math.round(credit.expiring.days)} 天内` : "近期"}
+                  过期清零，请及时使用
+                </span>
+              </div>
+            ) : null}
 
             <div className={cn("text-[11px] font-medium text-muted-foreground", compact ? "mt-3" : "mt-4")}>近期到期</div>
             <div className={cn(compact ? "mt-1.5 space-y-2" : "mt-2 space-y-2.5")}>
@@ -468,9 +498,32 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
         )}
       </section>
 
-      {!compact && (
+      {platform ? (
+        <footer className="flex flex-wrap items-center gap-2 border-t px-5 py-2.5 text-xs text-muted-foreground">
+          <span className="font-medium text-foreground">{platformName}</span>
+          {onQuickSwitchPlatform ? (
+            <>
+              <QuickSwitchMenu
+                account={account}
+                accounts={onQuickSwitchPlatform.accounts}
+                platform={onQuickSwitchPlatform.platform}
+                current={{ id: onQuickSwitchPlatform.currentId }}
+                onDone={onQuickSwitchPlatform.done}
+                disabled={featuresDisabled}
+                privacyMask={privacyMask}
+                compact={compact}
+              />
+              <span className="min-w-0 flex-1 truncate">
+                本机客户端账号 · 一键切换登录态
+              </span>
+            </>
+          ) : (
+            <span>本机客户端账号 · 登录态随客户端同步，无需切换</span>
+          )}
+        </footer>
+      ) : !compact && (
         <footer className="flex flex-wrap items-center gap-2.5 border-t px-5 py-2.5">
-          {workbuddyActive ? <ProductCurrentState product="workbuddy" compact /> : demoModeEnabled ? (
+          {workbuddyActive ? <ProductCurrentState compact /> : demoModeEnabled ? (
             <DemoAction>
               <Button variant="outline" size="sm" className="h-7 rounded-full px-2.5 pr-3.5 text-xs" aria-label="设为 WorkBuddy 当前账号">
                 <WorkBuddyMark size={18} /><span>设为当前</span>
@@ -486,26 +539,17 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
               <TooltipContent side="top">设为 WorkBuddy 当前账号（会重启 WorkBuddy）</TooltipContent>
             </Tooltip>
           )}
-          {codebuddyCnIdeActive ? <ProductCurrentState product="codebuddy-cn" compact /> : (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button variant="outline" size="sm" className="h-7 rounded-full px-2.5 pr-3.5 text-xs" disabled={featuresDisabled || !codebuddyCnIdeAvailable || !onSwitchCodebuddyCnIde || codebuddyCnIdeBusy} onClick={() => onSwitchCodebuddyCnIde?.(account)} aria-label={codebuddyCnIdeLoading ? "正在切换 CodeBuddy IDE" : "切换到 CodeBuddy IDE"} aria-busy={codebuddyCnIdeLoading}>
-                  {codebuddyCnIdeLoading ? <Loader2 className="size-4 animate-spin" /> : <CodeBuddyCnIdeMark size={18} />}<span>{codebuddyCnIdeLoading ? "切换中…" : "IDE"}</span>
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent side="top">{codebuddyCnIdeAvailable ? "切换到 CodeBuddy IDE（会重启 IDE）" : "未检测到 CodeBuddy IDE"}</TooltipContent>
-            </Tooltip>
-          )}
-          {codebuddyCliActive ? <ProductCurrentState product="codebuddy" compact /> : (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button variant="outline" size="sm" className="h-7 rounded-full px-2.5 pr-3.5 text-xs" disabled={featuresDisabled || !codebuddyCliConfigured || !onSwitchCodebuddyCli || codebuddyCliBusy} onClick={() => onSwitchCodebuddyCli?.(account)} aria-label={codebuddyCliLoading ? "正在切换 CodeBuddy CLI 当前账号" : "设为 CodeBuddy CLI 当前账号"} aria-busy={codebuddyCliLoading}>
-                  {codebuddyCliLoading ? <Loader2 className="size-4 animate-spin" /> : <CodeBuddyMark size={18} />}<span>{codebuddyCliLoading ? "切换中…" : "CLI 当前"}</span>
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent side="top">{codebuddyCliConfigured ? "设为 CodeBuddy CLI 当前账号" : "请先接入 CodeBuddy CLI"}</TooltipContent>
-            </Tooltip>
-          )}
+          {onQuickSwitch ? (
+            <QuickSwitchMenu
+              account={account}
+              accounts={quickSwitchAccounts ?? [account]}
+              current={currentAccount}
+              onDone={onQuickSwitchDone}
+              onAdvanced={onSwitch}
+              disabled={featuresDisabled}
+              privacyMask={privacyMask}
+            />
+          ) : null}
         </footer>
       )}
       </article>

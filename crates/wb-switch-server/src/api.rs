@@ -3,13 +3,13 @@
 //! 路由设计对应 Python 版 server.py 与桌面端 commands.rs。仅绑定 127.0.0.1，
 //! token 不出本机。
 
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 #[cfg(target_os = "windows")]
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::extract::RawQuery;
-use axum::http::{header, StatusCode, Uri};
+use axum::extract::{DefaultBodyLimit, RawQuery};
+use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -17,9 +17,17 @@ use rust_embed::RustEmbed;
 use serde_json::{json, Value};
 
 use wb_switch_core::modules::{
-    account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, config, credit_usage, credits, export_import,
-    oauth, process, refresh, rotate, session, switch, token_stats, travel, update,
+    account, account_protection, auth_file, checkin, config, credit_usage, credits, export_import,
+    autoclaw_accounts, glm_proxy, loomy, loomy_proxy, model_usage, oauth, platform_checkin, platform_switch, process, refresh,
+    gateway_admin, gateway_overview, glm_web, grok, grok_pool, kimi, qoder, grok_sso, session, switch, token_stats, travel, update, trae_accounts, trae_proxy, workbuddy_proxy,
 };
+
+/// 服务实际绑定端口（main.rs serve 启动时写入），供端点展示使用。
+static BOUND_PORT: OnceLock<u16> = OnceLock::new();
+
+pub fn set_bound_port(port: u16) {
+    let _ = BOUND_PORT.set(port);
+}
 
 /// WorkBuddy 运行状态缓存：Windows 上检测要跑 tasklist（慢），缓存几秒避免
 /// 前端切 tab 频繁触发命令行导致卡顿/闪窗。
@@ -53,19 +61,20 @@ struct Assets;
 static SWITCH_PROGRESS: Mutex<Option<String>> = Mutex::new(None);
 static SWITCH_RUNNING: Mutex<bool> = Mutex::new(false);
 
+/// 请求体上限。
+///
+/// axum 默认只允许 2 MiB，而代理端点（`/v1/chat/completions`、`/v1/messages`、
+/// `/workbuddy/v1/chat/completions` 等）要接收长上下文与 base64 图片，一超就被
+/// 读 body 阶段直接拒掉，客户端只会看到 `413 Failed to buffer the request body:
+/// length limit exceeded`（且与鉴权无关）。本机服务，放宽到 64 MiB。
+const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+
 pub fn router() -> Router {
     Router::new()
+        // 二进制自证：版本 / 构建时间 / git sha。部署脚本据此判断新二进制是否真的起来了。
+        .route("/api/version", get(api_version))
         .route("/api/status", get(api_status))
         .route("/api/accounts", get(api_accounts))
-        .route("/api/codebuddy-cli/status", get(api_codebuddy_cli_status))
-        .route(
-            "/api/codebuddy-cli/install-helper",
-            post(api_codebuddy_cli_install_helper),
-        )
-        .route("/api/codebuddy-cli/switch", post(api_codebuddy_cli_switch))
-        .route("/api/codebuddy-cn-ide/status", get(api_codebuddy_cn_ide_status))
-        .route("/api/codebuddy-cn-ide/switch", post(api_codebuddy_cn_ide_switch))
-        .route("/api/codebuddy-cn-ide/detect", post(api_codebuddy_cn_ide_detect))
         .route("/api/delete", post(api_delete))
         .route("/api/oauth/start", post(api_oauth_start))
         .route("/api/oauth/status", post(api_oauth_status))
@@ -92,18 +101,119 @@ pub fn router() -> Router {
             get(api_checkin_config).post(api_save_checkin_config),
         )
         .route("/api/checkin/logs", get(api_checkin_logs))
+        .route("/api/platform/accounts", get(api_platform_accounts))
+        .route("/v1/chat/completions", post(api_glm_chat_completions))
+        .route("/v1/messages", post(api_glm_anthropic_messages))
+        .route("/v1/models", get(api_glm_models))
+        .route(
+            "/api/glm-proxy/config",
+            get(api_glm_proxy_config_get).post(api_glm_proxy_config_save),
+        )
+        .route("/api/glm-proxy/status", get(api_glm_proxy_status))
+        .route("/api/glm-proxy/test", post(api_glm_proxy_test))
+        // Cuckoo Code 融合模块：本地聊天页 + 自定义 Provider 下载 + 免 Key 中转
+        .route("/cuckoo/chat", get(api_cuckoo_chat_page))
+        .route("/cuckoo/provider.js", get(api_cuckoo_provider_js))
+        .route("/cuckoo/api/chat", post(api_cuckoo_chat_relay))
+        .route("/cuckoo/api/models", get(api_cuckoo_models_relay))
+        .route("/api/glm-usage/summary", get(api_glm_usage_summary))
+        .route("/api/glm-usage/records", get(api_glm_usage_records))
+        .route("/api/glm-usage/monitor", get(api_glm_usage_monitor))
+        .route("/api/glm-usage/accounts-overview", get(api_glm_usage_accounts_overview))
+        .route("/api/protection/status", get(api_protection_status))
+        .route(
+            "/api/protection/config",
+            get(api_protection_config_get).post(api_protection_config_save),
+        )
+        .route("/api/protection/keepalive-now", post(api_protection_keepalive_now))
+        .route("/api/protection/cooldown/clear", post(api_protection_clear_cooldown))
+        .route("/api/autoclaw/accounts", get(api_autoclaw_accounts_list).post(api_autoclaw_accounts_add))
+        .route("/api/autoclaw/accounts/import-local", post(api_autoclaw_accounts_import_local))
+        .route("/api/autoclaw/accounts/remove", post(api_autoclaw_accounts_remove))
+        .route("/api/autoclaw/accounts/refresh", post(api_autoclaw_accounts_refresh))
+        .route("/api/autoclaw/checkin-all", post(api_autoclaw_checkin_all))
+        .route("/api/platform/switch", post(api_platform_account_switch))
+        .route("/api/trae/accounts", get(api_trae_accounts_list))
+        .route("/api/trae/accounts/import-local", post(api_trae_accounts_import_local))
+        .route("/api/trae/accounts/remove", post(api_trae_accounts_remove))
+        .route("/api/trae/accounts/refresh", post(api_trae_accounts_refresh))
+        .route("/api/trae/checkin-all", post(api_trae_checkin_all))
+        .route("/api/trae/checkin-one", post(api_trae_checkin_one))
+        .route("/qoder/v1/chat/completions", post(api_qoder_chat_completions))
+        .route("/qoder/v1/models", get(api_qoder_models))
+        .route("/api/qoder/accounts", get(api_qoder_accounts_list))
+        .route("/api/qoder/accounts/import-local", post(api_qoder_import_local))
+        .route("/api/qoder/accounts/remove", post(api_qoder_remove_account))
+        .route("/api/qoder/accounts/refresh", post(api_qoder_refresh_account))
+        .route("/api/qoder/accounts/import-manual", post(api_qoder_import_manual))
+        .route("/api/qoder/device-flow/start", post(api_qoder_device_flow_start))
+        .route("/api/qoder/device-flow/complete", post(api_qoder_device_flow_complete))
+        .route("/api/qoder/test", post(api_qoder_test))
+        .route("/kimi/v1/chat/completions", post(api_kimi_chat_completions))
+        .route("/kimi/v1/models", get(api_kimi_models))
+        .route("/api/kimi/accounts", get(api_kimi_accounts_list))
+        .route("/api/kimi/accounts/add", post(api_kimi_add_account))
+        .route("/api/kimi/accounts/remove", post(api_kimi_remove_account))
+        .route("/api/kimi/accounts/enable", post(api_kimi_enable_account))
+        .route("/api/kimi/accounts/limits", post(api_kimi_update_limits))
+        .route("/api/kimi/accounts/verify", post(api_kimi_verify_account))
+        .route("/api/kimi/test", post(api_kimi_test))
+        .route("/grok/v1/chat/completions", post(api_grok_chat_completions))
+        .route("/grok/v1/models", get(api_grok_models))
+        .route("/api/grok/accounts", get(api_grok_accounts_list))
+        .route("/api/grok/accounts/add", post(api_grok_add_account))
+        .route("/api/grok/accounts/remove", post(api_grok_remove_account))
+        .route("/api/grok/accounts/enable", post(api_grok_enable_account))
+        .route("/api/grok/test", post(api_grok_test))
+        .route("/api/grok/pool/overview", get(api_grok_pool_overview))
+        .route("/api/grok/pool/check", post(api_grok_pool_check))
+        .route("/api/grok/pool/policy", get(api_grok_pool_policy_get).post(api_grok_pool_policy_set))
+        .route("/api/grok/pool/history", get(api_grok_pool_history))
+        .route("/api/grok-sso/status", get(api_grok_sso_status))
+        .route("/api/grok-sso/sync", post(api_grok_sso_sync))
+        .route("/api/grok-sso/open-login", post(api_grok_sso_open_login))
+        .route("/api/gateway/keys", get(api_gateway_keys_list).post(api_gateway_key_create))
+        .route("/api/gateway/keys/delete", post(api_gateway_key_delete))
+        .route("/api/gateway/logs", get(api_gateway_logs))
+        .route("/api/gateway/overview", get(api_gateway_overview))
+        .route("/glmweb/v1/chat/completions", post(api_glmweb_chat_completions))
+        .route("/glmweb/v1/models", get(api_glmweb_models))
+        .route("/api/glmweb/tokens", get(api_glmweb_tokens_list).post(api_glmweb_token_add))
+        .route("/api/glmweb/tokens/remove", post(api_glmweb_token_remove))
+        // v0.1.46：浏览器同步工具的幂等写回端点（校验 + upsert + 健康快照）
+        .route("/api/glmweb/tokens/sync", post(api_glmweb_token_sync))
+        .route("/api/glmweb/test", post(api_glmweb_test))
+        .route("/api/gateways/overview", get(api_gateways_overview))
+        .route("/api/autoclaw/checkin-one", post(api_autoclaw_checkin_one))
+        .route("/api/loomy/status", get(api_loomy_status))
+        .route("/api/loomy/accounts", get(api_loomy_accounts_list).post(api_loomy_accounts_add))
+        .route("/api/loomy/accounts/import-local", post(api_loomy_accounts_import_local))
+        .route("/api/loomy/accounts/remove", post(api_loomy_accounts_remove))
+        .route("/api/loomy/credits", get(api_loomy_credits))
+        .route("/api/loomy/checkin-all", post(api_loomy_checkin_all))
+        .route("/api/loomy/checkin-one", post(api_loomy_checkin_one))
+        .route("/api/loomy-proxy/config", get(api_loomy_proxy_config_get).post(api_loomy_proxy_config_save))
+        .route("/api/loomy-proxy/status", get(api_loomy_proxy_status))
+        .route("/api/loomy/protection/status", get(api_loomy_protection_status))
+        .route("/api/loomy/protection/keepalive-now", post(api_loomy_protection_keepalive_now))
+        .route("/api/loomy/protection/cooldown/clear", post(api_loomy_protection_cooldown_clear))
+        .route("/api/loomy/models", get(api_loomy_models_catalog))
+        .route("/loomy/v1/chat/completions", post(api_loomy_chat_completions))
+        .route("/loomy/v1/messages", post(api_loomy_anthropic_messages))
+        .route("/loomy/v1/models", get(api_loomy_v1_models))
+        .route("/api/trae-proxy/status", get(api_trae_proxy_status))
+        .route("/api/trae-proxy/models", get(api_trae_proxy_models))
+        .route("/trae/v1/models", get(api_trae_v1_models))
+        .route("/api/workbuddy-proxy/status", get(api_workbuddy_proxy_status))
+        .route("/api/workbuddy-proxy/models", get(api_workbuddy_proxy_models))
+        .route("/workbuddy/v1/chat/completions", post(api_workbuddy_chat_completions))
+        .route("/workbuddy/v1/models", get(api_workbuddy_v1_models))
+        .route("/v1/status", get(api_glm_v1_status))
         .route("/api/travel/status", get(api_travel_status))
         .route(
             "/api/travel/config",
             get(api_travel_config).post(api_save_travel_config),
         )
-        .route(
-            "/api/rotate/config",
-            get(api_rotate_config).post(api_save_rotate_config),
-        )
-        .route("/api/rotate/status", get(api_rotate_status))
-        .route("/api/rotate/run", post(api_rotate_run))
-        .route("/api/rotate/logs", get(api_rotate_logs))
         .route("/api/refresh-token", post(api_refresh_token))
         .route("/api/update/check", get(api_update_check))
         .route(
@@ -111,6 +221,8 @@ pub fn router() -> Router {
             get(api_update_config).post(api_save_update_config),
         )
         .fallback(static_handler)
+        // 代理端点常带长上下文 / base64 图片，必须放宽请求体上限（默认 2 MiB）。
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
 }
 
 fn json_ok(v: Value) -> Response {
@@ -124,6 +236,29 @@ fn json_err(e: String, code: StatusCode) -> Response {
 // ---------------------------------------------------------------------------
 // 状态 / 账号
 // ---------------------------------------------------------------------------
+
+/// `GET /api/version` —— 让运行中的二进制自报身份。
+///
+/// 存在意义有两层：
+/// 1. **部署可信**：`deploy.py` 需要「新二进制真的起来了」的判据。此前它探的
+///    这个路径并不存在，被 SPA 兜底当成前端路由返回 index.html（200），
+///    于是健康检查恒为真 —— 换 exe 后跑的是新是旧无从分辨（2026-09-16 定位）。
+/// 2. **排障省事**：线上跑的到底是哪一版、哪次构建，一条 curl 就有答案。
+async fn api_version() -> Response {
+    json_ok(json!({
+        "ok": true,
+        "name": "wb-switch",
+        "version": env!("CARGO_PKG_VERSION"),
+        "buildTime": env!("WB_BUILD_TIME"),
+        "buildEpoch": env!("WB_BUILD_EPOCH").parse::<i64>().unwrap_or(0),
+        "gitSha": env!("WB_GIT_SHA"),
+        "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "pid": std::process::id(),
+        "boundPort": BOUND_PORT.get().copied(),
+    }))
+}
 
 async fn api_status() -> Response {
     let auth = auth_file::read_auth_file();
@@ -141,6 +276,9 @@ async fn api_status() -> Response {
         "current": current,
         "appPath": auth_file::workbuddy_app_path().to_string_lossy(),
         "version": update::APP_VERSION,
+        // WorkBuddy 桌面客户端版本（注册表卸载信息）；读不到为 null。
+        // 注意：与 `version`（Sylvia Switch 自身版本）语义不同，界面需分别标注。
+        "workbuddyVersion": process::workbuddy_client_version(),
     }))
 }
 
@@ -154,50 +292,6 @@ async fn api_accounts() -> Response {
             .and_then(|a| a.get("account").and_then(|x| x.get("uid")).and_then(|x| x.as_str()).map(String::from)),
     }))
 }
-
-async fn api_codebuddy_cli_status() -> Response {
-    json_ok(codebuddy_cli::status())
-}
-
-async fn api_codebuddy_cli_install_helper() -> Response {
-    match codebuddy_cli::install_helper() {
-        Ok(result) => json_ok(result),
-        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
-    }
-}
-
-async fn api_codebuddy_cli_switch(Json(body): Json<Value>) -> Response {
-    let id = body.get("accountId").and_then(|v| v.as_str()).unwrap_or("");
-    match codebuddy_cli::set_active_account(id) {
-        Ok(result) => json_ok(result),
-        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
-    }
-}
-
-async fn api_codebuddy_cn_ide_status() -> Response {
-    json_ok(codebuddy_cn_ide::status())
-}
-
-async fn api_codebuddy_cn_ide_switch(Json(body): Json<Value>) -> Response {
-    let account_id = body
-        .get("accountId")
-        .or_else(|| body.get("account_id"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let restart = body.get("restart").and_then(|v| v.as_bool()).unwrap_or(true);
-    match codebuddy_cn_ide::switch_account(account_id, restart) {
-        Ok(v) => json_ok(v),
-        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
-    }
-}
-
-async fn api_codebuddy_cn_ide_detect() -> Response {
-    match codebuddy_cn_ide::detect_current_account() {
-        Ok(v) => json_ok(v),
-        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
-    }
-}
-
 
 async fn api_delete(Json(body): Json<Value>) -> Response {
     let id = body.get("accountId").and_then(|v| v.as_str()).unwrap_or("");
@@ -429,10 +523,10 @@ async fn api_copy_sessions(Json(body): Json<Value>) -> Response {
 // ---------------------------------------------------------------------------
 
 async fn api_checkin_status() -> Response {
-    let list = account::load_accounts();
+    let list = platform_checkin::all_checkin_accounts();
     let mut items = Vec::new();
     for acc in &list {
-        let status = checkin::get_checkin_status(acc).await;
+        let status = checkin::get_checkin_status_for(acc).await;
         items.push(checkin_status_item(acc, status));
     }
     json_ok(json!({ "accounts": items }))
@@ -441,6 +535,9 @@ async fn api_checkin_status() -> Response {
 fn checkin_status_item(account: &Value, mut status: Value) -> Value {
     status["accountId"] = account.get("id").cloned().unwrap_or(Value::Null);
     status["email"] = json!(account::account_display_name(account));
+    status["platform"] = json!(platform_checkin::account_platform(account));
+    // 本机客户端当前登录的账号（一键切换时用于标注「当前」与幂等短路）。
+    status["localLogin"] = json!(platform_checkin::is_local_login_account(account));
     status
 }
 
@@ -480,7 +577,7 @@ async fn api_token_statistics(RawQuery(query): RawQuery) -> Response {
 
 async fn api_checkin(Json(body): Json<Value>) -> Response {
     let id = body.get("accountId").and_then(|v| v.as_str()).unwrap_or("");
-    let Some(acc) = account::find_account(id) else {
+    let Some(acc) = platform_checkin::find_checkin_account(id) else {
         return json_err("账号不存在".to_string(), StatusCode::BAD_REQUEST);
     };
     json_ok(checkin::checkin_account(&acc).await)
@@ -504,6 +601,1867 @@ async fn api_save_checkin_config(Json(body): Json<Value>) -> Response {
 
 async fn api_checkin_logs() -> Response {
     json_ok(json!({ "logs": config::load_checkin_logs() }))
+}
+
+/// 平台账号（AutoClaw / TRAE Work CN）签到状态 + 积分/额度，供账号卡片展示。
+// ---------------------------------------------------------------------------
+// GLM 代理（AutoClaw → OpenAI 兼容接口）
+// ---------------------------------------------------------------------------
+
+fn glm_proxy_auth_ok(headers: &HeaderMap, cfg: &glm_proxy::GlmProxyConfig) -> bool {
+    if cfg.api_key.is_empty() {
+        return true;
+    }
+    let bearer_ok = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|k| k == cfg.api_key)
+        .unwrap_or(false);
+    let x_api_key_ok = headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|k| k == cfg.api_key)
+        .unwrap_or(false);
+    bearer_ok || x_api_key_ok
+}
+
+fn glm_proxy_error(e: String, code: StatusCode) -> Response {
+    // OpenAI 风格错误体，Hermes / OpenAI SDK 可直接解析。
+    (
+        code,
+        Json(json!({"error": {"message": e, "type": "glm_proxy_error"}})),
+    )
+        .into_response()
+}
+
+async fn api_glm_chat_completions(
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let cfg = glm_proxy::load_config();
+    if !cfg.enabled {
+        return glm_proxy_error(
+            "GLM 代理未启用，请在 Sylvia Switch 设置中开启".to_string(),
+            StatusCode::SERVICE_UNAVAILABLE,
+        );
+    }
+    if !glm_proxy_auth_ok(&headers, &cfg) {
+        return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+    }
+    match glm_proxy::chat_completions(body).await {
+        Ok(glm_proxy::GlmChatCompletion::Json(value)) => json_ok(value),
+        Ok(glm_proxy::GlmChatCompletion::Stream(upstream)) => {
+            let stream = futures_util::stream::unfold(upstream.rx, |mut rx| async move {
+                rx.recv().await.map(|chunk| (chunk, rx))
+            });
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, upstream.content_type)],
+                axum::body::Body::from_stream(stream),
+            )
+                .into_response()
+        }
+        Err(e) => glm_proxy_error(e, StatusCode::BAD_GATEWAY),
+    }
+}
+
+/// Anthropic Messages API 兼容端点（`POST /v1/messages`）。
+/// 鉴权同 OpenAI 端点：`x-api-key` 或 `Authorization: Bearer`。
+async fn api_glm_anthropic_messages(
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let cfg = glm_proxy::load_config();
+    if !cfg.enabled {
+        return anthropic_error(
+            "GLM 代理未启用，请在 Sylvia Switch 设置中开启".to_string(),
+            StatusCode::SERVICE_UNAVAILABLE,
+        );
+    }
+    if !glm_proxy_auth_ok(&headers, &cfg) {
+        return anthropic_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+    }
+    match glm_proxy::anthropic_messages(body).await {
+        Ok(glm_proxy::GlmChatCompletion::Json(value)) => json_ok(value),
+        Ok(glm_proxy::GlmChatCompletion::Stream(upstream)) => {
+            let stream = futures_util::stream::unfold(upstream.rx, |mut rx| async move {
+                rx.recv().await.map(|chunk| (chunk, rx))
+            });
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, upstream.content_type)],
+                axum::body::Body::from_stream(stream),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            let status = anthropic_error_status(&e);
+            anthropic_error(e, status)
+        }
+    }
+}
+
+/// Anthropic 风格错误体：`{"type":"error","error":{type,message}}`。
+fn anthropic_error(e: String, code: StatusCode) -> Response {
+    let error_type = match code {
+        StatusCode::UNAUTHORIZED => "authentication_error",
+        StatusCode::BAD_REQUEST => "invalid_request_error",
+        StatusCode::SERVICE_UNAVAILABLE => "overloaded_error",
+        _ => "api_error",
+    };
+    (
+        code,
+        Json(json!({
+            "type": "error",
+            "error": {"type": error_type, "message": e},
+        })),
+    )
+        .into_response()
+}
+
+fn anthropic_error_status(message: &str) -> StatusCode {
+    if message.contains("未知模型") || message.contains("messages 字段") || message.contains("role") {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::BAD_GATEWAY
+    }
+}
+
+async fn api_glm_models(headers: HeaderMap) -> Response {
+    let cfg = glm_proxy::load_config();
+    if !cfg.enabled {
+        return glm_proxy_error("GLM 代理未启用".to_string(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+    if !glm_proxy_auth_ok(&headers, &cfg) {
+        return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+    }
+    json_ok(glm_proxy::models_payload())
+}
+
+// ---------------------------------------------------------------------------
+// Cuckoo Code 融合模块（https://github.com/wangyongpeng90/cuckoo-code）
+//
+// cuckoo-code 是「零 Token 成本 AI Agent 桌面端」：内嵌浏览器打开 AI 网页，
+// 引导 AI 输出工具调用 JSON，确认后本地执行并把结果回传，形成 Agent 循环。
+//
+// 本模块提供三样东西，让 cuckoo-code 直接以本网关桥接的网页账号为大脑：
+//   1. GET  /cuckoo/chat        本地聊天页（OpenAI 兼容 SSE 流式）
+//   2. GET  /cuckoo/provider.js cuckoo-code 自定义 Provider 文件（DOM 选择器
+//      与本页稳定对应；useIntercept 模式，回复由页面派发事件回收）
+//   3. POST /cuckoo/api/chat    免 Key 中转：页面无需持有网关 Key，
+//      服务端内部读取 glm_proxy_config 的 api_key 后走同一处理管线。
+//      仅回环监听（127.0.0.1:57890），不对外暴露。
+// ---------------------------------------------------------------------------
+
+const CUCKOO_CHAT_HTML: &str = include_str!("../assets/cuckoo/chat.html");
+const CUCKOO_PROVIDER_JS: &str = include_str!("../assets/cuckoo/provider.js");
+
+async fn api_cuckoo_chat_page() -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        CUCKOO_CHAT_HTML,
+    )
+        .into_response()
+}
+
+async fn api_cuckoo_provider_js() -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/javascript; charset=utf-8"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"sylvia-switch-provider.js\"",
+            ),
+        ],
+        CUCKOO_PROVIDER_JS,
+    )
+        .into_response()
+}
+
+/// 免 Key 的 chat/completions 中转：鉴权留在服务端（回环 + 本地页面），
+/// 请求体与响应流与 `/v1/chat/completions` 完全一致。
+async fn api_cuckoo_chat_relay(Json(body): Json<Value>) -> Response {
+    let cfg = glm_proxy::load_config();
+    if !cfg.enabled {
+        return glm_proxy_error(
+            "GLM 代理未启用，请在 Sylvia Switch 设置中开启".to_string(),
+            StatusCode::SERVICE_UNAVAILABLE,
+        );
+    }
+    match glm_proxy::chat_completions(body).await {
+        Ok(glm_proxy::GlmChatCompletion::Json(value)) => json_ok(value),
+        Ok(glm_proxy::GlmChatCompletion::Stream(upstream)) => {
+            let stream = futures_util::stream::unfold(upstream.rx, |mut rx| async move {
+                rx.recv().await.map(|chunk| (chunk, rx))
+            });
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, upstream.content_type)],
+                axum::body::Body::from_stream(stream),
+            )
+                .into_response()
+        }
+        Err(e) => glm_proxy_error(e, StatusCode::BAD_GATEWAY),
+    }
+}
+
+/// 免 Key 的模型列表中转（供聊天页下拉框）。
+async fn api_cuckoo_models_relay() -> Response {
+    let cfg = glm_proxy::load_config();
+    if !cfg.enabled {
+        return glm_proxy_error("GLM 代理未启用".to_string(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+    json_ok(glm_proxy::models_payload())
+}
+
+/// 从界面直接试调一次对话补全（服务端转发，浏览器无需直连 /v1）。
+async fn api_glm_proxy_test(Json(body): Json<Value>) -> Response {
+    let cfg = glm_proxy::load_config();
+    if !cfg.enabled {
+        return json_err("GLM 代理未启用".to_string(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("glm-5.3").to_string();
+    let prompt = body
+        .get("prompt")
+        .and_then(Value::as_str)
+        .unwrap_or("只回复：OK")
+        .trim()
+        .to_string();
+    if prompt.is_empty() {
+        return json_err("请输入测试内容".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let payload = json!({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 1500,
+        "stream": false,
+    });
+    let started = std::time::Instant::now();
+    match glm_proxy::chat_completions_json(payload).await {
+        Ok(value) => {
+            let latency = started.elapsed().as_millis() as u64;
+            let content = value
+                .pointer("/choices/0/message/content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            json_ok(json!({
+                "ok": true,
+                "model": value.get("model").cloned().unwrap_or(Value::Null),
+                "content": content,
+                "latencyMs": latency,
+                "usage": value.get("usage").cloned().unwrap_or(Value::Null),
+            }))
+        }
+        Err(e) => json_err(e, StatusCode::BAD_GATEWAY),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 模型用量统计
+// ---------------------------------------------------------------------------
+
+async fn api_glm_usage_summary() -> Response {
+    json_ok(model_usage::get_statistics().await)
+}
+
+async fn api_glm_usage_records(RawQuery(query): RawQuery) -> Response {
+    let limit = query
+        .as_deref()
+        .unwrap_or("")
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("limit=").and_then(|v| v.parse::<usize>().ok()))
+        .unwrap_or(100)
+        .min(500);
+    json_ok(json!({ "records": model_usage::recent_records(limit) }))
+}
+
+/// 模型监控：`?hours=<小时数>&bucketMinutes=<分钟>&provider=<平台>`；hours=0 表示全部历史。
+async fn api_glm_usage_monitor(RawQuery(query): RawQuery) -> Response {
+    fn query_number(query: Option<&str>, name: &str) -> Option<i64> {
+        let prefix = format!("{name}=");
+        query?.split('&').find_map(|pair| {
+            pair.strip_prefix(prefix.as_str())
+                .and_then(|value| value.trim().parse::<i64>().ok())
+        })
+    }
+    fn query_string(query: Option<&str>, name: &str) -> Option<String> {
+        let prefix = format!("{name}=");
+        query?.split('&').find_map(|pair| {
+            pair.strip_prefix(prefix.as_str())
+                .map(|value| value.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+    }
+    let raw = query.as_deref();
+    let hours = query_number(raw, "hours").unwrap_or(24).clamp(0, 24 * 365);
+    let bucket_ms = query_number(raw, "bucketMinutes")
+        .filter(|m| *m > 0)
+        .map(|m| m * 60_000)
+        .unwrap_or_else(|| model_usage::default_bucket_ms(hours));
+    let provider = query_string(raw, "provider");
+    json_ok(model_usage::get_monitor_filtered(hours, bucket_ms, provider.as_deref()))
+}
+
+/// 多账号（AutoClaw, Loomy, TRAE Work CN）模型用量概览指标
+async fn api_glm_usage_accounts_overview() -> Response {
+    json_ok(model_usage::get_accounts_overview().await)
+}
+
+// ---------------------------------------------------------------------------
+// 账号保护与保活
+// ---------------------------------------------------------------------------
+
+async fn api_protection_status() -> Response {
+    json_ok(account_protection::get_protection_status())
+}
+
+async fn api_protection_config_get() -> Response {
+    json_ok(json!(account_protection::load_protection_config()))
+}
+
+async fn api_protection_config_save(Json(body): Json<account_protection::AccountProtectionConfig>) -> Response {
+    match account_protection::save_protection_config(&body) {
+        Ok(()) => json_ok(json!({ "ok": true, "config": account_protection::load_protection_config() })),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_protection_keepalive_now() -> Response {
+    let report = account_protection::run_keepalive_cycle().await;
+    json_ok(json!({ "ok": true, "report": report }))
+}
+
+async fn api_protection_clear_cooldown(Json(body): Json<Value>) -> Response {
+    let Some(id) = body.get("accountId").and_then(Value::as_str) else {
+        return json_err("缺少 accountId".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let cleared = account_protection::clear_account_cooling(id);
+    json_ok(json!({ "ok": true, "cleared": cleared }))
+}
+
+// ---------------------------------------------------------------------------
+// AutoClaw 多账号池
+// ---------------------------------------------------------------------------
+
+async fn api_autoclaw_accounts_list() -> Response {
+    json_ok(json!({ "accounts": autoclaw_accounts::list_for_display() }))
+}
+
+async fn api_autoclaw_accounts_add(Json(body): Json<Value>) -> Response {
+    let label = body.get("label").and_then(Value::as_str).map(String::from);
+    let Some(access_token) = body.get("accessToken").and_then(Value::as_str) else {
+        return json_err("缺少 accessToken".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let Some(refresh_token) = body.get("refreshToken").and_then(Value::as_str) else {
+        return json_err("缺少 refreshToken".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let device_id = body
+        .get("deviceId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    match autoclaw_accounts::add_account(label, access_token, refresh_token, Some(device_id)).await {
+        Ok(account) => json_ok(json!({ "ok": true, "account": account })),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_autoclaw_accounts_import_local() -> Response {
+    match autoclaw_accounts::import_local().await {
+        Ok(account) => json_ok(json!({ "ok": true, "account": account })),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_autoclaw_accounts_remove(Json(body): Json<Value>) -> Response {
+    let Some(id) = body.get("id").and_then(Value::as_str) else {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    };
+    if autoclaw_accounts::remove_account(id) {
+        json_ok(json!({ "ok": true }))
+    } else {
+        json_err("账号不存在".to_string(), StatusCode::NOT_FOUND)
+    }
+}
+
+async fn api_autoclaw_accounts_refresh(Json(body): Json<Value>) -> Response {
+    let Some(id) = body.get("id").and_then(Value::as_str) else {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    };
+    match autoclaw_accounts::refresh_stored_account(id).await {
+        Ok(_) => json_ok(json!({ "ok": true })),
+        Err(e) => json_err(format!("刷新失败：{e}"), StatusCode::BAD_GATEWAY),
+    }
+}
+
+async fn api_autoclaw_checkin_all() -> Response {
+    json_ok(json!({ "accounts": platform_checkin::autoclaw_checkin_pool().await }))
+}
+
+/// 平台账号一键切换：关客户端 → 写登录态 → 重启客户端。
+/// `platform` 取 `autoclaw` / `trae_work_cn`，`id` 为账号池条目 id。
+async fn api_platform_account_switch(Json(body): Json<Value>) -> Response {
+    let Some(platform) = body.get("platform").and_then(Value::as_str) else {
+        return json_err("缺少 platform".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let Some(id) = body.get("id").and_then(Value::as_str) else {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    };
+    match platform_switch::switch_account(platform, id, body.get("restart").and_then(Value::as_bool).unwrap_or(true)).await {
+        Ok(result) => json_ok(result),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_autoclaw_checkin_one(Json(body): Json<Value>) -> Response {
+    let Some(id) = body.get("id").and_then(Value::as_str) else {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    };
+    json_ok(platform_checkin::autoclaw_checkin_pool_account_by_id(id).await)
+}
+
+// ---------------------------------------------------------------------------
+// TRAE Work CN 多账号池
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Kimi 融合网关（移植 kimi2api：账号池调度 + Kimi Web 协议）
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+async fn api_kimi_chat_completions(
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let started = std::time::Instant::now();
+    let (auth_ok, key_id) = gateway_key_status(&headers);
+    if !auth_ok {
+        log_gateway_request("kimi", key_id.as_deref(), "—", false, 0, "无效的 API Key");
+        return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+    }
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("kimi-k2d6").to_string();
+    match kimi::chat_completions(body).await {
+        Ok(kimi::TabbitLikeOutput::Json(value)) => json_ok(value),
+        Ok(kimi::TabbitLikeOutput::Stream(upstream)) => {
+            log_gateway_request("kimi", key_id.as_deref(), &model, true, started.elapsed().as_millis() as u64, "");
+            let stream = futures_util::stream::unfold(upstream.rx, |mut rx| async move {
+                rx.recv().await.map(|chunk| (chunk, rx))
+            });
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/event-stream".to_string())],
+                axum::body::Body::from_stream(stream),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            log_gateway_request("kimi", key_id.as_deref(), &model, false, started.elapsed().as_millis() as u64, &e);
+            let status = if e.contains("繁忙") || e.contains("冷却") {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else if e.contains("未知模型") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            glm_proxy_error(e, status)
+        }
+    }
+}
+
+async fn api_kimi_models(headers: HeaderMap) -> Response {
+    let (auth_ok, key_id) = gateway_key_status(&headers);
+    if !auth_ok {
+        log_gateway_request("kimi", key_id.as_deref(), "—", false, 0, "无效的 API Key");
+        return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+    }
+    match kimi::models_payload().await {
+        Ok(payload) => {
+            log_gateway_request("kimi", key_id.as_deref(), "models", true, 0, "");
+            json_ok(payload)
+        }
+        Err(e) => {
+            log_gateway_request("kimi", key_id.as_deref(), "models", false, 0, &e);
+            glm_proxy_error(e, StatusCode::BAD_GATEWAY)
+        }
+    }
+}
+
+/// Kimi 试调（服务端转发并聚合，浏览器无需直连 /kimi/v1）。
+async fn api_kimi_test(Json(body): Json<Value>) -> Response {
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("kimi-k2d6").to_string();
+    let prompt = body
+        .get("prompt")
+        .and_then(Value::as_str)
+        .unwrap_or("只回复：OK")
+        .trim()
+        .to_string();
+    if prompt.is_empty() {
+        return json_err("请输入测试内容".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let payload = json!({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": true,
+    });
+    let started = std::time::Instant::now();
+    let mut resp = match kimi::chat_completions(payload).await {
+        Ok(kimi::TabbitLikeOutput::Stream(resp)) => resp,
+        Ok(kimi::TabbitLikeOutput::Json(value)) => {
+            let content = value
+                .pointer("/choices/0/message/content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            return json_ok(json!({
+                "ok": true,
+                "model": value.get("model").cloned().unwrap_or(json!(model)),
+                "content": content,
+                "latencyMs": started.elapsed().as_millis() as u64,
+            }));
+        }
+        Err(e) => return json_err(e, StatusCode::BAD_GATEWAY),
+    };
+    let mut content = String::new();
+    let mut model_out = model.clone();
+    let mut resp = resp;
+    let mut stream_error: Option<String> = None;
+    let mut raw_frames: Vec<String> = Vec::new();
+    // 跨 chunk 的 UTF-8 半字符尾部：严格 from_utf8 失败会整块丢弃，中文大帧
+    // 会被静默吃掉（同 GLM 通路 2026-09-16 事故）。
+    let mut utf8_carry: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.rx.recv().await {
+        let chunk = match chunk {
+            Ok(c) => c,
+            // 🔴 流里的 Err 必须往外抛。以前这里写的是 `let Ok(chunk) = chunk else { break }`，
+            //    等于把上游业务错误（如「K3 仅对付费会员开放」）整条丢弃，
+            //    再返回 ok:true + 空 content —— 用户只看到「成功但空白」，无从判断原因。
+            Err(e) => {
+                stream_error = Some(e);
+                break;
+            }
+        };
+        // raw_frames 保留「上游原始证据」语义（lossy，含被切断的字符也能显示）；
+        // 解析则用跨 chunk 解码，保证字节不丢。
+        if raw_frames.len() < 8 {
+            raw_frames.push(
+                String::from_utf8_lossy(&chunk)
+                    .chars()
+                    .take(300)
+                    .collect::<String>(),
+            );
+        }
+        let text =
+            wb_switch_core::modules::glm_anthropic::decode_stream_chunk(&mut utf8_carry, &chunk);
+        for line in text.lines() {
+            let Some(payload) = line.strip_prefix("data: ") else { continue };
+            let payload = payload.trim();
+            if payload.is_empty() || payload == "[DONE]" { continue; }
+            if let Ok(v) = serde_json::from_str::<Value>(payload) {
+                if let Some(m) = v.get("model").and_then(Value::as_str) { model_out = m.to_string(); }
+                if let Some(delta) = v.pointer("/choices/0/delta/content").and_then(Value::as_str) {
+                    content.push_str(delta);
+                }
+            }
+        }
+        if payload_contains_done(&text) { break; }
+    }
+    if let Some(err) = stream_error {
+        return json_err(err, StatusCode::BAD_GATEWAY);
+    }
+    if content.is_empty() {
+        // 零正文 = 上游没真正产出：宁可报错，也不要返回「成功但空白」。
+        // 附带原始帧便于定位（帧里不含凭据）。
+        let dump = raw_frames.join(" ⏎ ");
+        return json_err(
+            format!(
+                "Kimi 上游未返回任何内容（模型 {model_out}）：账号可能无该模型权限或上游限流。原始帧：{}",
+                if dump.is_empty() { "（无）".to_string() } else { dump.chars().take(1000).collect::<String>() }
+            ),
+            StatusCode::BAD_GATEWAY,
+        );
+    }
+    json_ok(json!({
+        "ok": true,
+        "model": model_out,
+        "content": content,
+        "latencyMs": started.elapsed().as_millis() as u64,
+    }))
+}
+
+fn payload_contains_done(text: &str) -> bool {
+    text.contains("data: [DONE]")
+}
+
+async fn api_kimi_accounts_list() -> Response {
+    json_ok(json!({ "accounts": kimi::list_for_display() }))
+}
+
+async fn api_kimi_add_account(Json(body): Json<Value>) -> Response {
+    let Some(raw_token) = body.get("raw_token").and_then(Value::as_str) else {
+        return json_err("缺少 raw_token".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let name = body.get("name").and_then(Value::as_str);
+    // 扩展可带上浏览器的 device_id（与 kimi.com 同源，降低风控概率）
+    let device_id = body.get("device_id").and_then(Value::as_str);
+    match kimi::add_account(name, raw_token, device_id) {
+        // 🔴 `kimi::add_account` 自己已经返回 `{updated, reason, account}`，这里必须**摊平**再包一层，
+        // 否则响应体变成 `account.account.<字段>`（2026-09-16 实测：扩展读 `account.id` 拿到
+        // undefined，明明 HTTP 200 却报「写入网关失败（HTTP 200）」，并因此无法回收自己刚建的账号）。
+        Ok(added) => {
+            let reason = added.get("reason").cloned().unwrap_or_else(|| json!("added"));
+            let updated = added.get("updated").cloned().unwrap_or_else(|| json!(false));
+            let account = added
+                .get("account")
+                .cloned()
+                .unwrap_or_else(|| added.clone());
+            json_ok(json!({
+                "ok": true,
+                "reason": reason,
+                "updated": updated,
+                "account": account,
+            }))
+        }
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_kimi_remove_account(Json(body): Json<Value>) -> Response {
+    let Some(id) = body.get("id").and_then(Value::as_str) else {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    };
+    if kimi::remove_account(id) {
+        json_ok(json!({ "ok": true }))
+    } else {
+        json_err("账号不存在".to_string(), StatusCode::NOT_FOUND)
+    }
+}
+
+async fn api_kimi_enable_account(Json(body): Json<Value>) -> Response {
+    let Some(id) = body.get("id").and_then(Value::as_str) else {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let enabled = body.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+    if kimi::set_account_enabled(id, enabled) {
+        json_ok(json!({ "ok": true }))
+    } else {
+        json_err("账号不存在".to_string(), StatusCode::NOT_FOUND)
+    }
+}
+
+async fn api_kimi_update_limits(Json(body): Json<Value>) -> Response {
+    let Some(id) = body.get("id").and_then(Value::as_str) else {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let max_concurrency = body.get("max_concurrency").and_then(Value::as_u64).unwrap_or(2) as usize;
+    let min_interval_ms = body
+        .get("min_interval_seconds")
+        .and_then(Value::as_f64)
+        .map(|s| (s * 1000.0) as u64)
+        .unwrap_or(500);
+    if kimi::update_account_limits(id, max_concurrency, min_interval_ms) {
+        json_ok(json!({ "ok": true }))
+    } else {
+        json_err("账号不存在".to_string(), StatusCode::NOT_FOUND)
+    }
+}
+
+async fn api_kimi_verify_account(Json(body): Json<Value>) -> Response {
+    let Some(id) = body.get("id").and_then(Value::as_str) else {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    };
+    match kimi::verify_account(id).await {
+        Ok(result) => json_ok(result),
+        // 按错误类别回状态码：网络不可达 → 503（可重试）、凭据失效 → 401、
+        // 上游异常 → 502。响应体带 code/retryable，供扩展分级展示文案。
+        Err(e) => {
+            let status = StatusCode::from_u16(e.http_status().as_u16())
+                .unwrap_or(StatusCode::BAD_GATEWAY);
+            (status, Json(e.to_value())).into_response()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Grok 融合网关（多账号 → OpenAI 兼容接口，移植自 chenyme/grok2api）
+// ---------------------------------------------------------------------------
+
+async fn api_grok_chat_completions(
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let started = std::time::Instant::now();
+    let (auth_ok, key_id) = gateway_key_status(&headers);
+    if !auth_ok {
+        log_gateway_request("grok", key_id.as_deref(), "—", false, 0, "无效的 API Key");
+        return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+    }
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("grok-2").to_string();
+    let want_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    match grok::chat_completions_unified(body).await {
+        Ok(grok::GrokChatOutput::Stream(resp)) => {
+            // 旧直连流路径（build provider 可能仍走这里）。
+            log_gateway_request("grok", key_id.as_deref(), &model, true, started.elapsed().as_millis() as u64, "");
+            let stream = futures_util::stream::unfold(resp, |mut resp| async move {
+                match resp.chunk().await {
+                    Ok(Some(chunk)) => Some((Ok(chunk), resp)),
+                    Ok(None) => None,
+                    Err(e) => Some((Err(format!("Grok 上游流中断: {e}")), resp)),
+                }
+            });
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/event-stream".to_string())],
+                axum::body::Body::from_stream(stream),
+            )
+                .into_response()
+        }
+        Ok(grok::GrokChatOutput::Json(value)) => {
+            log_gateway_request("grok", key_id.as_deref(), &model, true, started.elapsed().as_millis() as u64, "");
+            if !want_stream {
+                return json_ok(value);
+            }
+            // v1.1.0：WebReply 通道无逐 token 流 —— 由完整 JSON 合成 OpenAI chunk 帧。
+            let content = value
+                .pointer("/choices/0/message/content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let reasoning = value
+                .pointer("/choices/0/message/reasoning_content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, String>>(16);
+            tokio::spawn(async move {
+                let frame = |delta: Value, finish: Option<&str>| {
+                    json!({
+                        "id": format!("chatcmpl-grok-{}", wb_switch_core::modules::config::now_ms()),
+                        "object": "chat.completion.chunk",
+                        "created": wb_switch_core::modules::config::now_ms() / 1000,
+                        "model": model,
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+                    })
+                    .to_string()
+                };
+                let _ = tx.send(Ok(axum::body::Bytes::from(format!("data: {}\n\n", frame(json!({"role": "assistant"}), None))))).await;
+                if !reasoning.is_empty() {
+                    let _ = tx.send(Ok(axum::body::Bytes::from(format!("data: {}\n\n", frame(json!({"reasoning_content": reasoning}), None))))).await;
+                }
+                if !content.is_empty() {
+                    let _ = tx.send(Ok(axum::body::Bytes::from(format!("data: {}\n\n", frame(json!({"content": content}), None))))).await;
+                }
+                let _ = tx.send(Ok(axum::body::Bytes::from("data: [DONE]\n\n"))).await;
+            });
+            let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|chunk| (chunk, rx))
+            });
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/event-stream".to_string())],
+                axum::body::Body::from_stream(stream),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            log_gateway_request("grok", key_id.as_deref(), &model, false, started.elapsed().as_millis() as u64, &e);
+            let status = if e.contains("尚未配置任何可用账号") || e.contains("账号池为空") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            glm_proxy_error(e, status)
+        }
+    }
+}
+
+async fn api_grok_models(headers: HeaderMap) -> Response {
+    let (auth_ok, key_id) = gateway_key_status(&headers);
+    if !auth_ok {
+        log_gateway_request("grok", key_id.as_deref(), "—", false, 0, "无效的 API Key");
+        return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+    }
+    log_gateway_request("grok", key_id.as_deref(), "models", true, 0, "");
+    json_ok(grok::models_payload())
+}
+
+async fn api_grok_accounts_list() -> Response {
+    json_ok(json!({ "accounts": grok::list_for_display() }))
+}
+
+async fn api_grok_add_account(Json(body): Json<Value>) -> Response {
+    let name = body.get("name").and_then(Value::as_str).unwrap_or("").trim();
+    let provider = body.get("provider").and_then(Value::as_str).unwrap_or("web").trim();
+    let token = body.get("token").and_then(Value::as_str).unwrap_or("").trim();
+    let tier = body.get("tier").and_then(Value::as_str);
+
+    match grok::import_account(name, provider, token, tier) {
+        Ok(acc) => json_ok(json!({ "ok": true, "account": acc })),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_grok_remove_account(Json(body): Json<Value>) -> Response {
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("").trim();
+    if id.is_empty() {
+        return json_err("缺少账号 id".to_string(), StatusCode::BAD_REQUEST);
+    }
+    if grok::remove_account(id) {
+        json_ok(json!({ "ok": true }))
+    } else {
+        json_err("账号不存在或删除失败".to_string(), StatusCode::NOT_FOUND)
+    }
+}
+
+async fn api_grok_enable_account(Json(body): Json<Value>) -> Response {
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("").trim();
+    let enabled = body.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+    if id.is_empty() {
+        return json_err("缺少账号 id".to_string(), StatusCode::BAD_REQUEST);
+    }
+    if grok::set_account_enabled(id, enabled) {
+        json_ok(json!({ "ok": true }))
+    } else {
+        json_err("账号不存在或设置失败".to_string(), StatusCode::NOT_FOUND)
+    }
+}
+
+async fn api_grok_pool_overview() -> Response {
+    json_ok(grok_pool::pool_overview())
+}
+
+async fn api_grok_pool_check() -> Response {
+    json_ok(grok_pool::run_check_batch().await)
+}
+
+async fn api_grok_pool_history() -> Response {
+    json_ok(grok_pool::history())
+}
+
+async fn api_grok_pool_policy_get() -> Response {
+    let p = grok_pool::load_policy();
+    json_ok(json!({
+        "autoCheckEnabled": p.auto_check_enabled,
+        "checkIntervalMinutes": p.check_interval_minutes,
+        "batchSize": p.batch_size,
+        "riskLowThreshold": p.risk_low_threshold,
+        "riskHighThreshold": p.risk_high_threshold,
+        "pauseHighRisk": p.pause_high_risk,
+        "successDelta": p.success_delta,
+        "rateLimitPenalty": p.rate_limit_penalty,
+        "timeoutPenalty": p.timeout_penalty,
+        "fatalPenalty": p.fatal_penalty,
+    }))
+}
+
+async fn api_grok_pool_policy_set(Json(body): Json<Value>) -> Response {
+    let mut p = grok_pool::load_policy();
+    if let Some(v) = body.get("autoCheckEnabled").and_then(Value::as_bool) { p.auto_check_enabled = v; }
+    if let Some(v) = body.get("checkIntervalMinutes").and_then(Value::as_u64) { p.check_interval_minutes = v.max(15); }
+    if let Some(v) = body.get("batchSize").and_then(Value::as_u64) { p.batch_size = (v as usize).clamp(1, 10); }
+    if let Some(v) = body.get("riskLowThreshold").and_then(Value::as_i64) { p.risk_low_threshold = v.clamp(0, 100); }
+    if let Some(v) = body.get("riskHighThreshold").and_then(Value::as_i64) { p.risk_high_threshold = v.clamp(0, 100); }
+    if let Some(v) = body.get("pauseHighRisk").and_then(Value::as_bool) { p.pause_high_risk = v; }
+    if let Some(v) = body.get("successDelta").and_then(Value::as_i64) { p.success_delta = v.clamp(0, 50); }
+    if let Some(v) = body.get("rateLimitPenalty").and_then(Value::as_i64) { p.rate_limit_penalty = v.clamp(0, 100); }
+    if let Some(v) = body.get("timeoutPenalty").and_then(Value::as_i64) { p.timeout_penalty = v.clamp(0, 100); }
+    if let Some(v) = body.get("fatalPenalty").and_then(Value::as_i64) { p.fatal_penalty = v.clamp(0, 100); }
+    match grok_pool::save_policy(&p) {
+        Ok(_) => json_ok(json!({"ok": true})),
+        Err(e) => json_err(e, StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+async fn api_grok_test(Json(body): Json<Value>) -> Response {
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("grok-2");
+    let prompt = body.get("prompt").and_then(Value::as_str).unwrap_or("你好");
+    let enable_thinking = body.get("enableThinking").and_then(Value::as_bool).unwrap_or(false);
+    let account_id = body.get("accountId").and_then(Value::as_str);
+
+    match grok::test_chat(model, prompt, enable_thinking, account_id).await {
+        Ok(res) => json_ok(res),
+        Err(e) => json_err(e, StatusCode::BAD_GATEWAY),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Qoder 融合网关（多账号 → OpenAI 兼容接口）
+// ---------------------------------------------------------------------------
+
+// ---- 网关管理端点（API Keys / 日志 / 概览）----
+
+// ---------------------------------------------------------------------------
+// ChatGLM 网页协议网关（glm2api 移植）
+// ---------------------------------------------------------------------------
+
+async fn api_glmweb_chat_completions(
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let started = std::time::Instant::now();
+    let (auth_ok, key_id) = gateway_key_status(&headers);
+    if !auth_ok {
+        log_gateway_request("glmweb", key_id.as_deref(), "—", false, 0, "无效的 API Key");
+        return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+    }
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("glm-4").to_string();
+    match glm_web::chat_completions(body).await {
+        Ok(glm_web::GlmChatOutput::Stream(upstream)) => {
+            log_gateway_request("glmweb", key_id.as_deref(), &model, true, started.elapsed().as_millis() as u64, "");
+            let stream = futures_util::stream::unfold(upstream.rx, |mut rx| async move {
+                rx.recv().await.map(|chunk| (chunk, rx))
+            });
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/event-stream".to_string())],
+                axum::body::Body::from_stream(stream),
+            )
+                .into_response()
+        }
+        Ok(glm_web::GlmChatOutput::Json(value)) => {
+            log_gateway_request("glmweb", key_id.as_deref(), &model, true, started.elapsed().as_millis() as u64, "");
+            json_ok(value)
+        }
+        Err(e) => {
+            log_gateway_request("glmweb", key_id.as_deref(), &model, false, started.elapsed().as_millis() as u64, &e);
+            glm_proxy_error(e, StatusCode::BAD_GATEWAY)
+        }
+    }
+}
+
+async fn api_glmweb_models(headers: HeaderMap) -> Response {
+    let (auth_ok, key_id) = gateway_key_status(&headers);
+    if !auth_ok {
+        return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+    }
+    log_gateway_request("glmweb", key_id.as_deref(), "models", true, 0, "");
+    json_ok(glm_web::models_payload())
+}
+
+/// ChatGLM 试调（服务端转发非流式请求并聚合）。
+async fn api_glmweb_test(Json(body): Json<Value>) -> Response {
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("glm-4.7-flash").to_string();
+    let prompt = body
+        .get("prompt")
+        .and_then(Value::as_str)
+        .unwrap_or("只回复：OK")
+        .trim()
+        .to_string();
+    if prompt.is_empty() {
+        return json_err("请输入测试内容".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let payload = json!({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": false,
+    });
+    let started = std::time::Instant::now();
+    match glm_web::chat_completions(payload).await {
+        Ok(glm_web::GlmChatOutput::Json(value)) => {
+            let content = value
+                .pointer("/choices/0/message/content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            json_ok(json!({
+                "ok": true,
+                "model": value.get("model").cloned().unwrap_or(json!(model)),
+                "content": content,
+                "latencyMs": started.elapsed().as_millis() as u64,
+            }))
+        }
+        Ok(glm_web::GlmChatOutput::Stream(_)) => {
+            json_err("非预期：非流式请求返回了流".to_string(), StatusCode::INTERNAL_SERVER_ERROR)
+        }
+        Err(e) => json_err(e, StatusCode::BAD_GATEWAY),
+    }
+}
+
+async fn api_glmweb_tokens_list() -> Response {
+    json_ok(json!({
+        "tokens": glm_web::list_tokens_masked(),
+        // v0.1.46：pool 增补 defaultModel / degraded / needRenew，便于前端与同步工具判断
+        "pool": glm_web::pool_health(),
+    }))
+}
+
+/// v0.1.46：浏览器同步工具专用 —— 幂等写回 chatglm refresh token。
+///
+/// body: `{ "token": "<refresh_token>", "validate": true, "source": "browser-extension" }`
+/// - `validate=true`（默认）时先真实调用上游 refresh，失败**不写盘**并返回 401/403 语义；
+/// - token 已存在则只刷新缓存、不新增槽位（幂等，可 20 分钟一次反复调用）。
+async fn api_glmweb_token_sync(Json(body): Json<Value>) -> Response {
+    let Some(token) = body.get("token").and_then(Value::as_str) else {
+        return json_err("缺少 token".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let validate = body.get("validate").and_then(Value::as_bool).unwrap_or(true);
+    let source = body.get("source").and_then(Value::as_str);
+
+    match glm_web::sync_token(token, validate, source).await {
+        Ok(result) => json_ok(result),
+        Err(e) => {
+            // 凭据失效（上游 refresh 被拒）→ 401；其余（网络/解析/写盘）→ 502
+            let invalid = e.contains("刷新失败")
+                || e.contains("401")
+                || e.contains("403")
+                || e.contains("业务失败")
+                || e.contains("缺少 access_token");
+            let status = if invalid {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            json_err(e, status)
+        }
+    }
+}
+
+async fn api_glmweb_token_add(Json(body): Json<Value>) -> Response {
+    let Some(token) = body.get("token").and_then(Value::as_str) else {
+        return json_err("缺少 token".to_string(), StatusCode::BAD_REQUEST);
+    };
+    match glm_web::add_token(token) {
+        Ok(result) => json_ok(result),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_glmweb_token_remove(Json(body): Json<Value>) -> Response {
+    let Some(index) = body.get("index").and_then(Value::as_u64) else {
+        return json_err("缺少 index".to_string(), StatusCode::BAD_REQUEST);
+    };
+    if glm_web::remove_token(index as usize) {
+        json_ok(json!({ "ok": true }))
+    } else {
+        json_err("槽位不存在".to_string(), StatusCode::NOT_FOUND)
+    }
+}
+
+async fn api_gateway_keys_list() -> Response {
+    json_ok(json!({ "keys": gateway_admin::list_keys_masked() }))
+}
+
+async fn api_gateway_key_create(Json(body): Json<Value>) -> Response {
+    let name = body.get("name").and_then(Value::as_str).unwrap_or("");
+    match gateway_admin::create_key(name) {
+        Ok(key) => json_ok(json!({ "ok": true, "key": key })),
+        Err(e) => json_err(e, StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+async fn api_gateway_key_delete(Json(body): Json<Value>) -> Response {
+    let Some(id) = body.get("id").and_then(Value::as_str) else {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    };
+    if gateway_admin::delete_key(id) {
+        json_ok(json!({ "ok": true }))
+    } else {
+        json_err("密钥不存在".to_string(), StatusCode::NOT_FOUND)
+    }
+}
+
+async fn api_gateway_logs(RawQuery(query): RawQuery) -> Response {
+    let params = query.unwrap_or_default();
+    let gateway = params
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("gateway="))
+        .map(String::from);
+    let limit = params
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("limit=").and_then(|v| v.parse::<usize>().ok()))
+        .unwrap_or(50)
+        .min(500);
+    json_ok(json!({ "logs": gateway_admin::list_logs(gateway.as_deref(), limit) }))
+}
+
+async fn api_gateway_overview() -> Response {
+    json_ok(gateway_admin::overview())
+}
+
+/// 所有模型网关的聚合总览（供统一网关下拉菜单浏览与切换）。
+async fn api_gateways_overview() -> Response {
+    json_ok(gateway_overview::overview().await)
+}
+
+fn qoder_auth_ok(headers: &HeaderMap) -> bool {
+    gateway_key_status(headers).0
+}
+
+/// 网关密钥校验：命中"网关专用 Key"（计数+1）或 GLM 代理主密钥。
+/// 返回 (有效, key id)。
+fn gateway_key_status(headers: &HeaderMap) -> (bool, Option<String>) {
+    let presented = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()));
+    let cfg = glm_proxy::load_config();
+    gateway_admin::verify_request_key(presented, &cfg.api_key)
+}
+
+/// 记录网关请求日志（chat 调用完成/失败后调用）。
+fn log_gateway_request(gateway: &str, key_id: Option<&str>, model: &str, ok: bool, latency_ms: u64, error: &str) {
+    gateway_admin::record_request(json!({
+        "ts": wb_switch_core::modules::config::now_ms(),
+        "gateway": gateway,
+        "keyId": key_id,
+        "model": model,
+        "ok": ok,
+        "latencyMs": latency_ms,
+        "error": if error.is_empty() { Value::Null } else { json!(error) },
+    }));
+}
+
+async fn api_qoder_chat_completions(
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let started = std::time::Instant::now();
+    let (auth_ok, key_id) = gateway_key_status(&headers);
+    if !auth_ok {
+        log_gateway_request("qoder", key_id.as_deref(), "—", false, 0, "无效的 API Key");
+        return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+    }
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("lite").to_string();
+    match qoder::chat_completions_unified(body).await {
+        Ok(qoder::QoderChatOutput::Stream(resp)) => {
+            // SSE 首帧到达即视为成功（流内错误对客户端透出，日志记 ok）
+            log_gateway_request("qoder", key_id.as_deref(), &model, true, started.elapsed().as_millis() as u64, "");
+            let stream = futures_util::stream::unfold(resp, |mut resp| async move {
+                match resp.chunk().await {
+                    Ok(Some(chunk)) => Some((Ok(chunk), resp)),
+                    Ok(None) => None,
+                    Err(e) => Some((Err(format!("Qoder 上游流中断: {e}")), resp)),
+                }
+            });
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/event-stream".to_string())],
+                axum::body::Body::from_stream(stream),
+            )
+                .into_response()
+        }
+        Ok(qoder::QoderChatOutput::Json(value)) => {
+            log_gateway_request("qoder", key_id.as_deref(), &model, true, started.elapsed().as_millis() as u64, "");
+            json_ok(value)
+        }
+        Err(e) => {
+            log_gateway_request("qoder", key_id.as_deref(), &model, false, started.elapsed().as_millis() as u64, &e);
+            let status = if e.contains("账号池为空") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            glm_proxy_error(e, status)
+        }
+    }
+}
+
+async fn api_qoder_models(headers: HeaderMap) -> Response {
+    let (auth_ok, key_id) = gateway_key_status(&headers);
+    if !auth_ok {
+        log_gateway_request("qoder", key_id.as_deref(), "—", false, 0, "无效的 API Key");
+        return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+    }
+    log_gateway_request("qoder", key_id.as_deref(), "models", true, 0, "");
+    json_ok(qoder::models_payload())
+}
+
+/// Qoder 试调（服务端转发非流式请求并聚合，浏览器无需直连 /qoder/v1）。
+async fn api_qoder_test(Json(body): Json<Value>) -> Response {
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("lite").to_string();
+    let prompt = body
+        .get("prompt")
+        .and_then(Value::as_str)
+        .unwrap_or("只回复：OK")
+        .trim()
+        .to_string();
+    if prompt.is_empty() {
+        return json_err("请输入测试内容".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let payload = json!({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": false,
+    });
+    let started = std::time::Instant::now();
+    let mut resp = match qoder::chat_completions(payload).await {
+        Ok(resp) => resp,
+        Err(e) => return json_err(e, StatusCode::BAD_GATEWAY),
+    };
+    // 聚合 SSE 全文，提取最终 content。
+    // 严格 from_utf8 失败会整块丢弃（TCP 切点落在中文等多字节字符中间），
+    // 用跨 chunk 的 carry 保证字节不丢——同 glm_anthropic::decode_stream_chunk。
+    let mut sse_text = String::new();
+    let mut carry: Vec<u8> = Vec::new();
+    while let Ok(Some(chunk)) = resp.chunk().await {
+        sse_text.push_str(&wb_switch_core::modules::glm_anthropic::decode_stream_chunk(
+            &mut carry,
+            &chunk,
+        ));
+        if sse_text.contains("[DONE]") {
+            break;
+        }
+    }
+    if !carry.is_empty() {
+        sse_text.push_str(&String::from_utf8_lossy(&carry));
+    }
+    let mut content = String::new();
+    let mut model_out = model.clone();
+    for line in sse_text.lines() {
+        let Some(payload) = line.strip_prefix("data: ") else { continue };
+        let payload = payload.trim();
+        if payload.is_empty() || payload == "[DONE]" { continue; }
+        if let Ok(v) = serde_json::from_str::<Value>(payload) {
+            if let Some(m) = v.get("model").and_then(Value::as_str) { model_out = m.to_string(); }
+            if let Some(delta) = v.pointer("/choices/0/delta/content").and_then(Value::as_str) {
+                content.push_str(delta);
+            }
+            if let Some(message) = v.pointer("/choices/0/message/content").and_then(Value::as_str) {
+                content.push_str(message);
+            }
+        }
+    }
+    json_ok(json!({
+        "ok": true,
+        "model": model_out,
+        "content": content,
+        "latencyMs": started.elapsed().as_millis() as u64,
+    }))
+}
+
+async fn api_qoder_import_manual(Json(body): Json<Value>) -> Response {
+    let token = body.get("accessToken").and_then(Value::as_str).unwrap_or_default().to_string();
+    let refresh = body.get("refreshToken").and_then(Value::as_str).unwrap_or_default().to_string();
+    let uid = body.get("uid").and_then(Value::as_str).unwrap_or_default().to_string();
+    match qoder::import_manual(&uid, &token, &refresh) {
+        Ok(account) => json_ok(json!({ "ok": true, "account": account })),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_qoder_accounts_list() -> Response {
+    json_ok(json!({ "accounts": qoder::list_for_display() }))
+}
+
+async fn api_qoder_import_local() -> Response {
+    match qoder::import_local() {
+        Ok(account) => json_ok(json!({ "ok": true, "account": account })),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_qoder_remove_account(Json(body): Json<Value>) -> Response {
+    let Some(uid) = body.get("uid").and_then(Value::as_str) else {
+        return json_err("缺少 uid".to_string(), StatusCode::BAD_REQUEST);
+    };
+    if qoder::remove_account(uid) {
+        json_ok(json!({ "ok": true }))
+    } else {
+        json_err("账号不存在".to_string(), StatusCode::NOT_FOUND)
+    }
+}
+
+async fn api_qoder_refresh_account(Json(body): Json<Value>) -> Response {
+    let Some(uid) = body.get("uid").and_then(Value::as_str) else {
+        return json_err("缺少 uid".to_string(), StatusCode::BAD_REQUEST);
+    };
+    match qoder::refresh_stored_account(uid).await {
+        Ok(_) => json_ok(json!({ "ok": true })),
+        Err(e) => json_err(format!("刷新失败：{e}"), StatusCode::BAD_GATEWAY),
+    }
+}
+
+async fn api_qoder_device_flow_start() -> Response {
+    match qoder::device_flow_start() {
+        Ok(session) => json_ok(json!({ "ok": true, "session": session })),
+        Err(e) => json_err(e, StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+async fn api_qoder_device_flow_complete(Json(body): Json<Value>) -> Response {
+    let Some(session) = body.get("session") else {
+        return json_err("缺少 session".to_string(), StatusCode::BAD_REQUEST);
+    };
+    match qoder::device_flow_complete(session).await {
+        Ok(account) => json_ok(json!({ "ok": true, "account": account })),
+        Err(e) => json_err(e, StatusCode::BAD_GATEWAY),
+    }
+}
+
+async fn api_trae_accounts_list() -> Response {
+    json_ok(json!({ "accounts": trae_accounts::list_for_display() }))
+}
+
+async fn api_trae_accounts_import_local() -> Response {
+    match trae_accounts::import_local_snapshot() {
+        Ok(account) => json_ok(json!({ "ok": true, "account": account })),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_trae_accounts_remove(Json(body): Json<Value>) -> Response {
+    let Some(id) = body.get("id").and_then(Value::as_str) else {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    };
+    if trae_accounts::remove_account(id) {
+        json_ok(json!({ "ok": true }))
+    } else {
+        json_err("账号不存在".to_string(), StatusCode::NOT_FOUND)
+    }
+}
+
+async fn api_trae_accounts_refresh(Json(body): Json<Value>) -> Response {
+    let Some(id) = body.get("id").and_then(Value::as_str) else {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    };
+    match trae_accounts::refresh_stored_account(id).await {
+        Ok(_) => json_ok(json!({ "ok": true })),
+        Err(e) => json_err(format!("刷新失败：{e}"), StatusCode::BAD_GATEWAY),
+    }
+}
+
+async fn api_trae_checkin_all() -> Response {
+    json_ok(json!({ "accounts": platform_checkin::trae_checkin_pool().await }))
+}
+
+async fn api_trae_checkin_one(Json(body): Json<Value>) -> Response {
+    let Some(id) = body.get("id").and_then(Value::as_str) else {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    };
+    json_ok(platform_checkin::trae_checkin_pool_account_by_id(id).await)
+}
+
+// ---------------------------------------------------------------------------
+// Loomy（讯飞）
+// ---------------------------------------------------------------------------
+
+async fn api_loomy_status() -> Response {
+    let local = loomy::read_local_session().is_ok();
+    json_ok(json!({
+        "localLogin": local,
+        "dataDir": loomy::auth_session_path().map(|p| p.to_string_lossy().to_string()),
+        "apiHost": "https://loomyad.xunfei.cn",
+    }))
+}
+
+async fn api_loomy_accounts_list() -> Response {
+    let mut accounts = loomy::list_for_display();
+    // 本机实时账号顺带拉一次积分（其余池条目按需刷新，避免批量打网关）。
+    if let Some(first) = accounts.first_mut() {
+        if first.get("source").and_then(Value::as_str) == Some("local-live") {
+            let credits = loomy::credits_local().await;
+            first["credit"] = credits;
+        }
+    }
+    json_ok(json!({ "accounts": accounts }))
+}
+
+async fn api_loomy_accounts_add(Json(body): Json<Value>) -> Response {
+    let Some(session) = body.get("session").and_then(Value::as_str) else {
+        return json_err("缺少 session".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let label = body.get("label").and_then(Value::as_str).map(String::from);
+    match loomy::add_account(label, session).await {
+        Ok(account) => json_ok(json!({ "ok": true, "account": account })),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_loomy_accounts_import_local() -> Response {
+    match loomy::import_local().await {
+        Ok(account) => json_ok(json!({ "ok": true, "account": account })),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_loomy_accounts_remove(Json(body): Json<Value>) -> Response {
+    let Some(id) = body.get("id").and_then(Value::as_str) else {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    };
+    if loomy::remove_account(id) {
+        json_ok(json!({ "ok": true }))
+    } else {
+        json_err("账号不存在".to_string(), StatusCode::NOT_FOUND)
+    }
+}
+
+async fn api_loomy_credits(RawQuery(query): RawQuery) -> Response {
+    if query_flag_enabled(query.as_deref(), "pool") {
+        // 逐池条目查积分（Loomy 页面账号池刷新按钮）。
+        let mut out = Vec::new();
+        for account in loomy::load_accounts() {
+            let Some(id) = account.get("id").and_then(Value::as_str).map(String::from) else {
+                continue;
+            };
+            let credits = loomy::credits_stored(&id).await;
+            out.push(json!({
+                "id": id,
+                "label": account.get("label").cloned().unwrap_or(Value::Null),
+                "credit": credits,
+            }));
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+        return json_ok(json!({ "accounts": out }));
+    }
+    json_ok(loomy::credits_local().await)
+}
+
+async fn api_loomy_checkin_all() -> Response {
+    // 本机账号 + 池条目逐个校验登录态（每日积分随登录自动发放）。
+    let mut results = Vec::new();
+    if let Some(entry) = loomy::discover_loomy_account() {
+        let status = platform_checkin::get_loomy_status().await;
+        results.push(json!({
+            "id": entry.get("id").cloned().unwrap_or(Value::Null),
+            "label": "本机登录",
+            "result": if status.get("ok").and_then(Value::as_bool) == Some(true) { "already" } else { "error" },
+            "error": status.get("error").cloned().unwrap_or(Value::Null),
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    for account in loomy::load_accounts() {
+        if loomy::hidden_by_local_login(&account) {
+            continue;
+        }
+        if account.get("status").and_then(Value::as_str) == Some("invalid") {
+            continue;
+        }
+        let Some(id) = account.get("id").and_then(Value::as_str).map(String::from) else {
+            continue;
+        };
+        let res = loomy::checkin_stored(&id).await;
+        results.push(json!({
+            "id": id,
+            "label": account.get("label").cloned().unwrap_or(Value::Null),
+            "result": res.get("result").cloned().unwrap_or(json!("error")),
+            "error": res.get("error").cloned().unwrap_or(Value::Null),
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    json_ok(json!({ "accounts": results }))
+}
+
+async fn api_loomy_checkin_one(Json(body): Json<Value>) -> Response {
+    let Some(id) = body.get("id").and_then(Value::as_str) else {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    };
+    // 本机账号（id == loomy:local 或与发现 ID 相同）实时校验。
+    let local_id = loomy::local_discovery_id();
+    if id == "loomy:local" || local_id.as_deref() == Some(id) {
+        let status = platform_checkin::get_loomy_status().await;
+        return json_ok(json!({
+            "id": id,
+            "result": if status.get("ok").and_then(Value::as_bool) == Some(true) { "already" } else { "error" },
+            "error": status.get("error").cloned().unwrap_or(Value::Null),
+        }));
+    }
+    json_ok(loomy::checkin_stored(id).await)
+}
+
+async fn api_loomy_proxy_config_get() -> Response {
+    let cfg = loomy_proxy::load_config();
+    json_ok(json!({
+        "enabled": cfg.enabled,
+        "apiKey": cfg.api_key,
+        "endpoint": "/loomy/v1/chat/completions",
+        "modelsEndpoint": "/loomy/v1/models",
+    }))
+}
+
+async fn api_loomy_proxy_config_save(Json(body): Json<Value>) -> Response {
+    let mut cfg = loomy_proxy::load_config();
+    if let Some(enabled) = body.get("enabled").and_then(Value::as_bool) {
+        cfg.enabled = enabled;
+    }
+    if let Some(api_key) = body.get("api_key").and_then(Value::as_str) {
+        let trimmed = api_key.trim();
+        if !trimmed.is_empty() {
+            cfg.api_key = trimmed.to_string();
+        }
+    }
+    match loomy_proxy::save_config(&cfg) {
+        Ok(()) => json_ok(json!({ "ok": true })),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_loomy_proxy_status() -> Response {
+    json_ok(loomy_proxy::proxy_status().await)
+}
+
+/// Loomy 模型目录（页面展示用，无需代理密钥；完整字段原样透传）。
+async fn api_loomy_models_catalog() -> Response {
+    match loomy_proxy::fetch_models().await {
+        Ok(value) => json_ok(value),
+        Err(e) => json_err(e, StatusCode::BAD_GATEWAY),
+    }
+}
+
+fn loomy_proxy_auth_ok(headers: &HeaderMap, cfg: &loomy_proxy::LoomyProxyConfig) -> bool {
+    if cfg.api_key.is_empty() {
+        return true;
+    }
+    let bearer_ok = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|k| k == cfg.api_key)
+        .unwrap_or(false);
+    let x_api_key_ok = headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|k| k == cfg.api_key)
+        .unwrap_or(false);
+    bearer_ok || x_api_key_ok
+}
+
+/// Loomy 对话补全（OpenAI 兼容；鉴权复用 GLM 代理密钥风格）。
+async fn api_loomy_chat_completions(
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let cfg = loomy_proxy::load_config();
+    if !cfg.enabled {
+        return glm_proxy_error(
+            "Loomy 代理未启用，请在设置中开启".to_string(),
+            StatusCode::SERVICE_UNAVAILABLE,
+        );
+    }
+    if !loomy_proxy_auth_ok(&headers, &cfg) {
+        return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+    }
+    match loomy_proxy::chat_completions(body).await {
+        Ok(loomy_proxy::LoomyChatCompletion::Json(value)) => json_ok(value),
+        Ok(loomy_proxy::LoomyChatCompletion::Stream(upstream)) => {
+            let stream = futures_util::stream::unfold(upstream.rx, |mut rx| async move {
+                rx.recv().await.map(|chunk| (chunk, rx))
+            });
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, upstream.content_type)],
+                axum::body::Body::from_stream(stream),
+            )
+                .into_response()
+        }
+        Err(e) => glm_proxy_error(e, StatusCode::BAD_GATEWAY),
+    }
+}
+
+/// Loomy 模型列表（OpenAI /v1/models 格式透传，缓存 10 分钟）。
+async fn api_loomy_v1_models(headers: HeaderMap) -> Response {
+    let cfg = loomy_proxy::load_config();
+    if !loomy_proxy_auth_ok(&headers, &cfg) {
+        return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+    }
+    match loomy_proxy::models_payload().await {
+        Ok(value) => json_ok(value),
+        Err(e) => glm_proxy_error(e, StatusCode::BAD_GATEWAY),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Grok SSO 自动同步（专用浏览器 + CDP）
+// ---------------------------------------------------------------------------
+
+async fn api_grok_sso_status() -> Response {
+    let mut status = grok_sso::token_status();
+    if let Some(obj) = status.as_object_mut() {
+        obj.insert("toolVersion".to_string(), json!(grok_sso::VERSION));
+        obj.insert("config".to_string(), json!({
+            "enabled": grok_sso::load_config().enabled,
+            "syncIntervalMinutes": 30,
+        }));
+    }
+    json_ok(status)
+}
+
+async fn api_grok_sso_sync() -> Response {
+    // 手动同步：重置「已被接管」标记，把当前浏览器登录态写回 autosync 账号。
+    json_ok(grok_sso::run_sync_manual().await)
+}
+
+async fn api_grok_sso_open_login() -> Response {
+    json_ok(grok_sso::open_login_window().await)
+}
+
+// ---------------------------------------------------------------------------
+// TRAE Work CN 模型反代（V1：目录+权益；对话需客户端会话态暂未开放）
+// ---------------------------------------------------------------------------
+
+async fn api_trae_proxy_status() -> Response {
+    json_ok(trae_proxy::proxy_status().await)
+}
+
+async fn api_trae_proxy_models() -> Response {
+    json_ok(trae_proxy::models_catalog().await)
+}
+
+async fn api_trae_v1_models(headers: HeaderMap) -> Response {
+    let cfg = loomy_proxy::load_config();
+    if !loomy_proxy_auth_ok(&headers, &cfg) {
+        return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+    }
+    json_ok(trae_proxy::models_payload().await)
+}
+
+// ---------------------------------------------------------------------------
+// WorkBuddy 模型反代（借道本机 OpenCode server）
+// ---------------------------------------------------------------------------
+
+fn workbuddy_proxy_auth_ok(headers: &HeaderMap, cfg: &workbuddy_proxy::WorkbuddyProxyConfig) -> bool {
+    if cfg.api_key.is_empty() {
+        return true;
+    }
+    let bearer_ok = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|k| k == cfg.api_key)
+        .unwrap_or(false);
+    let x_api_key_ok = headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|k| k == cfg.api_key)
+        .unwrap_or(false);
+    bearer_ok || x_api_key_ok
+}
+
+async fn api_workbuddy_proxy_status() -> Response {
+    json_ok(workbuddy_proxy::proxy_status().await)
+}
+
+async fn api_workbuddy_proxy_models() -> Response {
+    match workbuddy_proxy::models_catalog().await {
+        Ok(value) => json_ok(value),
+        Err(e) => json_err(e, StatusCode::BAD_GATEWAY),
+    }
+}
+
+async fn api_workbuddy_v1_models(headers: HeaderMap) -> Response {
+    let cfg = workbuddy_proxy::load_config();
+    if !workbuddy_proxy_auth_ok(&headers, &cfg) {
+        return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+    }
+    match workbuddy_proxy::models_payload().await {
+        Ok(value) => json_ok(value),
+        Err(e) => glm_proxy_error(e, StatusCode::BAD_GATEWAY),
+    }
+}
+
+/// WorkBuddy 对话补全（OpenAI 兼容；借道本机 OpenCode server）。
+async fn api_workbuddy_chat_completions(
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let cfg = workbuddy_proxy::load_config();
+    if !cfg.enabled {
+        return glm_proxy_error(
+            "WorkBuddy 代理未启用，请在设置中开启".to_string(),
+            StatusCode::SERVICE_UNAVAILABLE,
+        );
+    }
+    if !workbuddy_proxy_auth_ok(&headers, &cfg) {
+        return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+    }
+    let stream = body
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if stream {
+        match workbuddy_proxy::chat_completions_stream(body).await {
+            Ok(upstream) => {
+                let stream = futures_util::stream::unfold(upstream.rx, |mut rx| async move {
+                    rx.recv().await.map(|chunk| (chunk, rx))
+                });
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "text/event-stream".to_string())],
+                    axum::body::Body::from_stream(stream),
+                )
+                    .into_response()
+            }
+            Err(e) => glm_proxy_error(e, StatusCode::BAD_GATEWAY),
+        }
+    } else {
+        match workbuddy_proxy::chat_completions_json(body).await {
+            Ok(value) => json_ok(value),
+            Err(e) => glm_proxy_error(e, StatusCode::BAD_GATEWAY),
+        }
+    }
+}
+
+/// Loomy 对话补全（Anthropic Claude Messages 协议兼容）。
+async fn api_loomy_anthropic_messages(
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let cfg = loomy_proxy::load_config();
+    if !cfg.enabled {
+        return anthropic_error(
+            "Loomy 代理未启用，请在设置中开启".to_string(),
+            StatusCode::SERVICE_UNAVAILABLE,
+        );
+    }
+    if !loomy_proxy_auth_ok(&headers, &cfg) {
+        return anthropic_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+    }
+    match loomy_proxy::anthropic_messages(body).await {
+        Ok(loomy_proxy::LoomyChatCompletion::Json(value)) => json_ok(value),
+        Ok(loomy_proxy::LoomyChatCompletion::Stream(upstream)) => {
+            let stream = futures_util::stream::unfold(upstream.rx, |mut rx| async move {
+                rx.recv().await.map(|chunk| (chunk, rx))
+            });
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, upstream.content_type)],
+                axum::body::Body::from_stream(stream),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            let status = anthropic_error_status(&e);
+            anthropic_error(e, status)
+        }
+    }
+}
+
+async fn api_loomy_protection_status() -> Response {
+    json_ok(account_protection::get_loomy_protection_status())
+}
+
+async fn api_loomy_protection_keepalive_now() -> Response {
+    let report = account_protection::run_loomy_keepalive_cycle().await;
+    json_ok(json!({
+        "ok": true,
+        "report": report,
+    }))
+}
+
+async fn api_loomy_protection_cooldown_clear(Json(body): Json<Value>) -> Response {
+    let account_id = body.get("accountId").and_then(Value::as_str).unwrap_or("");
+    let cleared = account_protection::clear_account_cooling(account_id);
+    json_ok(json!({
+        "ok": true,
+        "cleared": cleared,
+    }))
+}
+
+/// AutoClaw 网关状态（UI 用）。
+async fn api_glm_proxy_status() -> Response {
+    json_ok(glm_proxy::gateway_status().await)
+}
+
+/// 网关状态（OpenAI 服务风格端点，供外部工具/脚本监控；需代理密钥）。
+async fn api_glm_v1_status(headers: HeaderMap) -> Response {
+    let cfg = glm_proxy::load_config();
+    if !cfg.enabled {
+        return glm_proxy_error("GLM 代理未启用".to_string(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+    if !glm_proxy_auth_ok(&headers, &cfg) {
+        return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+    }
+    let mut status = glm_proxy::gateway_status().await;
+    status["proxy"] = json!({
+        "enabled": true,
+        "endpoint": format!(
+            "http://127.0.0.1:{}/v1",
+            BOUND_PORT.get().copied().unwrap_or(57890)
+        ),
+        "models": glm_proxy::models_payload()["data"],
+    });
+    json_ok(status)
+}
+
+async fn api_glm_proxy_config_get() -> Response {
+    let cfg = glm_proxy::load_config();
+    let port = BOUND_PORT.get().copied().unwrap_or(57890);
+    json_ok(json!({
+        "enabled": cfg.enabled,
+        "apiKey": cfg.api_key,
+        "endpoint": format!("http://127.0.0.1:{port}/v1"),
+        "autoclawReady": glm_proxy::autoclaw_ready(),
+        "speedFirst": cfg.speed_first,
+        "speedFirstTarget": cfg.speed_first_target,
+        "speedFirstSources": glm_proxy::SPEED_FIRST_SOURCES,
+        "accountMode": cfg.account_mode,
+        "pinnedAccountId": cfg.pinned_account_id,
+        "accountModes": glm_proxy::ACCOUNT_MODES,
+        "models": glm_proxy::model_routes().iter().map(|r| {
+            let mut item = r.meta_summary();
+            item["id"] = json!(r.body_model);
+            item["alias"] = json!(r.alias);
+            item["routeId"] = json!(r.route_id);
+            item
+        }).collect::<Vec<_>>(),
+    }))
+}
+
+async fn api_glm_proxy_config_save(Json(body): Json<Value>) -> Response {
+    let mut cfg = glm_proxy::load_config();
+    if let Some(enabled) = body.get("enabled").and_then(Value::as_bool) {
+        cfg.enabled = enabled;
+    }
+    if let Some(speed_first) = body.get("speedFirst").and_then(Value::as_bool) {
+        cfg.speed_first = speed_first;
+    }
+    if let Some(target) = body.get("speedFirstTarget").and_then(Value::as_str) {
+        let target = target.trim();
+        if !target.is_empty() {
+            cfg.speed_first_target = target.to_string();
+        }
+    }
+    if let Some(mode) = body.get("accountMode").and_then(Value::as_str) {
+        let mode = mode.trim();
+        if !glm_proxy::ACCOUNT_MODES.contains(&mode) {
+            return json_err(
+                format!("未知的账号策略: {mode}"),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+        cfg.account_mode = mode.to_string();
+    }
+    if let Some(pinned) = body.get("pinnedAccountId").and_then(Value::as_str) {
+        cfg.pinned_account_id = pinned.trim().to_string();
+    }
+    if cfg.account_mode == glm_proxy::ACCOUNT_MODE_PINNED
+        && cfg.pinned_account_id.trim().is_empty()
+    {
+        return json_err(
+            "「固定账号」策略需要先选择一个账号".to_string(),
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    if body.get("regenerateKey").and_then(Value::as_bool) == Some(true) {
+        cfg.api_key = glm_proxy::generate_api_key();
+    } else if let Some(key) = body.get("apiKey").and_then(Value::as_str) {
+        let key = key.trim();
+        if !key.is_empty() {
+            cfg.api_key = key.to_string();
+        }
+    }
+    match glm_proxy::save_config(&cfg) {
+        Ok(()) => api_glm_proxy_config_get().await,
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_platform_accounts() -> Response {
+    let list = platform_checkin::all_checkin_accounts();
+    let mut items = Vec::new();
+    for acc in &list {
+        if platform_checkin::account_platform(acc) == platform_checkin::PLATFORM_WORKBUDDY {
+            continue;
+        }
+        let status = checkin::get_checkin_status_for(acc).await;
+        let mut item = checkin_status_item(acc, status);
+        item["credit"] = platform_checkin::get_platform_credits(acc).await;
+        items.push(item);
+    }
+    json_ok(json!({ "accounts": items }))
 }
 
 async fn api_travel_status() -> Response {
@@ -551,33 +2509,6 @@ async fn api_refresh_token(Json(body): Json<Value>) -> Response {
 }
 
 // ---------------------------------------------------------------------------
-// 自动轮换（CodeBuddy CLI）
-// ---------------------------------------------------------------------------
-
-async fn api_rotate_config() -> Response {
-    json_ok(config::load_auto_rotate_config())
-}
-
-async fn api_save_rotate_config(Json(body): Json<Value>) -> Response {
-    match config::save_auto_rotate_config(&body) {
-        Ok(()) => json_ok(json!({ "ok": true, "config": config::load_auto_rotate_config() })),
-        Err(e) => json_err(e.to_string(), StatusCode::BAD_REQUEST),
-    }
-}
-
-async fn api_rotate_status() -> Response {
-    json_ok(rotate::rotate_status())
-}
-
-async fn api_rotate_run() -> Response {
-    json_ok(rotate::run_rotate_cycle().await)
-}
-
-async fn api_rotate_logs() -> Response {
-    json_ok(json!({ "logs": rotate::rotate_logs() }))
-}
-
-// ---------------------------------------------------------------------------
 // 更新
 // ---------------------------------------------------------------------------
 
@@ -622,24 +2553,115 @@ fn content_type(path: &str) -> &'static str {
     }
 }
 
+/// 该路径是否属于「API 命名空间」——这些前缀下不存在前端 SPA 页面，
+/// 静态兜底必须返回 404 而不是 index.html。
+///
+/// ⚠️ 单段路径 `/kimi`、`/grok`、`/qoder` 同时是前端页面（见 `src/App.tsx` 的
+/// Route），所以这三个前缀只有**带斜杠的子路径**（`/kimi/v1/...`）才算 API；
+/// 而 `/api`、`/v1` 没有同名页面，精确匹配也算 API。
+fn is_api_namespace(path: &str) -> bool {
+    const EXACT: [&str; 2] = ["api", "v1"];
+    const WITH_SUB: [&str; 5] = ["api", "v1", "kimi", "grok", "qoder"];
+
+    if EXACT.contains(&path) {
+        return true;
+    }
+    WITH_SUB
+        .iter()
+        .any(|p| path.starts_with(p) && path.as_bytes().get(p.len()) == Some(&b'/'))
+}
+
 async fn static_handler(uri: Uri) -> Response {
     let mut path = uri.path().trim_start_matches('/').to_string();
     if path.is_empty() || path == "index.html" {
         path = "index.html".to_string();
     }
-    // 前端路由回退到 index.html
-    let data = Assets::get(&path).or_else(|| Assets::get("index.html"));
-    match data {
-        Some(f) => Response::builder()
+
+    // 1. 若请求匹配具体静态资源，直接返回该资源
+    if let Some(f) = Assets::get(&path) {
+        let cache_control = if path == "index.html" {
+            Some("no-cache")
+        } else if is_hashed_asset(&path) {
+            Some("public, max-age=31536000, immutable")
+        } else {
+            None
+        };
+        let mut builder = Response::builder()
             .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, content_type(&path))
-            .body(Body::from(f.data.into_owned()))
-            .unwrap(),
-        None => Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(Body::from("not found"))
-            .unwrap(),
+            .header(header::CONTENT_TYPE, content_type(&path));
+        if let Some(value) = cache_control {
+            builder = builder.header(header::CACHE_CONTROL, value);
+        }
+        return builder.body(Body::from(f.data.into_owned())).unwrap();
     }
+
+    // 2. 静态资源专属路径（如 assets/* 或带常见静态后缀），若找不到必须返回 404，
+    // 绝不能回退到 index.html（否则浏览器将 HTML 误作为 JS 执行会抛 SyntaxError 导致白屏）。
+    if path.starts_with("assets/")
+        || path.ends_with(".js")
+        || path.ends_with(".mjs")
+        || path.ends_with(".css")
+        || path.ends_with(".png")
+        || path.ends_with(".svg")
+        || path.ends_with(".ico")
+        || path.ends_with(".woff2")
+    {
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(Body::from("404 Not Found"))
+            .unwrap();
+    }
+
+    // 3. API 命名空间绝不能回退到 index.html。否则「路由漏注册 / 路径写错」会
+    // 表现为 200 + HTML：调用方拿到假成功，部署健康检查恒为真（2026-09-16 根因）。
+    // 宁可 404，也不要静默返回一个语义完全不同的文档。
+    if is_api_namespace(&path) {
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+            .body(Body::from(
+                json!({
+                    "ok": false,
+                    "code": "not_found",
+                    "error": format!("未知接口: /{path}"),
+                })
+                .to_string(),
+            ))
+            .unwrap();
+    }
+
+    // 4. 其余路径为前端 SPA 路由（如 /token-stats, /credit-stats, /settings 等），
+    // 统一回退到 index.html，且 Content-Type 必须是 text/html（绝不能是 octet-stream 触发下载）。
+    if let Some(index_file) = Assets::get("index.html") {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .body(Body::from(index_file.data.into_owned()))
+            .unwrap();
+    }
+
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .body(Body::from("not found"))
+        .unwrap()
+}
+
+/// vite 带内容 hash 的产物名（末段为 8 位 [0-9A-Za-z_-] 的 js/css）。
+fn is_hashed_asset(path: &str) -> bool {
+    let Some(dot) = path.rfind('.') else {
+        return false;
+    };
+    if !matches!(&path[dot + 1..], "js" | "css") {
+        return false;
+    }
+    let stem_tail = &path[..dot];
+    let segment = stem_tail.rsplit('-').next().unwrap_or("");
+    segment.len() == 8
+        && segment
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 #[cfg(test)]
@@ -671,3 +2693,4 @@ mod tests {
         assert_eq!(item["error"], "status failed");
     }
 }
+

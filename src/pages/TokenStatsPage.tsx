@@ -53,7 +53,7 @@ const TOKEN_SOURCE_STORAGE_KEY = "wb-switch:token-stats:source";
 const RANKING_LIMIT = 10;
 
 function isSourceKey(value: unknown): value is SourceKey {
-  return value === "workbuddy" || value === "codebuddy-cli" || value === "codebuddy-ide";
+  return value === "workbuddy" || value === "autoclaw";
 }
 
 function readPreferredTokenSource(): SourceKey {
@@ -97,19 +97,12 @@ const chartConfig = {
   records: { label: "调用次数", color: "var(--data-series-indigo)" },
 } satisfies ChartConfig;
 
-const compactTokenFormatter = new Intl.NumberFormat("en-US", {
-  notation: "compact",
-  compactDisplay: "short",
-  maximumFractionDigits: 1,
-});
 const exact = new Intl.NumberFormat("zh-CN");
 const exactTokenFormatter = new Intl.NumberFormat("en-US");
 
-function formatTokenCompact(value: number): string {
-  return compactTokenFormatter
-    .format(value)
-    .replace(/([kmb])$/i, (unit) => unit.toUpperCase());
-}
+// 展示格式化统一到 lib/stats-format（别名保持调用点不变）。
+// formatTokenExact 保留在本地：它用 en-US 精确千分位，属 Token 页专用展示。
+import { formatCompactNumber as formatTokenCompact, formatDateTimeShort as formatDateTime, formatMonthDay as formatChartDate } from "@/lib/stats-format";
 
 function formatTokenExact(value: number): string {
   return exactTokenFormatter.format(value);
@@ -132,20 +125,6 @@ function dateDaysAgo(days: number): string {
   date.setHours(12, 0, 0, 0);
   date.setDate(date.getDate() - days);
   return dateKey(date);
-}
-
-function formatDateTime(timestamp?: number | null): string {
-  if (!timestamp) return "—";
-  return new Date(timestamp).toLocaleString("zh-CN", {
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
-
-function formatChartDate(date: string): string {
-  return date.slice(5).replace("-", "/");
 }
 
 function formatHeatmapDate(date: Date): string {
@@ -335,7 +314,22 @@ function CompactComposition({ value }: { value: TokenStatsTotals }) {
 }
 
 function Overview({ source }: { source: TokenStatsSource }) {
-  const [range, setRange] = useState<OverviewRangeKey>("today");
+  const hasTodayData = useMemo(() => {
+    const todayPoints = rangePoints(source.daily, "today");
+    return todayPoints.length > 0 && todayPoints.some((p) => tokenTotal(p) > 0);
+  }, [source.daily]);
+
+  const [range, setRange] = useState<OverviewRangeKey>(() =>
+    hasTodayData || source.summary.records === 0 ? "today" : "total",
+  );
+
+  // 切换来源时，若新来源今日无数据但历史有数据，自动切换到"总计"，避免一进入看到0误以为无数据
+  useEffect(() => {
+    if (!hasTodayData && range === "today" && source.summary.records > 0) {
+      setRange("total");
+    }
+  }, [hasTodayData, source.source, source.summary.records]);
+
   const summary = useMemo(() => overviewTotals(source, range), [range, source]);
   const cacheRate = summary.cacheHitRate;
 
@@ -366,6 +360,11 @@ function Overview({ source }: { source: TokenStatsSource }) {
               </TabsList>
             </Tabs>
           </div>
+          {summary.records === 0 && source.summary.records > 0 && (
+            <p className="mt-2 text-xs text-muted-foreground">
+              当前所选时间段暂无调用（历史累计 {exact.format(source.summary.records)} 次调用、共 {formatTokenCompact(tokenTotal(source.summary))} Token，可点击右上角「总计」或「近 30 天」查看）。
+            </p>
+          )}
         </CardHeader>
         <CardContent className="grid min-w-0 grid-cols-1 divide-y divide-border/60 p-0 sm:grid-cols-4 sm:divide-y-0 sm:py-5">
           <StatMetric icon={MessagesSquare} label="总 Token" value={formatTokenCompact(tokenTotal(summary))} />
@@ -379,7 +378,7 @@ function Overview({ source }: { source: TokenStatsSource }) {
           <StatMetric
             icon={Gauge}
             label="缓存命中率"
-            value={cacheRate == null ? "—" : `${(cacheRate * 100).toFixed(1)}%`}
+            value={cacheRate == null || !Number.isFinite(cacheRate) ? "—" : `${(Math.min(1, Math.max(0, cacheRate)) * 100).toFixed(1)}%`}
             divided
           />
         </CardContent>
@@ -903,7 +902,7 @@ function Ranking({
   description: string;
   controls?: ReactNode;
 }) {
-  const rows = groups.slice(0, RANKING_LIMIT);
+  const rows = (groups || []).slice(0, RANKING_LIMIT);
 
   return (
     <Card className="min-w-0 gap-0 rounded-xl py-0 shadow-none">
@@ -957,7 +956,7 @@ function Ranking({
 }
 
 function SessionRanking({ groups, denominator }: { groups: TokenStatsGroup[]; denominator: number }) {
-  const rows = groups.slice(0, RANKING_LIMIT);
+  const rows = (groups || []).slice(0, RANKING_LIMIT);
 
   return (
     <section className="min-w-0 space-y-2.5" aria-labelledby="token-sessions-title">
@@ -1222,12 +1221,17 @@ function TokenStatsLoadingSkeleton() {
   );
 }
 
+/** 窗口重新可见时若数据已超过此时长（ms），自动重扫一次本地日志。 */
+const TOKEN_STATS_STALE_MS = 5 * 60 * 1000;
+
 export default function TokenStatsPage() {
   const [stats, setStats] = useState<TokenStatistics | null>(null);
   const [active, setActive] = useState<SourceKey>(readPreferredTokenSource);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [reload, setReload] = useState(0);
+  /** 最近一次成功扫描完成的时刻，用于判断是否需要在窗口回到前台时重扫。 */
+  const loadedAtRef = useRef(0);
 
   useEffect(() => {
     let disposed = false;
@@ -1236,7 +1240,9 @@ export default function TokenStatsPage() {
     api
       .getTokenStatistics()
       .then((result) => {
-        if (!disposed) setStats(result);
+        if (disposed) return;
+        loadedAtRef.current = Date.now();
+        setStats(result);
       })
       .catch((cause) => {
         if (!disposed) setError(api.asError(cause));
@@ -1248,6 +1254,22 @@ export default function TokenStatsPage() {
       disposed = true;
     };
   }, [reload]);
+
+  // 本地日志扫描是实时的，但页面长时间挂起会一直显示打开那一刻的数字。
+  // 窗口重新可见且数据已超过 5 分钟时自动重扫，保证「今日 Token」跟随实际使用。
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState !== "visible") return;
+      if (Date.now() - loadedAtRef.current < TOKEN_STATS_STALE_MS) return;
+      setReload((value) => value + 1);
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onVisible);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onVisible);
+    };
+  }, []);
 
   useEffect(() => {
     if (!stats || stats.sources.length === 0) return;
@@ -1277,7 +1299,9 @@ export default function TokenStatsPage() {
             <>
               <h1 className="text-[28px] font-semibold tracking-tight">Token 统计</h1>
               <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
-                当前数据更新于 {stats ? formatDateTime(stats.generatedAt) : "—"}
+                当前数据更新于 {stats ? formatDateTime(stats.generatedAt) : "—"}。AutoClaw
+                的 OpenClaw 会话已纳入统计；TRAE Work CN
+                不产生本地 Token 日志，其用量请在「积分统计」查看。
               </p>
             </>
           )}
@@ -1305,17 +1329,10 @@ export default function TokenStatsPage() {
                 </TabsTrigger>
                 <TabsTrigger
                   className="max-w-full whitespace-normal"
-                  value="codebuddy-cli"
-                  disabled={Boolean(stats && !stats.sources.some((item) => item.source === "codebuddy-cli"))}
+                  value="autoclaw"
+                  disabled={Boolean(stats && !stats.sources.some((item) => item.source === "autoclaw"))}
                 >
-                  CodeBuddy CLI
-                </TabsTrigger>
-                <TabsTrigger
-                  className="max-w-full whitespace-normal"
-                  value="codebuddy-ide"
-                  disabled={Boolean(stats && !stats.sources.some((item) => item.source === "codebuddy-ide"))}
-                >
-                  CodeBuddy IDE
+                  AutoClaw
                 </TabsTrigger>
               </TabsList>
             </Tabs>

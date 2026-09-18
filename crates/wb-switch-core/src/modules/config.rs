@@ -34,8 +34,6 @@ pub fn with_travel_cache_lock<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
-pub const ROTATE_LOG_MAX_RECORDS: usize = 200;
-
 /// 官网套餐页桌面 Chrome UA（plans-usage 捕获）。
 pub const DEFAULT_HTTP_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36";
 
@@ -83,14 +81,6 @@ pub fn official_usage_cache_file() -> PathBuf {
     store_dir().join("official_usage_cache.json")
 }
 
-pub fn auto_rotate_config_file() -> PathBuf {
-    store_dir().join("auto_rotate_config.json")
-}
-
-pub fn auto_rotate_logs_file() -> PathBuf {
-    store_dir().join("auto_rotate_logs.json")
-}
-
 pub fn workbuddy_exe_cache_file() -> PathBuf {
     store_dir().join("workbuddy_exe.json")
 }
@@ -125,35 +115,6 @@ pub fn save_workbuddy_exe_cache(exe: &Path) -> std::io::Result<()> {
 
 pub fn clear_workbuddy_exe_cache() {
     let _ = std::fs::remove_file(workbuddy_exe_cache_file());
-}
-
-pub fn codebuddy_cn_app_cache_file() -> PathBuf {
-    store_dir().join("codebuddy_cn_app.json")
-}
-
-fn parse_codebuddy_cn_app_cache_json(text: &str) -> Option<PathBuf> {
-    parse_workbuddy_exe_cache_json(text)
-}
-
-/// 读取上次成功解析到的 CodeBuddy CN 应用路径；损坏或空文件视为无缓存。
-pub fn load_codebuddy_cn_app_cache() -> Option<PathBuf> {
-    let f = codebuddy_cn_app_cache_file();
-    if !f.exists() {
-        return None;
-    }
-    let text = std::fs::read_to_string(&f).ok()?;
-    parse_codebuddy_cn_app_cache_json(&text)
-}
-
-pub fn save_codebuddy_cn_app_cache(path: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(store_dir())?;
-    let content =
-        serde_json::to_string_pretty(&json!({ "exe": path.to_string_lossy() })).unwrap_or_default();
-    atomic_write(&codebuddy_cn_app_cache_file(), &content)
-}
-
-pub fn clear_codebuddy_cn_app_cache() {
-    let _ = std::fs::remove_file(codebuddy_cn_app_cache_file());
 }
 
 // ---------------------------------------------------------------------------
@@ -420,92 +381,6 @@ pub fn save_travel_cache(cache: &Value) -> std::io::Result<()> {
     std::fs::create_dir_all(store_dir())?;
     let content = serde_json::to_string_pretty(cache).unwrap_or_default();
     atomic_write(&travel_cache_file(), &content)
-}
-
-// ---------------------------------------------------------------------------
-// 自动轮换配置 / 日志（CodeBuddy CLI 账号轮换）
-// ---------------------------------------------------------------------------
-
-/// 默认自动轮换配置。
-pub fn default_auto_rotate_config() -> Value {
-    json!({
-        "enabled": false,
-        "check_interval_minutes": 5,
-        "cooldown_minutes": 120,
-        "min_gap_hours": 24,
-        "min_urgency_hours": 72,
-        "active_guard_minutes": 30,
-        "min_remaining_credits": 0,
-    })
-}
-
-/// 读取自动轮换配置（缺失/损坏时合并默认值）。
-pub fn load_auto_rotate_config() -> Value {
-    let mut cfg = default_auto_rotate_config();
-    let f = auto_rotate_config_file();
-    if f.exists() {
-        if let Ok(text) = std::fs::read_to_string(&f) {
-            if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&text) {
-                for (k, v) in map {
-                    cfg[k] = v;
-                }
-            }
-        }
-    }
-    cfg
-}
-
-/// 保存自动轮换配置（只保留已知字段）。
-pub fn save_auto_rotate_config(cfg: &Value) -> std::io::Result<()> {
-    let mut merged = default_auto_rotate_config();
-    let allowed: Vec<&str> = vec![
-        "enabled",
-        "check_interval_minutes",
-        "cooldown_minutes",
-        "min_gap_hours",
-        "min_urgency_hours",
-        "active_guard_minutes",
-        "min_remaining_credits",
-    ];
-    for k in allowed {
-        if let Some(v) = cfg.get(k) {
-            merged[k] = v.clone();
-        }
-    }
-    std::fs::create_dir_all(store_dir())?;
-    let content = serde_json::to_string_pretty(&merged).unwrap_or_default();
-    atomic_write(&auto_rotate_config_file(), &content)
-}
-
-/// 读取自动轮换日志。
-pub fn load_rotate_logs() -> Vec<Value> {
-    let f = auto_rotate_logs_file();
-    if f.exists() {
-        if let Ok(text) = std::fs::read_to_string(&f) {
-            if let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(&text) {
-                return arr;
-            }
-        }
-    }
-    vec![]
-}
-
-/// 保存自动轮换日志（保留最近 N 条，保持插入顺序）。
-pub fn save_rotate_logs(logs: &[Value]) -> std::io::Result<()> {
-    let mut kept: Vec<Value> = logs.to_vec();
-    if kept.len() > ROTATE_LOG_MAX_RECORDS {
-        kept.drain(..kept.len() - ROTATE_LOG_MAX_RECORDS);
-    }
-    std::fs::create_dir_all(store_dir())?;
-    let content = serde_json::to_string_pretty(&kept).unwrap_or_default();
-    atomic_write(&auto_rotate_logs_file(), &content)
-}
-
-/// 追加一条自动轮换日志。
-pub fn add_rotate_log(entry: &Value) {
-    let mut logs = load_rotate_logs();
-    logs.push(entry.clone());
-    let _ = save_rotate_logs(&logs);
 }
 
 // ---------------------------------------------------------------------------
@@ -967,33 +842,6 @@ mod tests {
         assert!(parse_workbuddy_exe_cache_json("not-json").is_none());
         assert!(parse_workbuddy_exe_cache_json(r#"{ "exe": "  " }"#).is_none());
         assert!(parse_workbuddy_exe_cache_json("{}").is_none());
-    }
-
-    #[test]
-    fn parse_codebuddy_cn_app_cache_json_reads_exe() {
-        let path = parse_codebuddy_cn_app_cache_json(
-            r#"{ "exe": "/Applications/CodeBuddy CN.app" }"#,
-        )
-        .expect("valid cache");
-        assert_eq!(path.to_string_lossy(), "/Applications/CodeBuddy CN.app");
-    }
-
-    #[test]
-    fn parse_codebuddy_cn_app_cache_json_ignores_corrupt_and_empty() {
-        assert!(parse_codebuddy_cn_app_cache_json("not-json").is_none());
-        assert!(parse_codebuddy_cn_app_cache_json(r#"{ "exe": "  " }"#).is_none());
-        assert!(parse_codebuddy_cn_app_cache_json("{}").is_none());
-    }
-
-    #[test]
-    fn codebuddy_cn_app_cache_file_is_not_workbuddy_exe_cache() {
-        assert_ne!(
-            codebuddy_cn_app_cache_file(),
-            workbuddy_exe_cache_file()
-        );
-        assert!(codebuddy_cn_app_cache_file()
-            .file_name()
-            .is_some_and(|n| n == "codebuddy_cn_app.json"));
     }
 
     #[test]

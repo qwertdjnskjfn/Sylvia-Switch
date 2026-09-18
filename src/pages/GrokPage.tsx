@@ -1,0 +1,1069 @@
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  BrainCircuit,
+  MonitorSmartphone,
+  Timer,
+  Check,
+  ChevronDown,
+  ChevronRight,
+  CircleAlert,
+  CircleCheck,
+  Copy,
+  Globe,
+  KeyRound,
+  Loader2,
+  Plus,
+  RefreshCw,
+  ShieldCheck,
+  Activity,
+  Settings,
+  Sparkles,
+  Trash2,
+  Zap,
+} from "lucide-react";
+
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { cn } from "@/lib/utils";
+import * as api from "@/lib/api";
+import { GatewayAdminSection } from "@/components/gateway/GatewayAdminSection";
+import { CartesianGrid, Line, LineChart, XAxis, YAxis } from "recharts";
+import { ChartContainer, ChartTooltip, ChartTooltipContent, type ChartConfig } from "@/components/ui/chart";
+import type { GrokAccountInfo, GrokTestResult, GrokPoolOverview, GrokPoolPolicy, GrokPoolSnapshot } from "@/lib/types";
+
+const GROK_MODELS = [
+  { id: "grok-4.6", name: "Grok 4.6", desc: "最新旗舰（需 Build 通道账号；Web 通道自动回落 Grok 4）", badge: "最新" },
+  { id: "grok-4", name: "Grok 4", desc: "旗舰基座模型，推理能力全面升级（默认）", badge: "推荐" },
+  { id: "grok-4-fast", name: "Grok 4 Fast", desc: "Grok 4 高速版，速度与智能平衡", badge: "高速" },
+  { id: "grok-4-thinking", name: "Grok 4 Thinking", desc: "Grok 4 深度思考模式，完整思维链推演", badge: "推理" },
+  { id: "grok-3", name: "Grok 3", desc: "上一代旗舰基座模型", badge: "经典" },
+  { id: "grok-3-mini", name: "Grok 3 Mini", desc: "上一代轻量版，低延迟", badge: "轻量" },
+  { id: "grok-2", name: "Grok 2", desc: "旧代基座模型（不建议，智能明显弱于 Grok 4）", badge: "旧代" },
+  { id: "grok-2-mini", name: "Grok 2 Mini", desc: "旧代轻量版", badge: "旧代" },
+];
+
+export default function GrokPage() {
+  const [accounts, setAccounts] = useState<GrokAccountInfo[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [msg, setMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
+
+  // SSO 自动同步状态
+  const [ssoStatus, setSsoStatus] = useState<Record<string, unknown> | null>(null);
+  const [ssoBusy, setSsoBusy] = useState<string | null>(null);
+
+  // 添加账号弹窗状态
+  const [showAdd, setShowAdd] = useState(false);
+  const [addProvider, setAddProvider] = useState<"web" | "build" | "console">("web");
+  const [addName, setAddName] = useState("");
+  const [addToken, setAddToken] = useState("");
+  const [addTier, setAddTier] = useState("free");
+
+  // 测试对话状态
+  const [testModel, setTestModel] = useState("grok-4");
+  const [testPrompt, setTestPrompt] = useState("请用一句话介绍 Grok 的核心特色与优势");
+  const [enableThinking, setEnableThinking] = useState(false);
+  const [selectedAccountId, setSelectedAccountId] = useState<string>("");
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<GrokTestResult | null>(null);
+  const [testError, setTestError] = useState<string | null>(null);
+  const [showThinkDetails, setShowThinkDetails] = useState(true);
+
+  // 复制反馈
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+
+  // 账号池管理（v1.5.0）
+  const [pool, setPool] = useState<GrokPoolOverview | null>(null);
+  const [poolPolicy, setPoolPolicy] = useState<GrokPoolPolicy | null>(null);
+  const [poolBusy, setPoolBusy] = useState<string | null>(null);
+  const [showPolicy, setShowPolicy] = useState(false);
+  const [history, setHistory] = useState<GrokPoolSnapshot[]>([]);
+
+  const loadPool = useCallback(async () => {
+    try {
+      const [o, p, h] = await Promise.all([
+        api.getGrokPoolOverview(),
+        api.getGrokPoolPolicy(),
+        api.getGrokPoolHistory(),
+      ]);
+      setPool(o);
+      setPoolPolicy(p);
+      setHistory(h.snapshots ?? []);
+    } catch {
+      // 容错
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadPool();
+  }, [loadPool]);
+
+  async function handlePoolCheck() {
+    setPoolBusy("check");
+    try {
+      const res = await api.grokPoolCheck();
+      await loadPool();
+      await loadAccounts();
+      setMsg({ type: "ok", text: `体检完成：检查了 ${res.checked?.length ?? 0} 个账号` });
+    } catch (e) {
+      setMsg({ type: "err", text: api.asError(e) });
+    } finally {
+      setPoolBusy(null);
+    }
+  }
+
+  async function handleSavePolicy(patch: Partial<GrokPoolPolicy>) {
+    setPoolBusy("policy");
+    try {
+      await api.setGrokPoolPolicy(patch);
+      await loadPool();
+    } catch (e) {
+      setMsg({ type: "err", text: api.asError(e) });
+    } finally {
+      setPoolBusy(null);
+    }
+  }
+
+  // 趋势图数据（按时间升序，格式化时间标签）
+  const chartData = useMemo(
+    () =>
+      [...history]
+        .sort((a, b) => a.at - b.at)
+        .map((s) => ({
+          time: new Date(s.at).toLocaleString("zh-CN", {
+            month: "numeric",
+            day: "numeric",
+            hour: "2-digit",
+            minute: "2-digit",
+          }),
+          可用: s.ok,
+          异常: s.errored,
+          健康分: s.avgHealth,
+        })),
+    [history],
+  );
+
+  const poolChartConfig: ChartConfig = {
+    可用: { label: "可用", color: "var(--color-emerald-500, #10b981)" },
+    异常: { label: "异常", color: "var(--color-rose-500, #f43f5e)" },
+    健康分: { label: "平均健康分", color: "var(--color-blue-500, #3b82f6)" },
+  };
+
+  const loadAccounts = useCallback(async () => {
+    setLoading(true);
+    try {
+      const res = await api.getGrokAccounts();
+      setAccounts(res.accounts ?? []);
+    } catch {
+      // 容错处理
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadAccounts();
+  }, [loadAccounts]);
+
+  function copyText(key: string, text: string) {
+    void navigator.clipboard.writeText(text);
+    setCopiedKey(key);
+    setTimeout(() => setCopiedKey(null), 1500);
+  }
+
+  async function handleAddAccount() {
+    if (!addToken.trim()) {
+      setMsg({ type: "err", text: "凭证内容（Cookie 或 API Key）不能为空" });
+      return;
+    }
+    setBusy("add");
+    setMsg(null);
+    try {
+      await api.grokAddAccount({
+        name: addName.trim(),
+        provider: addProvider,
+        token: addToken.trim(),
+        tier: addTier,
+      });
+      setAddName("");
+      setAddToken("");
+      setShowAdd(false);
+      await loadAccounts();
+      setMsg({ type: "ok", text: "Grok 账号已成功接入账号池！" });
+    } catch (e) {
+      setMsg({ type: "err", text: api.asError(e) });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleRemoveAccount(id: string) {
+    if (!confirm("确定要移除该 Grok 账号吗？")) return;
+    setBusy(id);
+    try {
+      await api.grokRemoveAccount(id);
+      await loadAccounts();
+      setMsg({ type: "ok", text: "账号已移除" });
+    } catch (e) {
+      setMsg({ type: "err", text: api.asError(e) });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleToggleAccount(account: GrokAccountInfo) {
+    setBusy(account.id);
+    try {
+      await api.grokEnableAccount(account.id, !account.enabled);
+      await loadAccounts();
+    } catch (e) {
+      setMsg({ type: "err", text: api.asError(e) });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleRunTest() {
+    if (!testPrompt.trim()) return;
+    setTesting(true);
+    setTestResult(null);
+    setTestError(null);
+    try {
+      const res = await api.grokTest({
+        model: testModel,
+        prompt: testPrompt.trim(),
+        enableThinking,
+        accountId: selectedAccountId || undefined,
+      });
+      setTestResult(res);
+    } catch (e) {
+      setTestError(api.asError(e));
+    } finally {
+      setTesting(false);
+    }
+  }
+
+  // 拆解思维链标签与正文
+  function parseContent(raw: string) {
+    const thinkMatch = raw.match(/<think>([\s\S]*?)<\/think>/i);
+    if (thinkMatch) {
+      const reasoning = thinkMatch[1].trim();
+      const content = raw.replace(/<think>[\s\S]*?<\/think>/i, "").trim();
+      return { reasoning, content };
+    }
+    return { reasoning: null, content: raw };
+  }
+
+  const loadSso = useCallback(async () => {
+    try {
+      setSsoStatus(await api.getGrokSsoStatus());
+    } catch {
+      setSsoStatus(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadSso();
+  }, [loadSso]);
+
+  const openLogin = async () => {
+    setSsoBusy("login");
+    try {
+      const res = await api.openGrokSsoLogin();
+      if (res.ok) setMsg({ type: "ok", text: "专用浏览器已启动：请在弹出的窗口里登录 grok.com，登录后点「立即同步」。" });
+      else setMsg({ type: "err", text: res.error || "启动失败" });
+    } catch (e) {
+      setMsg({ type: "err", text: api.asError(e) });
+    } finally {
+      setSsoBusy(null);
+    }
+  };
+
+  const syncNow = async () => {
+    setSsoBusy("sync");
+    try {
+      const res = await api.syncGrokSso();
+      const status = res.status as string;
+      if (status === "ok") {
+        // v1.1.0：同步成功即刷新账号池列表，让 grok_web_autosync 立即可见。
+        await loadAccounts();
+        const poolEntry = (await api.getGrokAccounts()).accounts.find(
+          (a) => a.id === "grok_web_autosync",
+        );
+        setMsg({
+          type: "ok",
+          text: `同步完成：sso${res.ssoPresent ? "✓" : "✗"} / sso-rw${res.ssoRwPresent ? "✓" : "✗"}，${res.cookieCount} 个 cookie，已写入 Grok 账号池（grok_web_autosync · ${poolEntry?.status === "ok" ? "状态正常" : poolEntry?.status || "?"}），已写盘`,
+        });
+      } else if (status === "not_logged_in") {
+        setMsg({ type: "err", text: "专用浏览器里还没有 grok.com 登录态：请先点「打开登录窗口」登录。" });
+      } else if (status === "no_cookies") {
+        setMsg({ type: "err", text: "未抓到任何 grok.com cookie，请确认已在该浏览器窗口打开过 grok.com。" });
+      } else {
+        setMsg({ type: "err", text: `同步失败：${(res as Record<string, unknown>).error || status}（旧 token 未被改动）` });
+      }
+      await loadSso();
+    } catch (e) {
+      setMsg({ type: "err", text: api.asError(e) });
+    } finally {
+      setSsoBusy(null);
+    }
+  };
+
+  return (
+    <div className="mx-auto max-w-5xl space-y-6 pb-12">
+      {/* 顶部标题栏 */}
+      <div className="flex flex-wrap items-center justify-between gap-4 border-b pb-4">
+        <div>
+          <div className="flex items-center gap-2.5">
+            <div className="flex size-9 items-center justify-center rounded-xl bg-primary/10 text-primary">
+              <Sparkles className="size-5" />
+            </div>
+            <div>
+              <h1 className="text-xl font-bold tracking-tight">Grok 融合网关</h1>
+              <p className="text-xs text-muted-foreground">
+                移植自 chenyme/grok2api 开源项目，支持 Grok Web SSO 与 Build 开发者接口，提供完整 OpenAI / Anthropic 兼容能力
+              </p>
+            </div>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <Badge variant="outline" className="border-emerald-500/30 bg-emerald-500/10 text-emerald-600 text-xs">
+            网关在线 · 端口 57890
+          </Badge>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void loadAccounts()}
+            disabled={loading}
+            className="h-8 gap-1 text-xs"
+          >
+            <RefreshCw className={cn("size-3.5", loading && "animate-spin")} />
+            刷新
+          </Button>
+          <Button
+            size="sm"
+            onClick={() => setShowAdd(!showAdd)}
+            className="h-8 gap-1 text-xs"
+          >
+            <Plus className="size-3.5" />
+            添加账号
+          </Button>
+        </div>
+      </div>
+
+      {/* 消息提示 */}
+      {msg && (
+        <Alert
+          variant={msg.type === "ok" ? "default" : "destructive"}
+          className={cn(msg.type === "ok" && "border-emerald-500/30 bg-emerald-500/10 text-emerald-700")}
+        >
+          {msg.type === "ok" ? <CircleCheck className="size-4" /> : <CircleAlert className="size-4" />}
+          <AlertTitle className="text-sm font-medium">{msg.type === "ok" ? "成功" : "提示"}</AlertTitle>
+          <AlertDescription className="text-xs">{msg.text}</AlertDescription>
+        </Alert>
+      )}
+
+      {/* SSO 自动同步 */}
+      <Card className="border-primary/20 bg-primary/[0.02] shadow-sm">
+        <CardHeader className="pb-3">
+          <CardTitle className="flex items-center gap-2 text-sm font-semibold">
+            <MonitorSmartphone className="size-4" />
+            SSO Cookie 自动同步
+            <Badge variant="outline" className="px-1.5 py-0 text-[10px]">
+              v{(ssoStatus?.toolVersion as string) || "1.0.0"} · 每 30 分钟
+            </Badge>
+          </CardTitle>
+          <CardDescription className="text-xs">
+            专用浏览器实例（独立 profile，不影响日常 Chrome）里登录 grok.com 一次，工具定时经 CDP
+            抓取最新 sso / sso-rw 并自动更新到融合网关账号池，登录态长期有效。
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <Button size="sm" variant="outline" className="h-8 gap-1 text-xs" disabled={ssoBusy !== null} onClick={() => void openLogin()}>
+              <MonitorSmartphone className={cn("size-3.5", ssoBusy === "login" && "animate-pulse")} />
+              打开登录窗口
+            </Button>
+            <Button size="sm" variant="outline" className="h-8 gap-1 text-xs" disabled={ssoBusy !== null} onClick={() => void syncNow()}>
+              <Timer className={cn("size-3.5", ssoBusy === "sync" && "animate-spin")} />
+              立即同步
+            </Button>
+          </div>
+          <div className="grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
+            <div>
+              <span className="text-muted-foreground">登录态：</span>
+              {ssoStatus?.status === "ok" ? (
+                <span className="font-medium text-emerald-600">已登录</span>
+              ) : ssoStatus?.status === "empty" ? (
+                <span className="text-amber-600">尚未同步</span>
+              ) : (
+                <span className="text-destructive">{String(ssoStatus?.status || "未知")}</span>
+              )}
+            </div>
+            <div>
+              <span className="text-muted-foreground">账号池：</span>
+              {(() => {
+                const entry = accounts.find((a) => a.id === "grok_web_autosync");
+                if (!entry) return <span className="text-muted-foreground">未接入</span>;
+                return (
+                  <span className={cn("font-medium", entry.status === "ok" ? "text-emerald-600" : "text-amber-600")}>
+                    已接入 · {entry.status === "ok" ? "正常" : entry.status}
+                  </span>
+                );
+              })()}
+            </div>
+            <div>
+              <span className="text-muted-foreground">有效期：</span>
+              {typeof ssoStatus?.expiresInDays === "number" ? (
+                <span className={cn("font-medium", (ssoStatus.expiresInDays as number) <= 2 ? "text-amber-600" : "text-foreground")}>
+                  剩 {(ssoStatus.expiresInDays as number)} 天
+                </span>
+              ) : (
+                <span>—</span>
+              )}
+            </div>
+            <div>
+              <span className="text-muted-foreground">sso 预览：</span>
+              <span className="font-mono">{String(ssoStatus?.sso || "—")}</span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">cookie 数：</span>
+              <span className="tabular-nums">{String(ssoStatus?.cookieCount ?? "—")}</span>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* 添加账号折叠区 */}
+      {showAdd && (
+        <Card className="border-primary/20 bg-primary/[0.02] shadow-sm">
+          <CardHeader className="pb-3">
+            <CardTitle className="text-sm font-semibold">接入新的 Grok 账号凭证</CardTitle>
+            <CardDescription className="text-xs">
+              支持网页端 SSO Cookie 反代或开发者 API Key，添加后自动纳入轮询调度池
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+              <div>
+                <label className="text-xs font-medium text-muted-foreground">渠道类型</label>
+                <select
+                  value={addProvider}
+                  onChange={(e) => setAddProvider(e.target.value as "web" | "build" | "console")}
+                  className="mt-1 block w-full rounded-md border border-input bg-background px-3 py-1.5 text-xs shadow-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+                >
+                  <option value="web">Grok Web (网页端 SSO Cookie)</option>
+                  <option value="build">Grok Build (开发者 API Key)</option>
+                  <option value="console">Grok Console (控制台凭据)</option>
+                </select>
+              </div>
+              <div>
+                <label className="text-xs font-medium text-muted-foreground">账号备注（选填）</label>
+                <Input
+                  placeholder="例如：主号、网页版备用号"
+                  value={addName}
+                  onChange={(e) => setAddName(e.target.value)}
+                  className="mt-1 h-8 text-xs"
+                />
+              </div>
+              <div>
+                <label className="text-xs font-medium text-muted-foreground">订阅级别</label>
+                <select
+                  value={addTier}
+                  onChange={(e) => setAddTier(e.target.value)}
+                  className="mt-1 block w-full rounded-md border border-input bg-background px-3 py-1.5 text-xs shadow-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+                >
+                  <option value="free">免费用户 (Free Tier)</option>
+                  <option value="super">Premium / Super (付费会员)</option>
+                  <option value="enterprise">Enterprise (企业级)</option>
+                </select>
+              </div>
+            </div>
+
+            <div>
+              <label className="text-xs font-medium text-muted-foreground">
+                {addProvider === "web"
+                  ? "SSO Cookie（登录 grok.com 后在 DevTools 中提取的 sso / sso-rw 值，或整个 Cookie 字符串）"
+                  : "API Key / Access Token（xai-... 或 Bearer Token）"}
+              </label>
+              <textarea
+                rows={3}
+                placeholder={
+                  addProvider === "web"
+                    ? "例如：sso=eyJhbGciOi...; 或直接粘贴完整 sso Cookie 字符串"
+                    : "例如：xai-xxxxxxxxxxxx"
+                }
+                value={addToken}
+                onChange={(e) => setAddToken(e.target.value)}
+                className="mt-1 block w-full rounded-md border border-input bg-background p-2.5 font-mono text-xs shadow-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+              />
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-1">
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setShowAdd(false)}
+                className="h-8 text-xs"
+              >
+                取消
+              </Button>
+              <Button
+                size="sm"
+                onClick={() => void handleAddAccount()}
+                disabled={busy === "add"}
+                className="h-8 gap-1.5 text-xs"
+              >
+                {busy === "add" ? <Loader2 className="size-3.5 animate-spin" /> : <Check className="size-3.5" />}
+                保存凭证并入池
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* 账号池卡片列表 */}
+      <Card>
+        <CardHeader className="pb-3">
+          <div className="flex items-center justify-between">
+            <div>
+              <CardTitle className="text-base font-semibold">Grok 账号池</CardTitle>
+              <CardDescription className="text-xs">
+                系统对请求进行智能负载轮询与自动故障降级；遇到 429 会自动将账号冷却 60 秒
+              </CardDescription>
+            </div>
+            <span className="text-xs text-muted-foreground">
+              共 <strong className="text-foreground">{accounts.length}</strong> 个账号
+            </span>
+          </div>
+        </CardHeader>
+        <CardContent>
+          {accounts.length === 0 ? (
+            <div className="flex flex-col items-center justify-center rounded-xl border border-dashed py-10 text-center">
+              <KeyRound className="size-8 text-muted-foreground/50" />
+              <p className="mt-2 text-sm font-medium">账号池暂无已配置账号</p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                请点击上方“添加账号”，粘贴 Grok Web SSO Cookie 或 Build API Key 开通网关调用
+              </p>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => setShowAdd(true)}
+                className="mt-4 h-8 gap-1 text-xs"
+              >
+                <Plus className="size-3.5" />
+                立即添加第一个账号
+              </Button>
+            </div>
+          ) : (
+            <div className="divide-y rounded-xl border">
+              {accounts.map((acc) => (
+                <div
+                  key={acc.id}
+                  className="flex flex-wrap items-center justify-between gap-3 p-3.5 transition-colors hover:bg-muted/40"
+                >
+                  <div className="flex items-center gap-3">
+                    <div className="flex size-8 items-center justify-center rounded-lg bg-primary/10 text-primary">
+                      {acc.provider === "build" ? <Zap className="size-4" /> : <Globe className="size-4" />}
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-sm font-medium">{acc.name}</span>
+                        <Badge
+                          variant="secondary"
+                          className={cn(
+                            "h-5 text-[10px]",
+                            acc.provider === "build"
+                              ? "bg-emerald-500/10 text-emerald-600"
+                              : "bg-blue-500/10 text-blue-600",
+                          )}
+                        >
+                          {acc.provider === "build" ? "Build 开发者" : "Web 网页逆向"}
+                        </Badge>
+                        {acc.isCooling && (
+                          <Badge variant="outline" className="h-5 border-amber-500/30 bg-amber-500/10 text-[10px] text-amber-600">
+                            冷却降级中
+                          </Badge>
+                        )}
+                        {!acc.enabled && (
+                          <Badge variant="outline" className="h-5 text-[10px] text-muted-foreground">
+                            已禁用
+                          </Badge>
+                        )}
+                      </div>
+                      <div className="mt-1 flex items-center gap-3 text-xs text-muted-foreground">
+                        <span>凭证：<code className="rounded bg-muted px-1 py-0.5 font-mono">{acc.tokenMasked || "******"}</code></span>
+                        {acc.tier && <span>级别：{acc.tier}</span>}
+                        {acc.lastUsedAt && (
+                          <span>最近使用：{new Date(acc.lastUsedAt).toLocaleTimeString()}</span>
+                        )}
+                      </div>
+                      {acc.error && (
+                        <p className="mt-1 text-xs text-rose-500">最近错误：{acc.error}</p>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <Button
+                      variant={acc.enabled ? "outline" : "secondary"}
+                      size="sm"
+                      onClick={() => void handleToggleAccount(acc)}
+                      disabled={busy === acc.id}
+                      className="h-8 text-xs"
+                    >
+                      {acc.enabled ? "暂停" : "启用"}
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => void handleRemoveAccount(acc.id)}
+                      disabled={busy === acc.id}
+                      className="h-8 text-xs text-muted-foreground hover:text-destructive"
+                    >
+                      <Trash2 className="size-3.5" />
+                    </Button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* 账号池健康管理（v1.5.0） */}
+      <Card className="border-emerald-500/20 bg-emerald-500/[0.02]">
+        <CardHeader className="pb-3">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <ShieldCheck className="size-4 text-emerald-600" />
+              <CardTitle className="text-base font-semibold">账号池健康管理</CardTitle>
+            </div>
+            <div className="flex items-center gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-8 gap-1 text-xs"
+                disabled={poolBusy !== null}
+                onClick={() => void handlePoolCheck()}
+              >
+                <Activity className={cn("size-3.5", poolBusy === "check" && "animate-pulse")} />
+                立即体检
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-8 text-xs"
+                onClick={() => setShowPolicy(!showPolicy)}
+              >
+                <Settings className="size-3.5" />
+                策略
+              </Button>
+            </div>
+          </div>
+          <CardDescription className="text-xs">
+            低频轮转体检 + 健康分 + 风险分级，异常账号自动降权/退避，维护账号池长期可用
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {/* 总览 */}
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+            <div className="rounded-lg border p-2.5">
+              <div className="text-xs text-muted-foreground">账号总数</div>
+              <div className="mt-0.5 text-lg font-semibold tabular-nums">{pool?.total ?? "—"}</div>
+            </div>
+            <div className="rounded-lg border p-2.5">
+              <div className="text-xs text-muted-foreground">可用 / 异常</div>
+              <div className="mt-0.5 text-lg font-semibold tabular-nums">
+                <span className="text-emerald-600">{pool?.ok ?? "—"}</span>
+                <span className="text-muted-foreground"> / </span>
+                <span className="text-rose-500">{pool?.errored ?? "—"}</span>
+              </div>
+            </div>
+            <div className="rounded-lg border p-2.5">
+              <div className="text-xs text-muted-foreground">冷却中</div>
+              <div className="mt-0.5 text-lg font-semibold tabular-nums text-amber-600">{pool?.cooling ?? "—"}</div>
+            </div>
+            <div className="rounded-lg border p-2.5">
+              <div className="text-xs text-muted-foreground">风险 低/中/高</div>
+              <div className="mt-0.5 text-sm font-semibold tabular-nums">
+                <span className="text-emerald-600">{pool?.risk.low ?? 0}</span>
+                <span className="text-muted-foreground"> / </span>
+                <span className="text-amber-600">{pool?.risk.medium ?? 0}</span>
+                <span className="text-muted-foreground"> / </span>
+                <span className="text-rose-500">{pool?.risk.high ?? 0}</span>
+              </div>
+            </div>
+          </div>
+
+          {/* 账号健康明细 */}
+          {pool && pool.accounts.length > 0 && (
+            <div className="overflow-hidden rounded-xl border">
+              <table className="w-full text-xs">
+                <thead className="bg-muted/40 text-muted-foreground">
+                  <tr>
+                    <th className="px-3 py-2 text-left font-medium">账号</th>
+                    <th className="px-3 py-2 text-left font-medium">状态</th>
+                    <th className="px-3 py-2 text-left font-medium">健康分</th>
+                    <th className="px-3 py-2 text-left font-medium">风险</th>
+                    <th className="px-3 py-2 text-left font-medium">连续失败</th>
+                    <th className="px-3 py-2 text-left font-medium">限流次数</th>
+                    <th className="px-3 py-2 text-left font-medium">最近体检</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y">
+                  {pool.accounts.map((a) => (
+                    <tr key={a.id} className="hover:bg-muted/30">
+                      <td className="px-3 py-2 font-medium">{a.name}</td>
+                      <td className="px-3 py-2">
+                        <span className={cn(
+                          "rounded px-1.5 py-0.5 text-[10px]",
+                          a.status === "ok" ? "bg-emerald-500/10 text-emerald-600"
+                            : a.status === "cooldown" ? "bg-amber-500/10 text-amber-600"
+                            : "bg-rose-500/10 text-rose-600",
+                        )}>
+                          {a.status === "ok" ? "正常" : a.status === "cooldown" ? "冷却" : a.status === "error" ? "异常" : a.status}
+                        </span>
+                      </td>
+                      <td className="px-3 py-2">
+                        <div className="flex items-center gap-1.5">
+                          <div className="h-1.5 w-12 overflow-hidden rounded-full bg-muted">
+                            <div
+                              className={cn("h-full rounded-full",
+                                a.healthScore >= 80 ? "bg-emerald-500" : a.healthScore >= 50 ? "bg-amber-500" : "bg-rose-500")}
+                              style={{ width: `${a.healthScore}%` }}
+                            />
+                          </div>
+                          <span className="tabular-nums">{a.healthScore}</span>
+                        </div>
+                      </td>
+                      <td className="px-3 py-2">
+                        <span className={cn(
+                          "rounded px-1.5 py-0.5 text-[10px]",
+                          a.riskLevel === "low" ? "bg-emerald-500/10 text-emerald-600"
+                            : a.riskLevel === "medium" ? "bg-amber-500/10 text-amber-600"
+                            : "bg-rose-500/10 text-rose-600",
+                        )}>
+                          {a.riskLevel === "low" ? "低" : a.riskLevel === "medium" ? "中" : a.riskLevel === "high" ? "高" : a.riskLevel}
+                        </span>
+                      </td>
+                      <td className="px-3 py-2 tabular-nums">{a.consecutiveFailures}</td>
+                      <td className="px-3 py-2 tabular-nums">{a.rateLimitCount}</td>
+                      <td className="px-3 py-2 text-muted-foreground">
+                        {a.lastCheckAt ? new Date(a.lastCheckAt).toLocaleTimeString() : "—"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {/* 趋势图（C3） */}
+          {chartData.length > 0 && (
+            <div className="rounded-xl border p-3">
+              <div className="mb-2 flex items-center justify-between">
+                <span className="text-xs font-medium">健康趋势（近 7 天）</span>
+                <span className="text-[11px] text-muted-foreground">共 {chartData.length} 个采样点</span>
+              </div>
+              <ChartContainer config={poolChartConfig} className="h-48 w-full">
+                <LineChart data={chartData} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+                  <CartesianGrid vertical={false} strokeDasharray="3 3" />
+                  <XAxis dataKey="time" tickLine={false} axisLine={false} tickMargin={8} fontSize={10} />
+                  <YAxis tickLine={false} axisLine={false} width={36} fontSize={10} />
+                  <ChartTooltip content={<ChartTooltipContent />} />
+                  <Line type="monotone" dataKey="可用" stroke="var(--color-emerald-500, #10b981)" strokeWidth={2} dot={false} isAnimationActive={false} />
+                  <Line type="monotone" dataKey="异常" stroke="var(--color-rose-500, #f43f5e)" strokeWidth={2} dot={false} isAnimationActive={false} />
+                  <Line type="monotone" dataKey="健康分" stroke="var(--color-blue-500, #3b82f6)" strokeWidth={1.5} strokeDasharray="4 2" dot={false} isAnimationActive={false} />
+                </LineChart>
+              </ChartContainer>
+            </div>
+          )}
+
+          {/* 策略配置 */}
+          {showPolicy && poolPolicy && (
+            <div className="space-y-3 rounded-xl border bg-muted/20 p-3">
+              <div className="text-xs font-medium">监控策略</div>
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                <label className="flex items-center gap-2 text-xs">
+                  <input
+                    type="checkbox"
+                    checked={poolPolicy.autoCheckEnabled}
+                    onChange={(e) => void handleSavePolicy({ autoCheckEnabled: e.target.checked })}
+                    className="rounded border-input text-primary focus:ring-primary"
+                  />
+                  启用自动体检
+                </label>
+                <div>
+                  <label className="text-xs text-muted-foreground">体检间隔（分钟）</label>
+                  <Input
+                    type="number"
+                    defaultValue={poolPolicy.checkIntervalMinutes}
+                    onBlur={(e) => void handleSavePolicy({ checkIntervalMinutes: Number(e.target.value) })}
+                    className="mt-1 h-8 text-xs"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-muted-foreground">每轮体检账号数</label>
+                  <Input
+                    type="number"
+                    defaultValue={poolPolicy.batchSize}
+                    onBlur={(e) => void handleSavePolicy({ batchSize: Number(e.target.value) })}
+                    className="mt-1 h-8 text-xs"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-muted-foreground">低风险阈值</label>
+                  <Input
+                    type="number"
+                    defaultValue={poolPolicy.riskLowThreshold}
+                    onBlur={(e) => void handleSavePolicy({ riskLowThreshold: Number(e.target.value) })}
+                    className="mt-1 h-8 text-xs"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-muted-foreground">高风险阈值</label>
+                  <Input
+                    type="number"
+                    defaultValue={poolPolicy.riskHighThreshold}
+                    onBlur={(e) => void handleSavePolicy({ riskHighThreshold: Number(e.target.value) })}
+                    className="mt-1 h-8 text-xs"
+                  />
+                </div>
+                <label className="flex items-center gap-2 text-xs">
+                  <input
+                    type="checkbox"
+                    checked={poolPolicy.pauseHighRisk}
+                    onChange={(e) => void handleSavePolicy({ pauseHighRisk: e.target.checked })}
+                    className="rounded border-input text-primary focus:ring-primary"
+                  />
+                  高风险账号自动熔断（暂停）
+                </label>
+              </div>
+              <p className="text-[11px] text-muted-foreground">
+                体检为低频轮转（默认每 2 小时 1 个账号），行为接近真人使用；熔断宁可少用也不硬刚，降低风控风险。
+              </p>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* 在线全功能调试终端 */}
+      <Card className="border-blue-500/20 bg-blue-500/[0.01]">
+        <CardHeader className="pb-3">
+          <div className="flex items-center gap-2">
+            <BrainCircuit className="size-4 text-blue-500" />
+            <CardTitle className="text-base font-semibold">在线全功能测试终端</CardTitle>
+          </div>
+          <CardDescription className="text-xs">
+            无需启动第三方客户端，在此处直接测试 Grok 的多模型生成、深度思考思维链与联网响应
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+            <div>
+              <label className="text-xs font-medium text-muted-foreground">目标模型</label>
+              <select
+                value={testModel}
+                onChange={(e) => setTestModel(e.target.value)}
+                className="mt-1 block w-full rounded-md border border-input bg-background px-3 py-1.5 text-xs shadow-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+              >
+                {GROK_MODELS.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.name} ({m.badge}) - {m.desc}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div>
+              <label className="text-xs font-medium text-muted-foreground">指定账号（选填）</label>
+              <select
+                value={selectedAccountId}
+                onChange={(e) => setSelectedAccountId(e.target.value)}
+                className="mt-1 block w-full rounded-md border border-input bg-background px-3 py-1.5 text-xs shadow-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+              >
+                <option value="">自动轮询（系统最优调度）</option>
+                {accounts.map((a) => (
+                  <option key={a.id} value={a.id}>
+                    {a.name} ({a.provider})
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="flex items-end pb-1.5">
+              <label className="flex cursor-pointer items-center gap-2 text-xs font-medium">
+                <input
+                  type="checkbox"
+                  checked={enableThinking}
+                  onChange={(e) => setEnableThinking(e.target.checked)}
+                  className="rounded border-input text-primary focus:ring-primary"
+                />
+                <span>开启深度思考 (Thinking 模式)</span>
+              </label>
+            </div>
+          </div>
+
+          <div>
+            <label className="text-xs font-medium text-muted-foreground">提示词 (Prompt)</label>
+            <div className="mt-1 flex gap-2">
+              <Input
+                value={testPrompt}
+                onChange={(e) => setTestPrompt(e.target.value)}
+                placeholder="输入想要向 Grok 提问的内容..."
+                className="h-9 text-xs"
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    void handleRunTest();
+                  }
+                }}
+              />
+              <Button
+                onClick={() => void handleRunTest()}
+                disabled={testing || !testPrompt.trim() || accounts.length === 0}
+                className="h-9 shrink-0 gap-1.5 px-4 text-xs"
+              >
+                {testing ? <Loader2 className="size-3.5 animate-spin" /> : <Zap className="size-3.5" />}
+                发送测试
+              </Button>
+            </div>
+          </div>
+
+          {/* 测试错误展示 */}
+          {testError && (
+            <Alert variant="destructive" className="py-2.5">
+              <CircleAlert className="size-4" />
+              <AlertTitle className="text-xs font-medium">测试失败</AlertTitle>
+              <AlertDescription className="text-xs">{testError}</AlertDescription>
+            </Alert>
+          )}
+
+          {/* 测试结果展示 */}
+          {testResult && (
+            <div className="space-y-3 rounded-xl border bg-background p-4 shadow-sm">
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b pb-2 text-xs">
+                <div className="flex items-center gap-2">
+                  <Badge variant="outline" className="border-emerald-500/30 bg-emerald-500/10 text-emerald-600">
+                    调用成功
+                  </Badge>
+                  <span className="font-semibold text-foreground">{testResult.model}</span>
+                  <span className="text-muted-foreground">· 来自账号：{testResult.accountName}</span>
+                </div>
+                <div className="flex items-center gap-3 text-muted-foreground">
+                  <span>首字耗时：<strong className="text-foreground">{testResult.durationMs}ms</strong></span>
+                  {testResult.tokens ? <span>Token 消耗：~{testResult.tokens}</span> : null}
+                </div>
+              </div>
+
+              {/* 思维链展示 */}
+              {(() => {
+                const { reasoning, content } = parseContent(testResult.reply);
+                return (
+                  <div className="space-y-3 text-xs leading-relaxed">
+                    {reasoning && (
+                      <div className="rounded-lg border border-purple-500/20 bg-purple-500/[0.03] p-3">
+                        <button
+                          type="button"
+                          onClick={() => setShowThinkDetails(!showThinkDetails)}
+                          className="flex w-full items-center justify-between text-[11px] font-semibold text-purple-600"
+                        >
+                          <div className="flex items-center gap-1.5">
+                            <BrainCircuit className="size-3.5" />
+                            <span>深度思考推演过程 (Thinking Process)</span>
+                          </div>
+                          {showThinkDetails ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
+                        </button>
+                        {showThinkDetails && (
+                          <div className="mt-2.5 whitespace-pre-wrap font-mono text-[11px] text-muted-foreground/90">
+                            {reasoning}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                    <div className="whitespace-pre-wrap text-sm text-foreground">
+                      {content}
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* 接入说明与客户端配置卡片 */}
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="text-base font-semibold">第三方客户端接入指南</CardTitle>
+          <CardDescription className="text-xs">
+            网关提供完全标准的 OpenAI API 接口规范，可直接用于任何支持自定义 API 代理的应用
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-muted-foreground">接口 Base URL (OpenAI 兼容)</label>
+              <div className="flex items-center gap-1.5">
+                <code className="flex-1 rounded-md border bg-muted/50 px-3 py-1.5 font-mono text-xs text-foreground">
+                  http://127.0.0.1:57890/grok/v1
+                </code>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => copyText("base_url", "http://127.0.0.1:57890/grok/v1")}
+                  className="h-8 px-2.5 text-xs"
+                >
+                  {copiedKey === "base_url" ? <Check className="size-3.5 text-emerald-500" /> : <Copy className="size-3.5" />}
+                </Button>
+              </div>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-muted-foreground">推荐模型名称</label>
+              <div className="flex items-center gap-1.5">
+                <code className="flex-1 rounded-md border bg-muted/50 px-3 py-1.5 font-mono text-xs text-foreground">
+                  grok-2, grok-3-thinking, grok-2-mini
+                </code>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => copyText("models", "grok-2,grok-3-thinking,grok-2-mini")}
+                  className="h-8 px-2.5 text-xs"
+                >
+                  {copiedKey === "models" ? <Check className="size-3.5 text-emerald-500" /> : <Copy className="size-3.5" />}
+                </Button>
+              </div>
+            </div>
+          </div>
+
+          <div className="rounded-lg border bg-muted/20 p-3 text-xs text-muted-foreground">
+            <p className="font-semibold text-foreground">常用客户端配置步骤：</p>
+            <ol className="mt-1.5 list-inside list-decimal space-y-1">
+              <li>在 <strong>Chatbox / NextChat / VS Code Cline / Claude Code</strong> 等工具中将模型提供商选择为 <code>OpenAI 兼容</code> 或 <code>自定义</code>；</li>
+              <li>将 <strong>API 代理地址 (Base URL)</strong> 填入 <code>http://127.0.0.1:57890/grok/v1</code>；</li>
+              <li>在下方管理区创建或复制一个网关 API Key（以 <code>gw_live_...</code> 开头），填入客户端的 API Key 输入框；</li>
+              <li>模型名输入 <code>grok-2</code> 或 <code>grok-3-thinking</code> 即可畅享高质量对话！</li>
+            </ol>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* 统一密钥网关管理区域 */}
+      <GatewayAdminSection
+        title="Grok 网关 API Key 与调用审计"
+        description="所有对 /grok/v1/* 的请求均通过此密钥进行鉴权和频率监控，用量与延迟会自动汇聚到全局监控中"
+      />
+    </div>
+  );
+}

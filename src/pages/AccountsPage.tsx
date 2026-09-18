@@ -1,26 +1,39 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import {
   Columns3,
   Download,
+  Eye,
+  EyeOff,
   FileDown,
   FileUp,
   Loader2,
   QrCode,
   RefreshCw,
   Rows3,
-  Terminal,
+  Search,
+  X,
 } from "lucide-react";
 
 import { AccountCard } from "@/components/account-card";
 import { DemoAction } from "@/components/demo-action";
-import { CodeBuddyCnIdeMark, CodeBuddyMark, WorkBuddyMark } from "@/components/product-marks";
+import { WorkBuddyMark } from "@/components/product-marks";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
+import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import {
+  ACCOUNT_EXTRAS_CHANGE_EVENT,
+  getAccountNotes,
+  getPrivacyMask,
+  setAccountNote,
+  setPrivacyMask,
+} from "@/lib/account-extras";
 import {
   Dialog,
   DialogContent,
@@ -34,7 +47,7 @@ import { ImportAccountsDialog } from "@/components/import-accounts-dialog";
 import { OAuthLoginDialog } from "@/components/oauth-login-dialog";
 import { SwitchAccountDialog } from "@/components/switch-account-dialog";
 import * as api from "@/lib/api";
-import type { AccountMeta, AppStatus, CheckinConfig, CodeBuddyCliStatus, CodeBuddyCnIdeStatus, CreditExpiry, TravelConfig, TravelStatus } from "@/lib/types";
+import type { AccountMeta, AppStatus, CheckinConfig, CreditExpiry, PlatformCheckinItem, TravelConfig, TravelStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useAccountsStore } from "@/stores/accounts";
 
@@ -142,19 +155,17 @@ export default function AccountsPage() {
   const [autoCheckinSaving, setAutoCheckinSaving] = useState(false);
   /** 账号 id -> 今日是否已签到（undefined=查询中/未知） */
   const [checkinMap, setCheckinMap] = useState<Record<string, boolean>>({});
+  /** 本机平台账号（AutoClaw / TRAE Work CN）签到状态 + 积分 */
+  const [platformCheckins, setPlatformCheckins] = useState<PlatformCheckinItem[]>([]);
+  const [platformCheckinBusyId, setPlatformCheckinBusyId] = useState<string | null>(null);
+  /** 平台卡片积分刷新中 */
+  const [platformCreditLoadingId, setPlatformCreditLoadingId] = useState<string | null>(null);
   const [autoTravelConfig, setAutoTravelConfig] = useState<TravelConfig | null>(null);
   const [autoTravelSaving, setAutoTravelSaving] = useState(false);
   /** 账号 id -> 今日旅行状态（undefined=查询中/未知） */
   const [travelMap, setTravelMap] = useState<Record<string, TravelStatus>>({});
-  const [codebuddyCli, setCodebuddyCli] = useState<CodeBuddyCliStatus | null>(null);
-  const [codebuddyCliSwitchingId, setCodebuddyCliSwitchingId] = useState<string | null>(null);
-  const [codebuddyCnIde, setCodebuddyCnIde] = useState<CodeBuddyCnIdeStatus | null>(null);
-  const [codebuddyCnIdeSwitchingId, setCodebuddyCnIdeSwitchingId] = useState<string | null>(null);
-  const [installingCodebuddyCli, setInstallingCodebuddyCli] = useState(false);
   /** 刷新按钮触发的批量签到进行中 */
   const [checkinAllRunning, setCheckinAllRunning] = useState(false);
-  /** 接入/升级 CLI helper 确认框 */
-  const [installConfirmOpen, setInstallConfirmOpen] = useState(false);
   /** 删除账号确认目标（null=关闭） */
   const [deleteTarget, setDeleteTarget] = useState<AccountMeta | null>(null);
   /** 紧凑模式：卡片更小、同屏更多列；默认开启，持久化到 localStorage */
@@ -165,6 +176,47 @@ export default function AccountsPage() {
       return true;
     }
   });
+
+  // 搜索、过滤、排序与辅助功能状态
+  const [searchQuery, setSearchQuery] = useState("");
+  const [filterType, setFilterType] = useState<"all" | "unchecked" | "expiring" | "active">("all");
+  const [sortType, setSortType] = useState<"default" | "credits-desc" | "credits-asc" | "recent-expiry">("default");
+  const [privacyMask, setPrivacyMaskState] = useState<boolean>(getPrivacyMask);
+  const [accountNotes, setAccountNotes] = useState<Record<string, string>>(getAccountNotes);
+  const [editingNoteAccount, setEditingNoteAccount] = useState<AccountMeta | null>(null);
+  const [noteInput, setNoteInput] = useState("");
+
+  useEffect(() => {
+    const onExtrasChange = () => {
+      setAccountNotes(getAccountNotes());
+      setPrivacyMaskState(getPrivacyMask());
+    };
+    window.addEventListener(ACCOUNT_EXTRAS_CHANGE_EVENT, onExtrasChange);
+    return () => window.removeEventListener(ACCOUNT_EXTRAS_CHANGE_EVENT, onExtrasChange);
+  }, []);
+
+  function togglePrivacyMask() {
+    setPrivacyMask(!privacyMask);
+  }
+
+  function openEditNote(account: AccountMeta) {
+    setEditingNoteAccount(account);
+    setNoteInput(accountNotes[account.id] || "");
+  }
+
+  function saveNote() {
+    if (!editingNoteAccount) return;
+    setAccountNote(editingNoteAccount.id, noteInput);
+    setEditingNoteAccount(null);
+    toast.success("备注已保存");
+  }
+
+  function clearNote() {
+    if (!editingNoteAccount) return;
+    setAccountNote(editingNoteAccount.id, "");
+    setEditingNoteAccount(null);
+    toast.success("备注已清除");
+  }
 
   function toggleCompact() {
     setCompact((value) => {
@@ -228,56 +280,104 @@ export default function AccountsPage() {
       });
   }, [accounts.length, loading, importLocal, fetchAll]);
 
-  async function refreshCodebuddyCliStatus() {
+  async function loadPlatformCheckins() {
     try {
-      setCodebuddyCli(await api.getCodebuddyCliStatus());
+      setPlatformCheckins(await api.getPlatformCheckinItems());
     } catch {
-      setCodebuddyCli(null);
+      setPlatformCheckins([]);
     }
   }
 
-  async function refreshCodebuddyCnIdeStatus() {
-    try {
-      setCodebuddyCnIde(await api.getCodebuddyCnIdeStatus());
-    } catch {
-      setCodebuddyCnIde(null);
-    }
-  }
-
-  useEffect(() => {
-    let cancelled = false;
-    void refreshCodebuddyCliStatus();
-    void (async () => {
-      if (!api.isDemoMode()) {
-        try {
-          await api.detectCodebuddyCnIdeAccount();
-        } catch {
-          /* 未登录或钥匙串拒绝时静默，下面仍拉安装/运行状态 */
-        }
-      }
-      if (!cancelled) await refreshCodebuddyCnIdeStatus();
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [accounts.length]);
-
-  // 账号列表变化后并行查询各账号今日签到状态
+  // 账号列表变化后并行查询各账号今日签到状态，并开启 30 秒静默轮询与切屏/唤醒激活更新
   useEffect(() => {
     if (!accounts.length) return;
     let cancelled = false;
-    void fetchTodayCheckinMap(
-      accounts.map((account) => account.id),
-      () => cancelled,
-    ).then((next) => {
-      if (!cancelled && Object.keys(next).length > 0) {
-        setCheckinMap((prev) => ({ ...prev, ...next }));
+    const updateCheckin = () => {
+      void fetchTodayCheckinMap(
+        accounts.map((account) => account.id),
+        () => cancelled,
+      ).then((next) => {
+        if (!cancelled && Object.keys(next).length > 0) {
+          setCheckinMap((prev) => ({ ...prev, ...next }));
+        }
+      });
+      void loadPlatformCheckins();
+    };
+
+    updateCheckin();
+    const interval = window.setInterval(updateCheckin, 30_000);
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        updateCheckin();
       }
-    });
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    window.addEventListener("focus", updateCheckin);
+
     return () => {
       cancelled = true;
+      window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.removeEventListener("focus", updateCheckin);
     };
   }, [accounts]);
+
+  async function onPlatformCheckin(item: PlatformCheckinItem) {
+    if (platformCheckinBusyId !== null) return;
+    setPlatformCheckinBusyId(item.accountId);
+    try {
+      const res = await api.checkin(item.accountId);
+      const label =
+        res.result === "success"
+          ? "签到成功"
+          : res.result === "already"
+            ? "今天已签到"
+            : "签到失败";
+      const description = `${item.email}${res.error ? `：${res.error}` : ""}`;
+      if (res.result === "error") toast.error(label, { description });
+      else toast.success(label, { description });
+      void loadPlatformCheckins();
+    } catch (e) {
+      toast.error("签到失败", { description: api.asError(e) });
+    } finally {
+      setPlatformCheckinBusyId(null);
+    }
+  }
+
+  /** AccountCard 回调适配：按 id 找回平台账号条目 */
+  async function onPlatformCardCheckin(a: AccountMeta) {
+    const item = platformCheckins.find((p) => p.accountId === a.id);
+    if (item) await onPlatformCheckin(item);
+  }
+
+  /** 某平台的全部账号（供一键切换列出目标）。 */
+  function platformAccountsOf(platform: string): AccountMeta[] {
+    return platformCheckins
+      .filter((p) => p.platform === platform)
+      .map((p) => ({
+        id: p.accountId,
+        uid: null,
+        email: p.email,
+        nickname: p.email,
+        enterpriseName: null,
+        expiresAt: null,
+        refreshExpiresAt: null,
+        refreshedAt: null,
+        createdAt: null,
+        needsRelogin: false,
+        needsReloginReason: null,
+      }));
+  }
+
+  function onPlatformCardRefresh(a: AccountMeta) {
+    if (platformCreditLoadingId !== null) return;
+    setPlatformCreditLoadingId(a.id);
+    void loadPlatformCheckins()
+      .then(() => toast.success("平台积分已刷新", { description: a.nickname || a.id }))
+      .catch(() => toast.error("平台积分刷新失败"))
+      .finally(() => setPlatformCreditLoadingId(null));
+  }
 
   async function loadTravelMap(accountIds: string[], isStale?: () => boolean) {
     const next = await fetchTravelMap(accountIds, isStale);
@@ -456,6 +556,7 @@ export default function AccountsPage() {
         if (Object.keys(next).length > 0) {
           setCheckinMap((prev) => ({ ...prev, ...next }));
         }
+        void loadPlatformCheckins();
       } catch (e) {
         toast.error("批量签到失败", { description: api.asError(e) });
       }
@@ -464,71 +565,6 @@ export default function AccountsPage() {
       toast.success("积分到期情况已刷新");
     } finally {
       setCheckinAllRunning(false);
-    }
-  }
-
-  async function onSwitchCodebuddyCli(account: AccountMeta) {
-    if (codebuddyCliSwitchingId !== null) return;
-    setCodebuddyCliSwitchingId(account.id);
-    const toastId = toast.loading("正在切换 CodeBuddy CLI…", {
-      description: `正在将默认账号设为 ${account.nickname || account.email || account.id}`,
-    });
-    try {
-      const result = await api.switchCodebuddyCliAccount(account.id);
-      await refreshCodebuddyCliStatus();
-      toast.success("CodeBuddy CLI 默认账号已更新", {
-        id: toastId,
-        description: `${account.nickname || account.email || account.id}：${result.message || "配置已更新"}`,
-      });
-    } catch (error) {
-      toast.error("CodeBuddy CLI 切换失败", {
-        id: toastId,
-        description: api.asError(error),
-      });
-    } finally {
-      setCodebuddyCliSwitchingId(null);
-    }
-  }
-
-  async function onSwitchCodebuddyCnIde(account: AccountMeta) {
-    if (codebuddyCnIdeSwitchingId !== null) return;
-    setCodebuddyCnIdeSwitchingId(account.id);
-    const toastId = toast.loading("正在切换 CodeBuddy IDE…", {
-      description: "将注入凭证并重启 CodeBuddy IDE",
-    });
-    try {
-      const result = await api.switchCodebuddyCnIdeAccount(account.id, true);
-      await refreshCodebuddyCnIdeStatus();
-      toast.success("CodeBuddy IDE 已切换", {
-        id: toastId,
-        description: result.message || result.account,
-      });
-    } catch (error) {
-      toast.error("CodeBuddy IDE 切换失败", {
-        id: toastId,
-        description: api.asError(error),
-      });
-    } finally {
-      setCodebuddyCnIdeSwitchingId(null);
-    }
-  }
-
-  async function onInstallCodebuddyCli() {
-    // 桌面 App（Tauri WebView）不支持 window.confirm，改用 Dialog 确认
-    setInstallConfirmOpen(true);
-  }
-
-  async function confirmInstallCodebuddyCli() {
-    setInstallConfirmOpen(false);
-    setInstallingCodebuddyCli(true);
-    try {
-      const result = await api.installCodebuddyCliHelper();
-      toast.success("CodeBuddy CLI 接入已更新", { description: result.message });
-      await refreshCodebuddyCliStatus();
-    } catch (error) {
-      toast.error("CodeBuddy CLI 接入失败", { description: api.asError(error) });
-    } finally {
-      setInstallingCodebuddyCli(false);
     }
   }
 
@@ -555,22 +591,108 @@ export default function AccountsPage() {
         })
         .map(({ account }) => account)
     : accounts;
+
+  // 统计各标签数量
+  const uncheckedCount = useMemo(
+    () => accounts.filter((a) => checkinMap[a.id] === false).length,
+    [accounts, checkinMap],
+  );
+  const expiringCount = useMemo(
+    () => accounts.filter((a) => hasExpiringSoonCredits(creditMap[a.id])).length,
+    [accounts, creditMap],
+  );
+  const activeCount = useMemo(
+    () => accounts.filter((a) => isWorkbuddyCurrent(a, current)).length,
+    [accounts, current],
+  );
+
+  // 综合搜索、过滤与排序
+  const filteredAndSortedAccounts = useMemo(() => {
+    let list = accounts;
+
+    // 1. 关键字模糊搜索
+    const query = searchQuery.trim().toLowerCase();
+    if (query) {
+      list = list.filter((a) => {
+        const note = (accountNotes[a.id] || "").toLowerCase();
+        const nickname = (a.nickname || "").toLowerCase();
+        const email = (a.email || "").toLowerCase();
+        const uid = (a.uid || "").toLowerCase();
+        const id = (a.id || "").toLowerCase();
+        return (
+          note.includes(query) ||
+          nickname.includes(query) ||
+          email.includes(query) ||
+          uid.includes(query) ||
+          id.includes(query)
+        );
+      });
+    }
+
+    // 2. 状态标签过滤
+    if (filterType === "unchecked") {
+      list = list.filter((a) => checkinMap[a.id] === false);
+    } else if (filterType === "expiring") {
+      list = list.filter((a) => hasExpiringSoonCredits(creditMap[a.id]));
+    } else if (filterType === "active") {
+      list = list.filter((a) => isWorkbuddyCurrent(a, current));
+    }
+
+    // 3. 排序
+    const sorted = [...list];
+    if (sortType === "credits-desc") {
+      sorted.sort((a, b) => {
+        const crA = creditMap[a.id]?.totalRemaining ?? 0;
+        const crB = creditMap[b.id]?.totalRemaining ?? 0;
+        return crB - crA;
+      });
+    } else if (sortType === "credits-asc") {
+      sorted.sort((a, b) => {
+        const crA = creditMap[a.id]?.totalRemaining ?? 0;
+        const crB = creditMap[b.id]?.totalRemaining ?? 0;
+        return crA - crB;
+      });
+    } else if (sortType === "recent-expiry") {
+      sorted.sort((a, b) => {
+        const expA = soonestRelevantExpiry(creditMap[a.id]);
+        const expB = soonestRelevantExpiry(creditMap[b.id]);
+        return expA - expB;
+      });
+    } else {
+      // 默认排序：即将过期优先
+      if (creditOrderingReady) {
+        sorted.sort((left, right) => {
+          const leftCredit = creditMap[left.id];
+          const rightCredit = creditMap[right.id];
+          const rankDiff = creditPriorityRank(leftCredit) - creditPriorityRank(rightCredit);
+          if (rankDiff !== 0) return rankDiff;
+          const leftExpiry = soonestRelevantExpiry(leftCredit);
+          const rightExpiry = soonestRelevantExpiry(rightCredit);
+          if (leftExpiry !== rightExpiry) return leftExpiry - rightExpiry;
+          return expiringSoonAmount(rightCredit) - expiringSoonAmount(leftCredit);
+        });
+      }
+    }
+
+    return sorted;
+  }, [
+    accounts,
+    accountNotes,
+    searchQuery,
+    filterType,
+    sortType,
+    creditMap,
+    checkinMap,
+    creditOrderingReady,
+    current,
+  ]);
   const priorityAccountId =
     creditOrderingReady
       ? orderedAccounts.find((account) => hasExpiringSoonCredits(creditMap[account.id]))?.id
       : undefined;
-  const cliCurrentAccountId = codebuddyCli?.activeAccountId;
   const workbuddyCurrentName = current
     ? current.nickname || current.email || current.uid || "未知账号"
     : "未登录";
-  const codebuddyCurrentName = codebuddyCli?.configured
-    ? codebuddyCli.activeAccountName || "未检测到"
-    : "尚未接入";
-  const cnIdeCurrentAccountId = codebuddyCnIde?.activeAccountId;
-  const cnIdeCurrentName = codebuddyCnIde?.installed
-    ? codebuddyCnIde.activeAccountName || "未检测到"
-    : "未安装";
-  const codebuddyUsesSettingsEnv = codebuddyCli?.authMode === "settings-env";
   return (
     <div className="mx-auto w-full max-w-[1180px] px-6 py-8 sm:px-8 sm:py-9">
       <header className="mb-6">
@@ -578,7 +700,7 @@ export default function AccountsPage() {
           <div className="min-w-0">
             <h1 className="text-[28px] font-semibold tracking-tight">账号管理</h1>
             <p className="mt-2 text-sm leading-6 text-muted-foreground">
-              统一管理 WorkBuddy、CodeBuddy IDE 与 CodeBuddy CLI 账号、积分和签到状态。
+              统一管理 WorkBuddy、AutoClaw 与 TRAE Work CN 账号、积分和签到状态。
             </p>
           </div>
           <div className="flex shrink-0 items-center gap-4 pt-1">
@@ -597,34 +719,6 @@ export default function AccountsPage() {
                   WorkBuddy：{status?.running ? "运行中" : "未运行"} · 当前账号：{workbuddyCurrentName}
                 </span>
               </span>
-              <span className="group relative inline-flex cursor-default">
-                <span
-                  className={
-                    codebuddyCnIde?.installed
-                      ? "inline-flex rounded-[22%] bg-primary p-[2px] shadow-sm shadow-primary/40"
-                      : "inline-flex rounded-[22%] bg-muted-foreground/30 p-[2px]"
-                  }
-                >
-                  <CodeBuddyCnIdeMark size={28} />
-                </span>
-                <span className="pointer-events-none absolute right-0 top-full z-50 mt-2 hidden whitespace-nowrap rounded-md bg-popover px-2.5 py-1.5 text-xs text-popover-foreground shadow-lg ring-1 ring-black/5 group-hover:block">
-                  CodeBuddy IDE：{codebuddyCnIde?.installed ? (codebuddyCnIde.running ? "运行中" : "已接入") : "未接入"} · 当前账号：{cnIdeCurrentName}
-                </span>
-              </span>
-              <span className="group relative inline-flex cursor-default">
-                <span
-                  className={
-                    codebuddyCli?.configured
-                      ? "inline-flex rounded-[22%] bg-primary p-[2px] shadow-sm shadow-primary/40"
-                      : "inline-flex rounded-[22%] bg-muted-foreground/30 p-[2px]"
-                  }
-                >
-                  <CodeBuddyMark size={28} />
-                </span>
-                <span className="pointer-events-none absolute right-0 top-full z-50 mt-2 hidden whitespace-nowrap rounded-md bg-popover px-2.5 py-1.5 text-xs text-popover-foreground shadow-lg ring-1 ring-black/5 group-hover:block">
-                  CodeBuddy CLI：{codebuddyCli?.migrationRequired ? "需升级" : codebuddyCli?.configured ? "已接入" : "未接入"} · 当前账号：{codebuddyCurrentName}
-                </span>
-              </span>
             </div>
           </div>
         </div>
@@ -637,7 +731,10 @@ export default function AccountsPage() {
         <div className="relative flex flex-wrap items-center gap-x-5 gap-y-4">
           <div className="min-w-[190px] flex-1">
             <h2 className="text-sm font-semibold text-foreground">添加与迁移账号</h2>
-            <p className="mt-1 text-xs leading-5 text-muted-foreground">快速接入新账号，或从已有环境恢复</p>
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">
+              快速接入新账号，或从已有环境恢复。AutoClaw / TRAE Work CN 无需导入：
+              登录本机客户端后自动出现在下方「平台账号」。
+            </p>
           </div>
           <div className="flex flex-wrap items-center gap-2.5">
             <DemoAction>
@@ -676,47 +773,6 @@ export default function AccountsPage() {
         </Alert>
       )}
 
-      {codebuddyCli &&
-        (!codebuddyCli.configured ||
-          (!codebuddyUsesSettingsEnv && !codebuddyCli.helperSupportsAccountIds) ||
-          codebuddyCli.migrationRequired ||
-          codebuddyCli.syncPending) && (
-        <Alert className="mb-4">
-          <Terminal />
-          <AlertTitle>CodeBuddy CLI 接入</AlertTitle>
-          <AlertDescription>
-            <p>
-              {codebuddyUsesSettingsEnv
-                ? codebuddyCli.environmentOverride
-                  ? "检测到进程环境变量 CODEBUDDY_AUTH_TOKEN。它会覆盖 settings.json；请先从 Windows 用户或系统环境变量中删除它，再重启本应用与 CodeBuddy CLI。"
-                  : codebuddyCli.syncPending
-                    ? "Windows CLI 认证配置与当前账号 Token 已脱节。点击更新认证后写入最新 Token；当前运行会话不会切换，请由 ACP 重新加载会话或重启 CLI 后生效。"
-                    : codebuddyCli.migrationRequired
-                      ? "检测到旧版 Windows helper 配置。接入后会改用 settings.json 的 env.CODEBUDDY_AUTH_TOKEN，不再执行 helper。"
-                      : "Windows 使用 CodeBuddy settings.json 中的认证 Token；切换或保活刷新后会自动更新。当前运行会话不会切换，请由 ACP 重新加载会话或重启 CLI 后生效。"
-                : codebuddyCli.migrationRequired
-                  ? "检测到旧版 helper，请先升级；升级前不会将 CLI 切换显示为已验证。"
-                  : codebuddyCli.configured
-                    ? "当前 helper 仍按旧索引读取账号；升级后将按账号 ID 独立切换，账号增删也不会错位。"
-                    : "WorkBuddy 账号与积分功能可正常使用；如需从这里切换 CodeBuddy CLI 账号，点击下方按钮一键接入。"}
-            </p>
-            <DemoAction>
-              <Button
-                className="mt-2"
-                size="sm"
-                variant="outline"
-                onClick={() => void onInstallCodebuddyCli()}
-                disabled={installingCodebuddyCli}
-              >
-                {installingCodebuddyCli && <Loader2 className="animate-spin" />}
-                {codebuddyUsesSettingsEnv
-                  ? codebuddyCli.configured ? "更新 CLI 认证" : "接入 CLI"
-                  : codebuddyCli.configured || codebuddyCli.migrationRequired ? "升级 CLI helper" : "接入 CLI"}
-              </Button>
-            </DemoAction>
-          </AlertDescription>
-        </Alert>
-      )}
       <section className="mt-7 min-w-0" aria-labelledby="accounts-list-title">
         <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-2">
@@ -798,22 +854,195 @@ export default function AccountsPage() {
             </div>
           </TooltipProvider>
         </div>
+
+        {/* 搜索与多维过滤工具栏 */}
+        {accounts.length > 0 && (
+          <div className="mb-5 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            {/* 左侧：搜索输入框 */}
+            <div className="relative flex-1 max-w-sm">
+              <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="搜索账号昵称、邮箱、UID、备注…"
+                className="h-9 pl-9 pr-8 text-xs bg-background/60"
+              />
+              {searchQuery && (
+                <button
+                  type="button"
+                  onClick={() => setSearchQuery("")}
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                  aria-label="清空搜索"
+                >
+                  <X className="size-3.5" />
+                </button>
+              )}
+            </div>
+
+            {/* 中间/右侧：过滤标签组 + 排序 + 隐私脱敏 */}
+            <div className="flex flex-wrap items-center gap-2">
+              {/* 过滤 Pills */}
+              <div className="flex items-center rounded-lg border border-border/60 bg-muted/30 p-0.5 text-xs">
+                <button
+                  type="button"
+                  onClick={() => setFilterType("all")}
+                  className={cn(
+                    "rounded-md px-2.5 py-1 transition-all",
+                    filterType === "all"
+                      ? "bg-background font-medium text-foreground shadow-xs"
+                      : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  全部
+                  <span className="ml-1 text-[10px] text-muted-foreground">({accounts.length})</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setFilterType("unchecked")}
+                  className={cn(
+                    "rounded-md px-2.5 py-1 transition-all",
+                    filterType === "unchecked"
+                      ? "bg-background font-medium text-foreground shadow-xs"
+                      : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  未签到
+                  {uncheckedCount > 0 && (
+                    <span className="ml-1 rounded-full bg-amber-500/15 px-1 py-0.2 text-[10px] font-semibold text-amber-600 dark:text-amber-400">
+                      {uncheckedCount}
+                    </span>
+                  )}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setFilterType("expiring")}
+                  className={cn(
+                    "rounded-md px-2.5 py-1 transition-all",
+                    filterType === "expiring"
+                      ? "bg-background font-medium text-foreground shadow-xs"
+                      : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  即将到期
+                  {expiringCount > 0 && (
+                    <span className="ml-1 rounded-full bg-orange-500/15 px-1 py-0.2 text-[10px] font-semibold text-orange-600 dark:text-orange-400">
+                      {expiringCount}
+                    </span>
+                  )}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setFilterType("active")}
+                  className={cn(
+                    "rounded-md px-2.5 py-1 transition-all",
+                    filterType === "active"
+                      ? "bg-background font-medium text-foreground shadow-xs"
+                      : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  当前活跃
+                  {activeCount > 0 && (
+                    <span className="ml-1 text-[10px] text-muted-foreground">({activeCount})</span>
+                  )}
+                </button>
+              </div>
+
+              {/* 排序下拉 */}
+              <Select value={sortType} onValueChange={(v: any) => setSortType(v)}>
+                <SelectTrigger size="sm" className="h-9 w-[130px] text-xs bg-background/60">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="default">默认优先级</SelectItem>
+                  <SelectItem value="credits-desc">积分最多</SelectItem>
+                  <SelectItem value="credits-asc">积分最少</SelectItem>
+                  <SelectItem value="recent-expiry">到期最近</SelectItem>
+                </SelectContent>
+              </Select>
+
+              {/* 隐私脱敏开关 */}
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="icon"
+                    className={cn("size-9 rounded-lg transition-colors", privacyMask && "bg-primary/10 text-primary border-primary/30")}
+                    onClick={togglePrivacyMask}
+                    aria-label={privacyMask ? "关闭隐私脱敏" : "开启隐私脱敏"}
+                  >
+                    {privacyMask ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="top">{privacyMask ? "已开启隐私脱敏（点击关闭）" : "开启隐私脱敏模式"}</TooltipContent>
+              </Tooltip>
+            </div>
+          </div>
+        )}
+
         {loading && accounts.length === 0 ? (
-          <div className="flex items-center gap-2 py-16 text-sm text-muted-foreground">
-            <Loader2 className="animate-spin" />
-            加载账号…
+          /* 高保真骨架屏 */
+          <div
+            className={cn(
+              "grid min-w-0 items-start gap-5",
+              compact
+                ? "grid-cols-[repeat(auto-fit,minmax(min(100%,300px),1fr))]"
+                : "grid-cols-[repeat(auto-fit,minmax(min(100%,340px),1fr))]",
+            )}
+          >
+            {[1, 2, 3, 4].map((i) => (
+              <div
+                key={i}
+                className="flex flex-col rounded-2xl border border-border bg-card p-4 shadow-xs"
+              >
+                <div className="flex items-center gap-3 border-b border-border/50 pb-3">
+                  {!compact && <Skeleton className="size-12 rounded-full" />}
+                  <div className="flex-1 space-y-2">
+                    <Skeleton className="h-4 w-3/4 rounded" />
+                    <Skeleton className="h-3 w-1/2 rounded" />
+                  </div>
+                </div>
+                <div className="space-y-2 pt-3">
+                  <Skeleton className="h-6 w-1/3 rounded" />
+                  <Skeleton className="h-3.5 w-full rounded" />
+                  <Skeleton className="h-3.5 w-4/5 rounded" />
+                </div>
+                <div className="mt-4 flex justify-between gap-2 border-t border-border/50 pt-3">
+                  <Skeleton className="h-8 w-20 rounded-lg" />
+                  <Skeleton className="h-8 w-20 rounded-lg" />
+                </div>
+              </div>
+            ))}
           </div>
         ) : accounts.length === 0 ? (
           <div className="rounded-xl border border-dashed px-4 py-16 text-center text-sm text-muted-foreground">
             暂无账号。点击上方按钮导入本机账号或扫码登录。
           </div>
+        ) : filteredAndSortedAccounts.length === 0 ? (
+          <div className="rounded-xl border border-dashed px-4 py-16 text-center text-sm text-muted-foreground">
+            <p>未找到符合条件的账号</p>
+            <Button
+              variant="outline"
+              size="sm"
+              className="mt-3 text-xs"
+              onClick={() => {
+                setSearchQuery("");
+                setFilterType("all");
+              }}
+            >
+              清空搜索与筛选
+            </Button>
+          </div>
         ) : (
           <div className={cn("grid min-w-0 items-start gap-5", compact ? "grid-cols-[repeat(auto-fit,minmax(min(100%,300px),1fr))]" : "grid-cols-[repeat(auto-fit,minmax(min(100%,340px),1fr))]")}>
-            {orderedAccounts.map((a) => (
+            {filteredAndSortedAccounts.map((a) => (
               <AccountCard
                 key={a.id}
                 account={a}
                 compact={compact}
+                note={accountNotes[a.id]}
+                privacyMask={privacyMask}
+                onEditNote={openEditNote}
                 onDelete={onDelete}
                 onSwitch={setSwitchAccount}
                 onCheckin={onCheckin}
@@ -825,22 +1054,116 @@ export default function AccountsPage() {
                 creditUpdatedAt={creditUpdatedAtMap[a.id]}
                 creditPriority={a.id === priorityAccountId}
                 workbuddyActive={isWorkbuddyCurrent(a, current)}
-                codebuddyCliConfigured={codebuddyCli?.configured && !codebuddyCli.migrationRequired && !codebuddyCli.syncPending}
-                codebuddyCliActive={a.id === cliCurrentAccountId}
-                codebuddyCliBusy={codebuddyCliSwitchingId !== null}
-                onSwitchCodebuddyCli={onSwitchCodebuddyCli}
-                codebuddyCliLoading={codebuddyCliSwitchingId === a.id}
-                codebuddyCnIdeAvailable={Boolean(codebuddyCnIde?.installed)}
-                codebuddyCnIdeActive={a.id === cnIdeCurrentAccountId}
-                codebuddyCnIdeBusy={codebuddyCnIdeSwitchingId !== null}
-                codebuddyCnIdeLoading={codebuddyCnIdeSwitchingId === a.id}
-                onSwitchCodebuddyCnIde={onSwitchCodebuddyCnIde}
+                onQuickSwitch={{
+                  accounts,
+                  current,
+                  // 切换会重启 WorkBuddy：稍等片刻再拉状态，避免读到切换前的旧账号
+                  done: () => {
+                    window.setTimeout(() => void fetchAll(), 2500);
+                  },
+                }}
                 featuresDisabled={false}
               />
             ))}
           </div>
         )}
       </section>
+
+      {platformCheckins.length > 0 ? (
+        <section className="mt-2 space-y-4" aria-labelledby="platform-checkin-title">
+          <div>
+            <h2 id="platform-checkin-title" className="text-lg font-semibold">
+              平台账号
+            </h2>
+            <p className="text-sm text-muted-foreground">
+              本机登录的 AutoClaw / TRAE Work CN，与 WorkBuddy 账号一起自动签到
+            </p>
+          </div>
+          <div className={cn("grid min-w-0 items-start gap-5", compact ? "grid-cols-[repeat(auto-fit,minmax(min(100%,300px),1fr))]" : "grid-cols-[repeat(auto-fit,minmax(min(100%,340px),1fr))]")}>
+            {platformCheckins.map((item) => {
+              const meta: AccountMeta = {
+                id: item.accountId,
+                uid: null,
+                email: item.email,
+                nickname: item.email,
+                enterpriseName: null,
+                expiresAt: null,
+                refreshExpiresAt: null,
+                refreshedAt: null,
+                createdAt: null,
+                needsRelogin: false,
+                needsReloginReason: null,
+              };
+              return (
+                <AccountCard
+                  key={item.accountId}
+                  account={meta}
+                  platform={item.platform}
+                  compact={compact}
+                  privacyMask={privacyMask}
+                  todayCheckedIn={item.ok ? item.todayCheckedIn : undefined}
+                  credit={item.credit}
+                  creditUpdatedAt={item.credit?.updatedAt}
+                  creditLoading={platformCreditLoadingId === item.accountId}
+                  onCheckin={onPlatformCardCheckin}
+                  onRefresh={onPlatformCardRefresh}
+                  onDelete={() => {}}
+                  onQuickSwitchPlatform={{
+                    platform: item.platform,
+                    accounts: platformAccountsOf(item.platform),
+                    // 本机客户端当前登录的账号（用于标注「当前」与排除重复切换）
+                    currentId: platformCheckins.find(
+                      (p) => p.platform === item.platform && p.localLogin,
+                    )?.accountId,
+                    done: () => {
+                      // 切换会重启客户端：稍等再刷新，避免读到切换前的旧登录态
+                      window.setTimeout(() => void loadPlatformCheckins(), 3000);
+                    },
+                  }}
+                  featuresDisabled={false}
+                />
+              );
+            })}
+          </div>
+        </section>
+      ) : null}
+
+      {/* 修改账号备注弹窗 */}
+      <Dialog open={editingNoteAccount !== null} onOpenChange={(open) => !open && setEditingNoteAccount(null)}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>编辑账号备注</DialogTitle>
+            <DialogDescription>
+              为账号 {editingNoteAccount?.nickname || editingNoteAccount?.email || editingNoteAccount?.id} 设置一个易记的别名。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="py-2">
+            <Input
+              value={noteInput}
+              onChange={(e) => setNoteInput(e.target.value)}
+              placeholder="例如：主力工作号、备用小号…"
+              maxLength={20}
+              autoFocus
+              onKeyDown={(e) => {
+                if (e.key === "Enter") saveNote();
+              }}
+            />
+          </div>
+          <DialogFooter className="flex gap-2 sm:justify-between">
+            <Button variant="ghost" size="sm" onClick={clearNote} disabled={!accountNotes[editingNoteAccount?.id || ""]}>
+              清除备注
+            </Button>
+            <div className="flex gap-2">
+              <Button variant="outline" size="sm" onClick={() => setEditingNoteAccount(null)}>
+                取消
+              </Button>
+              <Button size="sm" onClick={saveNote}>
+                保存
+              </Button>
+            </div>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <OAuthLoginDialog open={oauthOpen} onOpenChange={setOauthOpen} />
       <ExportAccountsDialog
@@ -862,49 +1185,8 @@ export default function AccountsPage() {
         account={switchAccount}
         onDone={() => {
           void fetchAll();
-          void refreshCodebuddyCliStatus();
-          void refreshCodebuddyCnIdeStatus();
         }}
       />
-
-      {/* 接入/升级 CLI 认证确认（桌面 App 不支持 window.confirm） */}
-      <Dialog open={installConfirmOpen} onOpenChange={setInstallConfirmOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>
-              {codebuddyUsesSettingsEnv
-                ? "更新 CodeBuddy CLI 认证"
-                : codebuddyCli?.configured || codebuddyCli?.migrationRequired
-                  ? "升级 CodeBuddy CLI helper"
-                  : "接入 CodeBuddy CLI"}
-            </DialogTitle>
-            <DialogDescription>
-              {codebuddyUsesSettingsEnv ? (
-                <>
-                  将把当前账号的认证 Token 写入
-                  <code className="mx-1 rounded bg-muted px-1">~/.codebuddy/settings.json</code>
-                  的 <code className="mx-1 rounded bg-muted px-1">env.CODEBUDDY_AUTH_TOKEN</code>。
-                  其他配置会保留；更新只影响后续加载的会话，当前运行会话不会切换。是否继续？
-                </>
-              ) : (
-                <>
-                  {codebuddyCli?.configured || codebuddyCli?.migrationRequired ? "升级" : "接入"}会自动写入
-                  <code className="mx-1 rounded bg-muted px-1">~/.codebuddy-rotate/helper.cjs</code>
-                  并更新
-                  <code className="mx-1 rounded bg-muted px-1">~/.codebuddy/settings.json</code>
-                  的 apiKeyHelper 配置，是否继续？
-                </>
-              )}
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setInstallConfirmOpen(false)}>
-              取消
-            </Button>
-            <Button onClick={() => void confirmInstallCodebuddyCli()}>继续</Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
 
       {/* 删除账号确认 */}
       <Dialog open={deleteTarget !== null} onOpenChange={(o) => !o && setDeleteTarget(null)}>

@@ -10,16 +10,30 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration as StdDuration;
 
 use crate::modules::account::{account_display_name, get_str};
 use crate::modules::config::{atomic_write, official_usage_cache_file, store_dir};
 use crate::modules::credits::authenticated_post;
+use crate::modules::platform_checkin::{account_platform, PLATFORM_WORKBUDDY};
 
 pub const OFFICIAL_USAGE_URL: &str =
     "https://www.workbuddy.cn/billing/meter/get-user-request-usage";
 pub const OFFICIAL_USAGE_PAGE_SIZE: usize = 3_000;
 pub const OFFICIAL_USAGE_DETAIL_LIMIT: usize = 100;
 const OFFICIAL_USAGE_MAX_PAGES: usize = 100;
+/// 缓存投影版本：账号范围或字段结构变化时递增，旧缓存直接失效重采。
+/// v2：官方用量只覆盖 WorkBuddy 账号，平台账号（AutoClaw / TRAE）不再进入本投影。
+const OFFICIAL_USAGE_PAYLOAD_VERSION: i64 = 2;
+/// 投影有效期。官方口径的「今日消耗」随每次调用变化，跨天更会整体错位，
+/// 因此缓存必须带时效：
+/// - 超过该时长 → 视为过期，读缓存时自动重采；
+/// - `rangeEnd` 不是今天 → 无论多新都必须重采（否则「今日消耗」会停留在
+///   采集当天，表现为长期不随实际使用更新）。
+/// 10 分钟是「不打扰官方接口」与「及时同步」之间的折中。
+const OFFICIAL_USAGE_TTL_MS: i64 = 10 * 60 * 1000;
+/// 后台同步周期：与 TTL 对齐，保证没有页面请求时投影也会滚动刷新。
+pub const OFFICIAL_USAGE_SYNC_INTERVAL: StdDuration = StdDuration::from_secs(10 * 60);
 static OFFICIAL_USAGE_MEMORY: Mutex<Option<Value>> = Mutex::new(None);
 
 fn official_usage_fetch_lock() -> &'static tokio::sync::Mutex<()> {
@@ -127,6 +141,9 @@ fn sanitize_accounts(value: Option<&Value>) -> Value {
 }
 
 fn sanitize_cached_payload(value: &Value) -> Option<Value> {
+    if value.get("v").and_then(Value::as_i64) != Some(OFFICIAL_USAGE_PAYLOAD_VERSION) {
+        return None;
+    }
     let status = value.get("status")?.as_str()?;
     if !matches!(status, "complete" | "partial" | "unavailable") {
         return None;
@@ -134,6 +151,7 @@ fn sanitize_cached_payload(value: &Value) -> Option<Value> {
     let mut payload = take_object_fields(
         value,
         &[
+            "v",
             "status",
             "rangeStart",
             "rangeEnd",
@@ -191,22 +209,64 @@ fn remember_official_usage(payload: &Value) {
     save_official_usage_cache_to(&official_usage_cache_file(), payload);
 }
 
-/// 统计页默认读缓存；`refresh = true` 时才重新请求官方用量接口。
+/// 投影是否仍然有效：必须落在 TTL 内，且采集区间覆盖到今天。
+///
+/// 只判断 TTL 是不够的——服务进程常驻时，昨晚采集的投影「看起来」只差几个小时，
+/// 但它的 `rangeEnd` 还是昨天，直接返回会让「今日消耗」整整一天不更新。
+fn payload_is_fresh(payload: &Value, at_ms: i64) -> bool {
+    let Some(collected_at) = payload.get("collectedAt").and_then(Value::as_i64) else {
+        return false;
+    };
+    if collected_at > at_ms || at_ms - collected_at > OFFICIAL_USAGE_TTL_MS {
+        return false;
+    }
+    payload
+        .get("rangeEnd")
+        .and_then(Value::as_str)
+        .map(|end| end == local_date_at(at_ms).format("%Y-%m-%d").to_string())
+        .unwrap_or(false)
+}
+
+/// 统计页读取官方用量投影。
+///
+/// `refresh = true` 强制重采；否则缓存仅在 [`payload_is_fresh`] 通过时复用，
+/// 过期或跨天会自动重采，保证「今日消耗」始终对齐官方实际使用情况。
 pub async fn official_usage_for_statistics(accounts: &[Value], at_ms: i64, refresh: bool) -> Value {
     if !refresh {
         if let Some(cached) = remembered_official_usage() {
-            return cached;
+            if payload_is_fresh(&cached, at_ms) {
+                return cached;
+            }
         }
     }
     let _guard = official_usage_fetch_lock().lock().await;
+    // 双检：等锁期间可能已被其它请求（或后台同步）刷新。
     if !refresh {
         if let Some(cached) = remembered_official_usage() {
-            return cached;
+            if payload_is_fresh(&cached, at_ms) {
+                return cached;
+            }
         }
     }
     let usage = collect_official_usage(accounts, at_ms).await;
     remember_official_usage(&usage);
     usage
+}
+
+/// 后台同步一轮官方用量投影（由 `serve` 的周期任务调用）。
+///
+/// 没有 WorkBuddy 账号时直接返回，避免对官方接口做无意义请求；失败不抛出，
+/// 由下一次周期重试。
+pub async fn background_sync_once() {
+    let accounts = crate::modules::platform_checkin::all_checkin_accounts();
+    if !accounts
+        .iter()
+        .any(|account| account_platform(account) == PLATFORM_WORKBUDDY)
+    {
+        return;
+    }
+    let at_ms = crate::modules::config::now_ms();
+    let _ = official_usage_for_statistics(&accounts, at_ms, false).await;
 }
 
 #[derive(Clone, Debug)]
@@ -291,7 +351,9 @@ fn timestamp_to_parts(ts: i64) -> Option<(NaiveDate, i64)> {
         .map(|date| (date.date_naive(), ts))
 }
 
-fn parse_request_time(value: Option<&Value>) -> Option<(NaiveDate, i64, String)> {
+/// 解析官方请求时间（epoch 秒/毫秒、RFC3339 或 "YYYY-MM-DD HH:MM:SS"）
+/// → (本地日期, 毫秒时间戳, 原文)。供统计投影把请求明细转成消耗事件。
+pub(crate) fn parse_request_time(value: Option<&Value>) -> Option<(NaiveDate, i64, String)> {
     let value = value?;
     if let Some(number) = parse_number(Some(value)) {
         if !number.is_finite() {
@@ -570,8 +632,17 @@ fn request_value(account_id: &str, account_name: &str, row: &RequestRow) -> Valu
     })
 }
 
-/// 查询全部当前账号并生成官方请求用量投影。
+/// 查询 WorkBuddy 账号的官方请求用量投影，每个账号单独成行、单独聚合。
+///
+/// AutoClaw / TRAE Work CN 等平台账号的凭证不属于 workbuddy.cn，请求官方
+/// 用量接口只会得到网关 401，因此从一开始就不进入本投影；它们的消耗由
+/// 平台积分快照单独推导（见 credit_usage）。
 pub async fn collect_official_usage(accounts: &[Value], at_ms: i64) -> Value {
+    let accounts: Vec<Value> = accounts
+        .iter()
+        .filter(|account| account_platform(account) == PLATFORM_WORKBUDDY)
+        .cloned()
+        .collect();
     let today = local_date_at(at_ms);
     let range_start = today - Duration::days(30);
     let range_end = today;
@@ -705,6 +776,7 @@ pub async fn collect_official_usage(accounts: &[Value], at_ms: i64) -> Value {
     };
 
     json!({
+        "v": OFFICIAL_USAGE_PAYLOAD_VERSION,
         "status": status,
         "rangeStart": range_start_text,
         "rangeEnd": range_end_text,
@@ -887,6 +959,7 @@ mod tests {
     #[test]
     fn cache_round_trip_keeps_projection_and_strips_prompt_fields() {
         let payload = json!({
+            "v": 2,
             "status": "complete",
             "rangeStart": "2026-07-26",
             "rangeEnd": "2026-08-25",
@@ -945,5 +1018,39 @@ mod tests {
         assert!(parse_official_usage_cache("not-json").is_none());
         assert!(parse_official_usage_cache("{}").is_none());
         assert!(parse_official_usage_cache(r#"{"payload":{"status":"nope"}}"#).is_none());
+        // v1 及更早缓存包含平台账号的 401 记录，结构过期必须整份作废
+        assert!(parse_official_usage_cache(r#"{"payload":{"v":1,"status":"complete"}}"#).is_none());
+        assert!(parse_official_usage_cache(r#"{"payload":{"status":"complete"}}"#).is_none());
+    }
+
+    fn cached_payload(collected_at: i64, range_end: &str) -> Value {
+        json!({
+            "v": OFFICIAL_USAGE_PAYLOAD_VERSION,
+            "status": "complete",
+            "collectedAt": collected_at,
+            "rangeEnd": range_end,
+        })
+    }
+
+    #[test]
+    fn projection_expires_when_stale_or_from_an_earlier_day() {
+        let now = crate::modules::config::now_ms();
+        let today = local_date_at(now).format("%Y-%m-%d").to_string();
+        let yesterday = (local_date_at(now) - Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+
+        // 刚采集且覆盖到今天 → 有效（读缓存不打扰官方接口）
+        assert!(payload_is_fresh(&cached_payload(now, &today), now));
+        // 同一天但超过 TTL → 过期重采
+        assert!(!payload_is_fresh(
+            &cached_payload(now - OFFICIAL_USAGE_TTL_MS - 1, &today),
+            now
+        ));
+        // 采集区间只到昨天 → 无论多新都失效（跨天后「今日消耗」不能停留在旧投影）
+        assert!(!payload_is_fresh(&cached_payload(now, &yesterday), now));
+        // 缺字段 / 未来时间戳 → 失效
+        assert!(!payload_is_fresh(&json!({"status": "complete"}), now));
+        assert!(!payload_is_fresh(&cached_payload(now + 60_000, &today), now));
     }
 }
