@@ -7,6 +7,39 @@
 
 ---
 
+## 0.1.79 — 2026-09-23
+
+### 修复：模型测试的 `tokens 0+0=0` 误导性显示
+
+**现场**：0.1.78 上线后用户反馈结果卡片里显示 `tokens 0+0=0`，
+看着像计量功能坏了。实测复核确认根因在**上游**：GLM 通路的响应
+`usage` 三项**恒为 0**（`{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}`），
+而当时是「如实透传」成 UI 文案。
+
+**为什么这不是"如实显示"而是缺陷**：上游给了 usage 对象、但**没给有效计量** ——
+正确语义是「未上报」，而不是「消耗了 0 个 token」。渲染成 `0+0=0` 会让用户
+去排查一个不存在的计量故障（且 prompt 至少含系统提示，真为 0 在物理上也不可能）。
+
+**修复**（`model_probe.rs::extract_usage`）：三项**全零**时返回 `Null`（= 未上报），
+前端既有 `result.tokens?.total != null` 判断会自动不渲染该字段 —— **前端零改动**。
+只要**有一项非零**就原样保留，不抹掉部分上报的真实数据。
+
+**验证**：新增单测 `extract_usage_treats_all_zero_as_unreported`（全零 → Null；
+`{prompt:0, completion:7}` → 保留且 total=7）；端到端复核 GLM 结果卡不再出现 tokens 行
+（`tools/model_test_e2e.py` 全部用例符合预期 + `tools/model_test_ui_flow.mjs` 点击级流程通过）。
+
+**🔎 顺带查清的重要事实：非流式请求的 `usage` 恒为 0 —— 这是设计使然，不是故障**
+复核了 4 个网关的原始响应，非流式下**全部**返回
+`usage: {"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}`
+（`/v1`、`/kimi/v1`、`/qwen/v1`、`/trae/v1` 实测一致）。
+原因：本项目的用量计量写在**流式泵**里（`glm_proxy::pump_stream` 的 usage 计量），
+非流式路径不计数 —— 而所有真实客户端（ZCode / WorkBuddy）都用流式，所以不影响任何真实用量统计。
+⇒ 结论：`model_probe` 走非流式时 `tokens` 字段**实际上永远是 null**（本次修复后不再显示）。
+若日后想在自测里看到真实 token 数，需把探测改成流式并解析 SSE（注意 UTF-8 半字符 chunk 那条坑，
+见 0.1.43）。**当前不做**：tokens 本来就不在需求范围内，可用性结论不受影响。
+
+---
+
 ## 0.1.78 — 2026-09-22
 
 ### 修复：模型测试会把「不存在的模型」误报为 ✅（验证阶段发现的结论正确性缺陷）

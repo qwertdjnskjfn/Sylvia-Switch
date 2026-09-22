@@ -387,7 +387,12 @@ fn extract_usage(v: &Value) -> Value {
             (Some(p), Some(c)) => Some(p + c),
             _ => None,
         });
-    if prompt.is_none() && completion.is_none() && total.is_none() {
+    // 「有 usage 但三项全零」= 上游没有上报有效计量（GLM 通路实测：整条对话恒 0/0/0）。
+    // 如实渲染成 `tokens 0+0=0` 会让人误以为计量功能坏了 —— 按「未上报」处理（Null），
+    // 前端据此直接不显示该字段。只要有一项非零就保留，不抹掉部分上报的真实数据。
+    let all_zero =
+        prompt.unwrap_or(0) == 0 && completion.unwrap_or(0) == 0 && total.unwrap_or(0) == 0;
+    if (prompt.is_none() && completion.is_none() && total.is_none()) || all_zero {
         return Value::Null;
     }
     json!({ "prompt": prompt, "completion": completion, "total": total })
@@ -440,6 +445,21 @@ mod tests {
         let a = extract_usage(&json!({ "usage": { "input_tokens": 2, "output_tokens": 7 } }));
         assert_eq!(a["completion"], json!(7));
         assert_eq!(extract_usage(&json!({})), Value::Null);
+    }
+
+    #[test]
+    fn extract_usage_treats_all_zero_as_unreported() {
+        // GLM 通路实测：usage 存在但恒为 0/0/0 —— 不能渲染成 "tokens 0+0=0"
+        assert_eq!(
+            extract_usage(&json!({
+                "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 }
+            })),
+            Value::Null
+        );
+        // 只有一项非零（部分上报）必须保留，别抹掉真实数据
+        let part = extract_usage(&json!({ "usage": { "prompt_tokens": 0, "completion_tokens": 7 } }));
+        assert_eq!(part["completion"], json!(7));
+        assert_eq!(part["total"], json!(7));
     }
 
     #[test]
