@@ -7,6 +7,908 @@
 
 ---
 
+## 0.1.78 — 2026-09-22
+
+### 修复：模型测试会把「不存在的模型」误报为 ✅（验证阶段发现的结论正确性缺陷）
+
+**现场**：0.1.77 部署后跑 `tools/model_test_e2e.py`，用例「模型不存在」**没通过** ——
+请求 `model: "__not_a_real_model__"` 返回 `ok=true`。
+
+**根因**（网关行为，非本功能编码错误）：本机 GLM 网关对**任意**模型名都会**兜底路由**。
+直接验证：
+
+```
+POST /v1/chat/completions  {"model":"__definitely_not_a_model__", ...}
+→ HTTP 200，正文「可用」，响应里的 model 字段**回显请求值**（不是真实上游档位）
+```
+
+⇒ 所以「调通」**不等于**「该模型存在」。一个会对着随便什么字符串报 ✅ 的可用性测试，
+是**结论错误**，比没有这个功能更糟（用户会据此以为某个模型能用）。
+
+**修复**（前端 `ModelTestPage.tsx`）
+
+- 新增 `TestRecord = ModelTestResult & { modelKnown: boolean | null }` —— UI 侧判断，
+  **不进 API 契约**：判定「模型是否在网关模型目录里」，不在目录中时在结果卡上明确警示
+  「网关可能按兜底路由处理，此结论不代表该模型本身可用」。
+- **判定放前端而非后端**：目录本来就已经加载在内存里（下拉列表就是它），
+  放后端会给每次探测多加一次目录请求 —— `glm_proxy::models_payload()` 是本地静态表，
+  但 `kimi`/`loomy::models_payload()` 是**异步**的，会把探测延迟拉长。
+- 目录快照在**探测时点**取值（`catalogRef`），避免用户事后切换网关改写历史结论。
+- 网关未列任何模型时判定为 `null`（未知）而非 `false`，不误报警告。
+
+**E2E 脚本同步**（`tools/model_test_e2e.py`）
+
+- 移除「模型不存在」这条**错误期望**的用例（它断言的是功能不该有的行为）。
+- 改为独立的「**行为锁定：未知模型名**」段落 —— 只记录事实、不作失败判据，
+  把「网关会兜底」这一行为固化在回归脚本里，防止日后有人误以为这是功能缺陷。
+
+---
+
+## 0.1.77 — 2026-09-22
+
+### 新增：模型可用性测试（在 Sylvia Switch 内直接验证任意网关的任意模型能不能用）
+
+**动机**（用户需求）：以前要确认「某个模型的额度/登录态到底还行不行」，
+只能跑去 ZCode / WorkBuddy 里把模型配一遍再试 —— 配错、走错网关、看不出真因，
+排查成本高。现在在 Sylvia Switch 里选网关 + 模型，一次点击就得到结论与失败原因。
+
+**新增后端模块** `crates/wb-switch-core/src/modules/model_probe.rs`
+
+- **回环自调用**：请求打到本服务**自己的对外端点**
+  `http://127.0.0.1:{boundPort}{base}/chat/completions`，
+  因此覆盖「鉴权 → 路由 → 账号选择 → 上游 → 协议转换」**完整链路** ——
+  失败原因与真实客户端所见一致；若改成内部直连模块函数，就测不出鉴权/路由层的问题。
+- 🔴 **鉴权用 GLM 主密钥**（`glm_proxy::load_config().api_key`）：
+  `gateway_admin::verify_request_key` 允许「网关专用 Key」或「主密钥」二选一，
+  而主密钥命中时**提前 return、不计入 Key 的 `requestCount`/`lastUsedAt`** ——
+  用专用 Key 会让每次自测都给密钥计数 +1，污染管理台统计。
+- 🔴 **必须 `no_proxy()`**：本机回环不得继承系统代理。本机 `HTTP_PROXY` 残留会把
+  `127.0.0.1` 也送去代理，直接表现成「连不上网关」（与 glm_web/kimi/loomy 既有做法一致）。
+- 非流式 + 小 `max_tokens`（默认 64）：一次请求即得确定结论，且避开流式路径历史上
+  踩过的「UTF-8 半字符 chunk 整块丢弃」坑（见 0.1.43）。
+- **失败归因**（`code` 机器可读 + `reason` 人可读）：
+  `unknown_gateway` / `missing_model` / `no_master_key` / `client_build_failed` /
+  `connect_failed` / `timeout` / `network_error` / `auth_failed`(401·403) /
+  `model_not_found`(404) / `rate_limited`(429) / `upstream_error` /
+  `empty_reply`(200 但无正文无思维链) / `bad_response`(200 但非 JSON)。
+- 响应解析**双协议兼容**：OpenAI（`choices[].message.content` / `reasoning_content`）
+  与 Anthropic（`content[]` 的 `text` / `thinking`），usage 同时认
+  `prompt_tokens`/`completion_tokens` 与 `input_tokens`/`output_tokens`。
+- 只有思维链、无可见正文时**判为成功但如实标注**（`glm-5.3-flash` 等会先吐大段 thinking），
+  避免把「模型可用」误报成「空回复」。
+
+**新增路由**（`api.rs`）
+
+- `POST /api/model-test` → `api_model_test`，**恒返回 200 + 结果对象**：
+  「测不通」本身是有效结论，用 `ok`/`code`/`reason` 表达。
+  若改用 HTTP 状态码表达业务失败，前端就得把「业务失败」和「接口挂了」混在一起判断。
+- `gateway_overview::gateway_base(id)` 新增公开访问器（展示名 + 对外 base），
+  供本模块复用，避免各处再抄一份网关路由表导致漂移。
+
+**新增前端** `src/pages/ModelTestPage.tsx`（路由 `/model-test`，侧栏「模型测试」）
+
+- 网关下拉（复用既有 `/api/gateways/overview`，**未新增接口**）+ 模型下拉
+  （含「✏️ 手动输入模型 ID」以便测未列出的模型）+ 自定义提示词 + `max_tokens`。
+- 「测试该模型」/「测试该网关全部模型」/「停止」；**串行**执行（并发会把「限流」和
+  「真的不可用」混在一起）；结果按时间倒序累积，同一模型可反复测。
+- 每条结果卡片：✅/❌ 状态徽章 + 归因标签、网关·模型、耗时、HTTP 状态、tokens、
+  实际端点、可展开的上游原始响应（截断）；顶部给出「共 N 次 · 成功 / 失败 / 平均耗时」。
+- 契约类型独立成 `src/lib/model-test-types.ts`（同 `channel-health-types.ts` 先例），
+  含 `MODEL_TEST_CODE_META` 表驱动文案与配色。
+- 与 `channel_health` 一致：**webui 独占**，桌面端（Tauri）显示提示卡片，不动 `src-tauri`。
+
+**验证**：见本次部署实测（网关/模型矩阵、失败归因样例、重复测试）。
+
+---
+
+## 0.1.76 — 2026-09-22
+
+### 新增：OpenCode 网关落地（真实可用的接入信息 + 免费模型专用端点）
+
+**动机**（用户反馈）：OpenCode 页的「接入信息 · OpenCode 网关」之前标着 **待建**，
+只有 Base URL 占位与「待建」徽标 —— **用户拿不到密钥，无法真正调用里面的模型**。
+
+**新增后端模块** `crates/wb-switch-core/src/modules/opencode.rs`
+
+- 独立配置 `~/.wb-switch/opencode_proxy_config.json`（`enabled` + 独立 `api_key`，
+  **首次访问自动生成密钥并落盘**，用户无需手填）。
+- `is_free_model()` 与前端 `model-taxonomy.ts::isFreeModelId` **同口径**
+  （含 `free` / 以 `:0` 或 `/0` 结尾 / 含 `zero`），保证「页面显示」与「网关放行」不漂移。
+- `models_payload()`：只列免费模型。
+- `chat_completions_json()` / `chat_completions_stream()`：
+  **非免费模型一律拒绝**（提示改用 `/opencode/v1/models`）；**未指定 `model` 时自动选第一个免费模型**；
+  对话委托 `workbuddy_proxy` 的 server 通道（**共用同一个本机 OpenCode server 进程**，
+  不重复拉起第二个 server 抢端口）；流式为聚合后合成 SSE（含末尾 usage 帧）。
+- `proxy_status()`（server 健康 + 渠道数 + 免费/总数）、`config_info(port)`（Base URL / 密钥 / 启用态）。
+
+**新增路由**（`api.rs`）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/opencode/v1/models` | 只列免费模型（需本网关密钥） |
+| POST | `/opencode/v1/chat/completions` | 对话；非免费模型 → **400**（而非 502），server 故障 → 502 |
+| GET | `/api/opencode-proxy/status` | 网关状态 |
+| GET/POST | `/api/opencode-proxy/config` | 接入信息 / 启用开关 / 轮换密钥 |
+
+- 新增 `opencode_proxy_auth_ok()`（Bearer 或 `x-api-key`）；
+- `opencode_error_status()`：**区分「客户端选错模型」(400) 与「上游故障」(502)**，便于调用方判断该改模型还是该重试；
+- `is_logged_path` 补 `"/opencode/"`；`is_api_namespace` 的 `WITH_SUB` 补 `"opencode"`（14 → 15）
+  —— ⚠️ 该条只兜 `/opencode/<子路径>`，`/opencode`（前端页面，无尾斜杠）不受影响。
+
+**注册表**：`gateway_overview` 增 `opencode`（base `/opencode/v1`）+ `fetch_models` 臂（即免费数）。
+
+**前端**（`api.ts` + `OpencodePage.tsx`）
+
+- `api.ts`：`ROUTES` 增三条 + `getOpencodeProxyStatus` / `getOpencodeProxyConfig` / `saveOpencodeProxyConfig`。
+- 页头状态区改为读**真实状态**（渠道数 / 对外暴露免费数 / server 端口 / 启用开关）；
+- **接入信息区从「待建」改为真实值**：Base URL 可复制、密钥可复制、**一键重新生成密钥**、
+  可用模型数、上游健康检查、以及**可直接粘贴运行的 curl 示例**（自动填入当前端点与密钥）。
+
+**验证方式**
+
+- `cargo check -p wb-switch-core -p wb-switch-server` **0 错误**；`tsc --noEmit` **0 错误**。
+- 部署后应满足：`GET /opencode/v1/models` → 200 且**只含免费模型**；
+  `POST /opencode/v1/chat/completions` 用免费模型 → 200 正文；
+  用**非免费**模型 → **400** 且提示清单端点；错误密钥 → 401；`/opencode/v1/nope` → 404 JSON。
+
+---
+
+## 0.1.75 — 2026-09-22
+
+### 重构：分类口径抽成共享模块 + WorkBuddy「速度优先」改为每渠道首选
+
+**① 口径抽共享**（`src/lib/model-taxonomy.ts`，新增）
+
+把 `isFreeModelId` / `classifyTask` / `TASK_META` / `TASK_ORDER` / `TaskKind` 从 `OpencodePage`
+抽到共享模块，并新增 `speedScore()` / `groupByChannel()` / `stripChannel()`。
+⇒ WorkBuddy 与 OpenCode 两页的「免费判定 / 任务场景 / 排序」**从此完全一致**，不会再各自漂移。
+
+**② WorkBuddy 页「速度优先推荐」重构**（`WorkbuddyPage.tsx`）
+
+原先是对 591 个模型按名称特征排序后**只取前 8 个平铺成芯片** —— 既看不出归属渠道，
+也没有场景信息，且丢掉了另外 583 个模型的可读性。
+
+现改为：
+
+- **每渠道各取首选**（14 行）：`渠道 | 免费 x/total | 场景标签 | 首选模型 | 备选`
+  排序依据 `speedScore()`：**① 免费优先 ② 快速档 ③ 场景序 → 名称**；
+  自有 `opencode` 渠道置顶并标「自有 · 直连本机」。
+- **场景分布汇总条**：把「591 个模型」按任务场景展开（通用 300 / 推理 136 / 快速 129 / 视觉 12 / 代码 12 / 安全 2），
+  让大数字可读化。
+- 场景标签 hover 显示适用任务说明（与 OpenCode 页同一份 `TASK_META`）。
+
+**实测（591 模型 / 14 渠道）**
+
+| 渠道 | 免费 | 首选 |
+| --- | --- | --- |
+| `opencode`（自有） | 6/7 | `ling-3.0-flash-fin-free` |
+| `openrouter` | 22/375 | `inclusionai/ling-3.0-flash-fin:free` |
+| `orcarouter` | 4/122 | `deepseek/deepseek-v4-flash-free` |
+| `unorouter` | 11/23 | `deepseek-v4-flash:free` |
+| `stepfun*` / `xiaomi*` / `deepseek` / `agentrouter` 等 10 个 | 0 | 各自 flash 档（`step-3.5-flash`、`mimo-v2.6-flash`、`deepseek-v4-flash`…） |
+
+**验证方式**
+
+- `tsc --noEmit` **0 错误**（期间修掉一处：抽取后 `OpencodePage` 漏导入 `type TaskKind`）。
+- 抽取脚本用起止标记切片 + 双向断言（本地定义残留 = 0、引用数 > 0），一次通过。
+- 每渠道首选先用 Python 对**线上真实 591 个模型**做等价模拟复验，确认 4 个有免费的渠道
+  首选均为「免费 + 快速档」，其余渠道选到各自 flash 档，再落 TS。
+- 前端改动需重编 exe（`rust-embed` 在编译期嵌入 `dist/`），故 vite + cargo 双构建。
+
+---
+
+## 0.1.74 — 2026-09-22
+
+### 新增：OpenCode 网关免费模型「按渠道分组 + 按任务场景分类排序」
+
+**动机**（用户反馈）：43 个免费模型原先是**一堵平铺的芯片墙**，既没有分类也没有排序，
+无法判断「哪个模型干什么用」——这正是需求第三项「明确每个模型适用的任务场景」要解决的问题。
+
+**改动**（`src/pages/OpencodePage.tsx`）
+
+- 新增 `classifyTask()` 与 `TASK_META`：把模型按**任务场景**分为 6 类
+  （**快速** / **代码** / **视觉** / **推理** / **通用** / **安全**），每类带一句适用任务说明（悬停可见）。
+- 新增 `freeByChannel`：**先按渠道分组**（自有 `opencode` 渠道优先，其余按免费数降序），
+  **组内按任务场景排序**（快速 → 代码 → 视觉 → 推理 → 通用 → 安全），同类按名称。
+- 区块 UI 改为：顶部「按任务场景」汇总条（带计数）→ 下方按渠道分组的卡片，
+  每行 = 场景标签 + 模型名（已剥掉渠道前缀，hover 显示完整 id）。
+
+**🔴 实测踩到并修正的分类陷阱**
+
+`classifyTask` 最初对**完整 id**（`provider/model`）做匹配，而渠道名 **`opencode` 自带 "code"**，
+导致该渠道下**全部 6 个模型**被误判为「代码专用」（含 `nemotron-3-ultra`、`mimo-v2.6-flash`）。
+修正：**只对渠道之后的部分判定**。同时收紧了两个过宽规则：
+`/thinking/` 会误命中厂商名 `thinkingmachines` → 改为 `\breasoning\b|-reasoning|[-/]thinking`；
+规模档从 `\d{2,3}b` 收紧为 `\d{3,4}b`（否则 `gemma-4-31b` 会被当成推理模型）。
+
+**分类结果（实测 43 个免费模型）**
+
+| 场景 | 数量 | 代表 |
+| --- | --- | --- |
+| 快速 | 14 | `ling-3.0-flash-fin`、`nemotron-3.5-lightning`、`deepseek-v4-flash`、`glm-4.5-flash`、`inkling-small` |
+| 代码 | 1 | `cohere/north-mini-code` |
+| 视觉 | 1 | `inclusionai/ling-3.0-flash-vl` |
+| 推理 | 13 | `nemotron-3-ultra-550b`、`gpt-5.5`、`glm-5.2`、`deepseek-v4-pro`、`qwen3.5-397b` |
+| 通用 | 13 | `gemma-4-31b-it`、`minimax-m2.7`、`laguna-s-2.1`、`inkling` |
+| 安全 | 1 | `nemotron-3.5-content-safety` |
+
+渠道分布：`opencode` 6（自有·直连本机）、`openrouter` 22、`unorouter` 11、`orcarouter` 4。
+
+**验证方式**
+
+- `tsc --noEmit` **0 错误**。
+- 分类规则先用 Python 对**线上真实 43 个免费模型**做了等价模拟复验（修正前后各一次，
+  确认 `opencode` 组不再被误判为代码类），再落 TS 代码。
+- 部署后 OpenCode 页 `/opencode` 的「免费模型」区块应呈现 4 张渠道卡片 + 顶部场景汇总。
+
+---
+
+## 0.1.73 — 2026-09-22
+
+### 修复：WorkBuddy `modelCount = 594` 的口径误读 + 自引用 provider 过滤
+
+**背景**（用户质疑）：总览把 WorkBuddy 的模型数报成 **594**，与实际可用规模（预期 14）严重不符。
+
+**逐步核对结论（全部实测）**
+
+`modelCount` 取自 `gateway_overview::gateway_snapshot` 的 `simplified.len()`，
+而 `simplified` 来自 `workbuddy_proxy::models_payload()` —— 后者把
+**「每个已连接 provider × 该 provider 自身的 models」拍平成一份 `provider/model` 列表**：
+
+```
+594 = Σ(各 connected provider 的模型数)
+    = openrouter 375 + orcarouter 122 + unorouter 23
+      + stepfun-ai 9 + stepfun 8 + xiaomi-token-plan-{ams,cn,sgp} 各 8
+      + opencode 7 + xiaomi 6 + agentrouter 5 + stepfun-step-plan 5
+      + deepseek 4 + stepfun-ai-step-plan 3 + sylvia-qwen 3
+```
+
+**三层偏差原因**
+
+1. **范围界定过宽**：`openrouter`(375) + `orcarouter`(122) 两家聚合型目录就占了 **594 的 84%** ——
+   它们是"可路由到的第三方全量目录"，不等于"本机实际可用的模型"。
+2. **跨 provider 重复计数 129 条**：同一模型被多渠道提供会各计一次
+   （`step-3.x-flash` × 4 家 stepfun 变体、`mimo-v2.x` × 4 家 xiaomi 变体、`deepseek-v4-flash` × 3 家）。
+   去重后独立模型名 = **465**（594 − 129）。
+3. 🔴 **自引用回环（真隐患，非单纯计数问题）**：connected 里有
+   `sylvia-qwen → http://127.0.0.1:57890/qwen/v1`，即**网关把自己的 `/qwen/v1` 当成上游 provider**。
+   既虚增目录，又存在**请求环**风险（WorkBuddy 借道 OpenCode → 命中自身路由 → 若再回落 OpenCode 即成环）。
+
+**各口径对照（确认正确值）**
+
+| 口径 | 值 | 说明 |
+| --- | --- | --- |
+| **真实上游渠道数** | **14** | **= 用户预期的数字**（15 个 connected 减去 1 个自引用回环） |
+| connected provider 数 | 15 | 含自引用 |
+| 拍平 `provider/model` 条目（原 modelCount） | 594 | 每个都可寻址，但被聚合目录 + 跨家重复放大 |
+| 去重独立模型名 | 465 | 排除跨 provider 同名 |
+| 排除回环 + 去重 | 462 | 修复后的口径 |
+| 命中免费特征（`free`/`:0`） | 43 | 第三项「仅保留免费」的现有口径 |
+
+**改动**
+
+- `workbuddy_proxy::models_catalog()`：**过滤 baseURL 指向本机回环的 provider**
+  （新增 `is_loopback_url()` 辅助函数），消除自引用造成的虚增与潜在请求环。
+- `gateway_overview::gateway_snapshot()`：新增 **`providerCount`** 字段
+  （按 `owned_by` 去重的渠道数，通用适用于所有网关），向后兼容。
+- 前端：WorkBuddy 页与 OpenCode 页头的口径改为
+  **「N 个渠道 / M 个模型条目」**，并在模型目录旁注明
+  「条目数 = Σ(各渠道模型数)，同一模型被多渠道提供会各计一次」。
+
+**验证方式**
+
+- `tsc --noEmit` **0 错误**；`cargo check -p wb-switch-core -p wb-switch-server` **0 错误**。
+- 部署后：`/api/workbuddy-proxy/models` 的 provider 数应为 **14**（`sylvia-qwen` 消失）；
+  `/api/gateways/overview` 中 workbuddy 的 `providerCount=14`、`modelCount=591`。
+- 其余网关的 `modelCount` 与行为不受影响（仅多一个只读字段）。
+
+---
+
+## 0.1.72 — 2026-09-22
+
+### 重构（增量 1/4）：TRAE / WorkBuddy / OpenCode 三网关拆分
+
+原先把 TRAE 与 WorkBuddy 塞在一个页面（`TraeWorkbuddyProxyPage`，6 个 section）。本版按
+**上游来源**拆成三个相互独立的网关，各自有独立导航项、独立页面、独立密钥与职责边界。
+
+**模块划分（前端）**
+
+| 旧 | 新 | 页面 | 导航 label |
+| --- | --- | --- | --- |
+| `TraeWorkbuddyProxyPage`（合并页，**已删除**） | `TraeWorkCnPage` | `/trae-work-cn` | TRAE Work CN |
+| 〃 | `WorkbuddyPage` | `/workbuddy` | WorkBuddy |
+| —（原先只是 WorkBuddy 的传输层） | `OpencodePage`（**新建**） | `/opencode` | OpenCode |
+
+- `gateway-registry.ts`：`trae-workbuddy` 一条 → `trae-work-cn` / `workbuddy` / `opencode` 三条
+  （图标改用 `Blocks` / `Cpu` / `Terminal`）。
+- `App.tsx`：三条新路由 + **旧路径 `/trae-workbuddy` 重定向到 `/trae-work-cn`**（防书签 404）。
+
+**模块划分（后端注册表）** —— `gateway_overview.rs`
+
+- `GATEWAYS` 增 `trae-work-cn`（base `/trae/v1`）与 `workbuddy`（base `/workbuddy/v1`）。
+- `fetch_models` 增两臂：`trae-work-cn → trae_proxy::models_payload()`、
+  `workbuddy → workbuddy_proxy::models_payload()`（Result，失败回落空表）。
+- `fetch_accounts` 增两臂：`trae-work-cn → trae_accounts::list_for_display()`；
+  `workbuddy → 空表`（**它没有自有账号池**——其"账号"= 借道 OpenCode server 的已鉴权 provider 清单，
+  保活对象是 server 进程本身）。
+- ⚠️ OpenCode 的注册表条目留待增量 3（独立模块未建，不提前登记以免对外宣称不存在的 base）。
+
+**第一项的「账号迁移」——实况澄清与落地口径**
+
+- 🔴 **TRAE 账号数据本来就不在 GLM 代理里**：`glm_proxy.rs` 提及 `trae` = **0 行**；
+  账号独立存于 `~/.wb-switch/trae_accounts.json`，由 `trae_accounts.rs` 与 `/api/trae/*` 管辖。
+- 真正寄居在 GLM 页的是**前端 UI**：`GlmProxyPage.tsx` 曾有约 30 处 TRAE 代码（含 `TRAE Work CN 账号池` 区块），
+  且同一账号池**同时**被合并页渲染（重复）。故本次「迁移」= **只搬 UI**：
+  - `GlmProxyPage.tsx` 移除 TRAE 区块（JSX 83 行 + 5 个 `trae*` state + 5 个 trae 函数 + useEffect 调用 + 2 个类型导入）；
+  - TRAE 账号池 UI 迁入 `TraeWorkCnPage`。
+- **迁移后账号归属**：`trae_accounts.json` 与 `/api/trae/*` **一字未改**，账号始终属于 **TRAE Work CN 网关**；
+  迁移只改变"在哪里被看到"，不改变"归谁所有"。GLM 代理池（`autoclaw_accounts.json`）与 TRAE 池
+  **本来就是两套文件、两套凭据**，不存在跨池数据搬迁。
+
+**本次未做（后续增量）**
+
+- 增量 2：TRAE 六项能力深化（rate 驱动的「速度优先推荐」「场景选型参考」已落页面；保护/扣分策略深化待接）。
+- 增量 3：OpenCode 独立模块 + `/opencode/v1/*` 端点 + 免费白名单（当前页为"清单 + 状态"，已标注端点待建）。
+- 增量 4：WorkBuddy **直连优先 + OpenCode 兜底**（直连协议待探测；页面已把通道态显式标为
+  `opencode-fallback`，并预留 `channel === "direct"` 分支）。
+
+**验证方式**
+
+- `tsc --noEmit` **0 错误**；`vite build` 成功（19.9s，dist 已刷新）。
+- `cargo check -p wb-switch-core -p wb-switch-server` **0 错误**。
+- 残留检查：`GlmProxyPage.tsx` 提及 trae = **0 处**；旧合并页文件已删除。
+- 部署后：`/api/gateways/overview` 的 ids 应含 `trae-work-cn` 与 `workbuddy`。
+
+---
+
+## 0.1.71 — 2026-09-20
+
+### 修复：下线路由的残留路径被 SPA 兜底伪装成 200 HTML（0.1.70 的收尾）
+
+**现象**（0.1.70 部署后实测）：`/qwen3.8-flash/v1/models` 与 `.../chat/completions` 返回
+**HTTP 200 + `text/html`（index.html）** —— 比原来的 502 更糟：客户端会当成"成功"并解析到垃圾。
+
+**根因**：路由删掉后该路径成为未知路径，落进 `static_handler` 的 SPA 兜底。
+兜底前的守卫 `is_api_namespace()` 的 `WITH_SUB` 白名单里**只有 `qwen`**，
+而它要求「前缀后紧跟 `/`」——`/qwen3.8-flash/...` 的第 5 个字符是 `3` 而非 `/`，
+**`qwen` 覆盖不到 `qwen3.8-flash`**（与 `qwen` 覆盖不到 `qwen-flash` 是同一个坑）。
+
+**修复**：`is_api_namespace()` 的 `WITH_SUB` 增加 `"qwen3.8-flash"`（数组 7 → 8），
+并补注释说明「该路由已于 0.1.70 下线，登记是为了让残留路径返回 404 而非 200 HTML」。
+
+**验证方式**：部署后 `/qwen3.8-flash/v1/models`、`/qwen3.8-flash/v1/chat/completions`
+应返回 **404 JSON**；`/qwen-flash/v1/*`、`/qwen/v1/*`、`/qoder/v1/*` 等**不受影响**（仍在白名单内）。
+
+---
+
+## 0.1.70 — 2026-09-20
+
+### 回退：下线 `/qwen3.8-flash/v1` 路由（协议不可行，避免"永远 502"的入口）
+
+承接 0.1.69 —— 该路由经实测**确认协议层面不可行**（QoderWork CN 不暴露 OpenAI 兼容推理端点，
+其 device token 对 `api2-v2.qoder.sh` 推理端点返回 **401 unauthorized**；详见 0.1.69 追加节）。
+保留一个长期 502 的入口会误导客户端与后续排查，故**下线**。
+
+**删除**
+
+| 文件 | 删除内容 |
+| --- | --- |
+| `api.rs` | 路由 `POST /qwen3.8-flash/v1/chat/completions`、`GET /qwen3.8-flash/v1/models`；handler `api_qwen38_flash_models`、`api_qwen38_flash_chat_completions`；`is_logged_path` 前缀 `"/qwen3.8-flash/"` |
+| `gateway_overview.rs` | `GATEWAYS` 的 `qwen3.8-flash` 条目；`fetch_models` / `fetch_accounts` 两条 match 臂 |
+| `qoder.rs` | `routable_accounts_for` 的 `"qwen3.8-flash"` 分支；`pool_label` 条目；`qwen38_flash_chat_completions_unified()`、`qwen38_flash_models_payload()` |
+
+**保留（有意）**
+
+- `read_local_credential_work_cn()` / `import_local_work_cn()` / `qoderwork_cn_user_data_dir()` /
+  `iso_to_ms()` / `QODERWORK_CN_ENDPOINT` —— **导入器与凭据读取器保留**，
+  账号继续以"备份"形式存在（其 `gateway = "qwen3.8-flash"` 池标此时**无任何路由消费**，
+  即不会再被任何池取到）。
+- `POST /api/qoder/accounts/import-work-cn` 导入端点保留。
+- **per-account `endpoint` 接线保留**（通用能力，向后兼容：无该字段的账号行为不变）。
+- `resolve_qoder_model()` 与 `qoder::models_payload()` 里既有的 `qwen3.8-flash` **模型别名**保留
+  （那是 `/qwen-flash`、`/qwen` 的档位映射，与本路由无关）。
+
+**影响范围**：纯删除 + 无行为变更残留。账号池文件 `~/.wb-switch/qoder_accounts.json`
+**未改动**（账号与新鲜凭据都在）。
+
+**验证方式**
+
+- `cargo check -p wb-switch-core -p wb-switch-server` **0 错误**（残留检查：`qwen38_flash`=0 处）。
+- 部署后：`/qwen3.8-flash/v1/models` 与 `/chat/completions` 应返回 **404 JSON**（不再是 502）；
+  `/api/gateways/overview` 不再含 `qwen3.8-flash`；
+  `/qwen/v1`(7) / `/qwen-flash/v1`(1) / `/qoder/v1`(8) / `/glmweb/v1`(23) 无回归；
+  `POST /api/qoder/accounts/import-work-cn` 仍可用。
+
+---
+
+## 0.1.69 — 2026-09-20
+
+### 新增：`/qwen3.8-flash/v1` 路由 + per-account `endpoint` 接线（第 3 步）
+
+承接 0.1.68（导入 + 池标），本版把它**接通**：账号导入后即可正常调用。
+
+**改动**
+
+- 🔴 `qoder.rs::try_chat_for_account`：**per-account `endpoint` 接线** ——
+  上游主机优先取账号的 `endpoint` 字段，缺失时回落 `CHAT_HOST`（`.sh`）：
+  ```rust
+  let host = account.get("endpoint").and_then(Value::as_str)
+      .filter(|s| !s.is_empty()).unwrap_or(CHAT_HOST);
+  .post(format!("{host}/model/v1/chat/completions"))
+  ```
+  ⇒ **向后兼容**：无该字段的账号（默认池 / `qwen` / `qwen-flash`）行为**一字不变**。
+- `qoder.rs` 新增 `qwen38_flash_chat_completions_unified()`（pin `qwen3.8-flash`，
+  池 = `qwen3.8-flash`）与 `qwen38_flash_models_payload()`（单一模型）。
+- `api.rs`：注册 `POST /qwen3.8-flash/v1/chat/completions`、`GET /qwen3.8-flash/v1/models`
+  + 两个 handler（与 `/qwen-flash` 同结构：鉴权 → 日志 → `qoder_repaired_sse_body` 修复）；
+  `is_logged_path` 前缀白名单补 **`"/qwen3.8-flash/"`**
+  （⚠️ `/qwen/` 匹配不到 `/qwen3.8-flash/`，漏了就没有访问日志）。
+- `gateway_overview.rs`：`GATEWAYS` 增 `qwen3.8-flash` 条目（名 `Qwen3.8-Flash (WCN)`，
+  base `/qwen3.8-flash/v1`）；`fetch_models` / `fetch_accounts` 各加一条 match 臂
+  （账号视图**只显示打 `gateway == "qwen3.8-flash"` 标的账号**，与其它池完全隔离）。
+
+**分离效果（= 池标 + 独立游标）**
+
+| 维度 | `qwen3.8-flash` 池 | 其它池 |
+| --- | --- | --- |
+| 池成员 | 仅 `gateway == "qwen3.8-flash"` + 本机 QoderWork CN 登录态 | 各自标的账号 |
+| 轮转游标 | `next_pool_index("qwen3.8-flash")` **独立** | 各自独立 |
+| 兜底池 | **无**（保持严格隔离，不借其它池额度） | `qwen-flash→qoder` 等 |
+| 上游主机 | 账号自带 `endpoint`（`gateway.qoder.com.cn`） | `api2-v2.qoder.sh` |
+
+**影响范围**：新增路由与注册表条目；唯一触及既有路径的是 `try_chat_for_account` 的
+host 选择（默认值不变，故既有路由零行为变化）。
+
+**验证方式**
+
+- `cargo check -p wb-switch-core -p wb-switch-server` **0 错误**（构建前）。
+- 部署后实测（2026-09-20 15:09，0.1.69 / 停机 1.0s）：
+  - ✅ `GET /qwen3.8-flash/v1/models` → **1 个模型**（`qwen3.8-flash`）
+  - ✅ `/api/gateways/overview` → ids 已含 `qwen3.8-flash`
+  - ✅ 回归：`/qwen/v1`=7、`/qwen-flash/v1`=1、`/qoder/v1`=8、`/glmweb/v1`=23 全部 200
+  - ✅ 账号池：导入账号带 `gateway="qwen3.8-flash"` / `endpoint=`CN 网关，**与其它池隔离**（分离生效）
+  - ❌ **对话未通**：`POST /qwen3.8-flash/v1/chat/completions` → **502**
+    `[qwen3.8-flash] Qoder refresh 失败（400 Bad Request）`
+
+**🔴 未通过项根因（实测取证，留给下一步）**
+
+1. 刷新走错端点：现有 `refresh_token()` 固定打 `.sh` 的 `/api/v1/jobToken/refresh`；
+   而 **QoderWork CN 的刷新是 `POST /api/v1/deviceToken/refresh`**，body 同为
+   `{"refresh_token": …}`，但响应字段是 **`device_token`**（代码见其 `app.asar`：
+   `auth.refreshDeviceToken`）。故 CN 账号拿到 400。
+2. **通话路径不是 `model/v1/chat/completions`**：在 `E:\QoderWork CN\resources\app.asar`
+   （164 MB）全文检索 `model/v1` / `/completions`，**只匹配到
+   `https://api.openai.com/v1/chat/completions`（自定义 endpoint 默认值）**，
+   没有任何 CN 自身的 chat 路径；其 API 面是 `/api/v1/userinfo`、`/api/v1/deviceToken/refresh`、
+   `/api/v1/jobToken/exchange`（PAT 换 token）、`/api/v1/qcs/*`、`/api/v1/remote*`、`/algo/api/v1/ping`。
+   ⇒ **QoderWork CN 与 Qoder/QoderCN IDE 是两套不同的后端协议**，其模型调用很可能走
+   `remote` / QCS 体系而非 OpenAI 兼容 chat 端点。当前实现（照搬 IDE 的 chat 路径）**先天不适用**。
+
+**结论**：本版的「路由 + 池分离 + 端点接线」已就位且向后兼容；**QoderWork CN 的对话协议需要单独逆向**
+（下一步工作，非本版可完成）。
+
+### 追加：CN 对话协议逆向结论（2026-09-20 16:30–16:45，**判定为协议不可行**）
+
+在 `E:\QoderWork CN\resources\app.asar`（164 MB）上做字节级逆向 + 端点实证，得到**主机常量表**：
+
+```js
+OPENAPI_DOMAIN      = "openapi.qoder.com.cn"    // CN openapi
+IM_GATEWAY_DOMAIN   = "openapi.qoder.sh"        // IM 仍走 .sh
+CENTER_API_DOMAIN   = "gateway.qoder.com.cn"
+INFER_DOMAIN_US/SG/JP = "gateway.qoder.com.cn"  // 声明为推理域
+GATEWAY_HEALTH_PATH = "/algo/api/v1/ping"
+DEFAULT_MODEL_KEY   = "auto"
+```
+
+**端点实证（新 refresh 出的 dt-）**：
+
+| 主机 + 路径 | 结果 |
+| --- | --- |
+| `openapi.qoder.com.cn/api/v1/userinfo` | ✅ **200** |
+| `openapi.qoder.com.cn/api/v1/deviceToken/refresh` | ✅ **200** → `{device_token, refresh_token, expires_at}` |
+| `gateway.qoder.com.cn/api/v1/deviceToken/refresh` | 503（ALB 无此路由） |
+| `api2-v2.qoder.sh/model/v1/chat/completions`（IDE 的推理端点） | 🔴 **401 `{"error":"unauthorized"}`** —— **该 token 无推理权限** |
+| `gateway/openapi.qoder.com.cn/model/v1/chat/completions` | 503（ALB 无此路由） |
+| `/algo/api/v1/{models,chat/completions,completions,…}` | 404 JSON（路由不存在） |
+
+- `app.asar` 全文：`api2-v2` 出现 **0** 次、`model/v1` 出现 **0** 次 → **CN 客户端根本不用该推理端点**；
+  其 API 面为 `/api/v1/{userinfo,deviceToken/*,jobToken/exchange,qcs/*,remote/*,notebooks,graphql}`。
+- ⇒ **QoderWork CN 是 agent 平台架构**（notebooks + remote environments），
+  **不向客户端暴露 OpenAI 兼容的模型推理端点**；其 device token 仅供 CN openapi（账号/中心服务）使用。
+  **结论：无法用它的账号做 qwen3.8-flash 反代**（协议层面不成立，非实现问题）。
+
+**🔴 期间发现的正确 CN 刷新协议（已可用于账号续期）**
+
+- `POST {openapi.qoder.com.cn}/api/v1/deviceToken/refresh`，body `{"refresh_token": "<drt-…>"}`；
+  响应取 **`device_token`**（不是 `token`）+ 新 `refresh_token` + `expires_at`/`refresh_token_expires_at`。
+- ⚠️ **副作用与修复**：该接口**轮换 refresh_token**，探测过程中旧 drt- 已失效 →
+  已用新脚本 `tools/fixup_qoderwork_tokens.py` 把新凭据**加密写回 `auth-v2.dat`（含备份）**
+  并同步到 `~/.wb-switch/qoder_accounts.json`，读回校验一致 + `userinfo` 200（**客户端登录态已恢复**）。
+
+**环境提示**：本机所有 `*.qoder.*` 域名都解析到 **198.18.0.x（保留段）= fake-IP 代理**，
+故部分 SSL EOF/503 可能是代理侧表现；判定结论只以「401 unauthorized」（真实上游响应）为准。
+
+**新增脚本**：`tools/fixup_qoderwork_tokens.py`（刷新 + 回写 auth-v2.dat + 同步账号池，支持 `--dry-run`）。
+
+### 🟡 侧栏导航溢出遮挡修复：底部主题卡片盖住「设置」等项，点击命中卡片「完全没反应」
+
+**症状**（用户截图实测复现）：「模型网关」折叠组展开后，侧栏内容总高（实测 510px）超出导航区高度
+（412px）——底部固定区（主题切换卡片 / 版本底栏）按层叠顺序绘制在**溢出的导航项之上**：
+「设置」被完全盖住（看不见、点不到），最后一个网关项（TRAE/WB 模型）也会随窗口高度被部分压住；
+点击该区域时命中卡片而非目标项 → 表现为「点击后完全没有反应」。
+
+**根因**：`App.tsx` 的 `nav` 是 `flex-1 min-h-0` 但 **`overflow: visible`**，折叠组展开后内容
+**向下溢出**到同为 flex 子项的底部固定区下方（后者绘制在后、盖住前者），形成
+「看得见的区域 ≠ 可点的区域」错位。
+
+**修复**（纯布局 + 光标恢复，不改任何交互语义）：
+- `nav` 加 `overflow-y-auto overscroll-contain` → 超高内容**在导航区内部滚动**，不再溢出被盖；
+- 底部固定区加 `shrink-0`，主题卡片与版本底栏不被压缩；
+- `index.css` 恢复 `button:not(:disabled) / [role="button"]:not(:disabled) { cursor: pointer }`
+  —— Tailwind v4 preflight 把 button 光标重置为默认箭头（v3 曾是手型），此前全站按钮悬停
+  无「可点击」提示；
+- `gateway-nav-group.tsx`：`useState` 改惰性初始化（消除每渲染一次的多余 localStorage 读）。
+
+**影响范围**：折叠组「展开/收起、localStorage 记忆、网关页自动展开」等行为**语义零变化**；
+仅有 `nav` 出现滚动条与按钮光标变化两个视觉层差异。
+
+**验证方式**（CDP 驱动 Edge 同引擎同尺寸，本地 dist + 部署后线上双验）：
+- 展开态：`nav.scrollHeight(510) > clientHeight(412)` 且 `overflow-y:auto`；「设置」可滚动至
+  可见，`elementFromPoint` 命中自身（修复前命中主题卡片），真实鼠标点击 → 成功导航 `/settings`；
+- 头部逐子区域点击（左缘/图标/文字/计数/箭头）× 高度 [780/650/560/480] × 存取状态
+  （无值 / 1 / 0 / 网关页）展开收起全部可切换；
+- 反向对照（修复前）：同场景设置命中元素为主题卡片（`topIsSettings=false`）。
+- **部署后实测（2026-09-20 15:20，0.1.69 / 停机 0.9s）**：线上入口已切 `index-CEAx7Cwl.js`；
+  展开态 `nav` 出滚动条、「设置」滚动可见 → 真实鼠标点击 → 成功导航 `/settings`；
+  高度 [780/650/560/480] 展开/收起全过；`/api/gateways/overview` 8 网关全健康、
+  `/api/version` 与 `/api/status` 版本一致。
+
+---
+
+## 0.1.68 — 2026-09-20
+
+### 新增：QoderWork CN 账号导入（独立池）+ per-account `endpoint` 支持
+
+**背景**：`QoderWork CN`（`%APPDATA%\QoderWork CN`）是**独立 Electron 应用**，不是 VS Code fork ——
+它**没有** `User\globalStorage\state.vscdb`，因此既有的 `import_local_cn()`
+（读 `%APPDATA%\QoderCN\User\globalStorage\state.vscdb`）**覆盖不到它**。
+
+**改动**
+
+- `qoder.rs` 新增 `qoderwork_cn_user_data_dir()`：`%APPDATA%\QoderWork CN`。
+- `qoder.rs` 新增 `read_local_credential_work_cn()`：解密其登录态。
+  - 凭据在**同目录**的 `auth-v2.dat`（schemaVersion=2，优先）/ `auth.dat`（旧占位版，回退）；
+  - 格式与 Qoder 同源：`Chromium safeStorage v10` = `DPAPI(Local State 的
+    os_crypt.encrypted_key)` → master key → `AES-256-GCM(nonce=blob[3..15], ct=blob[15..])`；
+    复用既有原语 `vscode_cn_inject::{dpapi_decrypt, decrypt_windows_gcm_v10}`，**无新依赖**。
+  - 🔴 与 Qoder 的差异：Qoder 的 `Local State` 在 `User` 的**父目录**，QoderWork CN 在**同目录**。
+  - 字段映射：`uid←user.id`、`name←user.name`、`accessToken←token`、`refreshToken←refreshToken`、
+    `expireTime←expiresAt`(ISO8601→ms，新增 `iso_to_ms`)、`userTag←user.tier`、`source="qoderworkcn-local"`。
+- `qoder.rs` 新增 `import_local_work_cn()`：**打 `gateway = "qwen3.8-flash"` 独立池标**
+  （= 分离效果：池成员隔离 + 轮转游标独立，`next_pool_index` 按 gateway 分别记）、`region = "cn"`，
+  并写入 **per-account `endpoint`**：
+  - 🔴 实测依据：同一 `dt-` 在 `openapi.qoder.sh/api/v1/userinfo` → **401 TOKEN_EXPIRE**，
+    在 **`gateway.qoder.com.cn/api/v1/userinfo` → 200**。该主机取自其
+    `data\region-cache.json` 的 `endpoint` 字段 → 常量 `QODERWORK_CN_ENDPOINT`。
+- `routable_accounts_for()` 新增 `"qwen3.8-flash"` 分支：本机 QoderWork CN 登录态优先 +
+  打该池标的账号，跳过 `isQuotaExceeded` 账号（与 `qwen-flash` 池同规则）。
+- `pool_label()` 新增 `"qwen3.8-flash" => "Qwen3.8-Flash(WCN)"`。
+- `api.rs` 新增 `POST /api/qoder/accounts/import-work-cn`（幂等）。
+
+**影响范围**
+
+- 纯新增：新目录读取器 + 新导入端点 + 新池分支；**未改动** `/qoder/v1`、`/qwen/v1`、
+  `/qwen-flash/v1` 的既有行为（`pool_gateway` 对其余取值仍是恒等映射）。
+- ⚠️ **本版尚未接线**：per-account `endpoint` 已落盘，但**请求侧仍走 `CHAT_HOST`（.sh）**；
+  新路由 `/qwen3.8-flash/v1` 也尚未注册 —— 这两项属下一步。
+
+**验证方式**
+
+- `cargo check -p wb-switch-core -p wb-switch-server` **0 错误**。
+- 凭据解密用独立探针 `tools/probe_qoderwork_auth.py` 预先验证成功（DPAPI + AES-GCM），
+  解出 `dt-`/`drt-`/`user.{id,name,tier}`，并以 `userinfo` 200 证明凭据对该网关可用。
+- 导入端到端：`POST /api/qoder/accounts/import-work-cn` → 账号落盘且带
+  `gateway="qwen3.8-flash"` / `region="cn"` / `endpoint=gateway.qoder.com.cn`。
+
+---
+
+## 0.1.67 — 2026-09-18
+
+### 🔴 严重修复：`repair_gbk_mojibake()` 自己制造乱码 —— 1920 个汉字被改坏（含 682 个常用字）
+
+**症状**：流式回答首字符乱码，100% 可复现 ——「一、二、三！」被下发成「һ、二、三！」。
+
+**根因（不是上游，是我们自己）**：0.1.60 引入的 GBK 误码修复函数判据错误。
+原注释称「干净文本（GBK 字节不是合法 UTF-8）零误伤」—— **该假设不成立**：
+大量**合法汉字**的 GBK 双字节恰好构成合法 UTF-8，于是函数把它们当成乱码「修」坏了。
+以「一」为例：GBK 编码 → 字节 `D2 BB` → 而 `D2 BB` 恰是合法 UTF-8（= U+04BB `һ`）
+→ 函数把 `一` 改写成 `һ`。
+
+**实测规模**：扫描 U+4E00–U+9FA5 得 **1920 个汉字会被误修，其中 682 个是 GB2312 一级常用字**
+（`一`→`һ`、`为`→`Ϊ`、`业`→`ҵ`、`专`→`ר`、`位`→`λ`；双字串 `为之`→`Ϊ֮`）。
+**为何流式必现、非流式侥幸**：非流式对**整串**修复，串一长必然混入非法字节而 `break` 跳过；
+流式 `repair_qoder_sse_line` 是**逐帧累积**修复，`raw` 收敛到**单字**时即命中，
+故首个 token 就是常见字时必坏。**该缺陷同时影响 `/qwen/v1`、`/qoder/v1` 等全部 qoder 系路由。**
+
+**修复**：新增指纹校验 `fix_is_trustworthy()` —— 误修的产物**必然落在 `U+0080..=U+07FF`**：
+一个合法汉字能同时通过 `had_errors=false` 与 `from_utf8=Ok` 两道校验，
+唯一原因就是其 GBK 双字节恰好是一个合法 **2 字节 UTF-8** 序列，而 2 字节 UTF-8
+的码点范围恰是 `U+0080..=U+07FF`（拉丁扩展/希腊/西里尔/希伯来…），**永远不可能是汉字**。
+真乱码修复得到的却是正常文本（汉字/ASCII/全角），落不到该区间 → 精准放行。
+⚠️ 取舍：若上游把含该区间字符的**原文**弄乱码，此处会拒绝修复（宁留乱码不造新乱码）。
+
+**影响范围**：`repair_gbk_mojibake()` 是两条路径的**公共实现**（非流式聚合 + 流式逐帧），
+故一处修复两条路径同时痊愈；不改变任何路由语义与鉴权行为。
+
+**验证方式**：
+- 新增单测 `repair_never_corrupts_legitimate_cjk`（14 个高频常用字 + 6 条多字串必须原样返回）、
+  `fix_is_rejected_when_it_lands_in_latin_greek_cyrillic_range`；
+  **既有两条真乱码用例仍须通过**（`浣犲ソ鍛€`→`你好呀`、`濂界殑`→`好的`）。
+- 端到端：`repro-mojibake.py` 复现率应 12/16 → **0/16**；`一、二、三！` 首字符为 U+4E00。
+
+---
+
+## 0.1.66 — 2026-09-18
+
+### 修复：新网关路由未登记进 `is_api_namespace()` → 未知子路径落 SPA 兜底返回 200 HTML
+
+`/qwen-flash/v1/nonexistent` 实测**未返回 404**，而是被 SPA 兜底接走。根因：
+`api.rs::is_api_namespace()` 的 `WITH_SUB` 白名单只有 `api/v1/kimi/grok/qoder` ——
+**新路由没登记**，且 **`qwen` 本来也漏着**（既有缺陷，同一类问题）。
+
+**修复**：`WITH_SUB` 扩为 `[api, v1, kimi, grok, qoder, qwen, qwen-flash]`，并在原处留注释
+「新增网关路由必须在此登记」。安全性已验证：判定要求前缀后紧跟 `/`，
+而**前端并无 `/qwen` 或 `/qwen-flash` 路由**（Qwen 复用 `/qoder` 页面，见 `src/App.tsx`），
+故不会把页面误伤成 404。
+
+**影响范围**：仅影响「未注册路径」的响应形态（HTML 200 → 404 JSON），
+正常请求路径与鉴权行为不变；顺带修好 `/qwen/` 的同一缺口。
+
+**验证方式**：`GET /qwen-flash/v1/nonexistent` → **404 JSON**（`{"ok":false,"code":"not_found"}`）；
+`/qwen/v1`、`/qoder/v1`、`/qwen-flash/v1` 正常请求无回归。
+
+---
+
+## 0.1.65 — 2026-09-18
+
+### 修正：`/qwen-flash/v1` 的 `capabilities` 声明按实测收敛为 `["text"]`
+
+0.1.64 上线后做了**端到端能力审计**（含对照实验，见下），发现原先声明的
+`["text","reasoning","tools"]` 有 **2 项不实**，属乐观声明，已改正并加单测锁死。
+
+**实测能力矩阵**（`/qwen-flash/v1` 对照 `/qwen/v1`，2026-09-18 22:45 前后）：
+
+| 能力 | 结果 | 判定依据 |
+| --- | --- | --- |
+| 文本对话 | ✅ 可用 | 非流式 1.2s 正常出正文 |
+| 流式 | ✅ 稳定 | 4/4 成功，首字节 **0.08~0.37s**，无 `event: error`、无 U+FFFD |
+| `tools` | ❌ **不可用** | **带 `tools` 字段上游直接返回空正文**；同 prompt 不带 tools 正常出正文。lite 档不解析 tools；pro/max 档本账号零额度（无 tools 也空）。`/qwen/v1`、`/qoder/v1` 表现**完全一致** |
+| 多模态图片 | ❌ 不可用 | 图文混排 content 数组可透传，但模型回复「无法看到图片」 |
+| 独立 reasoning 流 | ❌ 无 | `reasoning_content` 恒为空（思考混在正文）；`reasoning_effort` 可传不报错，但无独立流可透传 |
+
+→ `capabilities` 改为 `["text"]`，`description` 同步注明；新增单测
+`qwen_flash_capabilities_stay_honest` 断言「未实测通过的能力不得写入」，防止回归。
+
+**⚠️ 同批发现的既有缺陷（本次未修，需单独决策）**：流式正文首字符乱码。
+上游把「一」按 **GBK** 发出（原始字节 `d2 bb`），而该字节对恰好是合法 UTF-8
+（解成 U+04BB `һ`），故严格解码不报错、`repair_gbk_mojibake` 也修不了
+（U+04BB 无法 GBK 编码 → 原样返回）。**`/qwen/v1` 的原始字节完全相同**，
+说明是 qoder 系路由共性、非本路由引入。根治需在**字节层**做修复
+（对可疑 2 字节序列按 GBK 重解），会影响全部 qoder 系路由，故留待确认。
+
+**验证方式**：`cargo test --release -p wb-switch-core --lib`（新增用例通过）；
+`verify-qwen-flash.py` + `forensic-qwen-flash.py` + `forensic-tools-tier.py` +
+`forensic-multimodal.py`（仓库根，可复跑）。
+
+---
+
+## 0.1.64 — 2026-09-18
+
+> 本版由**两个会话的改动同批上线**：① 并行会话的 AutoClaw 账号 `region`
+> 字段迁移（`autoclaw_accounts.rs` / `platform_checkin.rs` / `glm_proxy.rs`，
+> 按 region 区分国际版与国内版账号并分别执行签到）；② 本节的
+> `/qwen-flash/v1` 专用路由。两者共用一个版本号。
+
+### 新增：`/qwen-flash/v1` —— Qwen3.8-Flash 专用路由（从 Qoder 获取模型服务）
+
+**动机**：需要一条**语义单一**的 Qwen3.8-Flash 通路，与 `/qwen/v1`（模型名映射壳，兼跑
+max/pro/flash）解耦，便于独立观测与调优。
+
+**改动**：
+- `qoder.rs` 新增 `pool_gateway()` 归一映射：`qwen-flash` → 复用 **Qoder 默认池**
+  （本机实时登录态 + 未打 `gateway` 标的账号），但轮转游标仍按**原始** gateway 记
+  （`next_pool_index`）—— 两条路由取号互不推进，各自均匀、池成员相同。
+- `qoder.rs` 新增 `qwen_flash_chat_completions_unified()`：**强制 pin** `model=qwen3.8-flash`
+  （上游 `lite`）。**依据**：实测 Free 档 max/pro 额度为 0（上游 code 116 `quota exceeded`），
+  放行只会把请求送进必然失败的档位、徒增 502；该路由语义即「Flash 专用」。
+- `qoder.rs` 新增 `qwen_flash_models_payload()`：`/qwen-flash/v1/models` 只暴露单一模型，
+  不列 max/pro，避免下游客户端误选到零额度档位。
+- `api.rs`：注册 `POST /qwen-flash/v1/chat/completions` 与 `GET /qwen-flash/v1/models`；
+  `is_logged_path` 前缀白名单补 `"/qwen-flash/"`（**`/qwen/` 匹配不到 `/qwen-flash/`**，漏了就没有访问日志）。
+- `gateway_overview.rs`：`GATEWAYS` 增加 `qwen-flash` 条目，`fetch_models` / `fetch_accounts`
+  各加一条 match 臂（账号视图复用 `qoder::list_for_display()`，因池是同一个）。
+
+**透传不变**：`tools` / `reasoning_effort` / 多模态 content 数组 / `stream_options` 全部原样透传上游，
+不做裁剪；GBK 误码修复与 SSE 流修复复用既有 `qoder_repaired_sse_body()`。
+
+**影响范围**：纯新增路由，未改动 `/qoder/v1`、`/qwen/v1` 的既有行为（`pool_gateway` 对 `qwen`/`qoder`
+是恒等映射，已由单测锁住）。
+
+**验证方式**：
+- 单测 `cargo test --release -p wb-switch-core --lib`：`qwen_flash_reuses_qoder_pool_only`、
+  `pool_labels_are_distinct`、`qwen_flash_pins_to_lite_tier`。
+- 端到端：`GET /qwen-flash/v1/models` 只回 1 个模型；`POST /qwen-flash/v1/chat/completions`
+  流式返回正文、`/api/gateway/overview` 出现 `qwen-flash` 条目、原 `/qwen/v1` 与 `/qoder/v1` 无回归。
+
+**⚠️ 一并说明（未改代码）**：实测 `api2-v2.qoder.com.cn` = **NXDOMAIN**（阿里 DoH Status=3），即 **Qoder 没有独立的 CN 推理端点**；`openapi.qoder.com.cn` 与 `openapi.qoder.sh` 为同一后端双域名
+（同路径返回逐字节一致），**CN 侧推理端点也是 `api2-v2.qoder.sh`**。
+故本路由的「Qoder 来源」= 官方 Qoder 上游，无需也无法配置 CN 专属上游地址。
+`docs/qoder-protocol-research.md` 中「国内为 .com.cn」那句仅对 openapi 成立。
+
+---
+
+### 部署记录（2026-09-18 22:26，0.1.64 上线）
+
+- **树的编译阻塞已修复**：本次构建时 `wb-switch-core` 有 **7 个编译错误**，导致 0.1.64 无法产出。
+  全部集中在同期并入的「账号 region 字段迁移」改动（无独立 CHANGELOG 条目），已一次性修好：
+  - `autoclaw_accounts.rs` ×5：`serde_json::Value` 上误用 `.contains_key(k)` → 改为 `.get(k).is_none()`
+    （139 / 168 / 171 / 174 / 905 行）；
+  - `autoclaw_accounts.rs:916`：`log::info!` → `eprintln!`（**`log` 并非本 crate 依赖**，该 crate 约定用
+    `println!/eprintln!`，实测 23:23 次）；
+  - `platform_checkin.rs:768`：`all_accounts.into_iter()` 先消费掉了变量、779 行再次使用 →
+    首个改为 `all_accounts.clone().into_iter()`（**保持原语义**，仅消除移动冲突）。
+  - 影响范围：仅上述两文件的迁移/签到路径；不改变行为语义（`contains_key`→`get().is_none()` 等价）。
+  - 验证：`cargo check -p wb-switch-core -p wb-switch-server` **0 错误** → `cargo build --release` 成功。
+- **部署方式**：`deploy.py`（零停机），停机 **1.0s**，`version asserted after restart: 0.1.64`，
+  回滚点 `bin/wb-switch.exe.old` = 0.1.63。
+- **线上验证**：`/api/version` = 0.1.64；`/qwen-flash/v1/models` 返回 **1** 个模型（`qwen3.8-flash`）✅；
+  回归 `/qwen/v1/models`=7、`/qoder/v1/models`=8、`/glmweb/v1/models`=23、`/kimi/v1/models`=4 全部 200；
+  `/api/gateway/overview` 出现 `qwen-flash`；`tools/monitor.py` = **ALL GREEN**。
+- ⚠️ **构建姿势提醒**：本次必须用 `CARGO_TARGET_DIR=<ascii-target-dir>` +
+  `-p wb-switch-server`、并用 `deploy.py` 部署。手搓 `Copy-Item` 会踩两个坑：
+  ① `workbuddy-switch\target\release\` 里**没有** `wb-switch.exe`（默认 target 目录仅剩旧依赖残留）；
+  ② 直接覆盖运行中的 `bin\wb-switch.exe` 会被文件占用拒绝/且**无版本断言**。
+
+---
+
+## 0.1.63 — 2026-09-18
+
+### 修复：🔴 根因治理 —— 上游 reqwest 客户端继承系统代理，Clash 端口一抖全账号池「error sending request」
+
+**补全 19:10 ZCode 事故的完整根因链**：部署 0.1.62 的观测层后立即复现出
+`502「全部 1 个 Qwen 独立账号均不可用：Qoder chat 请求失败: error sending request for url」`——
+本机环境变量 `HTTP_PROXY=http://127.0.0.1:65269`（Clash **动态端口**，当前已死），
+而 `qoder.rs` 等 reqwest 客户端**默认继承系统代理** → 代理端口一换/一挂，
+所有走它的上游连接立即失败，**进行中的流被强制掐断**（今天 13:34 / 14:45 的
+GLM 断连、19:10 的 qwen 断连同根同源）。
+
+**修复**：国内可直连的上游客户端统一加 **`.no_proxy()`**：
+`qoder.rs` / `glm_proxy.rs`（AutoClaw）/ `glm_web.rs`（chatglm.cn）/ `kimi.rs` /
+`loomy_proxy.rs`（讯飞）/ `qwen.rs`。**grok.rs / grok_sso.rs 保留代理**
+（grok.com 国外站点需走 Clash）。`config.rs` 的签到 HTTP 客户端不动。
+
+**效果**：Clash 开/关/换端口不再影响任何模型网关；上午那种「peer closed / 10054」
+流中断将不再由本机代理引发。
+
+---
+
+## 0.1.62 — 2026-09-18
+
+### 修复：🔴 观测性黑洞 —— 请求没到 handler 就失败时无任何日志（ZCode -32603 事故的真正堵点）
+
+**现场**：19:10:29 ZCode `custom-local:qwen3.8-flash-qoder` 报
+`{"code":-32603,"message":"Internal error","data":{"details":"\"internal server error\""}}`，
+但网关日志（127 条）里 **19:09:23 之后就没有任何记录** —— 失败的请求根本没走到业务 handler，
+现有日志体系完全看不到它。排查确认：qwen 网关与账号池当前完全健康
+（复现 `qwen3.8-flash-qoder` 非流式/流式/带 tools 全部 200），
+故障只存在于那一个瞬间，且**无法回溯**（后端 `stdio:"ignore"`，panic 输出也被丢弃）。
+
+**修复（观测性兜底，两层中间件）：**
+1. **`access_log_middleware`**：所有网关/管理 API 路径的请求，
+   **非 2xx**（413 body 超限 / 422 body 解析失败 / 鉴权前拒绝 / 5xx）统一记入网关日志
+   （gateway=`http`，含 method/path/状态码/耗时）。成功的请求仍由各 handler 记业务日志，不重复。
+2. **`panic_guard_middleware`**（最外层）：handler panic 不再被 tokio 静默吞掉
+   （表现为客户端连接被断开、ZCode 报 -32603 Internal error），
+   改为捕获后返回 500 JSON 并记入网关日志。
+
+下次再出现「客户端报错但网关无日志」，`/api/gateway/logs` 里必有 `gateway=http` 的条目
+说明失败发生在哪一层（413=请求体超限 / 422=解析失败 / 500=panic / 无记录=连接层未到达）。
+
+---
+
+## 0.1.61 — 2026-09-18
+
+### 修复：🔴 Qoder 上游中文输出 GBK 误码（lite 档 100% 复现，两池皆中）
+
+**现场**：17:00 起 `/qoder/v1` 与 `/qwen/v1` 的流式/非流式中文回复全变乱码——
+`你好呀` → `浣犲ソ鍛€`（UTF-8 字节被按 GBK 误解码后再发出的双层编码）。
+16:35 同一请求还是干净的 → 上游在后端实例层面出了回归（与账号池无关，A/B 两池一致）。
+
+**修复**（网关侧确定性修复，变换可逆、零误伤）：
+- 新增 `qoder::repair_gbk_mojibake`：字符串按 GBK 重编码还原原始字节，**恰好是合法
+  UTF-8 时才采用**；干净文本/ASCII/emoji 原样返回（附 2 项冻结样本单测）。
+- 非流式：`chat_completions_unified_for` 聚合后对 `content`/`reasoning_content` 逐串修复。
+- 流式：api.rs 新增 `qoder_repaired_sse_body` —— 行缓冲（复用 `decode_stream_chunk`
+  的跨 chunk 拼接）+ 逐行解析 SSE，修复 `choices[].{delta,message}.content/reasoning_content`
+  后重序列化；`/qoder/v1` 与 `/qwen/v1` 两个 handler 接入。
+- 依赖：core 新增 `encoding_rs = "0.8"`。
+
+**若上游自己修好**：修复层自动退化为恒等变换（干净文本不满足「GBK 字节是合法 UTF-8」条件），
+无需回滚本次改动。
+
+**验证**：单测（含真实乱码样本）；部署后流式实测中文输出。
+
+---
+
+## 0.1.60 — 2026-09-18
+
+### 功能：`/qwen/v1` 独立账号池 —— 与 `/qoder/v1` 额度互不侵占
+
+**背景**：`/qwen/v1` 此前只是 `/qoder` 的**模型名映射壳**（`qwen3.8-max→max`、`flash→lite` 后
+直接调 Qoder 上游），两通路共享 `qoder_accounts.json` 同一池。池内唯一 Free 账号
+`isQuotaExceeded: true` 后，plus/max 档全灭（`{"code":116,"error":"quota exceeded"}`），
+lite 档仍可用——用户要求拆池。
+
+| 改动 | 说明 |
+| --- | --- |
+| `qoder.rs` | `routable_accounts_for(gateway)`：`qoder` 池 = 本机实时登录态 + 未打标账号；**`qwen` 池 = 只轮转 `gateway=="qwen"` 标记的账号，不回落本机登录态**；轮转游标按网关独立（`POOL_CURSORS`，原单一 `POOL_CURSOR` 删除） |
+| `qoder.rs` | `import_manual` / `device_flow_start` 增加 `gateway` 参数（设备授权会话携带池标记，complete 时入对应池）；upsert 合并字段补 `gateway`（改标可挪池）；`chat_completions_for` / `chat_completions_unified_for` 新入口，旧签名保留为 qoder 池别名 |
+| `qoder.rs` | `list_for_display` 每个账号带 `gateway` 字段（webui 可见池归属） |
+| `api.rs` | `api_qwen_chat_completions` 改走 `chat_completions_unified_for("qwen", …)`；空池报错文案改为指引「添加账号到 Qwen 独立池」；`/api/qoder/device-flow/start` 兼容空 body（旧前端不传参仍默认 qoder 池），非空时读 `gateway` |
+
+**兼容性**：`/qoder/v1` 行为完全不变（默认池 = 本机登录态 + 未打标账号）；存量账号无 `gateway`
+字段视为 qoder 池，零迁移。**`/qwen/v1` 拆池后为空池**——首次调用会得到明确的「Qwen 独立账号池为空」
+提示（而非误导性的上游 116），添加账号（设备授权选 `gateway=qwen`）后即恢复。
+
+**验证**：`cargo check --release`（core+server，all-targets）0 错误；部署后实测
+`/qwen/v1` 返回空池提示、`/qoder/v1` 行为不变。
+
+---
+
+## 0.1.59 — 2026-09-18
+
+### 修复：🔴 连接类故障漏判第二弹 —— 中文 Windows 本地化错误文案（ZCode 二次事故）
+
+**现场**：14:45 ZCode `model=auto` 再次报「上游流中断（多半是上下文过长…）」，原文：
+`error decoding response body: … 远程主机强迫关闭了一个现有的连接。 (os error 10054)`。
+0.1.52 补的 `peer closed` / `close_notify` 只覆盖 rustls 英文文案，
+**中文 Windows 的 OS 错误是本地化的**（`远程主机强迫关闭` + winsock 码 `10054` = WSAECONNRESET），
+又一次漏判 → 又给了「压缩上下文」的错误建议。
+
+**证据（与上下文长度无关）**：14:45 失败 `in=0/out=0`（连接阶段就被掐），
+中间 14:33 的 `auto` 小请求（in=20/out=70）成功 —— 间歇性上游断连，重试即可。
+
+**修复**：`upstream_interrupt_message` 连接类模式补上
+`os error 10054`（WSAECONNRESET）/ `os error 10053`（WSAECONNABORTED）/
+`远程主机强迫关闭` / `强迫关闭`；超时类补 `os error 10060`。
+新增回归测试 `localized_wsaconnreset_is_conn_lost`（14:45 事故原文）。
+GLM 与 Loomy 两条通路共用此函数，一处修复两端生效。
+
+**bump 方式改进**：吸取「re.sub 无匹配静默 no-op」教训，bump 脚本改为
+读当前版本号 +1 并 **assert 写入成功**（并行会话推进版本也不会再静默丢 bump）。
+
+---
+
+## 0.1.52 — 2026-09-18
+
+### 修复：🔴「上游流中断」误判连接类故障为「上下文过长」（ZCode 事故）
+
+**现场**：13:34 ZCode `model=auto` 报
+`上游流中断：响应在传输中被切断（多半是上下文过长…）（原文: error decoding response body: …
+peer closed connection without sending TLS close_notify…）`，且 ZCode 据此标 `retryable=false`。
+
+**根因**：`glm_anthropic::upstream_interrupt_message` 的连接类模式里是 `connection closed`，
+而 rustls 原文词序是 **`peer closed connection`** —— 不匹配 → 落进 decoding 分支 →
+给了「新开会话/压缩上下文」的**错误建议**（实际是上游断连，直接重试即可）。
+证据：同日 02:1x-02:3x 一串 **5 万 token 输入全部成功**，13:34 这条 `in=0/out=0`
+（上游一个计量字节都没产生），与上下文长度无关。
+
+**修复**：连接类模式补上 `peer closed` / `close_notify`；新增回归测试
+`peer_closed_without_close_notify_is_conn_lost`（含事故原文，断言归入「连接被重置/切断」
+且建议「可直接重试」、不含「压缩上下文」）。
+
+---
+
 ## 0.1.58 — 2026-09-18
 
 ### 前端（P4 收尾）：三个统计页的展示格式化收敛到 `lib/stats-format.ts`

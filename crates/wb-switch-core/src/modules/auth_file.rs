@@ -261,9 +261,94 @@ fn setdefault(map: &mut Map<String, Value>, key: &str, value: Value) {
     }
 }
 
+/// auth 文件的敏感字段是否为 `$wbEncrypted` 加密信封（WorkBuddy 5.5.6+）。
+fn is_encrypted_auth_file(root: &Value) -> bool {
+    root.pointer("/auth/accessToken")
+        .map(|v| v.is_object() && v.get("$wbEncrypted").is_some())
+        .unwrap_or(false)
+}
+
 /// 从当前 WorkBuddy 登录态导入账号。对照 server.py `import_from_auth_file`。
+///
+/// auth 文件 5.5.6 起把 accessToken/refreshToken 改为 `$wbEncrypted` 信封
+/// （protector 密钥内置在定制 Electron 原生模块，静态不可提取），明文导入
+/// 因此失效。此时回退到内存提取：WorkBuddy 客户端运行时在内存中持有已解密
+/// 的 token，按 auth 文件里的明文 uid 匹配后组装账号导入。
 pub fn import_from_auth_file() -> Option<Value> {
-    imported_account_from_root(read_auth_file()?)
+    let root = read_auth_file()?;
+    if !is_encrypted_auth_file(&root) {
+        return imported_account_from_root(root);
+    }
+    import_from_encrypted_auth_file(&root)
+}
+
+/// 加密 auth 文件的导入回退：内存提取 token + auth 文件明文字段组装。
+fn import_from_encrypted_auth_file(root: &Value) -> Option<Value> {
+    let uid = get_str(root, "uid")
+        .or_else(|| root.pointer("/account/uid").and_then(Value::as_str).map(String::from))?;
+    let (access_token, refresh_token, access_exp, refresh_exp) =
+        crate::modules::wb_memtoken::extract_account_tokens(&uid)?;
+    let account_obj = root.get("account").cloned().unwrap_or_else(|| json!({}));
+    // 直接复用已提取的 access token 取手机号兜底昵称（再扫一遍内存要多花
+    // 一倍时间且可能得到不同结果）。
+    let nickname = super::wb_memtoken::jwt_payload_for_display(&access_token)
+        .and_then(|payload| {
+            payload
+                .get("preferred_username")
+                .or_else(|| payload.get("phone_number"))
+                .and_then(Value::as_str)
+                .filter(|p| !p.is_empty())
+                .map(mask_phone)
+        });
+    let domain = root
+        .pointer("/auth/domain")
+        .and_then(Value::as_str)
+        .filter(|d| !d.trim().is_empty())
+        .unwrap_or("www.workbuddy.cn")
+        .to_string();
+    let auth_raw = json!({
+        "uid": uid,
+        "uin": account_obj.get("uin").cloned().unwrap_or(Value::Null),
+        "type": account_obj.get("type").cloned().unwrap_or(json!("personal")),
+        "lastLogin": true,
+    });
+    Some(json!({
+        "id": uuid::Uuid::new_v4().to_string(),
+        "uid": uid,
+        "nickname": nickname,
+        "email": Value::Null,
+        "createdAt": crate::modules::config::now_ms(),
+        "enterpriseName": account_obj
+            .get("enterpriseName")
+            .and_then(Value::as_str)
+            .map(String::from),
+        "enterpriseId": account_obj
+            .get("enterpriseId")
+            .and_then(Value::as_str)
+            .map(String::from),
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": root
+            .pointer("/auth/tokenType")
+            .and_then(Value::as_str)
+            .unwrap_or("Bearer")
+            .to_string(),
+        "expiresAt": access_exp.saturating_mul(1000),
+        "refreshExpiresAt": refresh_exp.saturating_mul(1000),
+        "domain": domain,
+        "auth_raw": auth_raw.clone(),
+        "profile_raw": auth_raw,
+    }))
+}
+
+/// 手机号脱敏：13800138000 → 180****2401。
+fn mask_phone(phone: &str) -> String {
+    let chars: Vec<char> = phone.chars().collect();
+    if chars.len() == 11 {
+        format!("{}****{}", chars[..3].iter().collect::<String>(), chars[7..].iter().collect::<String>())
+    } else {
+        phone.to_string()
+    }
 }
 
 fn imported_account_from_root(root: Value) -> Option<Value> {
@@ -346,6 +431,23 @@ fn parse_ts(v: Option<&Value>) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn encrypted_auth_file_detection() {
+        let encrypted = json!({"auth": {"accessToken": {"$wbEncrypted": 1, "envelope": "eyJ..."}}});
+        let plaintext = json!({"auth": {"accessToken": "eyJhbGciOiJSUzI1NiIs..."}});
+        assert!(is_encrypted_auth_file(&encrypted));
+        assert!(!is_encrypted_auth_file(&plaintext));
+        assert!(!is_encrypted_auth_file(&json!({})));
+    }
+
+    #[test]
+    fn mask_phone_masks_middle_digits() {
+        assert_eq!(mask_phone("13800138000"), "180****2401");
+        assert_eq!(mask_phone("13800138000"), "138****8000");
+        // 非 11 位原样返回（如虚拟号）。
+        assert_eq!(mask_phone("12345"), "12345");
+    }
+
     use super::*;
     use serde_json::json;
 

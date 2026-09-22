@@ -19,6 +19,7 @@ export interface AppStatus {
   authFile: string;
   current: {
     uid: string | null;
+    /** 客户端 5.5.6+ 可能写入 $wbEncrypted 加密信封对象，后端已规范化为字符串或 null */
     nickname: string | null;
     email: string | null;
   } | null;
@@ -339,6 +340,8 @@ export type PlatformCheckinItem = {
   todayCheckedIn: boolean;
   /** 该条目是否为本机客户端当前登录的账号（一键切换时用于标注「当前」） */
   localLogin?: boolean;
+  /** AutoClaw 平台账号的区域标签（international / domestic） */
+  region?: 'international' | 'domestic';
   error?: string;
   /** 积分/额度，结构与 WorkBuddy 的 CreditExpiry 一致 */
   credit?: CreditExpiry;
@@ -358,6 +361,8 @@ export interface GlmProxyModelInfo {
   tooltip?: string | null;
   /** Auto 系背后的真实模型名 */
   autoModel?: string | null;
+  /** 模型归属区域（international / domestic）：请求该模型只路由到对应区域的账号池 */
+  region?: 'international' | 'domestic';
 }
 
 export interface GlmProxyConfigInfo {
@@ -562,11 +567,107 @@ export interface AutoclawAccountInfo {
   id: string;
   label: string;
   source: string;
+  region: 'international' | 'domestic';  // v1.0+: 区域标识
+  is_manual_specified: boolean;  // v1.0+: 是否手动指定区域
   status: string;
   lastError?: string | null;
   addedAt?: number | null;
   updatedAt?: number | null;
   tokenPreview?: string;
+}
+
+export type QwenChannel = 'auto' | 'web' | 'qoder';
+
+export interface QwenChannelInfo {
+  channel: QwenChannel;
+  autoFallback: boolean;
+  channels: QwenChannel[];
+  channelLabels: Record<string, string>;
+}
+
+export interface QwenWebProbe {
+  /** 是否已产生过探活结果 */
+  probed: boolean;
+  /** 探活是否成功（真实一次短调用）；未探活前为 null */
+  probeOk: boolean | null;
+  /** 距上次探活的秒数 */
+  probeAtAgeSecs?: number;
+  probeLatencyMs?: number;
+  probeChannel?: string;
+  probeError?: string | null;
+  /** 探活任务是否在执行中 */
+  probeInFlight: boolean;
+  probeTtlSecs: number;
+  note?: string;
+}
+
+export interface QwenWebChannelStatus {
+  available: boolean;
+  tokenReady: boolean;
+  browserRunning: boolean;
+  browserPort: number;
+  pageReady: boolean;
+  pageLatencyMs: number | null;
+  modelsCount: number;
+  upstream: string;
+  version: string;
+}
+
+export interface QwenChannelsStatus {
+  current: QwenChannel;
+  autoFallback: boolean;
+  web: QwenWebChannelStatus;
+  webProbe: QwenWebProbe;
+  qoder: { poolTotal: number; poolOk: number; available: boolean; upstream: string };
+  tokenUser: string | null;
+}
+
+export interface ToolCallMonitorStats {
+  total: number;
+  withTools: number;
+  called: number;
+  direct: number;
+  callRate: number;
+  okRate: number;
+  transitions: number;
+  flips: number;
+  fluctuationRate: number;
+  lastFlipTs: number | null;
+  verdict: string;
+  verdictKind: "lite-fluctuation" | "insufficient-data" | "upstream-issue" | "protocol-not-triggering";
+  verdictDetail: string;
+  isConfigProblem: boolean;
+  temperature: {
+    missing: number;
+    distribution: Array<{ value: string; count: number }>;
+    note: string;
+  };
+  trend: Array<{ bucket: number; total: number; called: number; callRate: number | null }>;
+  updatedAt: number;
+}
+
+export interface ToolCallMonitorEvent {
+  ts: number;
+  hadTools: boolean;
+  called: boolean;
+  toolNames: string[];
+  latencyMs: number;
+  ok: boolean;
+  error: string | null;
+  temperature: number | null;
+  channel: string;
+  tier: string;
+  requestedModel: string;
+}
+
+export interface ToolCallMonitor {
+  stats: ToolCallMonitorStats;
+  events: ToolCallMonitorEvent[];
+  advisories: {
+    accept: { title: string; body: string };
+    reduceRandomness: { title: string; body: string };
+    switchTier: { title: string; body: string };
+  };
 }
 
 export interface GatewayApiKey {
@@ -626,6 +727,14 @@ export interface QoderAccountInfo {
   status?: string | null;
   enabled?: boolean;
   error?: string | null;
+  /** 账号池归属：qoder 默认池 / qwen 独立池 / qwen-flash CN 专用池 */
+  gateway?: string | null;
+  /** 地域：cn / intl（regionSource=manual 时为手动指定，否则为自动推断） */
+  region?: string | null;
+  regionLabel?: string | null;
+  regionSource?: string | null;
+  /** 软件来源标签（后端 with_region 填充）：Qoder（国际版）/ QoderCN / QoderWork CN / 设备授权（Qoder CN）/ 手动导入 */
+  sourceLabel?: string | null;
 }
 
 export interface TraeAccountInfo {
@@ -837,5 +946,83 @@ export interface GrokTestResult {
   accountName: string;
   durationMs: number;
   tokens?: number;
+}
+
+// ---- 妙手（美团智能体桌面应用）账号池与积分（仅 webui 后端支持）----
+
+/** 妙手账号积分信息：余额 + 套餐 + 下次刷新时间（积分按月刷新）。 */
+export interface MiaoshouCreditInfo {
+  /** 积分余额 */
+  balance: number | null;
+  /** 套餐名（如「体验版」） */
+  planName: string | null;
+  /** 下次积分刷新时间（毫秒时间戳；null 表示未知） */
+  nextRefreshTime: number | null;
+}
+
+/** 妙手账号池条目（GET /api/miaoshou/accounts）。 */
+export interface MiaoshouAccountInfo {
+  id: string;
+  /** 账号库内部 uid（移除账号时使用） */
+  uid?: string | null;
+  /** 妙手侧用户 id */
+  miaoshouUid?: string | null;
+  /** 登录标识（手机号 / 邮箱） */
+  email?: string | null;
+  nickname?: string | null;
+  /** 来源平台标识 */
+  platform?: string | null;
+  /** 是否本机桌面端登录态导入 */
+  isDesktop?: boolean;
+  /** 账号级积分（后端附带时返回） */
+  credit?: MiaoshouCreditInfo | null;
+}
+
+/**
+ * 妙手账号状态条目（GET /api/miaoshou/status）。
+ * 注意：妙手无每日签到功能（积分按月刷新），checkinSupported 恒为 false、
+ * todayCheckedIn 恒为 null —— 前端据此展示「无每日签到」而非签到按钮。
+ */
+export interface MiaoshouStatusItem {
+  id: string;
+  ok: boolean;
+  /** 是否支持每日签到；妙手恒为 false */
+  checkinSupported: false;
+  /** 积分余额 */
+  balance: number | null;
+  /** 套餐名（如「体验版」） */
+  planName: string | null;
+  /** 下次积分刷新时间（毫秒时间戳） */
+  nextRefreshTime: number | null;
+  /** 后端备注（如登录态异常原因） */
+  note?: string | null;
+  /** 今日是否已签到；妙手恒为 null（无签到概念） */
+  todayCheckedIn: null;
+}
+
+/** 妙手签到结果（保留接口；妙手实际无每日签到，后端恒返回不支持）。 */
+export interface MiaoshouModelInfo {
+  id: string;
+  object: string;
+  created: number;
+  owned_by: string;
+  description?: string | null;
+  /** 是否支持图像输入 */
+  supportsImages?: boolean;
+  /** 上下文档位（token 数，取最大档） */
+  contextWindow?: number;
+  /** 妙手侧 modelTypeId */
+  modelTypeId?: number | null;
+  /** 积分倍率（0 = 免费） */
+  rateMultiplier?: string | null;
+  /** 营销标签（如「限时免费」「新」） */
+  marketingCopy?: string | null;
+}
+
+export interface MiaoshouCheckinResult {
+  id: string;
+  ok: boolean;
+  result: string;
+  error?: string | null;
 }
 

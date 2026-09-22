@@ -45,3 +45,7 @@ npm/platform/*/bin/
 .codex/
 .grok/
 /.workbuddy/
+
+# 本地 ASCII 路径垫片（会话临时产物：Cargo.toml + 指向 crates/dist/node_modules/src-tauri
+# 的**绝对路径软链接**）。机器相关、且 git 会穿过软链接把整棵源码树再复制一份入库，故排除。
+/workbuddy-switch/

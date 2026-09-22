@@ -56,6 +56,7 @@ fn http_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
+            .no_proxy() // 国内上游直连，不继承系统代理
             .connect_timeout(std::time::Duration::from_secs(15))
             .read_timeout(std::time::Duration::from_secs(UPSTREAM_READ_IDLE_SECS))
             .build()
@@ -464,8 +465,19 @@ fn invalidate_access(slot: usize) {
 // ---------------------------------------------------------------------------
 
 /// OpenAI messages → glm2api 同款转写（system/System + role:text 行 + "Assistant: "）。
-fn format_messages(messages: &[Value]) -> String {
+/// 当请求含有 tools 时，将工具定义格式化为标准 Tool Calling 提示词注入到开头。
+fn format_messages(messages: &[Value], tools: Option<&[Value]>) -> String {
     let mut transcript: Vec<String> = Vec::new();
+
+    if let Some(tool_list) = tools {
+        if !tool_list.is_empty() {
+            let tools_json = serde_json::to_string_pretty(tool_list).unwrap_or_else(|_| "[]".to_string());
+            transcript.push(format!(
+                "System: [AVAILABLE_TOOLS]\nYou have access to the following tools:\n{tools_json}\n\nWhen you need to call one or more tools, you MUST respond ONLY with a JSON block in the following format:\n```json\n{{\n  \"tool_calls\": [\n    {{\n      \"name\": \"<tool_name>\",\n      \"arguments\": {{ /* arguments object */ }}\n    }}\n  ]\n}}\n```\nIf no tool call is needed, respond directly with plain text.\n[/AVAILABLE_TOOLS]"
+            ));
+        }
+    }
+
     for message in messages {
         let role = message.get("role").and_then(Value::as_str).unwrap_or("user");
         let text = match message.get("content") {
@@ -484,13 +496,27 @@ fn format_messages(messages: &[Value]) -> String {
             _ => String::new(),
         };
         let text = text.trim().to_string();
+
+        // 兼容 assistant 历史带 tool_calls
+        if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+            let calls_summary = serde_json::to_string(tool_calls).unwrap_or_default();
+            transcript.push(format!("Assistant: [TOOL_CALLS: {calls_summary}]"));
+            continue;
+        }
+
+        // 兼容 tool 结果回复
+        if role == "tool" {
+            let tool_id = message.get("tool_call_id").and_then(Value::as_str).unwrap_or("");
+            transcript.push(format!("User: [TOOL_RESULT id={tool_id}]: {text}"));
+            continue;
+        }
+
         if text.is_empty() {
             continue;
         }
         let title = match role {
             "system" | "developer" => "System",
             "assistant" => "Assistant",
-            "tool" => "User",
             "user" => "User",
             other => other,
         };
@@ -501,9 +527,83 @@ fn format_messages(messages: &[Value]) -> String {
     prompt
 }
 
+/// 解析文本中是否包含标准 tool_calls JSON 结构。
+pub(crate) fn try_extract_tool_calls(text: &str) -> Option<Vec<Value>> {
+    let trimmed = text.trim();
+    // 1. 尝试从 ```json ... ``` 代码块中提取
+    if let Some(start) = trimmed.find("```json") {
+        let after = &trimmed[start + 7..];
+        if let Some(end) = after.find("```") {
+            let block = after[..end].trim();
+            if let Ok(v) = serde_json::from_str::<Value>(block) {
+                if let Some(calls) = parse_tool_calls_json(&v) {
+                    return Some(calls);
+                }
+            }
+        }
+    }
+    // 2. 尝试整体解析为 JSON
+    if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+        if let Some(calls) = parse_tool_calls_json(&v) {
+            return Some(calls);
+        }
+    }
+    // 3. 尝试搜索首个 {"tool_calls" 结构
+    if let Some(start) = trimmed.find("{\"tool_calls\"") {
+        let candidate = &trimmed[start..];
+        // 尝试逐步向后寻找合法的 JSON 闭合
+        if let Some(end) = candidate.rfind('}') {
+            if let Ok(v) = serde_json::from_str::<Value>(&candidate[..=end]) {
+                if let Some(calls) = parse_tool_calls_json(&v) {
+                    return Some(calls);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn parse_tool_calls_json(val: &Value) -> Option<Vec<Value>> {
+    let raw_calls = if let Some(arr) = val.get("tool_calls").and_then(Value::as_array) {
+        arr
+    } else if val.is_array() {
+        val.as_array()?
+    } else {
+        return None;
+    };
+    let mut out = Vec::new();
+    for (i, item) in raw_calls.iter().enumerate() {
+        let name = item.pointer("/function/name")
+            .or_else(|| item.get("name"))
+            .and_then(Value::as_str)?;
+        let raw_args = item.pointer("/function/arguments").or_else(|| item.get("arguments"));
+        let args_str = match raw_args {
+            Some(Value::String(s)) => s.clone(),
+            Some(other) => other.to_string(),
+            None => "{}".to_string(),
+        };
+        let call_id = item.get("id").and_then(Value::as_str)
+            .map(String::from)
+            .unwrap_or_else(|| format!("call_{}_{}", uuid::Uuid::new_v4().simple(), i));
+        out.push(json!({
+            "id": call_id,
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": args_str,
+            }
+        }));
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 /// chat 请求体（glm2api `_open_chat_stream` 同款结构）。
-fn build_chat_body(messages: &[Value], model: &str) -> Result<Value, String> {
-    let prompt = format_messages(messages);
+fn build_chat_body(messages: &[Value], model: &str, tools: Option<&[Value]>) -> Result<Value, String> {
+    let prompt = format_messages(messages, tools);
     if prompt.trim().is_empty() {
         return Err("messages 不能为空".to_string());
     }
@@ -640,19 +740,29 @@ pub fn chat_completions(
         let want_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
         // v0.1.46：缺省模型由陈旧的 `glm-4` 改为可配置的 GLM5.3Flash（`default_model()`）。
         let fallback_model = default_model();
-        let model = body
+        let raw_model = body
             .get("model")
             .and_then(Value::as_str)
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
-            .unwrap_or(&fallback_model)
-            .to_string();
+            .unwrap_or(&fallback_model);
+
+        // 统一模型别名归一化与 AutoClaw 目录兼容
+        let model = match raw_model.to_ascii_lowercase().as_str() {
+            "auto" | "zai_auto" | "auto-fast" | "zai_auto-fast" => "glm-5.3-flash",
+            "glm-5.3" | "zaicoding_glm-5.3" => "glm-5.3",
+            "glm-5.3-flash" | "zai_glm-5.3-flash" => "glm-5.3-flash",
+            other => other,
+        }.to_string();
+
         let messages = body
             .get("messages")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let chat_body = build_chat_body(&messages, &model)?;
+        let tools = body.get("tools").and_then(Value::as_array).cloned();
+        let has_tools = tools.as_ref().map(|t| !t.is_empty()).unwrap_or(false);
+        let chat_body = build_chat_body(&messages, &model, tools.as_deref())?;
 
         let (access, slot) = next_access_token().await?;
         let started = std::time::Instant::now();
@@ -695,10 +805,12 @@ pub fn chat_completions(
             ));
         }
 
+        let return_model = raw_model.to_string();
+
         if want_stream {
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, String>>(16);
             tokio::spawn(async move {
-                pump_stream(resp, model, tx).await;
+                pump_stream(resp, return_model, has_tools, tx).await;
             });
             Ok(GlmChatOutput::Stream(GlmWebStream { rx }))
         } else {
@@ -767,11 +879,41 @@ pub fn chat_completions(
                 return Err(format!("GLM 上游错误：{error_message}"));
             }
             let _ = latency;
+
+            let final_id = if conversation_id.is_empty() {
+                format!("chatcmpl-{}", uuid::Uuid::new_v4().simple())
+            } else {
+                conversation_id
+            };
+
+            // 如果客户端声明了 tools 且模型输出了结构化 tool_calls，封装为标准工具调用响应
+            if has_tools {
+                if let Some(tool_calls) = try_extract_tool_calls(&content) {
+                    return Ok(GlmChatOutput::Json(json!({
+                        "id": final_id,
+                        "object": "chat.completion",
+                        "created": now_ms() / 1000,
+                        "model": return_model,
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": Value::Null,
+                                "tool_calls": tool_calls,
+                                "reasoning_content": if reasoning.is_empty() { Value::Null } else { json!(reasoning) },
+                            },
+                            "finish_reason": "tool_calls",
+                        }],
+                        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                    })));
+                }
+            }
+
             Ok(GlmChatOutput::Json(json!({
-                "id": if conversation_id.is_empty() { format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()) } else { conversation_id },
+                "id": final_id,
                 "object": "chat.completion",
                 "created": now_ms() / 1000,
-                "model": model,
+                "model": return_model,
                 "choices": [{
                     "index": 0,
                     "message": {
@@ -787,10 +929,11 @@ pub fn chat_completions(
     })
 }
 
-/// 流式泵：GLM SSE → OpenAI chunk SSE（think→reasoning_content）。
+/// 流式泵：GLM SSE → OpenAI chunk SSE（think→reasoning_content，支持 tool_calls 转译）。
 async fn pump_stream(
     mut resp: reqwest::Response,
     model: String,
+    has_tools: bool,
     tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, String>>,
 ) {
     use bytes::Bytes;
@@ -869,6 +1012,14 @@ async fn pump_stream(
                             }
                         }
                         if done {
+                            if has_tools {
+                                if let Some(tool_calls) = try_extract_tool_calls(&emitted_text) {
+                                    let frame = send_frame(&chunk_id, json!({"tool_calls": tool_calls}), json!("tool_calls"));
+                                    let _ = tx.send(Ok(Bytes::from(frame))).await;
+                                    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+                                    return;
+                                }
+                            }
                             let frame = send_frame(&chunk_id, json!({}), json!("stop"));
                             let _ = tx.send(Ok(Bytes::from(frame))).await;
                             let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
@@ -885,6 +1036,14 @@ async fn pump_stream(
         }
     }
     if started {
+        if has_tools {
+            if let Some(tool_calls) = try_extract_tool_calls(&emitted_text) {
+                let frame = send_frame(&chunk_id, json!({"tool_calls": tool_calls}), json!("tool_calls"));
+                let _ = tx.send(Ok(Bytes::from(frame))).await;
+                let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+                return;
+            }
+        }
         let frame = send_frame(&chunk_id, json!({}), json!("stop"));
         let _ = tx.send(Ok(Bytes::from(frame))).await;
         let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
@@ -897,13 +1056,14 @@ pub enum GlmChatOutput {
     Stream(GlmWebStream),
 }
 
-/// 模型清单（glm2api 固定表）。
+/// 模型清单（对齐 AutoClaw 模型目录 + 网页支持的官方模型）。
 pub fn models_payload() -> Value {
     let models = [
-        // v0.1.46：GLM5.3Flash 置首，并作为未显式传 model 时的默认模型。
+        "auto",
+        "auto-fast",
         "glm-5.3-flash",
-        "cogView-4-250304",
         "glm-5.3",
+        "cogView-4-250304",
         "glm-5.2",
         "glm-5.1",
         "glm-5v-turbo",
@@ -919,8 +1079,6 @@ pub fn models_payload() -> Value {
         "glm-4-flash",
         "glm-4-air",
         "glm-4v",
-        "glm-4-flashx-250414",
-        "glm-4-flash-250414",
         "glm-zero-preview",
         "glm-deep-research",
         "glm-image-1",
@@ -944,3 +1102,108 @@ pub fn pool_status() -> Value {
         "withCachedAccess": pool.iter().filter(|a| !a.cached_access.is_empty()).count(),
     })
 }
+
+// ---------------------------------------------------------------------------
+// 签到与账号查询对外接口
+// ---------------------------------------------------------------------------
+
+/// 检查 token 池中是否有可用且非游客的 refresh token
+pub fn has_usable_token() -> bool {
+    load_pool().iter().any(|a| !a.is_guest && !a.refresh_token.is_empty())
+}
+
+/// 获取 token 池中所有非游客的 refresh token 列表
+pub fn get_refresh_tokens() -> Vec<String> {
+    load_pool()
+        .into_iter()
+        .filter(|a| !a.is_guest && !a.refresh_token.is_empty())
+        .map(|a| a.refresh_token)
+        .collect()
+}
+
+/// 获取当前或下一个有效的 access token
+pub async fn get_current_or_next_access_token() -> Result<String, String> {
+    next_access_token().await.map(|(token, _)| token)
+}
+
+/// 按特定的 refresh_token 获取有效的 access token（优先使用缓存，必要时自动刷新）
+pub async fn get_access_token_for_refresh(refresh_token: &str) -> Result<String, String> {
+    let mut pool = load_pool();
+    if let Some(account) = pool.iter_mut().find(|a| !a.is_guest && a.refresh_token == refresh_token) {
+        let now = now_ms();
+        if !account.cached_access.is_empty() && account.access_expires_at_ms - 60_000 > now {
+            return Ok(account.cached_access.clone());
+        }
+        refresh_access_token(account).await?;
+        return Ok(account.cached_access.clone());
+    }
+    let mut temp = GlmAccount {
+        refresh_token: refresh_token.to_string(),
+        is_guest: false,
+        cached_access: String::new(),
+        access_expires_at_ms: 0,
+    };
+    refresh_access_token(&mut temp).await?;
+    Ok(temp.cached_access)
+}
+
+/// 获取首个已登录的正式账号 access token（排除游客）
+pub async fn get_authenticated_access_token() -> Result<String, String> {
+    let mut pool = load_pool();
+    for account in pool.iter_mut() {
+        if !account.is_guest && !account.refresh_token.is_empty() {
+            let now = now_ms();
+            if !account.cached_access.is_empty() && account.access_expires_at_ms - 60_000 > now {
+                return Ok(account.cached_access.clone());
+            }
+            refresh_access_token(account).await?;
+            return Ok(account.cached_access.clone());
+        }
+    }
+    Err("未配置有效的正式 ChatGLM refresh token".to_string())
+}
+
+/// 为外部模块提供带有签名的请求头
+pub fn signed_headers_for(token: String, accept_default: bool) -> reqwest::header::HeaderMap {
+    signed_headers(token, accept_default)
+}
+
+/// 获取 ChatGLM 用户的个人信息、手机号及当前剩余积分
+pub async fn fetch_user_info(access_token: &str) -> Result<Value, String> {
+    let url = format!("{GLM_BASE}/user-api/user/info");
+    let headers = signed_headers(access_token.to_string(), true);
+    let resp = http_client()
+        .get(&url)
+        .headers(headers)
+        .send()
+        .await
+        .map_err(|e| format!("ChatGLM 用户信息请求失败: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!("ChatGLM 用户信息请求失败（{status}）：{}", text.chars().take(150).collect::<String>()));
+    }
+    let val: Value = serde_json::from_str(&text).map_err(|e| format!("解析用户信息失败: {e}"))?;
+    Ok(val)
+}
+
+/// 调用桌面端每日登录打卡签到接口（获取每日积分）
+pub async fn perform_daily_checkin(access_token: &str) -> Result<Value, String> {
+    let url = format!("{GLM_BASE}/member-api/member/daily_login_score");
+    let headers = signed_headers(access_token.to_string(), true);
+    let resp = http_client()
+        .post(&url)
+        .headers(headers)
+        .body(b"{}".to_vec())
+        .send()
+        .await
+        .map_err(|e| format!("ChatGLM 签到打卡请求失败: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!("ChatGLM 签到请求失败（{status}）：{}", text.chars().take(150).collect::<String>()));
+    }
+    let val: Value = serde_json::from_str(&text).map_err(|e| format!("解析签到打卡响应失败: {e}"))?;
+    Ok(val)
+}
+

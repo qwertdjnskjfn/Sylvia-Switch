@@ -17,7 +17,7 @@ use std::sync::Mutex;
 
 use crate::modules::config::{atomic_write, http_request, now_ms, store_dir};
 use crate::modules::platform_checkin::{
-    autoclaw_headers, read_autoclaw_token, AUTOCLAW_API_HOST,
+    autoclaw_headers, read_autoclaw_token,
 };
 // 累加算术与派生指标统一到 stats::engine（原先本文件有两套累加器各算一遍）。
 use crate::modules::stats::engine::UsageAgg;
@@ -77,6 +77,18 @@ pub fn record_usage(record: Value) {
     save_records(&records);
 }
 
+/// T5：按渠道记录一次请求级调用（channel：`workbuddy`/`trae`/`glm`/`loomy`…）。
+///
+/// 与 [`record_usage`] 写同一份 `glm_usage_records.json`（channel 字段区分渠道，
+/// 不清空历史数据），内部复用既有 `save_records`/裁剪逻辑；调用方传入的记录
+/// 若缺 `channel` 字段，此处统一补齐，保证统计与筛选口径一致。
+pub fn record_channel_call(channel: &str, mut record: Value) {
+    if let Some(obj) = record.as_object_mut() {
+        obj.insert("channel".to_string(), json!(channel));
+    }
+    record_usage(record);
+}
+
 // ---------------------------------------------------------------------------
 // 钱包余额 / 积分计量
 // ---------------------------------------------------------------------------
@@ -88,8 +100,13 @@ pub async fn wallet_balance() -> Result<f64, String> {
 }
 
 /// AutoClaw 钱包总余额（按 token，供账号池计量归因）。
+/// 网关按 token 所属区域路由（国际账号的钱包在国际网关）。
 pub async fn wallet_balance_for(token: &str) -> Result<f64, String> {
-    let url = format!("{AUTOCLAW_API_HOST}/agent-assetmgr/api/v2/wallets?biz_app_id=autoclaw");
+    let region = crate::modules::autoclaw_accounts::region_for_token(token);
+    let url = format!(
+        "{}/agent-assetmgr/api/v2/wallets?biz_app_id=autoclaw",
+        region.api_host()
+    );
     let resp = http_request(&url, "GET", None, Some(&autoclaw_headers(Some(token)))).await;
     if resp.get("code").and_then(Value::as_i64) != Some(0) {
         let msg = resp
@@ -516,8 +533,26 @@ fn summary_window_json(
 /// 汇总统计：今日 / 近 7 天 / 全部 三个窗口，按模型分列 + 总计。
 /// 读取前先尝试流水对账，尽可能把「待对账」补成精确值。
 pub async fn get_statistics() -> Value {
+    summarize_statistics(None).await
+}
+
+/// T5：按 channel 过滤的汇总统计（`channel` 合法值：`workbuddy`/`trae`/`glm`/
+/// `loomy`/`autoclaw`…，见 [`record_matches_provider`]）。
+/// `channel=None` 时与 [`get_statistics`] 完全等价（不过滤）。
+///
+/// 签名说明：契约 §三 写作 `pub fn get_statistics_filtered(channel: Option<&str>) -> Value`，
+/// 但「None 时等价现 get_statistics」要求走同一条流水对账 + 钱包余额路径（均为
+/// async），故实现为 `async fn`；入参/返回值与契约一致。
+pub async fn get_statistics_filtered(channel: Option<&str>) -> Value {
+    summarize_statistics(channel).await
+}
+
+async fn summarize_statistics(channel: Option<&str>) -> Value {
     let reconcile_matched = reconcile_with_ledger().await.unwrap_or(0);
-    let records = load_records();
+    let records: Vec<Value> = load_records()
+        .into_iter()
+        .filter(|record| record_matches_provider(record, channel))
+        .collect();
     let now = now_ms();
     let today_start = local_day_start_ms(now);
     let week_start = now - 7 * 24 * 3600 * 1000;
@@ -605,6 +640,9 @@ fn monitor_model_json(model: &str, agg: &MonitorAgg, total_calls: u64) -> Value 
 }
 
 /// 判断调用记录是否归属于指定的 provider（autoclaw, loomy, trae_work_cn）。
+///
+/// T5：记录自带 `channel` 字段（workbuddy/trae/glm/loomy…）时**优先按 channel
+/// 归类**；缺省（历史记录）回退 `accountId` 前缀判定，行为与从前一致。
 pub fn record_matches_provider(record: &Value, filter: Option<&str>) -> bool {
     let Some(filter) = filter else {
         return true;
@@ -614,24 +652,35 @@ pub fn record_matches_provider(record: &Value, filter: Option<&str>) -> bool {
         return true;
     }
     let provider = record
-        .get("provider")
+        .get("channel")
         .and_then(Value::as_str)
+        .map(|c| c.to_lowercase())
+        .or_else(|| {
+            record
+                .get("provider")
+                .and_then(Value::as_str)
+                .map(|p| p.to_lowercase())
+        })
         .unwrap_or_else(|| {
             let account_id = record.get("accountId").and_then(Value::as_str).unwrap_or("");
             if account_id.starts_with("loomy") {
-                "loomy"
+                "loomy".to_string()
             } else if account_id.starts_with("trae") {
-                "trae_work_cn"
+                "trae_work_cn".to_string()
             } else {
-                "autoclaw"
+                "autoclaw".to_string()
             }
         });
-    if f == "autoclaw" {
-        provider == "autoclaw"
+    if f == "autoclaw" || f == "glm" {
+        // GLM 代理历史记录无 channel 字段（accountId=local/池条目），归 autoclaw；
+        // 新记录若显式带 channel="glm" 同样归入该类。
+        provider == "autoclaw" || provider == "glm"
     } else if f == "loomy" {
         provider == "loomy"
     } else if f == "trae" || f == "trae_work_cn" {
         provider == "trae_work_cn" || provider == "trae"
+    } else if f == "workbuddy" {
+        provider == "workbuddy"
     } else {
         provider.eq_ignore_ascii_case(&f)
     }
@@ -1097,6 +1146,36 @@ mod tests {
         let trae_monitor = build_monitor_filtered(&records, now, 24, hour, Some("trae_work_cn"));
         assert_eq!(trae_monitor["summary"]["calls"], json!(1));
         assert_eq!(trae_monitor["models"][0]["model"], json!("claude-3.5"));
+    }
+
+    #[test]
+    fn channel_field_drives_provider_classification() {
+        // T5：channel 字段优先于 accountId 前缀（workbuddy/trae 记录按 channel 归类）。
+        let wb = json!({"id": "w", "ts": 1, "model": "opencode/mimo", "channel": "workbuddy",
+                        "accountId": "workbuddy", "ok": true});
+        let trae = json!({"id": "t", "ts": 2, "model": "models", "channel": "trae",
+                          "accountId": "trae_work_cn", "ok": true});
+        let glm = json!({"id": "g", "ts": 3, "model": "glm-5.3", "channel": "glm",
+                         "accountId": "local", "ok": true});
+        let legacy = json!({"id": "l", "ts": 4, "model": "glm-5.3", "accountId": "local", "ok": true});
+
+        assert!(record_matches_provider(&wb, Some("workbuddy")));
+        assert!(!record_matches_provider(&wb, Some("autoclaw")));
+        assert!(!record_matches_provider(&wb, Some("loomy")));
+
+        assert!(record_matches_provider(&trae, Some("trae")));
+        assert!(record_matches_provider(&trae, Some("trae_work_cn")));
+
+        // channel="glm" 归入 autoclaw 类（GLM 代理历史记录无 channel，同样归此类）。
+        assert!(record_matches_provider(&glm, Some("autoclaw")));
+        assert!(record_matches_provider(&glm, Some("glm")));
+        assert!(record_matches_provider(&legacy, Some("autoclaw")));
+        assert!(!record_matches_provider(&legacy, Some("workbuddy")));
+
+        // None / all / 空串不过滤。
+        assert!(record_matches_provider(&wb, None));
+        assert!(record_matches_provider(&wb, Some("all")));
+        assert!(record_matches_provider(&wb, Some("")));
     }
 }
 

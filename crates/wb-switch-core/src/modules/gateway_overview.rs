@@ -21,8 +21,33 @@ const GATEWAYS: &[GatewayEntry] = &[
     GatewayEntry { id: "glm", name: "GLM 代理", page: "/glm-proxy", base: "/v1" },
     GatewayEntry { id: "kimi", name: "Kimi", page: "/kimi", base: "/kimi/v1" },
     GatewayEntry { id: "qoder", name: "Qoder", page: "/qoder", base: "/qoder/v1" },
+    GatewayEntry { id: "qwen", name: "Qwen 桌面版", page: "/qoder", base: "/qwen/v1" },
+    GatewayEntry { id: "qwen-flash", name: "Qwen3.8-Flash", page: "/qoder", base: "/qwen-flash/v1" },
     GatewayEntry { id: "grok", name: "Grok", page: "/grok", base: "/grok/v1" },
     GatewayEntry { id: "loomy", name: "Loomy", page: "/loomy", base: "/loomy/v1" },
+    // 妙手（美团智能体）：反代未通，base 先占位；账号数来自本机登录态发现。
+    GatewayEntry { id: "miaoshou", name: "妙手", page: "/miaoshou", base: "—" },
+    // ── 2026-09-22 三拆：原先 TRAE 与 WorkBuddy 共用一个「TRAE/WB 模型」页，
+    //    现按上游来源拆成相互独立的网关（OpenCode 网关见 /opencode 页，其模块待建）。
+    GatewayEntry {
+        id: "trae-work-cn",
+        name: "TRAE Work CN",
+        page: "/trae-work-cn",
+        base: "/trae/v1",
+    },
+    GatewayEntry {
+        id: "workbuddy",
+        name: "WorkBuddy",
+        page: "/workbuddy",
+        base: "/workbuddy/v1",
+    },
+    // OpenCode 网关：本机 OpenCode server 的**免费模型专用**入口（独立密钥）。
+    GatewayEntry {
+        id: "opencode",
+        name: "OpenCode",
+        page: "/opencode",
+        base: "/opencode/v1",
+    },
 ];
 
 /// 账号是否处于健康可用状态（用于统计）。
@@ -114,8 +139,19 @@ async fn fetch_models(gateway: &str) -> Result<Vec<Value>, String> {
         "kimi" => crate::modules::kimi::models_payload().await?,
         "loomy" => crate::modules::loomy_proxy::models_payload().await?,
         "qoder" => crate::modules::qoder::models_payload(),
+        "qwen" => crate::modules::qwen::models_payload().await,
+        "qwen-flash" => crate::modules::qoder::qwen_flash_models_payload(),
         "grok" => crate::modules::grok::models_payload(),
         "glm" => crate::modules::glm_proxy::models_payload(),
+        // ── 2026-09-22 三拆新增 ──
+        "trae-work-cn" => crate::modules::trae_proxy::models_payload().await,
+        "workbuddy" => crate::modules::workbuddy_proxy::models_payload()
+            .await
+            .unwrap_or_else(|_| json!({ "data": [] })),
+        // OpenCode 网关只暴露免费模型，故总览里的 modelCount 即为免费数
+        "opencode" => crate::modules::opencode::models_payload()
+            .await
+            .unwrap_or_else(|_| json!({ "data": [] })),
         _ => return Ok(Vec::new()),
     };
     let list = payload
@@ -131,8 +167,37 @@ fn fetch_accounts(gateway: &str) -> Vec<Value> {
     match gateway {
         "kimi" => crate::modules::kimi::list_for_display(),
         "qoder" => crate::modules::qoder::list_for_display(),
+        // qwen-flash 走 Qoder CN 专用池：账号视图只保留 🇨🇳 国内账号（2026-09-18 起与国际池隔离）
+        "qwen-flash" => crate::modules::qoder::list_for_display()
+            .into_iter()
+            .filter(|a| a.get("region").and_then(Value::as_str) == Some("cn"))
+            .collect(),
+        "qwen" => {
+            if crate::modules::qwen::extract_desktop_token().is_some() {
+                vec![json!({ "name": "Qwen 桌面版", "status": "ok", "enabled": true })]
+            } else {
+                Vec::new()
+            }
+        }
         "grok" => crate::modules::grok::list_for_display(),
         "loomy" => crate::modules::loomy::list_for_display(),
+        // 妙手（美团智能体）：账号 = 本机客户端登录态 + 已导入池账号（仅统计数量）。
+        "miaoshou" => crate::modules::platform_checkin::discover_miaoshou_accounts()
+            .into_iter()
+            .map(|a| {
+                json!({
+                    "name": a.get("nickname").or_else(|| a.get("email")).cloned().unwrap_or(Value::Null),
+                    "status": "ok",
+                    "enabled": true,
+                })
+            })
+            .collect(),
+        // ── 2026-09-22 三拆新增 ──
+        // TRAE Work CN：自有账号池（trae_accounts.json），与 GLM / 其它网关互不相干。
+        "trae-work-cn" => crate::modules::trae_accounts::list_for_display(),
+        // WorkBuddy：无自有账号池 —— 它的"账号"= 借道 OpenCode server 的已鉴权 provider 清单，
+        // 而保护/保活对象是该 server 进程（见 workbuddy_proxy 的 watchdog/端口探测）。
+        "workbuddy" => Vec::new(),
         _ => Vec::new(),
     }
 }
@@ -142,75 +207,126 @@ pub async fn overview() -> Value {
     let mut out = Vec::new();
 
     for gw in GATEWAYS {
-        let accounts = fetch_accounts(gw.id);
-        let healthy = accounts.iter().filter(|a| account_healthy(a)).count();
-
-        let models = match fetch_models(gw.id).await {
-            Ok(list) => list,
-            Err(err) => {
-                // 单网关失败不影响整体：健康态记为 error，模型为空
-                out.push(json!({
-                    "id": gw.id,
-                    "name": gw.name,
-                    "page": gw.page,
-                    "base": gw.base,
-                    "enabled": !accounts.is_empty() || gw.id == "glm",
-                    "health": "error",
-                    "error": err,
-                    "accountCount": accounts.len(),
-                    "healthyAccounts": healthy,
-                    "modelCount": 0,
-                    "capabilities": [],
-                    "models": [],
-                }));
-                continue;
-            }
-        };
-
-        let mut capabilities: Vec<&'static str> = Vec::new();
-        let mut simplified: Vec<Value> = Vec::new();
-        for model in &models {
-            let caps = model_capabilities(model);
-            for cap in &caps {
-                if !capabilities.contains(cap) {
-                    capabilities.push(cap);
-                }
-            }
-            simplified.push(json!({
-                "id": model.get("id").cloned().unwrap_or(Value::Null),
-                "name": model
-                    .get("display_name")
-                    .or_else(|| model.get("name"))
-                    .cloned()
-                    .unwrap_or_else(|| model.get("id").cloned().unwrap_or(Value::Null)),
-                "capabilities": caps,
-            }));
-        }
-
-        // 有模型目录的网关（无「账号」概念）也视为可用：只要有模型就算启用
-        let enabled = !accounts.is_empty() || !models.is_empty();
-        let health = if !enabled {
-            "disabled"
-        } else if healthy == 0 && !accounts.is_empty() {
-            "cooling"
-        } else {
-            "ok"
-        };
-
-        out.push(json!({
-            "id": gw.id,
-            "name": gw.name,
-            "page": gw.page,
-            "base": gw.base,
-            "enabled": enabled,
-            "health": health,
-            "accountCount": accounts.len(),
-            "healthyAccounts": healthy,
-            "modelCount": simplified.len(),
-            "capabilities": capabilities,
-            "models": simplified,
-        }));
+        out.push(gateway_snapshot(gw.id).await);
     }
 
     json!({ "gateways": out })
+}
+
+/// 取网关的展示名与对外调用基址（OpenAI 兼容端点前缀）。
+///
+/// 供模型自测等模块复用 —— 避免各处重复维护一份网关路由表而导致漂移。
+/// 未知 id 返回 `None`（由调用方给可行动的报错，不 panic）。
+pub fn gateway_base(id: &str) -> Option<(&'static str, &'static str)> {
+    GATEWAYS
+        .iter()
+        .find(|g| g.id == id)
+        .map(|g| (g.name, g.base))
+}
+
+/// 单个网关的快照（总览循环体抽出，供渠道健康度等模块复用）。
+///
+/// 返回结构与 [`overview()`] 中的单条完全一致（`id/name/page/base/enabled/
+/// health/error/accountCount/healthyAccounts/modelCount/capabilities/models`）；
+/// 未知 id 返回降级快照（`enabled=false` / `health="error"`），不 panic。
+pub async fn gateway_snapshot(id: &str) -> Value {
+    let Some(gw) = GATEWAYS.iter().find(|g| g.id == id) else {
+        return json!({
+            "id": id,
+            "name": id,
+            "page": "",
+            "base": "",
+            "enabled": false,
+            "health": "error",
+            "error": "未知网关",
+            "accountCount": 0,
+            "healthyAccounts": 0,
+            "modelCount": 0,
+            "capabilities": [],
+            "models": [],
+        });
+    };
+
+    let accounts = fetch_accounts(gw.id);
+    let healthy = accounts.iter().filter(|a| account_healthy(a)).count();
+
+    let models = match fetch_models(gw.id).await {
+        Ok(list) => list,
+        Err(err) => {
+            // 单网关失败不影响整体：健康态记为 error，模型为空
+            return json!({
+                "id": gw.id,
+                "name": gw.name,
+                "page": gw.page,
+                "base": gw.base,
+                "enabled": !accounts.is_empty() || gw.id == "glm",
+                "health": "error",
+                "error": err,
+                "accountCount": accounts.len(),
+                "healthyAccounts": healthy,
+                "modelCount": 0,
+                "capabilities": [],
+                "models": [],
+            });
+        }
+    };
+
+    let mut capabilities: Vec<&'static str> = Vec::new();
+    let mut simplified: Vec<Value> = Vec::new();
+    for model in &models {
+        let caps = model_capabilities(model);
+        for cap in &caps {
+            if !capabilities.contains(cap) {
+                capabilities.push(cap);
+            }
+        }
+        simplified.push(json!({
+            "id": model.get("id").cloned().unwrap_or(Value::Null),
+            "name": model
+                .get("display_name")
+                .or_else(|| model.get("name"))
+                .cloned()
+                .unwrap_or_else(|| model.get("id").cloned().unwrap_or(Value::Null)),
+            "capabilities": caps,
+        }));
+    }
+
+    // 有模型目录的网关（无「账号」概念）也视为可用：只要有模型就算启用
+    let enabled = !accounts.is_empty() || !models.is_empty();
+    let health = if !enabled {
+        "disabled"
+    } else if healthy == 0 && !accounts.is_empty() {
+        "cooling"
+    } else {
+        "ok"
+    };
+
+    // 渠道数（去重 owned_by）：模型目录型网关（WorkBuddy / OpenCode）的模型数会被
+    // 「同一模型被多个 provider 提供」放大，单看 modelCount 容易误读，故同时给出渠道数。
+    let provider_count = {
+        let mut set = std::collections::HashSet::new();
+        for model in &models {
+            if let Some(owner) = model.get("owned_by").and_then(Value::as_str) {
+                if !owner.is_empty() {
+                    set.insert(owner);
+                }
+            }
+        }
+        set.len()
+    };
+
+    json!({
+        "id": gw.id,
+        "name": gw.name,
+        "page": gw.page,
+        "base": gw.base,
+        "enabled": enabled,
+        "health": health,
+        "accountCount": accounts.len(),
+        "healthyAccounts": healthy,
+        "modelCount": simplified.len(),
+        "providerCount": provider_count,
+        "capabilities": capabilities,
+        "models": simplified,
+    })
 }

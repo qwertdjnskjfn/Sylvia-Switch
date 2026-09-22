@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { useRefreshAllListener } from "@/lib/refresh-all";
 import { ChevronDown, Network } from "lucide-react";
 import { NavLink, useLocation } from "react-router-dom";
 
@@ -82,25 +83,27 @@ function HealthNote({ info }: { info?: GatewayInfo }) {
 export function GatewayNavGroup() {
   const location = useLocation();
   const [overview, setOverview] = useState<GatewayInfo[]>([]);
-  const stored = readStored();
-  const [userOpen, setUserOpen] = useState<boolean | null>(stored);
+  // 惰性初始化：只在挂载时读一次 localStorage（此前在每次渲染里调用 readStored）
+  const [userOpen, setUserOpen] = useState<boolean | null>(readStored);
 
   // 落在任一网关页时默认展开；否则尊重用户上次的选择（未选择则收起）
   const open = userOpen ?? isGatewayPath(location.pathname);
 
   useEffect(() => {
     let disposed = false;
-    (async () => {
+    const load = async () => {
       try {
         const data = await api.getGatewaysOverview();
         if (!disposed) setOverview(data.gateways ?? []);
       } catch {
         // 静默降级：分组仍可正常导航，只是不显示状态摘要
       }
-    })();
-    return () => {
-      disposed = true;
     };
+    void load();
+    // 全局刷新按钮广播时重拉网关总览（侧边栏健康摘要实时更新）
+    return useRefreshAllListener(() => {
+      if (!disposed) void load();
+    }) || (() => { disposed = true; });
   }, []);
 
   /** 注册表项（含后端状态）+ 后端返回但注册表未登记的新网关（自动归入）。 */

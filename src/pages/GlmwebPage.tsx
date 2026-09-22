@@ -177,7 +177,7 @@ export default function GlmwebPage() {
               <div className="mt-3 space-y-2 rounded-lg border border-border/60 bg-muted/30 px-3 py-3">
                 <Input
                   className="h-8 text-xs"
-                  placeholder="refresh token（登录 chatglm.cn 后从 Local Storage 取 chatglm_refresh_token；填 guest 为游客槽位）"
+                  placeholder="refresh token（推荐用「ChatGLM Token 自动同步」浏览器扩展自动写入；手动获取需从 DevTools→Application→Cookies 找 chatglm.cn 的 refresh 凭据；填 guest 为游客槽位）"
                   value={newToken}
                   onChange={(e) => setNewToken(e.target.value)}
                 />

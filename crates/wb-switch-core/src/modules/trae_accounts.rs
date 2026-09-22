@@ -157,6 +157,86 @@ pub fn remove_account(id: &str) -> bool {
     save_accounts(&accounts).is_ok()
 }
 
+/// 手动添加账号的输入（T4：/trae-workbuddy 页账号池「手动添加」）。
+/// 与 import_local_snapshot 的区别：不带设备密钥对与 userId，凭据由用户粘贴；
+/// 续期（ExchangeToken 需要设备私钥）不可用，但签到/状态/额度在 expiredAt 前可用。
+pub struct ManualAccountInput {
+    pub label: Option<String>,
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub device_id: Option<String>,
+    pub machine_id: Option<String>,
+}
+
+/// 手动添加池条目（幂等：同 access token 更新凭据，保留 addedAt）。
+pub fn add_manual_account(input: ManualAccountInput) -> Result<Value, String> {
+    let access = input.access_token.trim().to_string();
+    if access.is_empty() {
+        return Err("accessToken 不能为空".to_string());
+    }
+    // id 派生：token 稳定哈希，同 token 重复添加即更新而非重复条目。
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(access.as_bytes());
+    let hash = hasher.finalize();
+    let hash_hex: String = hash.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    let id = format!("trae_work_cn:manual:{hash_hex}");
+
+    let _guard = WRITE_LOCK.lock().unwrap();
+    let mut accounts = load_accounts();
+    let now = now_ms();
+    let label = input
+        .label
+        .as_deref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "手动导入账号".to_string());
+    let mut entry = json!({
+        "id": id,
+        "label": label,
+        "userId": "",
+        "accessToken": access,
+        "refreshToken": input.refresh_token.clone().unwrap_or_default(),
+        "expiredAt": Value::Null,
+        "refreshExpiredAt": Value::Null,
+        "host": TRAE_DEFAULT_HOST,
+        "deviceId": input.device_id.clone().unwrap_or_default(),
+        "machineId": input.machine_id.clone().unwrap_or_default(),
+        "clientVersion": Value::Null,
+        "keypairs": json!([]),
+        "status": "ok",
+        "error": Value::Null,
+        "manual": true,
+        "updatedAt": now,
+        "addedAt": now,
+    });
+    if let Some(existing) = accounts
+        .iter_mut()
+        .find(|a| a.get("id").and_then(Value::as_str) == Some(id.as_str()))
+    {
+        for field in [
+            "label",
+            "accessToken",
+            "refreshToken",
+            "deviceId",
+            "machineId",
+            "manual",
+        ] {
+            existing[field] = entry[field].clone();
+        }
+        existing["status"] = json!("ok");
+        existing["error"] = Value::Null;
+        existing["updatedAt"] = json!(now);
+        let updated = existing.clone();
+        save_accounts(&accounts)?;
+        return Ok(updated);
+    }
+    accounts.push(entry.clone());
+    save_accounts(&accounts)?;
+    entry["addedAt"] = json!(now);
+    Ok(entry)
+}
+
 fn cred_from_entry(entry: &Value) -> Result<TraeCredential, String> {
     let token = entry
         .get("accessToken")
@@ -258,43 +338,61 @@ pub async fn refresh_stored_account(id: &str) -> Result<String, String> {
     }
 
     let mut last_error = String::new();
-    for (private_key_pem, public_key_pem) in &keypairs {
-        match trae_exchange_token(
-            &host,
-            &old_token,
-            &refresh_token,
-            &device_id,
-            &machine_id,
-            private_key_pem,
-            public_key_pem,
-            &client_version,
-        )
-        .await
-        {
-            Ok(out) => {
-                let token = out.token.clone();
-                entry["accessToken"] = json!(out.token);
-                if let Some(new_refresh) = out.refresh_token {
-                    entry["refreshToken"] = json!(new_refresh);
+    'keypairs: for (private_key_pem, public_key_pem) in &keypairs {
+        let mut net_attempt = 0u32;
+        loop {
+            match trae_exchange_token(
+                &host,
+                &old_token,
+                &refresh_token,
+                &device_id,
+                &machine_id,
+                private_key_pem,
+                public_key_pem,
+                &client_version,
+            )
+            .await
+            {
+                Ok(out) => {
+                    let token = out.token.clone();
+                    entry["accessToken"] = json!(out.token);
+                    if let Some(new_refresh) = out.refresh_token {
+                        entry["refreshToken"] = json!(new_refresh);
+                    }
+                    if let Some(expired_at) = out.expired_at {
+                        entry["expiredAt"] = json!(expired_at);
+                    }
+                    if let Some(refresh_expired_at) = out.refresh_expired_at {
+                        entry["refreshExpiredAt"] = json!(refresh_expired_at);
+                    }
+                    entry["status"] = json!("ok");
+                    entry["error"] = Value::Null;
+                    entry["updatedAt"] = json!(now_ms());
+                    save_accounts(&accounts)?;
+                    return Ok(token);
                 }
-                if let Some(expired_at) = out.expired_at {
-                    entry["expiredAt"] = json!(expired_at);
+                Err(error) => {
+                    last_error = error;
+                    // F1：网络类错误（传输层，http_request 统一映射 code=-1）指数退避
+                    // 重试，每个密钥对最多 3 次；服务端明确拒鉴权（如 20403）不重试，
+                    // 直接走下方「不判死」提示。
+                    if last_error.contains("code=-1") && net_attempt < 2 {
+                        net_attempt += 1;
+                        let backoff = 800u64 * (1u64 << net_attempt);
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                        continue;
+                    }
+                    continue 'keypairs;
                 }
-                if let Some(refresh_expired_at) = out.refresh_expired_at {
-                    entry["refreshExpiredAt"] = json!(refresh_expired_at);
-                }
-                entry["status"] = json!("ok");
-                entry["error"] = Value::Null;
-                entry["updatedAt"] = json!(now_ms());
-                save_accounts(&accounts)?;
-                return Ok(token);
             }
-            Err(error) => last_error = error,
         }
     }
     // 注意：续期失败不判死条目——TRAE 的刷新令牌随客户端会话绑定（账号
     // 从客户端切换/重新登录后即被服务端拒绝），但 access token 在 expiredAt
     // 前仍可直接签到；条目到期后由 entry_expired 剔除。
+    if last_error.is_empty() {
+        last_error = "所有设备密钥对均续期失败".to_string();
+    }
     if last_error.contains("刷新令牌已失效") {
         let expired_at = entry
             .get("expiredAt")
@@ -305,7 +403,43 @@ pub async fn refresh_stored_account(id: &str) -> Result<String, String> {
             "TRAE 刷新令牌已随客户端切换账号失效（20403）。该快照登录态在 {expired_at} 前仍可直接签到；到期后请切换客户端登录该账号并重新导入"
         );
     }
+    // F1：失败仅记录 error（status 保持 ok，不判死），供池列表与保活巡检可见。
+    entry["error"] = json!(last_error);
+    entry["updatedAt"] = json!(now_ms());
+    let _ = save_accounts(&accounts);
     Err(last_error)
+}
+
+/// F3：上游限流特征码命中时把账号置入冷却熔断（account_protection，
+/// 以 trae_work_cn: 前缀的条目 id 为键，与 loomy:/autoclaw 隔离）。
+pub fn note_trae_rate_limit(entry: &Value, err: &str) {
+    let id = entry
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if id.is_empty() || !id.starts_with("trae_work_cn:") {
+        return;
+    }
+    let is_rate = err.contains("429")
+        || err.contains("太多")
+        || err.contains("稍后再试")
+        || err.contains("请稍后")
+        || err.contains("繁忙")
+        || err.contains("稍后重试")
+        || err.contains("限流")
+        || err.contains("rate limit")
+        || err.contains("RateLimit");
+    if !is_rate {
+        return;
+    }
+    let cfg = crate::modules::account_protection::load_protection_config();
+    let label = entry.get("label").and_then(Value::as_str).unwrap_or(id);
+    crate::modules::account_protection::mark_account_cooling(
+        id,
+        label,
+        &format!("TRAE 上游限流：{err}"),
+        cfg.cooldown_minutes,
+    );
 }
 
 /// 池条目签到状态查询：用自身快照凭证，失败时自动续期重试一次。
@@ -327,6 +461,11 @@ pub async fn status_stored(store_id: &str) -> Value {
             status = get_trae_status_with(&refreshed).await;
         }
     }
+    if status.get("ok").and_then(Value::as_bool) != Some(true) {
+        if let Some(err) = status.get("error").and_then(Value::as_str) {
+            note_trae_rate_limit(&entry, err);
+        }
+    }
     status
 }
 
@@ -344,6 +483,9 @@ pub async fn claim_stored(store_id: &str) -> Value {
     };
     let status = status_stored(store_id).await;
     if status.get("ok").and_then(Value::as_bool) != Some(true) {
+        if let Some(err) = status.get("error").and_then(Value::as_str) {
+            note_trae_rate_limit(&entry, err);
+        }
         return json!({
             "result": "error",
             "error": status
@@ -399,6 +541,11 @@ pub async fn credits_stored(store_id: &str) -> Value {
             let mut refreshed = cred;
             refreshed.token = new_token;
             credits = get_trae_credits_with(&refreshed).await;
+        }
+    }
+    if credits.get("ok").and_then(Value::as_bool) != Some(true) {
+        if let Some(err) = credits.get("error").and_then(Value::as_str) {
+            note_trae_rate_limit(&entry, err);
         }
     }
     credits

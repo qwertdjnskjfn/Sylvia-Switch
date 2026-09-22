@@ -60,6 +60,7 @@ fn http_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
+            .no_proxy() // 国内上游直连，不继承系统代理
             .connect_timeout(std::time::Duration::from_secs(20))
             .read_timeout(std::time::Duration::from_secs(UPSTREAM_READ_IDLE_SECS))
             .build()

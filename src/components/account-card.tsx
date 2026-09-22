@@ -247,7 +247,7 @@ export function AccountCard({
   const quickSwitchAccounts = onQuickSwitch?.accounts;
   const currentAccount = onQuickSwitch?.current;
   const onQuickSwitchDone = onQuickSwitch?.done;
-  const platformName = platform === "autoclaw" ? "AutoClaw" : platform === "trae_work_cn" ? "TRAE Work CN" : platform;
+  const platformName = platform === "autoclaw" ? "AutoClaw" : platform === "trae_work_cn" ? "TRAE Work CN" : platform === "loomy" ? "Loomy" : platform === "chatglm" ? "ChatGLM" : platform;
   const rawName = account.nickname || account.uid || "未命名账号";
   const name = note ? note : privacyMask ? maskIdentity(rawName) : rawName;
   const secondaryIdentity = note

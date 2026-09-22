@@ -391,12 +391,11 @@ mod tests {
 
     #[test]
     fn db_paths_point_to_home() {
-        assert!(workbuddy_db_path()
-            .to_string_lossy()
-            .ends_with(".workbuddy/workbuddy.db"));
-        assert!(edge_sync_db_path()
-            .to_string_lossy()
-            .ends_with("edge-sync-mapping-v2.db"));
+        // Windows 的 PathBuf 用反斜杠渲染，断言前统一分隔符再比较。
+        let db = workbuddy_db_path().to_string_lossy().replace('\\', "/");
+        assert!(db.ends_with(".workbuddy/workbuddy.db"), "实际: {db}");
+        let edge = edge_sync_db_path().to_string_lossy().replace('\\', "/");
+        assert!(edge.ends_with("edge-sync-mapping-v2.db"), "实际: {edge}");
     }
 
     fn temp_db(name: &str) -> PathBuf {

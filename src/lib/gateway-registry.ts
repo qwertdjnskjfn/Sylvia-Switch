@@ -1,9 +1,12 @@
 import {
+  Blocks,
+  Cpu,
   Globe,
   MessagesSquare,
   Network,
   PlugZap,
   Sparkles,
+  Terminal,
   Zap,
   type LucideIcon,
 } from "lucide-react";
@@ -31,12 +34,16 @@ export type GatewayNavEntry = {
 
 export const GATEWAY_NAV_ENTRIES: GatewayNavEntry[] = [
   { id: "glm", path: "/glm-proxy", label: "GLM 代理", icon: PlugZap },
+  { id: "qwen", path: "/qwen", label: "Qwen 通道", icon: Globe },
   { id: "qoder", path: "/qoder", label: "Qoder 网关", icon: Zap },
   { id: "kimi", path: "/kimi", label: "Kimi 网关", icon: MessagesSquare },
   { id: "glmweb", path: "/glmweb", label: "ChatGLM 网关", icon: Globe },
   { id: "grok", path: "/grok", label: "Grok 网关", icon: Sparkles },
   { id: "loomy", path: "/loomy", label: "Loomy", icon: Sparkles },
-  { id: "trae-workbuddy", path: "/trae-workbuddy", label: "TRAE/WB 模型", icon: Globe },
+  // ── 2026-09-22 三拆：原先合并为一条「TRAE/WB 模型」，现按上游来源拆成三个相互独立的网关 ──
+  { id: "trae-work-cn", path: "/trae-work-cn", label: "TRAE Work CN", icon: Blocks },
+  { id: "workbuddy", path: "/workbuddy", label: "WorkBuddy", icon: Cpu },
+  { id: "opencode", path: "/opencode", label: "OpenCode", icon: Terminal },
 ];
 
 /** 分组里未登记、但后端总览已返回且路由可达时的兜底图标。 */

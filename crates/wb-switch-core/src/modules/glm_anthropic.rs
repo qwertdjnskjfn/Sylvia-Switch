@@ -169,11 +169,12 @@ pub(crate) fn to_openai_payload(body: &Value) -> Result<(Value, String, bool), S
         "messages": messages,
         "stream": stream,
     });
-    // Anthropic 的 max_tokens 必填；缺省给一个安全值。
+    // Anthropic 的 max_tokens 必填；缺省给一个安全值（最高钳位到 131072 避免上游 400）。
     let max_tokens = body
         .get("max_tokens")
         .and_then(Value::as_u64)
         .filter(|v| *v > 0)
+        .map(|v| v.min(131072))
         .unwrap_or(4096);
     payload["max_tokens"] = json!(max_tokens);
     for (from, to) in [("temperature", "temperature"), ("top_p", "top_p")] {
@@ -186,6 +187,14 @@ pub(crate) fn to_openai_payload(body: &Value) -> Result<(Value, String, bool), S
     if let Some(stops) = body.get("stop_sequences").and_then(Value::as_array) {
         if !stops.is_empty() {
             payload["stop"] = json!(stops);
+        }
+    }
+    // 推理档位透传：支持 reasoning_effort 或 Anthropic thinking 模式映射
+    if let Some(effort) = body.get("reasoning_effort") {
+        payload["reasoning_effort"] = effort.clone();
+    } else if let Some(thinking) = body.get("thinking") {
+        if thinking.get("type").and_then(Value::as_str) == Some("enabled") {
+            payload["reasoning_effort"] = json!("medium");
         }
     }
     // 工具调用：编码 agent（ZCode 等）依赖它驱动多步任务，必须透传。
@@ -880,14 +889,30 @@ pub(crate) fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
 /// 带上 [`error_chain`] 也没用——细化分类会被包装文案抢走。
 pub(crate) fn upstream_interrupt_message(raw: &str) -> String {
     let lower = raw.to_ascii_lowercase();
-    let is_timeout = lower.contains("timed out") || lower.contains("timeout");
+    // ⚠️ 中文 Windows 的 OS 错误文案是本地化的（如「远程主机强迫关闭了一个现有的连接。
+    // (os error 10054)」），不含英文 `connection reset` 字样 —— 必须同时匹配
+    // winsock 错误码与中文文案，否则连接类故障又会漏判（2026-09-18 第二次事故）。
+    let is_timeout = lower.contains("timed out") || lower.contains("timeout")
+        || lower.contains("os error 10060");
     let is_conn_lost = lower.contains("connection reset")
         || lower.contains("connection closed")
         || lower.contains("connection aborted")
         || lower.contains("unexpected eof")
         || lower.contains("incomplete message")
         || lower.contains("broken pipe")
-        || lower.contains("channel closed");
+        || lower.contains("channel closed")
+        // rustls 的「上游没发 TLS close_notify 就断开」：原文是
+        // `peer closed connection without sending TLS close_notify`，
+        // 注意词序是 `peer closed connection` 而非 `connection closed`，
+        // 漏了会把连接类故障误判成「上下文过长」（2026-09-18 ZCode 事故）。
+        || lower.contains("peer closed")
+        || lower.contains("close_notify")
+        // Windows winsock：10054=WSAECONNRESET（远程主机强迫关闭），
+        // 10053=WSAECONNABORTED（本机软件中止连接）。
+        || lower.contains("os error 10054")
+        || lower.contains("os error 10053")
+        || raw.contains("远程主机强迫关闭")
+        || raw.contains("强迫关闭");
     let detail = if is_timeout {
         "本机侧读超时上限触发（连续无数据到达超过上限，上游长时间不吐字节）"
     } else if is_conn_lost {
@@ -1566,6 +1591,32 @@ mod tests {
                 "{raw} 应映射到 {expect}"
             );
         }
+    }
+
+    /// 回归（2026-09-18 ZCode 事故）：rustls 的「上游未发 close_notify 就断开」
+    /// 原文词序是 `peer closed connection`，必须归入连接类（可直接重试），
+    /// 不得落进「上下文过长」分支误导用户去压缩会话。
+    #[test]
+    fn peer_closed_without_close_notify_is_conn_lost() {
+        let raw = "error decoding response body: error reading a body from connection: \
+                   peer closed connection without sending TLS close_notify: \
+                   https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof";
+        let msg = upstream_interrupt_message(raw);
+        assert!(msg.contains("连接被重置/切断"), "应归入连接类：{msg}");
+        assert!(msg.contains("可直接重试"), "连接类是瞬时故障：{msg}");
+        assert!(!msg.contains("压缩上下文"), "不得建议压缩上下文：{msg}");
+    }
+
+    /// 回归（2026-09-18 14:45 ZCode 二次事故）：中文 Windows 的 OS 错误文案是
+    /// 本地化的，`os error 10054`（WSAECONNRESET）+「远程主机强迫关闭」必须归入连接类。
+    #[test]
+    fn localized_wsaconnreset_is_conn_lost() {
+        let raw = "error decoding response body: error reading a body from connection: \
+                   远程主机强迫关闭了一个现有的连接。 (os error 10054)";
+        let msg = upstream_interrupt_message(raw);
+        assert!(msg.contains("连接被重置/切断"), "应归入连接类：{msg}");
+        assert!(msg.contains("可直接重试"), "连接类是瞬时故障：{msg}");
+        assert!(!msg.contains("压缩上下文"), "不得建议压缩上下文：{msg}");
     }
 
     /// 模拟 reqwest 的两层错误：外层 Display 恒为 `error decoding response body`，

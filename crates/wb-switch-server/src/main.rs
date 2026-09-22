@@ -12,7 +12,8 @@ mod api;
 use serde_json::json;
 
 use wb_switch_core::modules::{
-    account, account_protection, auth_file, checkin, config, official_usage, process, travel, update,
+    account, account_protection, auth_file, checkin, config, official_usage, process, travel,
+    update, workbuddy_proxy,
 };
 
 fn default_port() -> u16 {
@@ -94,6 +95,9 @@ fn spawn_background_loops() {
 
     // 账号保护与 AutoClaw 反代主动保活：启动巡检、周期心跳与前瞻式静默续期。
     account_protection::spawn_protection_loop();
+    // WorkBuddy 反代上游（独立 OpenCode server，4097）模块级看门狗：
+    // 与 Startup 文件夹的 vbs 看门狗协同，30s 探活 + 限流重启。
+    workbuddy_proxy::spawn_server_watchdog();
 }
 
 fn print_status() {

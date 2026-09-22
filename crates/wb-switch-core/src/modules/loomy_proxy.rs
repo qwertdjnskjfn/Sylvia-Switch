@@ -129,18 +129,25 @@ pub(crate) fn ordered_pool() -> Vec<(String, String, Option<String>)> {
 /// 长回答不会被总时长误杀，而真卡死（上游一个字节都不再吐）仍会及时断开。
 const UPSTREAM_READ_IDLE_SECS: u64 = 300;
 
-/// 构造注入官方拟真 UA 的 HTTP 客户端。
+/// 构造注入官方拟真 UA 的 HTTP 客户端（全局单例连接池，复用 TCP/TLS 保持长连接）。
 ///
 /// ⚠️ 超时一律在 **client 层**用 connect + read 表达，禁止在单个请求上叠
 /// `.timeout()`——那会重新引入上面的总时长掐断问题。
-fn upstream_client() -> reqwest::Client {
-    let ua = crate::modules::account_protection::simulated_loomy_user_agent();
-    reqwest::Client::builder()
-        .user_agent(ua)
-        .connect_timeout(std::time::Duration::from_secs(15))
-        .read_timeout(std::time::Duration::from_secs(UPSTREAM_READ_IDLE_SECS))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+fn upstream_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        let ua = crate::modules::account_protection::simulated_loomy_user_agent();
+        reqwest::Client::builder()
+            .no_proxy() // 国内上游直连，不继承系统代理
+            .user_agent(ua)
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .read_timeout(std::time::Duration::from_secs(UPSTREAM_READ_IDLE_SECS))
+            .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
+            .pool_idle_timeout(Some(std::time::Duration::from_secs(90)))
+            .pool_max_idle_per_host(10)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
 }
 
 /// 获取单账号并发槽位，若忙碌则在 2.5 秒内自适应排队等待
@@ -236,8 +243,62 @@ pub async fn proxy_status() -> Value {
 // Chat 转发（OpenAI 兼容）
 // ---------------------------------------------------------------------------
 
+/// 针对 Loomy 上游网关做参数兼容与安全清洗：
+/// 1. 模型名统一归一化（不区分大小写匹配真实 ID，如 `glm-5.3-flash` -> `GLM-5.3-Flash`）；
+/// 2. `max_tokens` 安全钳位：上游硬上限为 131072（128K），超限上游直接报 400，此处自动安全钳位；
+/// 3. 空 content 与无效属性修正。
+pub(crate) fn sanitize_loomy_payload(body: &mut Value) {
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+
+    // 1. 模型名统一归一化映射
+    if let Some(m) = obj.get("model").and_then(Value::as_str) {
+        let trimmed = m.trim();
+        if trimmed.eq_ignore_ascii_case("glm-5.3-flash")
+            || trimmed.eq_ignore_ascii_case("glm-5.3")
+            || trimmed.eq_ignore_ascii_case("glm5.3-flash")
+            || trimmed.eq_ignore_ascii_case("glm5.3")
+            || trimmed.eq_ignore_ascii_case("GLM-5.3-Flash")
+        {
+            obj.insert("model".to_string(), json!("GLM-5.3-Flash"));
+        } else if trimmed.eq_ignore_ascii_case("kimi-k2.6") {
+            obj.insert("model".to_string(), json!("Kimi-k2.6"));
+        } else if trimmed.eq_ignore_ascii_case("minimax-m3") {
+            obj.insert("model".to_string(), json!("MiniMax-M3"));
+        } else if trimmed.eq_ignore_ascii_case("deepseek-v4-flash-0731") {
+            obj.insert("model".to_string(), json!("deepseek-v4-flash-0731"));
+        } else if trimmed.eq_ignore_ascii_case("spark-x") {
+            obj.insert("model".to_string(), json!("spark-x"));
+        }
+    }
+
+    // 2. max_tokens 安全钳位
+    if let Some(mt) = obj.get("max_tokens").and_then(Value::as_i64) {
+        if mt > 131072 {
+            obj.insert("max_tokens".to_string(), json!(131072));
+        } else if mt <= 0 {
+            obj.remove("max_tokens");
+        }
+    }
+
+    // 3. 消息 content 与 tool_calls 兼容
+    if let Some(msgs) = obj.get_mut("messages").and_then(Value::as_array_mut) {
+        for msg in msgs {
+            if let Some(msg_obj) = msg.as_object_mut() {
+                if msg_obj.get("content").map(Value::is_null).unwrap_or(false)
+                    && !msg_obj.contains_key("tool_calls")
+                {
+                    msg_obj.insert("content".to_string(), json!(""));
+                }
+            }
+        }
+    }
+}
+
 /// 非流式对话补全：透传上游 OpenAI 格式响应。
-pub async fn chat_completions_json(body: Value) -> Result<Value, String> {
+pub async fn chat_completions_json(mut body: Value) -> Result<Value, String> {
+    sanitize_loomy_payload(&mut body);
     let pool = ordered_pool();
     if pool.is_empty() {
         return Err("Loomy 可用账号池为空（无有效账号或全部账号处于安全冷却保护中）".to_string());
@@ -404,7 +465,8 @@ fn record_usage(value: &Value, model: &str, account_id: &str, started: i64) {
 }
 
 /// 流式对话补全：透传上游 SSE（Loomy 网关本身支持 stream）。
-pub async fn chat_completions_stream(body: Value) -> Result<LoomyUpstreamStream, String> {
+pub async fn chat_completions_stream(mut body: Value) -> Result<LoomyUpstreamStream, String> {
+    sanitize_loomy_payload(&mut body);
     let pool = ordered_pool();
     if pool.is_empty() {
         return Err("Loomy 可用账号池为空（无有效账号或全部账号处于安全冷却保护中）".to_string());
@@ -473,7 +535,19 @@ pub async fn chat_completions_stream(body: Value) -> Result<LoomyUpstreamStream,
                         loop {
                             let next = match pending.take() {
                                 Some(chunk) => Ok(Some(chunk)),
-                                None => resp.chunk().await,
+                                None => {
+                                    // 8 秒无新数据（如处于深度思考推理中）则往下游发送 SSE 注释保活帧，
+                                    // 避免客户端由于空闲读取超时（Read Timeout）而单方面切断连接。
+                                    match tokio::time::timeout(std::time::Duration::from_secs(8), resp.chunk()).await {
+                                        Ok(chunk_res) => chunk_res,
+                                        Err(_) => {
+                                            if tx.send(Ok(Bytes::from_static(b": keep-alive\n\n"))).await.is_err() {
+                                                break;
+                                            }
+                                            continue;
+                                        }
+                                    }
+                                }
                             };
                             match next {
                                 Ok(Some(chunk)) => {
@@ -635,4 +709,38 @@ pub async fn chat_completions(body: Value) -> Result<LoomyChatCompletion, String
 /// Anthropic Messages 协议兼容转发。
 pub async fn anthropic_messages(body: Value) -> Result<LoomyChatCompletion, String> {
     super::loomy_anthropic::messages(body).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_normalizes_glm_model_and_clamps_max_tokens() {
+        let mut body = json!({
+            "model": "glm-5.3-flash",
+            "messages": [
+                {"role": "user", "content": "hello"}
+            ],
+            "max_tokens": 200000
+        });
+        sanitize_loomy_payload(&mut body);
+        assert_eq!(body["model"], json!("GLM-5.3-Flash"));
+        assert_eq!(body["max_tokens"], json!(131072));
+    }
+
+    #[test]
+    fn sanitize_removes_invalid_max_tokens_and_fixes_null_content() {
+        let mut body = json!({
+            "model": "kimi-k2.6",
+            "messages": [
+                {"role": "user", "content": null}
+            ],
+            "max_tokens": 0
+        });
+        sanitize_loomy_payload(&mut body);
+        assert_eq!(body["model"], json!("Kimi-k2.6"));
+        assert!(!body.as_object().unwrap().contains_key("max_tokens"));
+        assert_eq!(body["messages"][0]["content"], json!(""));
+    }
 }

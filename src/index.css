@@ -163,6 +163,13 @@
     height: 100%;
     overflow: hidden;
   }
+  /* Tailwind v4 preflight 把 button 的 cursor 重置为浏览器默认（箭头），
+     全站按钮因此失去「可点击」提示（原 Tauri 模板 App.css 曾设 pointer）。
+     恢复手型光标；:disabled 除外。 */
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
 }
 
 @media (min-width: 900px) {

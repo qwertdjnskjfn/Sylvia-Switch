@@ -9,6 +9,11 @@
 //! （动态跟随桌面端登录），与池内账号按 uid 去重后合并，互不干扰。
 //! token 以明文存放于 `~/.wb-switch/autoclaw_accounts.json`（用户目录内，
 //! 与其他本地配置一致），请勿把该文件分享给他人。
+//!
+//! 区域隔离 (v1.0+): 
+//! - 国际版账号 (international): OAuth/手动导入/抓包获取
+//! - 国内版账号 (domestic): 从本机 AutoClaw 桌面端导入
+//! - 两个账号池完全隔离，互不共享 API 访问权限
 
 use base64::engine::general_purpose;
 use base64::Engine;
@@ -19,12 +24,119 @@ use std::sync::Mutex;
 use crate::modules::config::{atomic_write, http_request, now_ms, store_dir};
 use crate::modules::platform_checkin::{
     autoclaw_data_dir, autoclaw_decrypt_token, autoclaw_headers, read_autoclaw_token,
-    AUTOCLAW_API_HOST,
 };
 
 const ACCOUNTS_FILE: &str = "autoclaw_accounts.json";
 
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// 账号区域枚举
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AccountRegion {
+    #[serde(rename = "international")]
+    International,  // 国际版（海外）
+    
+    #[serde(rename = "domestic")]
+    Domestic,       // 国内版（中国大陆）
+}
+
+impl std::fmt::Display for AccountRegion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AccountRegion::International => write!(f, "🌐 国际"),
+            AccountRegion::Domestic => write!(f, "🇨🇳 国内"),
+        }
+    }
+}
+
+impl AccountRegion {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AccountRegion::International => "international",
+            AccountRegion::Domestic => "domestic",
+        }
+    }
+
+    /// 该区域账号使用的 AutoClaw 网关 host（2026-09-18 逆向国际版客户端
+    /// app.asar + 实测：两区签到/续期/积分/模型代理路径同构，仅 host 不同；
+    /// 国际账号调国内网关返回 code=410000「用户未登录」，绝不可跨区调用）。
+    /// 国内 = `autoglm-acceleration-api.zhipuai.cn`；国际 = `autoglm-api.autoglm.ai`。
+    pub fn api_host(self) -> &'static str {
+        match self {
+            AccountRegion::Domestic => "https://autoglm-acceleration-api.zhipuai.cn",
+            AccountRegion::International => "https://autoglm-api.autoglm.ai",
+        }
+    }
+
+    /// 模型代理 chat completions 上游 URL（两区路径结构相同，仅 host 不同；
+    /// 国际版 2026-09-18 实测 200）。仅供 glm_proxy 使用。
+    pub fn chat_upstream_url(self) -> String {
+        format!(
+            "{}/autoclaw-proxy/proxy/autoclaw/chat/completions",
+            self.api_host()
+        )
+    }
+    
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "international" | "intl" | "overseas" | "global" => Some(AccountRegion::International),
+            "domestic" | "cn" | "china" | "local" => Some(AccountRegion::Domestic),
+            _ => None,
+        }
+    }
+    
+    /// 根据账号来源设置默认区域
+    pub fn default_for_source(source: &AccountSource) -> Self {
+        match source {
+            AccountSource::LocalSnapshot => AccountRegion::Domestic,
+            _ => AccountRegion::International,
+        }
+    }
+}
+
+/// 账号来源枚举
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountSource {
+    #[serde(rename = "oauth")]
+    OAuth,                    // OAuth 扫码
+    
+    #[serde(rename = "manual_import")]
+    ManualImport,             // 手动导入 Token
+    
+    #[serde(rename = "packet_capture")]
+    PacketCapture,            // 抓包获取
+    
+    #[serde(rename = "local_snapshot")]
+    LocalSnapshot,            // 本机桌面端快照
+    
+    #[serde(rename = "imported")]
+    Imported,                 // 从其他设备导入
+}
+
+impl AccountSource {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "oauth" | "scan" | "qr" => Some(AccountSource::OAuth),
+            "manual" | "paste" | "import" => Some(AccountSource::ManualImport),
+            "capture" | "packets" => Some(AccountSource::PacketCapture),
+            "local" | "snapshot" | "desktop" => Some(AccountSource::LocalSnapshot),
+            "imported" | "migrated" => Some(AccountSource::Imported),
+            _ => None,
+        }
+    }
+    
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AccountSource::OAuth => "oauth",
+            AccountSource::ManualImport => "manual_import",
+            AccountSource::PacketCapture => "packet_capture",
+            AccountSource::LocalSnapshot => "local_snapshot",
+            AccountSource::Imported => "imported",
+        }
+    }
+}
 
 pub(crate) fn accounts_path() -> PathBuf {
     store_dir().join(autoclaw_accounts_file_name())
@@ -38,8 +150,20 @@ pub fn load_accounts() -> Vec<Value> {
     std::fs::read_to_string(accounts_path())
         .ok()
         .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-        .and_then(|v| v.get("accounts").and_then(Value::as_array).cloned())
+        .and_then(|v| v.get("accounts").and_then(Value::as_array).cloned())     
         .unwrap_or_default()
+        .into_iter()
+        .map(|mut account| {
+            // 缺 region 的历史数据按身份/来源推断（手机号账号=国内、
+            // 邮箱账号=国际），不能无脑默认国际。
+            if account.get("region").is_none() {
+                account["region"] = json!(stored_region(&account).as_str());
+            }
+            account
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .collect()
 }
 
 /// 按 id 取池条目（一键切换用）。
@@ -55,8 +179,24 @@ fn save_accounts(accounts: &[Value]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
+    
+    // 确保每个账号都有 region、source、is_manual_specified 字段
+    let enriched_accounts: Vec<Value> = accounts.iter().map(|acc| {
+        let mut acc = acc.clone();
+        if acc.get("region").is_none() {
+            acc["region"] = json!("international");
+        }
+        if acc.get("source").is_none() {
+            acc["source"] = json!("imported");
+        }
+        if acc.get("is_manual_specified").is_none() {
+            acc["is_manual_specified"] = json!(false);
+        }
+        acc
+    }).collect();
+    
     let content = serde_json::to_string_pretty(&json!({
-        "accounts": accounts,
+        "accounts": enriched_accounts,
         "updatedAt": now_ms(),
     }))
     .map_err(|e| e.to_string())?;
@@ -71,6 +211,7 @@ fn find_account_mut<'a>(
 }
 
 /// 解析 access token（JWT）里的 user_id，作为账号稳定 ID。
+/// 服务端对手机号/邮箱账号返回数字 uid，字符串解析需兼容数字类型。
 fn user_id_from_access_token(access_token: &str) -> Option<String> {
     let raw = access_token.strip_prefix("Bearer ").unwrap_or(access_token);
     let middle = raw.split('.').nth(1)?;
@@ -81,8 +222,90 @@ fn user_id_from_access_token(access_token: &str) -> Option<String> {
     let value: Value = serde_json::from_slice(&payload).ok()?;
     value
         .get("user_id")
+        .and_then(|v| {
+            v.as_str()
+                .map(str::to_string)
+                .or_else(|| v.as_i64().map(|n| n.to_string()))
+                .or_else(|| v.as_u64().map(|n| n.to_string()))
+        })
+}
+
+/// 解析 access token（JWT）里的 jti（登录身份：国际账号 = 邮箱，国内账号 = 手机号）。
+fn jti_from_access_token(access_token: &str) -> Option<String> {
+    let raw = access_token.strip_prefix("Bearer ").unwrap_or(access_token);
+    let middle = raw.split('.').nth(1)?;
+    let payload = general_purpose::URL_SAFE_NO_PAD
+        .decode(middle)
+        .or_else(|_| general_purpose::URL_SAFE.decode(middle))
+        .ok()?;
+    let value: Value = serde_json::from_slice(&payload).ok()?;
+    value
+        .get("jti")
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+/// 从登录身份特征推断区域：含 `@`（邮箱注册，如国际版 Gmail 账号）→ 国际；
+/// 纯数字（国内手机号）→ 国内；无法识别 → None。
+pub fn infer_region_from_identity(identity: &str) -> Option<AccountRegion> {
+    if identity.contains('@') {
+        Some(AccountRegion::International)
+    } else if !identity.is_empty() && identity.chars().all(|c| c.is_ascii_digit()) {
+        Some(AccountRegion::Domestic)
+    } else {
+        None
+    }
+}
+
+/// 账号条目的区域：显式 `region` 字段优先（含手动指定）；缺失时按 JWT jti
+/// 推断，再按来源兜底（本机桌面端导入 = 国内，其余 = 国际）。
+pub(crate) fn stored_region(account: &Value) -> AccountRegion {    if let Some(r) = account
+        .get("region")
+        .and_then(Value::as_str)
+        .and_then(AccountRegion::from_str)
+    {
+        return r;
+    }
+    let access = account.get("accessToken").and_then(Value::as_str).unwrap_or("");
+    if let Some(jti) = jti_from_access_token(access) {
+        if let Some(r) = infer_region_from_identity(&jti) {
+            return r;
+        }
+    }
+    match account.get("source").and_then(Value::as_str) {
+        Some("local_snapshot") | Some("local_import") | Some("local-import") => AccountRegion::Domestic,
+        _ => AccountRegion::International,
+    }
+}
+
+/// 本机 auth.json 当前登录账号的区域：优先按 JWT jti 判断，其次按
+/// userInfo 的邮箱/手机号（国际版 = 邮箱注册无手机号）；均不可得默认国内。
+pub fn local_autoclaw_region() -> AccountRegion {
+    if let Ok(token) = read_autoclaw_token() {
+        if let Some(jti) = jti_from_access_token(token.trim_start_matches("Bearer ")) {
+            if let Some(r) = infer_region_from_identity(&jti) {
+                return r;
+            }
+        }
+    }
+    if let Some(dir) = autoclaw_data_dir() {
+        if let Ok(text) = std::fs::read_to_string(dir.join("auth.json")) {
+            if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                let email = v.pointer("/userInfo/email").and_then(Value::as_str).unwrap_or("");
+                let phone = v
+                    .pointer("/userInfo/user_phone")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if !email.is_empty() && phone.is_empty() {
+                    return AccountRegion::International;
+                }
+                if !phone.is_empty() {
+                    return AccountRegion::Domestic;
+                }
+            }
+        }
+    }
+    AccountRegion::Domestic
 }
 
 /// 解析 access token（JWT）里的过期时间戳（exp，秒级 UNIX 时间戳）。
@@ -98,7 +321,12 @@ pub fn jwt_exp_from_access_token(access_token: &str) -> Option<i64> {
 }
 
 /// 调 user-profile 补齐账号信息（uid + 脱敏手机号），失败不影响导入。
-async fn profile_info(access_token: &str, device_id: &str) -> Option<(String, String)> {
+/// 必须用账号所属区域的网关：跨区网关对该账号返回 410000。
+async fn profile_info_region(
+    access_token: &str,
+    device_id: &str,
+    region: AccountRegion,
+) -> Option<(String, String)> {
     let bearer = if access_token.starts_with("Bearer ") {
         access_token.to_string()
     } else {
@@ -110,7 +338,7 @@ async fn profile_info(access_token: &str, device_id: &str) -> Option<(String, St
         "device_id": device_id,
     });
     let resp = http_request(
-        &format!("{AUTOCLAW_API_HOST}/userapi/v1/user-profile"),
+        &format!("{}/userapi/v1/user-profile", region.api_host()),
         "POST",
         Some(body),
         Some(&headers),
@@ -192,7 +420,7 @@ pub async fn import_local() -> Result<Value, String> {
         .unwrap_or_default()
         .to_string();
 
-    let (uid, phone) = profile_info(&token, &device_id)
+    let (uid, phone) = profile_info_region(&token, &device_id, local_autoclaw_region())
         .await
         .map(|(uid, phone)| (Some(uid), Some(phone)))
         .unwrap_or((None, None));
@@ -212,7 +440,10 @@ pub async fn import_local() -> Result<Value, String> {
         "accessToken": token.trim_start_matches("Bearer ").to_string(),
         "refreshToken": refresh_token.trim_start_matches("Bearer ").to_string(),
         "deviceId": device_id,
-        "source": "local-import",
+        "source": "local_snapshot",
+        // 本机快照不再硬编码国内：按当前登录账号身份推断（本机登录国际
+        // 账号时快照同样是国际版），推断不出才回退国内。
+        "region": local_autoclaw_region().as_str(),
         "localDiscoveryId": local_discovery.clone().map(|v| json!(v)).unwrap_or(Value::Null),
         "status": "ok",
         "addedAt": now_ms(),
@@ -245,20 +476,39 @@ pub async fn import_local() -> Result<Value, String> {
     Ok(account)
 }
 
-/// 手动导入账号（access + refresh token 必填）。uid 优先取 JWT/Profile。
+/// 手动导入账号（access + refresh token 必填）。
+/// 区域优先级：调用方显式指定 > JWT jti 身份推断 > 国际版（用户规则：
+/// OAuth/手动导入/抓包默认国际；token 是手机号账号时自动纠正为国内）。
 pub async fn add_account(
     label: Option<String>,
     access_token: &str,
     refresh_token: &str,
     device_id: Option<String>,
 ) -> Result<Value, String> {
+    add_account_v2(label, access_token, refresh_token, device_id, None, AccountSource::ManualImport).await
+}
+
+/// 带区域和来源元数据的账号导入（region 传 None 时按身份自动归类）。
+pub async fn add_account_v2(
+    label: Option<String>,
+    access_token: &str,
+    refresh_token: &str,
+    device_id: Option<String>,
+    region: Option<AccountRegion>,
+    source: AccountSource,
+) -> Result<Value, String> {
     let access_token = access_token.trim().trim_start_matches("Bearer ").to_string();
     let refresh_token = refresh_token.trim().trim_start_matches("Bearer ").to_string();
     if access_token.is_empty() || refresh_token.is_empty() {
         return Err("access token 与 refresh token 均不能为空".to_string());
     }
+    // 先定区域（决定去哪个网关验证 token）：显式指定 > 身份推断 > 国际。
+    let inferred = jti_from_access_token(&access_token)
+        .as_deref()
+        .and_then(infer_region_from_identity);
+    let region = region.or(inferred).unwrap_or(AccountRegion::International);
     let device_id = device_id.unwrap_or_default();
-    let (uid, phone) = profile_info(&access_token, &device_id)
+    let (uid, phone) = profile_info_region(&access_token, &device_id, region)
         .await
         .map(|(uid, phone)| (Some(uid), Some(phone)))
         .unwrap_or((user_id_from_access_token(&access_token), None));
@@ -277,7 +527,9 @@ pub async fn add_account(
         "accessToken": access_token,
         "refreshToken": refresh_token,
         "deviceId": device_id,
-        "source": "manual",
+        "source": source.as_str(),
+        "region": region.as_str(),
+        "is_manual_specified": false,
         "status": "ok",
         "addedAt": now_ms(),
         "updatedAt": now_ms(),
@@ -362,6 +614,8 @@ pub async fn refresh_stored_account(id: &str) -> Result<String, String> {
         .to_string();
     // 网络错误（code == -1）按瞬时故障退避重试；仅服务端明确拒绝鉴权时
     // 才标记失效——瞬时网络抖动不应永久废掉账号。
+    // 续期网关按账号所属区域路由（跨区网关会报 410000）。
+    let region = stored_region(&account);
     let mut last_error = String::from("未知错误");
     let mut new_access = String::new();
     let mut attempt = 0u32;
@@ -370,7 +624,7 @@ pub async fn refresh_stored_account(id: &str) -> Result<String, String> {
             tokio::time::sleep(std::time::Duration::from_millis(800 * (1 << attempt))).await;
         }
         let resp = http_request(
-            &format!("{AUTOCLAW_API_HOST}/userapi/v1/refresh"),
+            &format!("{}/userapi/v1/refresh", region.api_host()),
             "POST",
             Some(json!({
                 "source_id": "autoclaw",
@@ -447,11 +701,14 @@ pub async fn recover_invalid_accounts() -> usize {
 pub fn list_for_display() -> Vec<Value> {
     let mut out = Vec::new();
     // 1) 本机实时账号（离线读取 auth.json，无需网络）。
+    // 区域按当前登录账号身份动态推断——本机登录国际账号（如 Gmail）时
+    // 必须显示国际版，不能再硬编码国内。
     if let Some(entry) = crate::modules::platform_checkin::discover_autoclaw_account() {
         out.push(json!({
             "id": entry.get("id").cloned().unwrap_or(Value::Null),
             "label": entry.get("email").cloned().unwrap_or(Value::Null),
             "source": "local-live",
+            "region": local_autoclaw_region().as_str(),
             "status": "ok",
             "lastError": Value::Null,
             "addedAt": Value::Null,
@@ -468,6 +725,8 @@ pub fn list_for_display() -> Vec<Value> {
             "id": account.get("id").cloned().unwrap_or(Value::Null),
             "label": account.get("label").cloned().unwrap_or(Value::Null),
             "source": account.get("source").cloned().unwrap_or(Value::Null),
+            "region": account.get("region").cloned().unwrap_or(json!("international")),
+            "is_manual_specified": account.get("is_manual_specified").cloned().unwrap_or(json!(false)),
             "status": account.get("status").cloned().unwrap_or(json!("ok")),
             "lastError": account.get("lastError").cloned().unwrap_or(Value::Null),
             "addedAt": account.get("addedAt").cloned().unwrap_or(Value::Null),
@@ -492,6 +751,8 @@ pub(crate) struct PoolAccount {
     pub refresh_token: String,
     pub device_id: String,
     pub store_id: Option<String>,
+    /// 账号所属区域：签到/续期/代理必须路由到该区域的网关。
+    pub region: AccountRegion,
 }
 
 impl PoolAccount {
@@ -524,6 +785,7 @@ impl PoolAccount {
 
 /// 账号池：本机 auth.json 登录账号优先，其后是账号池条目；
 /// 按访问 token 的 user_id 去重（同一账号不重复参与轮询）。
+/// 每个条目携带所属区域，签到/代理按区域过滤与路由。
 pub(crate) fn pool_accounts() -> Vec<PoolAccount> {
     let mut pool: Vec<PoolAccount> = Vec::new();
     let mut seen_user_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -581,9 +843,41 @@ pub(crate) fn pool_accounts() -> Vec<PoolAccount> {
                 .get("id")
                 .and_then(Value::as_str)
                 .map(String::from),
+            region: stored_region(&account),
         });
     }
     pool
+}
+
+/// 按区域过滤账号池（None = 全部）。签到与代理的区域隔离入口。
+pub(crate) fn pool_accounts_filtered(region: Option<AccountRegion>) -> Vec<PoolAccount> {
+    pool_accounts()
+        .into_iter()
+        .filter(|a| region.map_or(true, |r| a.region == r))
+        .collect()
+}
+
+/// 按访问 token 匹配账号区域（本机/池内精确比对；JWT 可解析时按 jti 优先）。
+/// 供钱包/流水查询按账号路由网关；无法匹配时回退国内（向后兼容旧数据）。
+pub fn region_for_token(token: &str) -> AccountRegion {
+    let raw = token.trim().trim_start_matches("Bearer ");
+    if let Some(jti) = jti_from_access_token(raw) {
+        if let Some(r) = infer_region_from_identity(&jti) {
+            return r;
+        }
+    }
+    for account in load_accounts() {
+        let at = account.get("accessToken").and_then(Value::as_str).unwrap_or("");
+        if at.trim_start_matches("Bearer ") == raw {
+            return stored_region(&account);
+        }
+    }
+    if let Some(local) = local_pool_account() {
+        if local.access_token.trim_start_matches("Bearer ") == raw {
+            return local.region;
+        }
+    }
+    AccountRegion::Domestic
 }
 
 fn local_pool_account() -> Option<PoolAccount> {
@@ -604,6 +898,7 @@ fn local_pool_account() -> Option<PoolAccount> {
         refresh_token: String::new(),
         device_id,
         store_id: None,
+        region: local_autoclaw_region(),
     })
 }
 
@@ -625,6 +920,8 @@ pub async fn checkin_stored(id: &str) -> Value {
     }
     let invalid_hint = "请重新导入该账号的 token";
 
+    // 状态/签到请求按账号区域路由：get_autoclaw_status_with 内部按 token
+    // 自动解析区域网关（region_for_token）。
     let mut status = crate::modules::platform_checkin::get_autoclaw_status_with(&access_token).await;
     if status.get("ok").and_then(Value::as_bool) != Some(true) {
         // 登录态可能过期：续期后重试一次。
@@ -708,4 +1005,55 @@ mod tests {
         assert_eq!(user_id_from_access_token(&token), Some("560128".to_string()));
         assert_eq!(user_id_from_access_token("not-a-jwt"), None);
     }
+}
+
+// ---------------------------------------------------------------------------
+// 区域隔离功能 (v1.0+)
+// ---------------------------------------------------------------------------
+
+/// 手动指定账号归属区域（防误判；写入 is_manual_specified 后自动推断不再覆盖）。
+pub fn set_account_region(id: &str, region: AccountRegion) -> Result<Value, String> {
+    let _guard = WRITE_LOCK.lock().unwrap();
+    let mut accounts = load_accounts();
+    let snapshot = {
+        let Some(account) = find_account_mut(&mut accounts, id) else {
+            return Err("账号不存在".to_string());
+        };
+        account["region"] = json!(region.as_str());
+        account["is_manual_specified"] = json!(true);
+        account["updatedAt"] = json!(now_ms());
+        account.clone()
+    };
+    save_accounts(&accounts)?;
+    Ok(snapshot)
+}
+
+/// 迁移旧数据（无 region 字段）：按 JWT jti 身份推断（邮箱=国际、
+/// 手机号=国内），推断不出再按来源兜底（本机桌面端导入=国内）。
+pub fn migrate_accounts_data() -> Result<usize, String> {
+    let accounts = load_accounts();
+    let mut migrated_count = 0;
+
+    let migrated_accounts: Vec<Value> = accounts.into_iter().map(|mut acc| {
+        if acc.get("region").is_none() {
+            acc["region"] = json!(stored_region(&acc).as_str());
+            if acc.get("is_manual_specified").is_none() {
+                acc["is_manual_specified"] = json!(false);
+            }
+            migrated_count += 1;
+        }
+        acc
+    }).collect();
+
+    if migrated_count > 0 {
+        save_accounts(&migrated_accounts)?;
+        eprintln!("成功迁移 {migrated_count} 个账号到新版本格式（添加 region 字段）");
+    }
+
+    Ok(migrated_count)
+}
+
+/// 根据来源设置默认区域
+pub fn set_default_region_by_source(source: &AccountSource) -> AccountRegion {
+    AccountRegion::default_for_source(source)
 }

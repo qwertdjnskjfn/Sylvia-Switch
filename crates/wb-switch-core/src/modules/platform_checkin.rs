@@ -29,6 +29,8 @@ use crate::modules::config::{
 use crate::modules::vscode_cn_inject::{
     decrypt_windows_gcm_v10, dpapi_decrypt, encrypt_windows_gcm_v10,
 };
+use crate::modules::autoclaw_accounts::pool_accounts;
+use crate::modules::miaoshou;
 
 use aes::Aes128;
 use cbc::cipher::block_padding::Pkcs7;
@@ -42,12 +44,19 @@ pub const PLATFORM_WORKBUDDY: &str = "workbuddy";
 pub const PLATFORM_AUTOCLAW: &str = "autoclaw";
 pub const PLATFORM_TRAE_WORK_CN: &str = "trae_work_cn";
 pub const PLATFORM_LOOMY: &str = "loomy";
+pub const PLATFORM_CHATGLM: &str = "chatglm";
+pub const PLATFORM_MIAOSHOU: &str = "miaoshou";
 
 // ---------------------------------------------------------------------------
 // AutoClaw（澳龙）客户端常量（自 resources/app.asar 逆向确认）
 // ---------------------------------------------------------------------------
 
+/// 国内版网关（保留常量名向后兼容；新代码用 `AccountRegion::api_host()`）。
 pub(crate) const AUTOCLAW_API_HOST: &str = "https://autoglm-acceleration-api.zhipuai.cn";
+/// 国际版网关（2026-09-18 逆向国际版客户端 app.asar 的
+/// OVERSEA_PRODUCTION_USER_API_BASE_URL，并实测 user-profile/task-list/chat 全通；
+/// 国际账号调国内网关返回 code=410000，两区不可跨用）。
+pub(crate) const AUTOCLAW_API_HOST_INTL: &str = "https://autoglm-api.autoglm.ai";
 const AUTOCLAW_APP_ID: &str = "100003";
 const AUTOCLAW_APP_KEY: &str = "38d2391985e2369a5fb8227d8e6cd5e5";
 const AUTOCLAW_APP_VERSION_FALLBACK: &str = "1.17.9";
@@ -116,6 +125,8 @@ pub fn account_platform(account: &Value) -> &'static str {
         Some(PLATFORM_AUTOCLAW) => PLATFORM_AUTOCLAW,
         Some(PLATFORM_TRAE_WORK_CN) => PLATFORM_TRAE_WORK_CN,
         Some(PLATFORM_LOOMY) => PLATFORM_LOOMY,
+        Some(PLATFORM_CHATGLM) => PLATFORM_CHATGLM,
+        Some(PLATFORM_MIAOSHOU) => PLATFORM_MIAOSHOU,
         _ => PLATFORM_WORKBUDDY,
     }
 }
@@ -125,15 +136,14 @@ pub fn platform_display_name(platform: &str) -> &'static str {
         PLATFORM_AUTOCLAW => "AutoClaw",
         PLATFORM_TRAE_WORK_CN => "TRAE Work CN",
         PLATFORM_LOOMY => "Loomy",
+        PLATFORM_CHATGLM => "ChatGLM",
+        PLATFORM_MIAOSHOU => "妙手",
         _ => "WorkBuddy",
     }
 }
 
-/// 全部可签到账号：WorkBuddy 账号库 + 本机发现的 AutoClaw / TRAE Work CN。
+/// 全部可签到账号：WorkBuddy 账号库 + 本机发现的 AutoClaw / TRAE Work CN / Loomy / ChatGLM / 妙手。
 /// 该签到条目是否就是「本机客户端当前登录」的账号。
-///
-/// - AutoClaw：id 等于实时发现 ID（`autoclaw:<auth.json 的 user_id>`）；
-/// - TRAE Work CN：id 为 `trae_work_cn:local`（实时账号固定用该 id 展示）。
 pub fn is_local_login_account(account: &Value) -> bool {
     let Some(id) = account.get("id").and_then(Value::as_str) else {
         return false;
@@ -147,6 +157,8 @@ pub fn is_local_login_account(account: &Value) -> bool {
                     .is_some_and(|local| local == id)
         }
         PLATFORM_LOOMY => crate::modules::loomy::is_local_login(account),
+        PLATFORM_CHATGLM => id.starts_with("chatglm:"),
+        PLATFORM_MIAOSHOU => id.starts_with("miaoshou:"),
         _ => false,
     }
 }
@@ -177,6 +189,7 @@ pub fn all_checkin_accounts() -> Vec<Value> {
                 "nickname": format!("AutoClaw · {label}"),
                 "platform": PLATFORM_AUTOCLAW,
                 "autoclawStoreId": id,
+                "region": crate::modules::autoclaw_accounts::stored_region(&acct).as_str(),
             }));
         }
     }
@@ -247,6 +260,27 @@ pub fn all_checkin_accounts() -> Vec<Value> {
             accounts.push(candidate);
         }
     }
+    for acct in discover_chatglm_accounts() {
+        let id = acct
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if !id.is_empty() && seen.insert(id) {
+            accounts.push(acct);
+        }
+    }
+    // 妙手（美团智能体）：本机客户端登录态 + 账号池，一并纳入签到/积分视图。
+    for acct in discover_miaoshou_accounts() {
+        let id = acct
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if !id.is_empty() && seen.insert(id) {
+            accounts.push(acct);
+        }
+    }
     accounts
 }
 
@@ -264,16 +298,54 @@ pub fn find_checkin_account(account_id: &str) -> Option<Value> {
 
 /// TRAE Work CN 全部账号（本机客户端 + 账号池）批量签到，逐个执行防限流。
 pub async fn trae_checkin_pool() -> Vec<Value> {
+    let prot_cfg = crate::modules::account_protection::load_protection_config();
     let mut results = Vec::new();
     for account in trae_checkin_pool_accounts() {
+        let label = account
+            .get("nickname")
+            .and_then(Value::as_str)
+            .map(|n| n.strip_prefix("TRAE Work CN · ").unwrap_or(n).to_string())
+            .unwrap_or_else(|| "账号".to_string());
+        let id = account
+            .get("traeStoreId")
+            .or_else(|| account.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        // F3：限流冷却期账号跳过；F2：单账号并发槽位（默认 2），取不到槽位跳过。
+        if !id.is_empty() && crate::modules::account_protection::is_account_cooling(&id) {
+            results.push(json!({
+                "id": account.get("id").cloned().unwrap_or(Value::Null),
+                "label": label,
+                "result": "cooling_skipped",
+                "error": "账号处于限流冷却保护期，本轮跳过",
+            }));
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            continue;
+        }
+        let slot = if id.is_empty() {
+            None
+        } else {
+            crate::modules::account_protection::try_acquire_concurrency_slot(
+                &id,
+                prot_cfg.max_concurrency_per_account,
+            )
+        };
+        if !id.is_empty() && slot.is_none() {
+            results.push(json!({
+                "id": account.get("id").cloned().unwrap_or(Value::Null),
+                "label": label,
+                "result": "concurrency_skipped",
+                "error": "该账号并发槽位已满，本轮跳过",
+            }));
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            continue;
+        }
         let result = checkin_platform_account(&account).await;
+        drop(slot);
         results.push(json!({
             "id": account.get("id").cloned().unwrap_or(Value::Null),
-            "label": account
-                .get("nickname")
-                .and_then(Value::as_str)
-                .map(|n| n.strip_prefix("TRAE Work CN · ").unwrap_or(n).to_string())
-                .unwrap_or_else(|| "账号".to_string()),
+            "label": label,
             "result": result.get("result").cloned().unwrap_or(json!("error")),
             "error": result.get("error").cloned().unwrap_or(Value::Null),
         }));
@@ -372,6 +444,8 @@ pub async fn get_platform_status(account: &Value) -> Value {
                 get_loomy_status().await
             }
         }
+        PLATFORM_CHATGLM => get_chatglm_status(account).await,
+        PLATFORM_MIAOSHOU => get_miaoshou_status(account).await,
         _ => json!({"ok": false, "error": "未知签到平台"}),
     }
 }
@@ -474,13 +548,20 @@ pub async fn checkin_platform_account(account: &Value) -> Value {
                 }
             }
         }
+        PLATFORM_CHATGLM => perform_chatglm_checkin(account).await,
+        PLATFORM_MIAOSHOU => perform_miaoshou_checkin().await,
         _ => json!({"ok": false, "error": "未知签到平台"}),
     };
     if let Some(result) = res.get("result").and_then(Value::as_str) {
-        return json!({
+        let mut out = json!({
             "result": result,
             "error": res.get("error").cloned().unwrap_or(Value::Null),
         });
+        // 附加说明（如「妙手无每日签到」的 unsupported 提示）原样带给调用方。
+        if let Some(message) = res.get("message") {
+            out["message"] = message.clone();
+        }
+        return out;
     }
     if res.get("ok").and_then(Value::as_bool) == Some(true) {
         if res.get("already").and_then(Value::as_bool) == Some(true) {
@@ -544,6 +625,8 @@ pub fn discover_autoclaw_account() -> Option<Value> {
         "email": format!("AutoClaw · {display}"),
         "nickname": format!("AutoClaw · {display}"),
         "platform": PLATFORM_AUTOCLAW,
+        // 本机实时登录账号的区域按身份动态推断（邮箱=国际、手机号=国内）。
+        "region": crate::modules::autoclaw_accounts::local_autoclaw_region().as_str(),
     }))
 }
 
@@ -688,8 +771,11 @@ pub(crate) async fn autoclaw_refresh_access_token() -> Result<String, String> {
         .get("deviceId")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    // 本机续期：按当前登录账号所属区域选网关（国际账号的 refresh token
+    // 在国内网关会被拒绝）。
+    let region = crate::modules::autoclaw_accounts::local_autoclaw_region();
     let resp = http_request(
-        &format!("{AUTOCLAW_API_HOST}/userapi/v1/refresh"),
+        &format!("{}/userapi/v1/refresh", region.api_host()),
         "POST",
         Some(json!({
             "source_id": "autoclaw",
@@ -727,13 +813,17 @@ pub(crate) async fn autoclaw_refresh_access_token() -> Result<String, String> {
 
 /// AutoClaw 网关请求封装（按 token，账号池与本机账号共用）。
 /// 401 时不做自愈、原样返回，由调用方决定如何续期重试。
+///
+/// 区域隔离：按 token 自动解析账号所属区域并路由到对应网关
+/// （国内 = zhipuai.cn，国际 = autoglm.ai；跨区调用返回 410000）。
 pub(crate) async fn autoclaw_call_with(
     token: &str,
     path: &str,
     method: &str,
     body: Option<Value>,
 ) -> Value {
-    let url = format!("{AUTOCLAW_API_HOST}{path}");
+    let region = crate::modules::autoclaw_accounts::region_for_token(token);
+    let url = format!("{}{path}", region.api_host());
     http_request(&url, method, body, Some(&autoclaw_headers(Some(token)))).await
 }
 
@@ -746,14 +836,19 @@ fn resp_error(resp: &Value, fallback: &str) -> String {
         .to_string()
 }
 
-/// AutoClaw 账号池批量签到：依次对池内每个账号查状态并领取，
-/// 逐账号返回结果（依次执行，避免触发上游限流）。结果同步写入签到日志。
+/// AutoClaw 账号池批量签到：按区域分组依次执行（先国际后国内，两组互不
+/// 干扰、禁止跨区调用），组内逐账号查状态并领取（依次执行，避免触发上游
+/// 限流）。结果同步写入签到日志并携带区域标签。
 pub async fn autoclaw_checkin_pool() -> Vec<Value> {
-    let pool = crate::modules::autoclaw_accounts::pool_accounts();
     let mut results = Vec::new();
-    for account in &pool {
-        results.push(autoclaw_checkin_pool_account(account).await);
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    for region in [
+        crate::modules::autoclaw_accounts::AccountRegion::International,
+        crate::modules::autoclaw_accounts::AccountRegion::Domestic,
+    ] {
+        for account in crate::modules::autoclaw_accounts::pool_accounts_filtered(Some(region)) {
+            results.push(autoclaw_checkin_pool_account(&account).await);
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
     }
     results
 }
@@ -822,6 +917,7 @@ async fn autoclaw_checkin_pool_account(
         "ts": started,
         "accountId": account.id,
         "email": email,
+        "region": account.region.as_str(),
         "result": result,
     });
     if !error.is_empty() {
@@ -832,6 +928,7 @@ async fn autoclaw_checkin_pool_account(
     let mut out = json!({
         "id": account.id,
         "label": account.label,
+        "region": account.region.as_str(),
         "result": result,
     });
     if !error.is_empty() {
@@ -2266,6 +2363,368 @@ async fn get_autoclaw_pool_credits(store_id: &str) -> Value {
     result
 }
 
+// ---------------------------------------------------------------------------
+// ChatGLM（智谱清言）桌面端与 Web 签到与账号管理
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+struct ChatGlmCachedInfo {
+    pub uid: String,
+    pub phone: String,
+    pub nickname: String,
+    pub score: f64,
+    pub last_checkin_day: String,
+    pub updated_at: i64,
+}
+
+static CHATGLM_INFO_CACHE: OnceLock<Mutex<HashMap<String, ChatGlmCachedInfo>>> = OnceLock::new();
+
+fn chatglm_cache_lock() -> &'static Mutex<HashMap<String, ChatGlmCachedInfo>> {
+    CHATGLM_INFO_CACHE.get_or_init(|| {
+        let mut map = HashMap::new();
+        let path = crate::modules::config::store_dir().join("chatglm_cache.json");
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if let Ok(loaded) = serde_json::from_str::<HashMap<String, ChatGlmCachedInfo>>(&text) {
+                map = loaded;
+            }
+        }
+        Mutex::new(map)
+    })
+}
+
+fn save_chatglm_cache(map: &HashMap<String, ChatGlmCachedInfo>) {
+    let path = crate::modules::config::store_dir().join("chatglm_cache.json");
+    if let Ok(text) = serde_json::to_string_pretty(map) {
+        let _ = atomic_write(&path, &text);
+    }
+}
+
+/// 检查本机是否安装了智谱清言（ChatGLM）桌面端软件
+pub fn chatglm_desktop_installed() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        let known_paths = [
+            r"E:\智谱清言\chatglm\智谱清言.exe",
+            r"C:\Program Files\chatglm\智谱清言.exe",
+            r"C:\Program Files (x86)\chatglm\智谱清言.exe",
+        ];
+        for p in known_paths {
+            if Path::new(p).exists() {
+                return true;
+            }
+        }
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            let desktop_lnk = PathBuf::from(profile).join(r"Desktop\智谱清言.lnk");
+            if desktop_lnk.exists() {
+                return true;
+            }
+        }
+        if let Some(public) = std::env::var_os("PUBLIC") {
+            let desktop_lnk = PathBuf::from(public).join(r"Desktop\智谱清言.lnk");
+            if desktop_lnk.exists() {
+                return true;
+            }
+        }
+        if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") {
+            let exe_path = PathBuf::from(local_appdata).join(r"Programs\chatglm\智谱清言.exe");
+            if exe_path.exists() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 从 refresh token 的 JWT payload 中解析 ChatGLM 用户 uid
+fn parse_chatglm_uid(token: &str) -> Option<String> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() >= 2 {
+        let decoded = general_purpose::URL_SAFE_NO_PAD
+            .decode(parts[1])
+            .or_else(|_| general_purpose::STANDARD.decode(parts[1]))
+            .ok()?;
+        let val: Value = serde_json::from_slice(&decoded).ok()?;
+        if let Some(uid) = val
+            .get("uid")
+            .or_else(|| val.get("sub"))
+            .or_else(|| val.get("id"))
+            .and_then(Value::as_str)
+        {
+            if !uid.is_empty() {
+                return Some(uid.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// 获取 ChatGLM 账号对应的有效 access token（针对已登录正式账号，排除游客）
+async fn get_chatglm_token(account: &Value) -> Result<String, String> {
+    if let Some(rt) = account.get("refreshToken").and_then(Value::as_str) {
+        if !rt.is_empty() {
+            return crate::modules::glm_web::get_access_token_for_refresh(rt).await;
+        }
+    }
+    crate::modules::glm_web::get_authenticated_access_token().await
+}
+
+/// 获取当天的日期字符串（"YYYY-MM-DD"），用于判定每日签到状态
+fn today_date_str() -> String {
+    crate::modules::checkin::date_str(None)
+}
+
+/// 发现已同步的 ChatGLM 账号（通过 ChatGLM Token 自动同步插件录入）
+pub fn discover_chatglm_accounts() -> Vec<Value> {
+    let tokens = crate::modules::glm_web::get_refresh_tokens();
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+    let is_desktop = chatglm_desktop_installed();
+    let cache_lock = chatglm_cache_lock().lock().unwrap();
+    let mut out = Vec::new();
+
+    for token in tokens {
+        let uid = parse_chatglm_uid(&token).unwrap_or_else(|| {
+            let mut hasher = Md5::new();
+            hasher.update(token.as_bytes());
+            let hex = hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            hex[..12].to_string()
+        });
+        let id = format!("{PLATFORM_CHATGLM}:{uid}");
+        let cached = cache_lock.get(&uid);
+        let phone = cached.and_then(|c| if c.phone.is_empty() { None } else { Some(c.phone.as_str()) });
+        let nickname = cached.and_then(|c| if c.nickname.is_empty() { None } else { Some(c.nickname.as_str()) });
+        let tag = if is_desktop { " (桌面端)" } else { "" };
+        let label = phone
+            .map(|p| format!("{p}{tag}"))
+            .or_else(|| nickname.map(|n| format!("{n}{tag}")))
+            .unwrap_or_else(|| {
+                let short = if uid.len() > 8 { &uid[..8] } else { &uid };
+                format!("{short}{tag}")
+            });
+        let display = format!("ChatGLM · {label}");
+
+        out.push(json!({
+            "id": id,
+            "email": display,
+            "nickname": display,
+            "platform": PLATFORM_CHATGLM,
+            "chatglmUid": uid,
+            "refreshToken": token,
+            "isDesktop": is_desktop,
+        }));
+    }
+    out
+}
+
+/// 查询 ChatGLM 账号的今日签到状态与积分
+pub async fn get_chatglm_status(account: &Value) -> Value {
+    let access_token = match get_chatglm_token(account).await {
+        Ok(t) => t,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    let today = today_date_str();
+    let uid = account.get("chatglmUid").and_then(Value::as_str).unwrap_or("");
+
+    // 检查缓存中是否今日已完成签到
+    let cached_already = {
+        let lock = chatglm_cache_lock().lock().unwrap();
+        lock.get(uid).map(|c| c.last_checkin_day == today).unwrap_or(false)
+    };
+
+    // 查用户信息刷新手机号与积分
+    let info_res = crate::modules::glm_web::fetch_user_info(&access_token).await;
+    let mut score = 0.0;
+    if let Ok(info) = &info_res {
+        // 调试日志：输出 member_info 原始结构以定位积分字段
+        if let Some(mi) = info.pointer("/result/member_info") {
+            eprintln!("[ChatGLM] member_info 原始数据: {mi}");
+        } else {
+            eprintln!("[ChatGLM] 用户信息中不存在 member_info 字段，完整 result: {}", info.pointer("/result").map(|v| v.to_string()).unwrap_or_default());
+        }
+        let phone = info.pointer("/result/phone").and_then(Value::as_str).unwrap_or("");
+        let nickname = info.pointer("/result/nickname").and_then(Value::as_str).unwrap_or("");
+        let left_score = info.pointer("/result/member_info/left_score").and_then(Value::as_f64).unwrap_or(0.0);
+        score = left_score;
+        let mut lock = chatglm_cache_lock().lock().unwrap();
+        let entry = lock.entry(uid.to_string()).or_default();
+        entry.uid = uid.to_string();
+        if !phone.is_empty() {
+            entry.phone = phone.to_string();
+        }
+        if !nickname.is_empty() {
+            entry.nickname = nickname.to_string();
+        }
+        entry.score = left_score;
+        entry.updated_at = now_ms();
+        save_chatglm_cache(&lock);
+    }
+
+    if cached_already {
+        return json!({
+            "ok": true,
+            "todayCheckedIn": true,
+            "score": score,
+            "platform": PLATFORM_CHATGLM,
+        });
+    }
+
+    // 若缓存中未记录今日签到，则调用签到接口探测（签到接口为幂等打卡）
+    match crate::modules::glm_web::perform_daily_checkin(&access_token).await {
+        Ok(res) => {
+            let code = res.get("code").or_else(|| res.get("status")).and_then(Value::as_i64).unwrap_or(-1);
+            let message = res.get("message").and_then(Value::as_str).unwrap_or("");
+            if code == 0 || code == 10001 || message.contains("已领取") {
+                let mut lock = chatglm_cache_lock().lock().unwrap();
+                let entry = lock.entry(uid.to_string()).or_default();
+                entry.last_checkin_day = today;
+                entry.updated_at = now_ms();
+                save_chatglm_cache(&lock);
+                json!({
+                    "ok": true,
+                    "todayCheckedIn": true,
+                    "score": score,
+                    "platform": PLATFORM_CHATGLM,
+                })
+            } else {
+                json!({
+                    "ok": true,
+                    "todayCheckedIn": false,
+                    "score": score,
+                    "platform": PLATFORM_CHATGLM,
+                })
+            }
+        }
+        Err(e) => {
+            json!({
+                "ok": false,
+                "error": e,
+                "platform": PLATFORM_CHATGLM,
+            })
+        }
+    }
+}
+
+/// 执行 ChatGLM 桌面签到打卡（每日一次，持续获取积分）
+pub async fn perform_chatglm_checkin(account: &Value) -> Value {
+    let access_token = match get_chatglm_token(account).await {
+        Ok(t) => t,
+        Err(e) => return json!({"result": "error", "error": e}),
+    };
+    let today = today_date_str();
+    let uid = account.get("chatglmUid").and_then(Value::as_str).unwrap_or("");
+
+    // 检查缓存
+    {
+        let lock = chatglm_cache_lock().lock().unwrap();
+        if let Some(entry) = lock.get(uid) {
+            if entry.last_checkin_day == today {
+                return json!({
+                    "result": "already",
+                    "message": "今日已完成 ChatGLM 桌面端签到",
+                });
+            }
+        }
+    }
+
+    match crate::modules::glm_web::perform_daily_checkin(&access_token).await {
+        Ok(res) => {
+            let code = res.get("code").or_else(|| res.get("status")).and_then(Value::as_i64).unwrap_or(-1);
+            let message = res.get("message").and_then(Value::as_str).unwrap_or("");
+            if code == 0 {
+                let mut lock = chatglm_cache_lock().lock().unwrap();
+                let entry = lock.entry(uid.to_string()).or_default();
+                entry.last_checkin_day = today;
+                entry.updated_at = now_ms();
+                save_chatglm_cache(&lock);
+
+                // 记录签到日志
+                let log_entry = json!({
+                    "ts": now_secs() as i64,
+                    "accountId": account.get("id").and_then(Value::as_str).unwrap_or("chatglm"),
+                    "email": account.get("email").and_then(Value::as_str).unwrap_or("ChatGLM"),
+                    "result": "success",
+                });
+                add_checkin_log(&log_entry);
+
+                json!({
+                    "result": "success",
+                    "message": "ChatGLM 桌面端每日签到成功，已增加积分",
+                })
+            } else if code == 10001 || message.contains("已领取") {
+                let mut lock = chatglm_cache_lock().lock().unwrap();
+                let entry = lock.entry(uid.to_string()).or_default();
+                entry.last_checkin_day = today;
+                entry.updated_at = now_ms();
+                save_chatglm_cache(&lock);
+
+                let log_entry = json!({
+                    "ts": now_secs() as i64,
+                    "accountId": account.get("id").and_then(Value::as_str).unwrap_or("chatglm"),
+                    "email": account.get("email").and_then(Value::as_str).unwrap_or("ChatGLM"),
+                    "result": "already",
+                });
+                add_checkin_log(&log_entry);
+
+                json!({
+                    "result": "already",
+                    "message": "ChatGLM 今日已领取过打卡积分",
+                })
+            } else {
+                json!({
+                    "result": "error",
+                    "error": format!("ChatGLM 签到失败: code={code}, {message}"),
+                })
+            }
+        }
+        Err(e) => json!({"result": "error", "error": e}),
+    }
+}
+
+/// 查询 ChatGLM 积分余额（供用量统计与监控中心调用）
+pub async fn get_chatglm_credits(account: &Value) -> Value {
+    let access_token = match get_chatglm_token(account).await {
+        Ok(t) => t,
+        Err(e) => return json!({"ok": false, "error": e}),
+    };
+    match crate::modules::glm_web::fetch_user_info(&access_token).await {
+        Ok(info) => {
+            let left_score = info.pointer("/result/member_info/left_score").and_then(Value::as_f64).unwrap_or(0.0);
+            let phone = info.pointer("/result/phone").and_then(Value::as_str).unwrap_or("").to_string();
+            let nickname = info.pointer("/result/nickname").and_then(Value::as_str).unwrap_or("").to_string();
+            let uid = account.get("chatglmUid").and_then(Value::as_str).unwrap_or("");
+            if !uid.is_empty() {
+                let mut lock = chatglm_cache_lock().lock().unwrap();
+                let entry = lock.entry(uid.to_string()).or_default();
+                entry.uid = uid.to_string();
+                if !phone.is_empty() {
+                    entry.phone = phone.clone();
+                }
+                if !nickname.is_empty() {
+                    entry.nickname = nickname.clone();
+                }
+                entry.score = left_score;
+                entry.updated_at = now_ms();
+                save_chatglm_cache(&lock);
+            }
+            json!({
+                "ok": true,
+                "balance": left_score,
+                "remainingTotal": left_score,
+                "totalRemaining": left_score,
+                "platform": PLATFORM_CHATGLM,
+                "phone": phone,
+                "nickname": nickname,
+            })
+        }
+        Err(e) => json!({"ok": false, "error": e}),
+    }
+}
+
 pub async fn get_platform_credits(account: &Value) -> Value {
     let result = match account_platform(account) {
         PLATFORM_AUTOCLAW => {
@@ -2289,6 +2748,8 @@ pub async fn get_platform_credits(account: &Value) -> Value {
                 crate::modules::loomy::credits_local().await
             }
         }
+        PLATFORM_CHATGLM => get_chatglm_credits(account).await,
+        PLATFORM_MIAOSHOU => get_miaoshou_credits(account).await,
         _ => json!({"ok": false, "error": "未知签到平台"}),
     };
     if result.get("ok").and_then(Value::as_bool) == Some(true) {
@@ -2317,6 +2778,78 @@ pub async fn get_platform_credits(account: &Value) -> Value {
 }
 
 // ---------------------------------------------------------------------------
+// 妙手（美团智能体，catpaw-moon Electron 客户端）
+//
+// 2026-09-21 逆向实测：whoami / 积分端点通（catpaw.meituan.com，access-token
+// 头），登录态在 `%APPDATA%\catpaw-moon`；**无每日签到功能**（全量扫描 asar
+// 确认），积分按月刷新（nextRefreshTime）。因此签到相关一律按
+// unsupported 处理，todayCheckedIn 用 null 表达「不适用」。
+// ---------------------------------------------------------------------------
+
+/// 发现妙手账号：本机客户端登录态 + 已导入的池账号（由 miaoshou 模块读取）。
+pub fn discover_miaoshou_accounts() -> Vec<Value> {
+    miaoshou::discover_accounts()
+}
+
+/// 检查本机是否安装了妙手（美团智能体）桌面端。
+///
+/// 判据：登录态目录 `%APPDATA%\catpaw-moon` 存在，或安装目录
+/// `E:\妙手美团智能体` 存在。
+pub fn miaoshou_desktop_installed() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            if PathBuf::from(appdata).join("catpaw-moon").is_dir() {
+                return true;
+            }
+        }
+        for p in [r"E:\妙手美团智能体"] {
+            if Path::new(p).exists() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 妙手账号状态：直接取 miaoshou 模块的探测结果。
+///
+/// 该平台无每日签到，`todayCheckedIn` 用 `null`（而非 `false`）表达
+/// 「不适用」，并附 `checkinSupported: false` 与中文说明。
+pub async fn get_miaoshou_status(account: &Value) -> Value {
+    let mut status = miaoshou::get_status(account).await;
+    if let Some(obj) = status.as_object_mut() {
+        obj.insert("todayCheckedIn".to_string(), Value::Null);
+        obj.insert("checkinSupported".to_string(), json!(false));
+        obj.insert(
+            "note".to_string(),
+            json!("该平台无每日签到，积分按月自动刷新"),
+        );
+        if !obj.contains_key("platform") {
+            obj.insert("platform".to_string(), json!(PLATFORM_MIAOSHOU));
+        }
+    }
+    status
+}
+
+/// 妙手「签到」：平台无每日签到功能，统一返回 unsupported 提示
+/// （接口形状与其他平台保持一致，前端不特殊处理）。
+pub async fn perform_miaoshou_checkin() -> Value {
+    json!({
+        "result": "unsupported",
+        "message": "妙手无每日签到功能，积分按月自动刷新",
+    })
+}
+
+/// 妙手积分查询（按月刷新的额度余额）。
+pub async fn get_miaoshou_credits(account: &Value) -> Value {
+    match miaoshou::get_credits(account).await {
+        Ok(value) => value,
+        Err(e) => json!({"ok": false, "error": e}),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 测试
 // ---------------------------------------------------------------------------
 
@@ -2339,6 +2872,21 @@ mod tests {
             account_platform(&json!({"id": "a", "platform": "loomy"})),
             PLATFORM_LOOMY
         );
+        assert_eq!(
+            account_platform(&json!({"id": "a", "platform": "miaoshou"})),
+            PLATFORM_MIAOSHOU
+        );
+    }
+
+    #[tokio::test]
+    async fn miaoshou_checkin_reports_unsupported() {
+        // 妙手无每日签到：统一 unsupported + 中文说明。
+        let res = perform_miaoshou_checkin().await;
+        assert_eq!(res.get("result").and_then(Value::as_str), Some("unsupported"));
+        assert!(res
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|m| m.contains("无每日签到")));
     }
 
     #[test]

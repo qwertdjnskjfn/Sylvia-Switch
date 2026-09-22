@@ -7,6 +7,7 @@ import {
   EyeOff,
   FileDown,
   FileUp,
+  Globe,
   Loader2,
   QrCode,
   RefreshCw,
@@ -45,6 +46,7 @@ import {
 import { ExportAccountsDialog } from "@/components/export-accounts-dialog";
 import { ImportAccountsDialog } from "@/components/import-accounts-dialog";
 import { OAuthLoginDialog } from "@/components/oauth-login-dialog";
+import { QoderCnImportDialog } from "@/components/qoder-cn-import-dialog";
 import { SwitchAccountDialog } from "@/components/switch-account-dialog";
 import * as api from "@/lib/api";
 import type { AccountMeta, AppStatus, CheckinConfig, CreditExpiry, PlatformCheckinItem, TravelConfig, TravelStatus } from "@/lib/types";
@@ -149,6 +151,7 @@ export default function AccountsPage() {
   const [oauthOpen, setOauthOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
+  const [qoderCnOpen, setQoderCnOpen] = useState(false);
   const [switchAccount, setSwitchAccount] = useState<AccountMeta | null>(null);
   const [importing, setImporting] = useState(false);
   const [autoCheckinConfig, setAutoCheckinConfig] = useState<CheckinConfig | null>(null);
@@ -690,8 +693,15 @@ export default function AccountsPage() {
     creditOrderingReady
       ? orderedAccounts.find((account) => hasExpiringSoonCredits(creditMap[account.id]))?.id
       : undefined;
+  // 展示字段防御：客户端新版本可能把 nickname/email 写成加密信封对象
+  // （$wbEncrypted），对象作为 React child 会触发 error #31 白屏，只接受字符串。
+  const pickStatusText = (v: unknown): string | null =>
+    typeof v === "string" && v.trim() !== "" ? v : null;
   const workbuddyCurrentName = current
-    ? current.nickname || current.email || current.uid || "未知账号"
+    ? pickStatusText(current.nickname) ||
+      pickStatusText(current.email) ||
+      pickStatusText(current.uid) ||
+      "未知账号"
     : "未登录";
   return (
     <div className="mx-auto w-full max-w-[1180px] px-6 py-8 sm:px-8 sm:py-9">
@@ -748,6 +758,11 @@ export default function AccountsPage() {
             <DemoAction>
               <Button className="h-10 px-4" onClick={onImport} disabled={importing} variant="outline">
                 {importing ? <Loader2 className="animate-spin" /> : <Download />}导入本机账号
+              </Button>
+            </DemoAction>
+            <DemoAction>
+              <Button className="h-10 px-4" onClick={() => setQoderCnOpen(true)} variant="outline" title="导入 Qoder CN（中国版）账号：本机登录态 / 手动凭证 / 设备码授权">
+                <Globe />导入 Qoder CN 账号
               </Button>
             </DemoAction>
           </div>
@@ -1076,16 +1091,24 @@ export default function AccountsPage() {
               平台账号
             </h2>
             <p className="text-sm text-muted-foreground">
-              本机登录的 AutoClaw / TRAE Work CN，与 WorkBuddy 账号一起自动签到
+              本机登录的 AutoClaw / TRAE Work CN，与 WorkBuddy 账号一起自动签到；AutoClaw 账号按 🌐 国际 / 🇨🇳 国内分网关隔离签到
             </p>
           </div>
           <div className={cn("grid min-w-0 items-start gap-5", compact ? "grid-cols-[repeat(auto-fit,minmax(min(100%,300px),1fr))]" : "grid-cols-[repeat(auto-fit,minmax(min(100%,340px),1fr))]")}>
             {platformCheckins.map((item) => {
+              // AutoClaw 平台账号展示区域标签（🌐 国际 / 🇨🇳 国内）。
+              const regionMark =
+                item.platform === "autoclaw" && item.region
+                  ? item.region === "international"
+                    ? " 🌐国际版"
+                    : " 🇨🇳国内版"
+                  : "";
+              const displayName = item.email + regionMark;
               const meta: AccountMeta = {
                 id: item.accountId,
                 uid: null,
-                email: item.email,
-                nickname: item.email,
+                email: displayName,
+                nickname: displayName,
                 enterpriseName: null,
                 expiresAt: null,
                 refreshExpiresAt: null,
@@ -1166,6 +1189,7 @@ export default function AccountsPage() {
       </Dialog>
 
       <OAuthLoginDialog open={oauthOpen} onOpenChange={setOauthOpen} />
+      <QoderCnImportDialog open={qoderCnOpen} onOpenChange={setQoderCnOpen} />
       <ExportAccountsDialog
         open={exportOpen}
         onOpenChange={setExportOpen}

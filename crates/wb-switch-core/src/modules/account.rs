@@ -379,7 +379,12 @@ pub fn delete_account(account_id: &str) -> Result<(), String> {
 }
 
 /// 导入本机当前账号（从认证文件读取）。
+///
+/// 串行化：auth 文件加密时回退到进程内存扫描（可达两分钟），并发点击会在
+/// 读改写账号库时竞争出重复条目，用互斥锁保证一次只跑一个导入。
 pub fn import_local() -> Result<Value, String> {
+    static IMPORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = IMPORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let acc = crate::modules::auth_file::import_from_auth_file()
         .ok_or("未读取到本地 WorkBuddy 登录信息")?;
     let saved = save_collected_account(acc).map_err(|e| e.to_string())?;

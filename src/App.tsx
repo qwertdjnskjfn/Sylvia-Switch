@@ -1,21 +1,29 @@
 import { Component, Suspense, lazy, useEffect, useState, type ErrorInfo, type ReactNode } from "react";
 import { BrowserRouter, HashRouter, Navigate, NavLink, Outlet, Route, Routes } from "react-router-dom";
-import { AlertTriangle, ArrowUp, Loader2, RotateCcw, Settings, User, BarChart3 } from "lucide-react";
+import { AlertTriangle, ArrowUp, Cat, FlaskConical, Loader2, RefreshCw, RotateCcw, Settings, User, BarChart3, Activity } from "lucide-react";
 
 import { cn } from "@/lib/utils";
+import { emitRefreshAll } from "@/lib/refresh-all";
 import * as api from "@/lib/api";
 import type { UpdateInfo } from "@/lib/types";
 import AccountsPage from "@/pages/AccountsPage";
 import GlmProxyPage from "@/pages/GlmProxyPage";
 import QoderPage from "@/pages/QoderPage";
+import QwenPage from "@/pages/QwenPage";
 import KimiPage from "@/pages/KimiPage";
 import GlmwebPage from "@/pages/GlmwebPage";
 import GrokPage from "@/pages/GrokPage";
 import LoomyPage from "@/pages/LoomyPage";
-import TraeWorkbuddyProxyPage from "@/pages/TraeWorkbuddyProxyPage";
+import MiaoshouPage from "@/pages/MiaoshouPage";
+import OpencodePage from "@/pages/OpencodePage";
+import TraeWorkCnPage from "@/pages/TraeWorkCnPage";
+import WorkbuddyPage from "@/pages/WorkbuddyPage";
 
 const StatsPage = lazy(() => import("@/pages/StatsPage"));
 const SettingsPage = lazy(() => import("@/pages/SettingsPage"));
+const ChannelHealthPage = lazy(() => import("@/pages/ChannelHealthPage"));
+const ChannelHealthDetailPage = lazy(() => import("@/pages/ChannelHealthDetailPage"));
+const ModelTestPage = lazy(() => import("@/pages/ModelTestPage"));
 import { StatusDot, AppIconMark } from "@/components/product-marks";
 import { SidebarThemeSwitcher } from "@/components/theme-switcher";
 import { GatewaySwitcher } from "@/components/gateway/gateway-switcher";
@@ -183,6 +191,23 @@ function Layout() {
   useCreditAutoRefresh();
   useWorkbuddyStatusRefresh();
 
+  // 全局刷新：store（账号+状态）+ 网关总览 + 广播让当前页重载自己的数据。
+  const [globalRefreshing, setGlobalRefreshing] = useState(false);
+  async function runGlobalRefresh() {
+    setGlobalRefreshing(true);
+    try {
+      await useAccountsStore.getState().fetchAll();
+      try {
+        await api.getGatewaysOverview();
+      } catch {
+        // 网关总览失败不阻断其余刷新（GatewaySwitcher 自己有静默降级）
+      }
+      emitRefreshAll();
+    } finally {
+      setGlobalRefreshing(false);
+    }
+  }
+
   // 标题栏/标签页带上版本号，便于一眼确认跑的是哪一版（版本号取自后端 /api/version）。
   useEffect(() => {
     if (version) document.title = `Sylvia Switch ${version}`;
@@ -205,7 +230,7 @@ function Layout() {
       >
         <div className="flex items-center gap-2.5 px-1 pb-5">
           <AppIconMark size={36} className="drop-shadow-sm" />
-          <div className="min-w-0">
+          <div className="min-w-0 flex-1">
             <div
               className="truncate text-[15px] leading-5 tracking-[-0.02em] text-sidebar-foreground/90"
               style={{
@@ -232,11 +257,39 @@ function Layout() {
               ) : null}
             </div>
           </div>
+          {/* 全局刷新：一键重拉账号/状态/网关总览，并广播让当前页重载。
+              避免"改完桌面端登录态必须重启应用"才能看到。 */}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="size-8 shrink-0 rounded-full text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-foreground"
+                aria-label="全局刷新"
+                disabled={globalRefreshing}
+                onClick={() => void runGlobalRefresh()}
+              >
+                {globalRefreshing ? (
+                  <Loader2 className="size-4 animate-spin" />
+                ) : (
+                  <RefreshCw className="size-4" />
+                )}
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">全局刷新（账号 / 状态 / 网关总览 / 当前页）</TooltipContent>
+          </Tooltip>
         </div>
         <div className="px-2 pb-1">
           <GatewaySwitcher />
         </div>
-        <nav className="flex min-h-0 flex-1 flex-col gap-0.5" aria-label="主导航">
+        {/* overflow-y-auto：导航区自身可滚动。折叠组展开后内容可能超出侧栏高度，
+            若放任溢出（overflow visible），底部固定区（主题切换卡片）会盖住
+            「设置」等导航项 —— 视觉上被吞、命中测试落在卡片上，点击"完全没反应"。
+            滚动容器让所有导航项始终可达、可点。 */}
+        <nav
+          className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto overscroll-contain"
+          aria-label="主导航"
+        >
           <NavLink
             to="/"
             end
@@ -266,7 +319,49 @@ function Layout() {
             <BarChart3 className="size-4" />
             统计
           </NavLink>
+          <NavLink
+            to="/channel-health"
+            className={({ isActive }) =>
+              cn(
+                "flex items-center gap-2.5 rounded-xl px-3 py-2.5 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sidebar-ring/50",
+                isActive
+                  ? "bg-primary/[0.13] font-medium text-foreground"
+                  : "text-muted-foreground hover:bg-foreground/[0.045] hover:text-foreground",
+              )
+            }
+          >
+            <Activity className="size-4" />
+            渠道健康
+          </NavLink>
+          <NavLink
+            to="/model-test"
+            className={({ isActive }) =>
+              cn(
+                "flex items-center gap-2.5 rounded-xl px-3 py-2.5 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sidebar-ring/50",
+                isActive
+                  ? "bg-primary/[0.13] font-medium text-foreground"
+                  : "text-muted-foreground hover:bg-foreground/[0.045] hover:text-foreground",
+              )
+            }
+          >
+            <FlaskConical className="size-4" />
+            模型测试
+          </NavLink>
           <GatewayNavGroup />
+          <NavLink
+            to="/miaoshou"
+            className={({ isActive }) =>
+              cn(
+                "flex items-center gap-2.5 rounded-xl px-3 py-2.5 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sidebar-ring/50",
+                isActive
+                  ? "bg-primary/[0.13] font-medium text-foreground"
+                  : "text-muted-foreground hover:bg-foreground/[0.045] hover:text-foreground",
+              )
+            }
+          >
+            <Cat className="size-4" />
+            妙手
+          </NavLink>
           <NavLink
             to="/settings"
             className={({ isActive }) =>
@@ -282,7 +377,7 @@ function Layout() {
             设置
           </NavLink>
         </nav>
-        <div className="mt-auto space-y-2 pt-2">
+        <div className="mt-auto shrink-0 space-y-2 pt-2">
           <SidebarThemeSwitcher />
           {demoModeEnabled ? null : <UpdateCenter running={running} />}
         </div>
@@ -325,12 +420,22 @@ export default function App() {
             <Route path="/token-stats" element={<Navigate to="/stats?tab=token" replace />} />
             <Route path="/settings" element={<SettingsPage />} />
             <Route path="/glm-proxy" element={<GlmProxyPage />} />
+            <Route path="/qwen" element={<QwenPage />} />
             <Route path="/qoder" element={<QoderPage />} />
             <Route path="/kimi" element={<KimiPage />} />
             <Route path="/glmweb" element={<GlmwebPage />} />
             <Route path="/grok" element={<GrokPage />} />
             <Route path="/loomy" element={<LoomyPage />} />
-            <Route path="/trae-workbuddy" element={<TraeWorkbuddyProxyPage />} />
+            {/* 2026-09-22 三拆：原 /trae-workbuddy 合并页 → 三个独立网关页 */}
+          <Route path="/trae-work-cn" element={<TraeWorkCnPage />} />
+          <Route path="/workbuddy" element={<WorkbuddyPage />} />
+          <Route path="/opencode" element={<OpencodePage />} />
+          {/* 旧路径重定向，避免书签/外链 404 */}
+          <Route path="/trae-workbuddy" element={<Navigate to="/trae-work-cn" replace />} />
+            <Route path="/miaoshou" element={<MiaoshouPage />} />
+            <Route path="/channel-health" element={<ChannelHealthPage />} />
+            <Route path="/channel-health/:gatewayId" element={<ChannelHealthDetailPage />} />
+            <Route path="/model-test" element={<ModelTestPage />} />
             <Route path="/model-usage" element={<Navigate to="/stats?tab=model" replace />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>

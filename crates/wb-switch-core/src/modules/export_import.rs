@@ -413,16 +413,22 @@ mod tests {
 
     #[test]
     fn export_path_validation() {
+        // 绝对路径用 temp_dir 构造：Windows 上 "/tmp/x" 没有盘符，is_absolute()
+        // 为 false，会把「扩展名大小写」断言误判成失败。
+        let base = std::env::temp_dir();
+        let abs_json = base.join("out.json").to_string_lossy().to_string();
+        let abs_upper = base.join("out.JSON").to_string_lossy().to_string();
+        let abs_txt = base.join("out.txt").to_string_lossy().to_string();
         assert!(
             validate_export_path("relative/out.json").is_err(),
             "必须绝对路径"
         );
-        assert!(validate_export_path("/tmp/out.txt").is_err(), "必须 .json");
+        assert!(validate_export_path(&abs_txt).is_err(), "必须 .json");
         assert!(
-            validate_export_path("/tmp/out.JSON").is_ok(),
+            validate_export_path(&abs_upper).is_ok(),
             "扩展名不区分大小写"
         );
-        assert!(validate_export_path("/tmp/out.json").is_ok());
+        assert!(validate_export_path(&abs_json).is_ok());
     }
 
     #[test]

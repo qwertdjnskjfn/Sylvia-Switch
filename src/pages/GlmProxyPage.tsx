@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react";
-import { Activity, Check, CircleCheck, Copy, Loader2, PlugZap, RefreshCw, Send, ShieldAlert, ShieldCheck, Trash2, UserPlus } from "lucide-react";
+import { Activity, Check, CircleCheck, Loader2, PlugZap, RefreshCw, Send, ShieldAlert, ShieldCheck, Trash2, UserPlus } from "lucide-react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { CopyButton } from "@/components/ui/copy-button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
@@ -13,8 +14,6 @@ import type {
   AccountProtectionStatusInfo,
   AutoclawAccountInfo,
   AutoclawCheckinResult,
-  TraeAccountInfo,
-  TraeCheckinResult,
   GlmProxyConfigInfo,
   GlmProxyStatus,
   ModelMonitorItem,
@@ -53,6 +52,17 @@ interface SectionProps {
   children: React.ReactNode;
 }
 
+// v1.0+: 区域图标和标签映射
+const REGION_ICONS = {
+  international: '🌐',
+  domestic: '🇨🇳',
+};
+
+const REGION_LABELS = {
+  international: '国际版',
+  domestic: '国内版',
+};
+
 function Section({ title, description, children }: SectionProps) {
   return (
     <section className="min-w-0 space-y-2.5" aria-labelledby={title}>
@@ -76,29 +86,6 @@ function Row({ label, hint, children }: { label: string; hint?: string; children
       </div>
       {children}
     </div>
-  );
-}
-
-function CopyButton({ text, label }: { text: string; label: string }) {
-  const [copied, setCopied] = useState(false);
-  return (
-    <Button
-      size="icon"
-      variant="ghost"
-      className="size-7"
-      aria-label={`复制${label}`}
-      onClick={() => {
-        void navigator.clipboard.writeText(text).then(
-          () => {
-            setCopied(true);
-            window.setTimeout(() => setCopied(false), 1500);
-          },
-          () => undefined,
-        );
-      }}
-    >
-      {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
-    </Button>
   );
 }
 
@@ -128,11 +115,8 @@ export default function GlmProxyPage() {
   const [newAccess, setNewAccess] = useState("");
   const [newRefresh, setNewRefresh] = useState("");
   const [newDevice, setNewDevice] = useState("");
-  const [traeAccounts, setTraeAccounts] = useState<TraeAccountInfo[]>([]);
-  const [traeResults, setTraeResults] = useState<Record<string, TraeCheckinResult>>({});
-  const [traeBusy, setTraeBusy] = useState<string | null>(null);
-  const [traeAllRunning, setTraeAllRunning] = useState(false);
-  const [traeMsg, setTraeMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
+  /** 添加账号的区域分入口：国际版 / 国内版（默认国际版） */
+  const [newRegion, setNewRegion] = useState<'international' | 'domestic'>('international');
   /** 模型 id -> 近 7 天实测统计（用于「模型选型参考」表格） */
   const [speedStats, setSpeedStats] = useState<Record<string, ModelMonitorItem>>({});
   const [protection, setProtection] = useState<AccountProtectionStatusInfo | null>(null);
@@ -214,7 +198,6 @@ export default function GlmProxyPage() {
       })
       .catch((e) => setLoadError(api.asError(e)));
     void loadAccounts().catch(() => undefined);
-    void loadTraeAccounts().catch(() => undefined);
     void probe();
     void loadSpeedStats();
     void reloadProtection();
@@ -341,65 +324,6 @@ export default function GlmProxyPage() {
     }
   }
 
-  async function loadTraeAccounts() {
-    const res = await api.getTraeAccounts();
-    setTraeAccounts(res.accounts ?? []);
-  }
-
-  async function traeCheckinOne(id: string) {
-    setTraeBusy(id);
-    try {
-      const res = await api.traeCheckinOne(id);
-      setTraeResults((prev) => ({ ...prev, [id]: res }));
-    } catch (e) {
-      setTraeResults((prev) => ({
-        ...prev,
-        [id]: { id, label: id, result: "error", error: api.asError(e) },
-      }));
-    } finally {
-      setTraeBusy(null);
-    }
-  }
-
-  async function traeCheckinAll() {
-    setTraeAllRunning(true);
-    try {
-      const res = await api.traeCheckinAll();
-      const map: Record<string, TraeCheckinResult> = {};
-      for (const item of res.accounts ?? []) map[item.id] = item;
-      setTraeResults(map);
-    } catch (e) {
-      setTraeMsg({ type: "err", text: api.asError(e) });
-    } finally {
-      setTraeAllRunning(false);
-    }
-  }
-
-  async function removeTraeAccount(id: string) {
-    setTraeBusy(id);
-    try {
-      await api.removeTraeAccount(id);
-      await loadTraeAccounts();
-    } catch (e) {
-      setTraeMsg({ type: "err", text: api.asError(e) });
-    } finally {
-      setTraeBusy(null);
-    }
-  }
-
-  async function importTraeLocal() {
-    setTraeBusy("import");
-    try {
-      await api.importTraeLocal();
-      await loadTraeAccounts();
-      setTraeMsg({ type: "ok", text: "已导入客户端当前登录的 TRAE 账号快照" });
-    } catch (e) {
-      setTraeMsg({ type: "err", text: api.asError(e) });
-    } finally {
-      setTraeBusy(null);
-    }
-  }
-
   async function importLocal() {
     setAccountsBusy("import");
     try {
@@ -425,6 +349,7 @@ export default function GlmProxyPage() {
         accessToken: newAccess.trim(),
         refreshToken: newRefresh.trim(),
         deviceId: newDevice.trim() || undefined,
+        region: newRegion,
       });
       setNewLabel("");
       setNewAccess("");
@@ -432,7 +357,21 @@ export default function GlmProxyPage() {
       setNewDevice("");
       setShowAddForm(false);
       await loadAccounts();
-      setMsg({ type: "ok", text: "账号已加入账号池" });
+      setMsg({ type: "ok", text: `账号已加入${REGION_LABELS[newRegion]}账号池` });
+    } catch (e) {
+      setMsg({ type: "err", text: api.asError(e) });
+    } finally {
+      setAccountsBusy(null);
+    }
+  }
+
+  /** 手动指定账号归属区域（防误判修正） */
+  async function changeRegion(id: string, region: 'international' | 'domestic') {
+    setAccountsBusy(id);
+    try {
+      await api.setAutoclawAccountRegion(id, region);
+      await loadAccounts();
+      setMsg({ type: "ok", text: `账号已归入${REGION_LABELS[region]}（签到与代理将路由到${REGION_LABELS[region]}网关）` });
     } catch (e) {
       setMsg({ type: "err", text: api.asError(e) });
     } finally {
@@ -656,13 +595,33 @@ export default function GlmProxyPage() {
 
             <Section
               title="AutoClaw 账号池"
-              description="池内账号参与每日自动签到，GLM 代理按请求轮询使用；本机当前登录账号始终自动包含"
+              description="池内账号按区域隔离参与每日自动签到与 GLM 代理轮询（🌐 国际版 → autoglm-api.autoglm.ai，🇨🇳 国内版 → autoglm-acceleration-api.zhipuai.cn，互不跨区）；本机当前登录账号始终自动包含"
             >
               <CardContent className="p-0">
                 <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-3 sm:mx-0 sm:px-5">
-                  <span className="text-xs text-muted-foreground">
-                    共 {accounts.length} 个账号（含本机登录）
-                  </span>
+                  {/* v1.0+: 显示区域账号统计 */}
+                  {(() => {
+                    const intlCount = accounts.filter((a: any) => a.region === 'international').length;
+                    const domCount = accounts.filter((a: any) => a.region === 'domestic').length;
+                    return (
+                      <span className="text-xs text-muted-foreground">
+                        共 {accounts.length} 个账号（国际版 {intlCount} / 国内版 {domCount}）
+                      </span>
+                    );
+                  })()}
+                  
+                  {!(() => {
+                    const intlCount = accounts.filter((a: any) => a.region === 'international').length;
+                    const domCount = accounts.filter((a: any) => a.region === 'domestic').length;
+                    if (intlCount === 0 && domCount === 0) return null;
+                    return (
+                      <div className="flex gap-2 text-xs text-muted-foreground">
+                        {intlCount > 0 && <span>🌐 国际版：{intlCount}</span>}
+                        {domCount > 0 && <span>🇨🇳 国内版：{domCount}</span>}
+                      </div>
+                    );
+                  })()}
+                  
                   <div className="flex flex-wrap gap-2">
                     <Button size="sm" onClick={() => void checkinAll()} disabled={checkinAllRunning || accounts.length === 0}>
                       {checkinAllRunning ? <Loader2 className="animate-spin" /> : <CircleCheck />}全部签到
@@ -678,6 +637,29 @@ export default function GlmProxyPage() {
 
                 {showAddForm ? (
                   <div className="space-y-2 border-t border-border/50 px-4 py-3 sm:px-5">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-xs font-medium text-muted-foreground">账号归属：</span>
+                      <div className="flex gap-1.5">
+                        {(Object.keys(REGION_LABELS) as Array<keyof typeof REGION_LABELS>).map((r) => (
+                          <button
+                            key={r}
+                            type="button"
+                            onClick={() => setNewRegion(r)}
+                            className={cn(
+                              "rounded-full border px-3 py-1 text-xs transition-colors",
+                              newRegion === r
+                                ? "border-primary bg-primary/10 font-medium text-primary"
+                                : "border-border text-muted-foreground hover:bg-muted/60",
+                            )}
+                          >
+                            {REGION_ICONS[r]} {REGION_LABELS[r]}
+                          </button>
+                        ))}
+                      </div>
+                      <span className="text-[11px] text-muted-foreground">
+                        国际版（OAuth/邮箱账号）与国内版（本机桌面端/手机号账号）完全隔离，禁止跨区调用
+                      </span>
+                    </div>
                     <div className="grid gap-2 sm:grid-cols-2">
                       <Input placeholder="备注名（可选，如：小号A）" value={newLabel} onChange={(e) => setNewLabel(e.target.value)} />
                       <Input placeholder="deviceId（可选）" value={newDevice} onChange={(e) => setNewDevice(e.target.value)} />
@@ -686,12 +668,12 @@ export default function GlmProxyPage() {
                     </div>
                     <div className="flex gap-2">
                       <Button size="sm" onClick={() => void submitAdd()} disabled={accountsBusy === "add"}>
-                        {accountsBusy === "add" ? <Loader2 className="animate-spin" /> : <Check />}保存并加入账号池
+                        {accountsBusy === "add" ? <Loader2 className="animate-spin" /> : <Check />}保存并加入{REGION_LABELS[newRegion]}账号池
                       </Button>
                       <Button size="sm" variant="ghost" onClick={() => setShowAddForm(false)}>取消</Button>
                     </div>
                     <p className="text-[11px] text-muted-foreground">
-                      token 可从其他设备 AutoClaw 的 auth.json 获取；保存后立即参与签到与代理轮询。
+                      token 可从其他设备 AutoClaw 的 auth.json 获取；保存后立即参与对应区域的签到与代理轮询。
                     </p>
                   </div>
                 ) : null}
@@ -712,17 +694,30 @@ export default function GlmProxyPage() {
                   ) : (
                     accounts.map((account) => {
                       const result = checkinResults[account.id];
+                      // v1.0+: 获取区域信息
+                      const region = account.region as 'international' | 'domestic' | undefined;
+                      const regionIcon = region ? REGION_ICONS[region] : null;
+                      const regionLabel = region ? REGION_LABELS[region] : null;
+                      const isManualSpecified = account.is_manual_specified as boolean | undefined;
+                      
                       return (
                         <div key={account.id} className="flex min-w-0 flex-wrap items-center justify-between gap-2 border-b border-border/50 px-4 py-3 last:border-0 sm:px-5">
                           <div className="min-w-0">
                             <div className="flex flex-wrap items-center gap-2">
                               <span className="text-sm font-medium">{account.label}</span>
+                              {/* v1.0+: 显示区域标签 */}
+                              {regionIcon && regionLabel ? (
+                                <Badge variant="outline" className="text-[10px]" title={regionLabel}>
+                                  {regionIcon} {regionLabel}
+                                  {isManualSpecified && ' ✏️'}
+                                </Badge>
+                              ) : null}
                               <Badge variant={account.status === "ok" ? "secondary" : "destructive"}>
                                 {account.status === "ok" ? "正常" : "失效"}
                               </Badge>
                               {account.source === "local-live" ? (
                                 <Badge className="text-[10px]">本机登录</Badge>
-                              ) : account.source === "local-import" ? (
+                              ) : account.source === "local-import" || account.source === "local_snapshot" ? (
                                 <Badge variant="outline" className="text-[10px]">本机快照</Badge>
                               ) : null}
                               {result ? (
@@ -744,6 +739,18 @@ export default function GlmProxyPage() {
                             <Button size="sm" variant="outline" onClick={() => void checkinOne(account.id)} disabled={accountsBusy === account.id || checkinAllRunning}>
                               {accountsBusy === account.id ? <Loader2 className="animate-spin" /> : <CircleCheck />}签到
                             </Button>
+                            {region ? (
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                className="text-[11px]"
+                                title={`手动把该账号归入${REGION_LABELS[region === 'international' ? 'domestic' : 'international']}（防误判修正）`}
+                                onClick={() => void changeRegion(account.id, region === 'international' ? 'domestic' : 'international')}
+                                disabled={accountsBusy === account.id}
+                              >
+                                设为{REGION_LABELS[region === 'international' ? 'domestic' : 'international']}
+                              </Button>
+                            ) : null}
                             <Button size="sm" variant="ghost" onClick={() => void refreshAccount(account.id)} disabled={accountsBusy === account.id} aria-label="刷新该账号登录态">
                               {accountsBusy === account.id ? <Loader2 className="animate-spin" /> : <RefreshCw />}
                             </Button>
@@ -759,89 +766,6 @@ export default function GlmProxyPage() {
               </CardContent>
             </Section>
 
-            <Section
-              title="TRAE Work CN 账号池"
-              description="TRAE 客户端同一时间只保留一个登录账号：先导入当前登录账号，再切换客户端账号继续导入。注意：TRAE 的刷新令牌与客户端会话绑定，账号切换后旧快照无法续期（与 AutoClaw 不同），但登录态在到期日（约导入后 2 周）前可直接签到；到期后请切换客户端登录该账号并重新导入"
-            >
-              <CardContent className="p-0">
-                <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-3 sm:mx-0 sm:px-5">
-                  <span className="text-xs text-muted-foreground">
-                    共 {traeAccounts.length} 个快照账号（本机登录账号自动包含）
-                  </span>
-                  <div className="flex flex-wrap gap-2">
-                    <Button size="sm" onClick={() => void traeCheckinAll()} disabled={traeAllRunning || traeAccounts.length === 0}>
-                      {traeAllRunning ? <Loader2 className="animate-spin" /> : <CircleCheck />}全部签到
-                    </Button>
-                    <Button size="sm" variant="outline" onClick={() => void importTraeLocal()} disabled={traeBusy === "import"}>
-                      {traeBusy === "import" ? <Loader2 className="animate-spin" /> : <UserPlus />}导入客户端当前账号
-                    </Button>
-                  </div>
-                </div>
-
-                {traeMsg ? (
-                  <p
-                    className={cn(
-                      "px-4 pt-3 text-xs sm:px-5",
-                      traeMsg.type === "ok" ? "text-primary" : "text-destructive",
-                    )}
-                  >
-                    {traeMsg.text}
-                  </p>
-                ) : null}
-                <div className="divide-y divide-border/50 border-t border-border/50">
-                  {traeAccounts.length === 0 ? (
-                    <p className="px-4 py-3.5 text-sm text-muted-foreground">
-                      账号池为空。登录 TRAE Work CN 客户端后点「导入客户端当前账号」。
-                    </p>
-                  ) : (
-                    traeAccounts.map((account) => {
-                      const result = traeResults[account.id];
-                      return (
-                        <div key={account.id} className="flex min-w-0 flex-wrap items-center justify-between gap-2 border-b border-border/50 px-4 py-3 last:border-0 sm:px-5">
-                          <div className="min-w-0">
-                            <div className="flex flex-wrap items-center gap-2">
-                              <span className="text-sm font-medium">{account.label}</span>
-                              {account.expired ? (
-                                <Badge variant="destructive">已到期</Badge>
-                              ) : account.status === "ok" ? (
-                                <Badge variant="secondary">正常</Badge>
-                              ) : (
-                                <Badge variant="destructive">失效</Badge>
-                              )}
-                              {account.localLogin ? (
-                                <Badge className="text-[10px]">客户端登录中</Badge>
-                              ) : null}
-                              {result ? (
-                                result.result === "success" ? (
-                                  <Badge variant="success">签到成功</Badge>
-                                ) : result.result === "already" ? (
-                                  <Badge variant="secondary">已签到</Badge>
-                                ) : (
-                                  <Badge variant="destructive">失败</Badge>
-                                )
-                              ) : null}
-                            </div>
-                            <p className="mt-0.5 truncate text-[11px] text-muted-foreground" title={result?.error || account.error || ""}>
-                              {account.expiredAt ? `登录态至 ${String(account.expiredAt).slice(0, 10)}` : ""}
-                              {result?.error ? ` · ${result.error}` : account.error ? ` · ${account.error}` : ""}
-                            </p>
-                          </div>
-                          <div className="flex shrink-0 items-center gap-1.5">
-                            <Button size="sm" variant="outline" onClick={() => void traeCheckinOne(account.id)} disabled={traeBusy === account.id || traeAllRunning}>
-                              {traeBusy === account.id ? <Loader2 className="animate-spin" /> : <CircleCheck />}签到
-                            </Button>
-
-                            <Button size="sm" variant="ghost" className="text-destructive hover:text-destructive" onClick={() => void removeTraeAccount(account.id)} disabled={traeBusy === account.id} aria-label="移除账号">
-                              <Trash2 />
-                            </Button>
-                          </div>
-                        </div>
-                      );
-                    })
-                  )}
-                </div>
-              </CardContent>
-            </Section>
 
             <Section
               title="扣分账号"
@@ -993,6 +917,11 @@ export default function GlmProxyPage() {
                               <span className="flex flex-wrap items-baseline gap-1.5">
                                 <span className="font-medium">{m.alias}</span>
                                 <code className="text-[11px] text-muted-foreground">{m.id}</code>
+                                {m.region ? (
+                                  <Badge variant="outline" className="h-5 px-1.5 text-[10px]" title={`该模型只路由到${REGION_LABELS[m.region]}账号池`}>
+                                    {REGION_ICONS[m.region]} {REGION_LABELS[m.region]}
+                                  </Badge>
+                                ) : null}
                                 {cfg.speedFirst && cfg.speedFirstSources.includes(m.id) ? (
                                   <Badge variant="warning" className="h-5 px-1.5 text-[10px]">
                                     已改投 {cfg.speedFirstTarget}
@@ -1068,15 +997,17 @@ export default function GlmProxyPage() {
                 </Row>
                 <div className="mx-4 border-b-0 py-3.5 sm:mx-5">
                   <p className="text-sm font-medium leading-5">可用模型</p>
-                  <p className="mb-2 mt-0.5 text-xs text-muted-foreground">来自 AutoClaw 当前模型目录，客户端按模型名直接调用</p>
+                  <p className="mb-2 mt-0.5 text-xs text-muted-foreground">
+                    来自 AutoClaw 模型目录（🌐 国际 / 🇨🇳 国内分别路由到对应区域的账号池与网关），客户端按模型名直接调用
+                  </p>
                   <div className="flex flex-wrap gap-1.5">
                     {cfg.models.map((m) => (
                       <span
                         key={m.id}
                         className="rounded bg-muted/70 px-2 py-1 text-xs"
-                        title={`${m.alias || m.id} · 路由 ${m.routeId}`}
+                        title={`${m.alias || m.id} · 路由 ${m.routeId}${m.region ? ` · ${REGION_LABELS[m.region]}` : ''}`}
                       >
-                        {m.id}
+                        {m.region ? `${REGION_ICONS[m.region]} ` : ''}{m.id}
                       </span>
                     ))}
                   </div>
@@ -1095,7 +1026,7 @@ export default function GlmProxyPage() {
                       <SelectContent>
                         {cfg.models.map((m) => (
                           <SelectItem key={m.id} value={m.id}>
-                            {m.alias ? `${m.alias}（${m.id}）` : m.id}
+                            {m.alias ? `${m.alias}（${m.id}${m.region ? ` · ${REGION_ICONS[m.region]}` : ''}）` : m.id}
                           </SelectItem>
                         ))}
                       </SelectContent>

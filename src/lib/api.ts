@@ -28,6 +28,9 @@ import type {
   ModelMonitor,
   AutoclawAccountInfo,
   AutoclawCheckinResult,
+  QwenChannelInfo,
+  QwenChannelsStatus,
+  ToolCallMonitor,
   GatewayApiKey,
   GatewayLogEntry,
   GatewayOverview,
@@ -41,6 +44,10 @@ import type {
   LoomyProxyConfigInfo,
   LoomyProxyStatus,
   LoomyModel,
+  MiaoshouAccountInfo,
+  MiaoshouCheckinResult,
+  MiaoshouModelInfo,
+  MiaoshouStatusItem,
   AccountProtectionConfigInfo,
   AccountProtectionStatusInfo,
   AccountsOverviewResponse,
@@ -50,6 +57,8 @@ import type {
   GrokPoolPolicy,
   GrokPoolSnapshot,
 } from "./types";
+import type { ChannelDetail, ChannelHealthOverview } from "@/lib/channel-health-types";
+import type { ModelTestRequest, ModelTestResult } from "@/lib/model-test-types";
 import { DEMO_UNAVAILABLE_MESSAGE, demoModeEnabled } from "./demo-mode";
 import { screenshotDemoResponse } from "./screenshot-demo";
 
@@ -125,12 +134,14 @@ const ROUTES: Record<string, Route> = {
   get_accounts_usage_overview: { method: "GET", path: "/api/glm-usage/accounts-overview" },
   get_autoclaw_accounts: { method: "GET", path: "/api/autoclaw/accounts" },
   add_autoclaw_account: { method: "POST", path: "/api/autoclaw/accounts" },
+  set_autoclaw_account_region: { method: "POST", path: "/api/autoclaw/accounts/set-region" },
   import_autoclaw_local: { method: "POST", path: "/api/autoclaw/accounts/import-local" },
   remove_autoclaw_account: { method: "POST", path: "/api/autoclaw/accounts/remove" },
   refresh_autoclaw_account: { method: "POST", path: "/api/autoclaw/accounts/refresh" },
   autoclaw_checkin_all: { method: "POST", path: "/api/autoclaw/checkin-all" },
   autoclaw_checkin_one: { method: "POST", path: "/api/autoclaw/checkin-one" },
   get_trae_accounts: { method: "GET", path: "/api/trae/accounts" },
+  add_trae_account: { method: "POST", path: "/api/trae/accounts" },
   import_trae_local: { method: "POST", path: "/api/trae/accounts/import-local" },
   remove_trae_account: { method: "POST", path: "/api/trae/accounts/remove" },
   refresh_trae_account: { method: "POST", path: "/api/trae/accounts/refresh" },
@@ -142,6 +153,12 @@ const ROUTES: Record<string, Route> = {
   qoder_device_flow_start: { method: "POST", path: "/api/qoder/device-flow/start" },
   qoder_device_flow_complete: { method: "POST", path: "/api/qoder/device-flow/complete" },
   qoder_test_completion: { method: "POST", path: "/api/qoder/test" },
+  get_qwen_channel: { method: "GET", path: "/api/qwen/channel" },
+  set_qwen_channel: { method: "POST", path: "/api/qwen/channel" },
+  get_qwen_channels: { method: "GET", path: "/api/qwen/channels" },
+  get_qwen_web_log: { method: "GET", path: "/api/qwen/web/log" },
+  get_qwen_toolcall_monitor: { method: "GET", path: "/api/qwen/toolcall-monitor" },
+  clear_qwen_toolcall_monitor: { method: "POST", path: "/api/qwen/toolcall-monitor/clear" },
   get_kimi_accounts: { method: "GET", path: "/api/kimi/accounts" },
   kimi_add_account: { method: "POST", path: "/api/kimi/accounts/add" },
   kimi_remove_account: { method: "POST", path: "/api/kimi/accounts/remove" },
@@ -167,6 +184,9 @@ const ROUTES: Record<string, Route> = {
   get_gateway_logs: { method: "GET", path: "/api/gateway/logs" },
   get_gateway_overview: { method: "GET", path: "/api/gateway/overview" },
   qoder_import_manual: { method: "POST", path: "/api/qoder/accounts/import-manual" },
+  qoder_import_local_cn: { method: "POST", path: "/api/qoder/accounts/import-local-cn" },
+  qoder_import_work_cn: { method: "POST", path: "/api/qoder/accounts/import-work-cn" },
+  qoder_set_region: { method: "POST", path: "/api/qoder/accounts/region" },
   get_glmweb_tokens: { method: "GET", path: "/api/glmweb/tokens" },
   glmweb_add_token: { method: "POST", path: "/api/glmweb/tokens" },
   glmweb_remove_token: { method: "POST", path: "/api/glmweb/tokens/remove" },
@@ -185,10 +205,28 @@ const ROUTES: Record<string, Route> = {
   save_loomy_proxy_config: { method: "POST", path: "/api/loomy-proxy/config" },
   get_loomy_proxy_status: { method: "GET", path: "/api/loomy-proxy/status" },
   get_loomy_models_catalog: { method: "GET", path: "/api/loomy/models" },
+  // 妙手（美团智能体桌面应用）：账号池 + 积分；平台无每日签到，checkin 端点保留占位
+  get_miaoshou_accounts: { method: "GET", path: "/api/miaoshou/accounts" },
+  miaoshou_import_local: { method: "POST", path: "/api/miaoshou/accounts/import-local" },
+  miaoshou_remove_account: { method: "POST", path: "/api/miaoshou/accounts/remove" },
+  get_miaoshou_status: { method: "GET", path: "/api/miaoshou/status" },
+  miaoshou_checkin_all: { method: "POST", path: "/api/miaoshou/checkin-all" },
+  miaoshou_checkin_one: { method: "POST", path: "/api/miaoshou/checkin-one" },
+  get_miaoshou_credits: { method: "GET", path: "/api/miaoshou/credits" },
+  get_miaoshou_models: { method: "GET", path: "/api/miaoshou/models" },
+  miaoshou_chat: { method: "POST", path: "/api/miaoshou/chat" },
   get_trae_proxy_status: { method: "GET", path: "/api/trae-proxy/status" },
   get_trae_proxy_models: { method: "GET", path: "/api/trae-proxy/models" },
+  get_trae_proxy_config: { method: "GET", path: "/api/trae-proxy/config" },
   get_workbuddy_proxy_status: { method: "GET", path: "/api/workbuddy-proxy/status" },
   get_workbuddy_proxy_models: { method: "GET", path: "/api/workbuddy-proxy/models" },
+  get_workbuddy_proxy_config: { method: "GET", path: "/api/workbuddy-proxy/config" },
+  save_workbuddy_proxy_config: { method: "POST", path: "/api/workbuddy-proxy/config" },
+  get_workbuddy_native_models: { method: "GET", path: "/workbuddy-native/v1/models" },
+  // OpenCode 网关（2026-09-22 三拆新增，独立密钥）
+  get_opencode_proxy_status: { method: "GET", path: "/api/opencode-proxy/status" },
+  get_opencode_proxy_config: { method: "GET", path: "/api/opencode-proxy/config" },
+  save_opencode_proxy_config: { method: "POST", path: "/api/opencode-proxy/config" },
   trae_checkin_one: { method: "POST", path: "/api/trae/checkin-one" },
   test_glm_proxy: { method: "POST", path: "/api/glm-proxy/test" },
   save_glm_proxy_config: { method: "POST", path: "/api/glm-proxy/config" },
@@ -216,6 +254,9 @@ const ROUTES: Record<string, Route> = {
   get_loomy_protection_status: { method: "GET", path: "/api/loomy/protection/status" },
   loomy_protection_keepalive_now: { method: "POST", path: "/api/loomy/protection/keepalive-now" },
   loomy_protection_clear_cooldown: { method: "POST", path: "/api/loomy/protection/cooldown/clear" },
+  get_channel_health: { method: "GET", path: "/api/channel-health" },
+  get_channel_health_detail: { method: "GET", path: "/api/channel-health/detail" },
+  model_test: { method: "POST", path: "/api/model-test" },
 };
 
 function queryString(args?: Record<string, unknown>): string {
@@ -248,9 +289,21 @@ async function httpCall<T>(cmd: string, args?: Record<string, unknown>): Promise
   }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    throw new Error(data.message || data.error || `请求失败 (${res.status})`);
+    const err = new Error(data.message || data.error || `请求失败 (${res.status})`);
+    // 挂上原始错误体，便于调用方读机器可读标记（如 recovering）。
+    Object.assign(err, { payload: data });
+    throw err;
   }
   return data as T;
+}
+
+/** G2：上游恢复中的瞬态错误（看门狗拉起窗口，通常 ≤60s）。
+ *  优先读后端 recovering 标记，兜底用负缓存文案关键词。 */
+export function isRecoveringError(e: unknown): boolean {
+  const payload = (e as { payload?: { recovering?: boolean } }).payload;
+  if (payload && payload.recovering === true) return true;
+  const msg = e instanceof Error ? e.message : String(e);
+  return msg.includes("负缓存");
 }
 
 async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -513,8 +566,18 @@ export async function addAutoclawAccount(input: {
   accessToken: string;
   refreshToken: string;
   deviceId?: string;
+  /** 区域分入口：显式指定 international / domestic；缺省由后端按 token 身份推断 */
+  region?: 'international' | 'domestic';
 }): Promise<{ ok: boolean; account: AutoclawAccountInfo }> {
   return call("add_autoclaw_account", input as unknown as Record<string, unknown>);
+}
+
+/** 手动指定账号归属区域（防误判修正；后端记录 is_manual_specified） */
+export async function setAutoclawAccountRegion(
+  id: string,
+  region: 'international' | 'domestic',
+): Promise<{ ok: boolean; account: AutoclawAccountInfo }> {
+  return call("set_autoclaw_account_region", { id, region });
 }
 
 export async function importAutoclawLocal(): Promise<{ ok: boolean; account: AutoclawAccountInfo }> {
@@ -555,6 +618,17 @@ export async function refreshTraeAccount(id: string): Promise<{ ok: boolean }> {
   return call("refresh_trae_account", { id });
 }
 
+/** 手动添加 TRAE Work CN 账号（粘贴快照凭证，不走本机客户端登录态）。 */
+export async function addTraeAccount(input: {
+  label?: string;
+  accessToken: string;
+  refreshToken?: string;
+  deviceId?: string;
+  machineId?: string;
+}): Promise<{ ok: boolean; account: TraeAccountInfo }> {
+  return call("add_trae_account", input as unknown as Record<string, unknown>);
+}
+
 export async function traeCheckinAll(): Promise<{ accounts: TraeCheckinResult[] }> {
   return call("trae_checkin_all");
 }
@@ -566,6 +640,35 @@ export async function traeCheckinOne(id: string): Promise<TraeCheckinResult> {
 // ---- Qoder 融合网关（仅 webui 后端支持）----
 
 // ---- Kimi 融合网关（仅 webui 后端支持）----
+
+// ---- Qwen 双通道（网页版 chat.qwen.ai + Qoder 算力池，仅 webui 后端支持）----
+
+export async function getQwenChannel(): Promise<QwenChannelInfo> {
+  return call("get_qwen_channel");
+}
+
+export async function setQwenChannel(
+  channel: 'auto' | 'web' | 'qoder',
+  autoFallback = true,
+): Promise<{ ok: boolean; channel: string; autoFallback: boolean }> {
+  return call("set_qwen_channel", { channel, autoFallback });
+}
+
+export async function getQwenChannels(force = false): Promise<QwenChannelsStatus> {
+  return call("get_qwen_channels", force ? { force: 1 } : {});
+}
+
+export async function getQwenToolcallMonitor(n = 40): Promise<ToolCallMonitor> {
+  return call("get_qwen_toolcall_monitor", { n });
+}
+
+export async function clearQwenToolcallMonitor(): Promise<{ ok: boolean }> {
+  return call("clear_qwen_toolcall_monitor");
+}
+
+export async function getQwenWebLog(n = 40): Promise<{ logs: string[] }> {
+  return call("get_qwen_web_log", { n });
+}
 
 export async function getKimiAccounts(): Promise<{ accounts: KimiAccountInfo[] }> {
   return call("get_kimi_accounts");
@@ -611,6 +714,25 @@ export async function getGatewayOverview(): Promise<GatewayOverview> {
   return call("get_gateway_overview");
 }
 
+// ---- 渠道健康度监控 ----
+
+export async function getChannelHealth(hours: number): Promise<ChannelHealthOverview> {
+  return call("get_channel_health", { hours });
+}
+
+export async function getChannelHealthDetail(gatewayId: string, hours: number): Promise<ChannelDetail> {
+  return call("get_channel_health_detail", { gateway: gatewayId, hours });
+}
+
+// ---- 模型可用性自测（webui 后端）----
+
+/** 对指定「网关 + 模型」发起一次真实调用，返回可用性结论。
+ *  注意：**失败也是一次有效结论**（后端恒返回 200，用 `ok`/`code`/`reason` 表达），
+ *  所以这里不会 throw，调用方直接读结果即可。 */
+export async function testModel(input: ModelTestRequest): Promise<ModelTestResult> {
+  return call("model_test", input as unknown as Record<string, unknown>);
+}
+
 // ---- ChatGLM 网页协议网关（仅 webui 后端支持）----
 
 export async function getGlmwebTokens(): Promise<{ tokens: { index: number; type: string; preview: string; hasCachedAccess: boolean; accessExpiresAt: number | null }[]; pool: { accounts: number; guestSlots: number; refreshAccounts: number; withCachedAccess: number } }> {
@@ -653,8 +775,23 @@ export async function glmwebTestCompletion(model: string, prompt: string): Promi
   return call("glmweb_test_completion", { model, prompt });
 }
 
-export async function qoderImportManual(input: { uid?: string; accessToken: string; refreshToken?: string }): Promise<{ ok: boolean; account: QoderAccountInfo }> {
+export async function qoderImportManual(input: { uid?: string; accessToken: string; refreshToken?: string; gateway?: string }): Promise<{ ok: boolean; account: QoderAccountInfo }> {
   return call("qoder_import_manual", input);
+}
+
+/** 导入本机 QoderCN（中国版 IDE）登录态 → Qoder CN 专用池（/qwen-flash/v1 凭据来源）。 */
+export async function qoderImportLocalCn(): Promise<{ ok: boolean; account: QoderAccountInfo }> {
+  return call("qoder_import_local_cn");
+}
+
+/** 导入本机 QoderWork CN（独立 Electron 应用）登录态 → 独立池（服务 /qwen-flash/v1）。 */
+export async function qoderImportLocalWorkCn(): Promise<{ ok: boolean; account: QoderAccountInfo }> {
+  return call("qoder_import_work_cn");
+}
+
+/** 手动指定 Qoder 账号地域（防误判）：cn / intl / auto（清除手动指定）。 */
+export async function qoderSetAccountRegion(uid: string, region: "cn" | "intl" | "auto"): Promise<{ ok: boolean; account: QoderAccountInfo }> {
+  return call("qoder_set_region", { uid, region });
 }
 
 export async function kimiTestCompletion(model: string, prompt: string): Promise<{ ok: boolean; model: string; content: string; latencyMs: number }> {
@@ -829,6 +966,62 @@ export async function getLoomyModelsCatalog(): Promise<{ object: string; data: L
   return httpCall("get_loomy_models_catalog");
 }
 
+// ---- 妙手（美团智能体桌面应用）账号池与积分（仅 webui 后端支持）----
+
+export async function getMiaoshouAccounts(): Promise<{ accounts: MiaoshouAccountInfo[] }> {
+  return call("get_miaoshou_accounts");
+}
+
+/** 导入本机妙手（美团智能体桌面应用）登录态 → 账号池。 */
+export async function miaoshouImportLocal(): Promise<{ ok: boolean; account: MiaoshouAccountInfo }> {
+  return call("miaoshou_import_local");
+}
+
+export async function miaoshouRemoveAccount(uid: string): Promise<{ ok: boolean }> {
+  return call("miaoshou_remove_account", { uid });
+}
+
+/** 账号状态与积分明细；妙手无每日签到（积分按月刷新），checkinSupported 恒为 false。 */
+export async function getMiaoshouStatus(): Promise<{ accounts: MiaoshouStatusItem[] }> {
+  return call("get_miaoshou_status");
+}
+
+export async function miaoshouCheckinAll(): Promise<{ accounts: MiaoshouCheckinResult[] }> {
+  return call("miaoshou_checkin_all");
+}
+
+export async function miaoshouCheckinOne(id: string): Promise<MiaoshouCheckinResult> {
+  return call("miaoshou_checkin_one", { id });
+}
+
+/** 全账号积分明细（余额 / 套餐 / 下次刷新时间）。 */
+/** 妙手桌面端模型目录（webui）。force=true 绕过服务端 10 分钟缓存直拉上游。 */
+export async function getMiaoshouModels(force = false): Promise<{ object: string; data: MiaoshouModelInfo[] }> {
+  return call("get_miaoshou_models", force ? { force: 1 } : {});
+}
+
+/** 妙手反代试调（webui 内部用，走 webui 会话而非网关密钥）。 */
+export async function miaoshouChat(input: {
+  model: string;
+  messages: Array<{ role: string; content: string }>;
+  stream?: boolean;
+}): Promise<{
+  id?: string;
+  choices?: Array<{ message?: { role?: string; content?: string; reasoning_content?: string } }>;
+  usage?: unknown;
+  error?: { message?: string };
+}> {
+  return call("miaoshou_chat", input as unknown as Record<string, unknown>);
+}
+
+export async function getMiaoshouCredits(): Promise<{
+  ok: boolean;
+  accounts: MiaoshouStatusItem[];
+  error?: string;
+}> {
+  return call("get_miaoshou_credits");
+}
+
 // ---- TRAE / WorkBuddy 模型代理（仅 webui 后端支持）----
 
 export interface TraeProxyStatus {
@@ -856,6 +1049,33 @@ export interface WorkbuddyProxyStatus {
   modelCount?: number;
 }
 
+/** WorkBuddy 反代接入配置（GET /api/workbuddy-proxy/config）。 */
+export interface WorkbuddyProxyConfigInfo {
+  enabled: boolean;
+  /** 客户端填入的 Base URL，如 http://127.0.0.1:57890/workbuddy/v1 */
+  endpoint: string;
+  apiKey: string;
+  /** opencode server 端口，0 = 自动发现 */
+  serverPort: number;
+}
+
+/** TRAE 反代接入配置（GET /api/trae-proxy/config）。
+ *
+ * v0.1.59+：TRAE 有了自有密钥体系（`traeKey`）；迁移窗口内仍兼容 Loomy 代理的
+ * 旧密钥，`keySource` 如实反映当前生效来源（`trae` = TRAE 自有密钥，
+ * `loomy` = 仍在迁移窗口、复用 Loomy 代理的密钥）。
+ */
+export interface TraeProxyConfigInfo {
+  endpoint: string;
+  apiKey: string;
+  /** TRAE 自有密钥（迁移窗口内与 apiKey 可能同值，窗口结束后 apiKey 即该值）。 */
+  traeKey?: string;
+  keySource: "loomy" | "trae";
+  chatForwarding: boolean;
+  credential?: { ok: boolean; user?: string; host?: string; error?: string };
+  modelCount?: { count: number };
+}
+
 export async function getTraeProxyStatus(): Promise<TraeProxyStatus> {
   return httpCall("get_trae_proxy_status");
 }
@@ -879,6 +1099,69 @@ export async function getWorkbuddyProxyModels(): Promise<{
   error?: string;
 }> {
   return httpCall("get_workbuddy_proxy_models");
+}
+
+/** WorkBuddy 反代接入配置（Base URL / 密钥 / 端口）。 */
+export async function getWorkbuddyProxyConfig(): Promise<WorkbuddyProxyConfigInfo> {
+  return httpCall("get_workbuddy_proxy_config");
+}
+
+/** WorkBuddy 桌面端自带模型目录（/workbuddy-native/v1/models，实时探测内嵌会话 --model）。 */
+export async function getWorkbuddyNativeModels(): Promise<{
+  object: string;
+  data: { id: string; object: string; created: number; owned_by: string }[];
+}> {
+  return httpCall("get_workbuddy_native_models");
+}
+
+/** 保存 WorkBuddy 反代接入配置；regenerateKey 为 true 时轮换密钥。 */
+export async function saveWorkbuddyProxyConfig(patch: {
+  enabled?: boolean;
+  serverPort?: number;
+  apiKey?: string;
+  regenerateKey?: boolean;
+}): Promise<WorkbuddyProxyConfigInfo> {
+  return httpCall("save_workbuddy_proxy_config", patch);
+}
+
+/** TRAE 反代接入配置（密钥复用 Loomy 代理）。 */
+export async function getTraeProxyConfig(): Promise<TraeProxyConfigInfo> {
+  return httpCall("get_trae_proxy_config");
+}
+
+/* -------------------------------------------------------------------------- */
+/* OpenCode 网关（独立网关 · 2026-09-22 三拆新增）                                */
+/* -------------------------------------------------------------------------- */
+
+/** OpenCode 网关状态：本机 server 健康 + 免费/总模型数 + 渠道数。 */
+export async function getOpencodeProxyStatus(): Promise<{
+  enabled: boolean;
+  server: { ok: boolean; port?: number; error?: string };
+  channelCount: number;
+  modelCount: number;
+  freeModelCount: number;
+  exposedModelCount: number;
+}> {
+  return httpCall("get_opencode_proxy_status");
+}
+
+/** OpenCode 网关接入信息（Base URL / 密钥 / 启用态）—— 独立密钥，与 WorkBuddy/TRAE 不共用。 */
+export async function getOpencodeProxyConfig(): Promise<{
+  enabled: boolean;
+  endpoint: string;
+  apiKey: string;
+  note?: string;
+}> {
+  return httpCall("get_opencode_proxy_config");
+}
+
+/** 保存 OpenCode 网关配置；regenerateKey 为 true 时轮换密钥。 */
+export async function saveOpencodeProxyConfig(patch: {
+  enabled?: boolean;
+  apiKey?: string;
+  regenerateKey?: boolean;
+}): Promise<{ enabled: boolean; endpoint: string; apiKey: string; note?: string }> {
+  return httpCall("save_opencode_proxy_config", patch);
 }
 
 /** AutoClaw 网关状态探测（仅 webui 后端支持）。 */
@@ -1083,4 +1366,27 @@ export type GatewayInfo = {
 };
 
 export type GatewaysOverview = { gateways: GatewayInfo[] };
+
+export interface QwenDesktopStatus {
+  installed: boolean;
+  install_path?: string | null;
+  running: boolean;
+  appdata_dir: string;
+  token_found: boolean;
+  user_id?: string | null;
+  token_expires_at?: number | null;
+  models_count: number;
+  models: Array<{
+    id: string;
+    name: string;
+    description?: string;
+    capabilities?: string[];
+  }>;
+  notice: string;
+}
+
+export async function getQwenDesktopStatus(): Promise<QwenDesktopStatus> {
+  const res = await fetch("/api/qwen/desktop/status");
+  return res.json();
+}
 

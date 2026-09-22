@@ -18,11 +18,8 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 
 use crate::modules::config::{atomic_write, now_ms, store_dir};
-use crate::modules::autoclaw_accounts::{pool_accounts, PoolAccount};
+use crate::modules::autoclaw_accounts::{pool_accounts, PoolAccount, AccountRegion};
 use crate::modules::platform_checkin::{autoclaw_data_dir, read_autoclaw_token};
-
-const GLM_PROXY_UPSTREAM: &str =
-    "https://autoglm-acceleration-api.zhipuai.cn/autoclaw-proxy/proxy/autoclaw";
 
 // ---------------------------------------------------------------------------
 // 配置（~/.wb-switch/glm_proxy_config.json）
@@ -154,6 +151,8 @@ pub struct GlmModelRoute {
     pub alias: String,
     /// 目录元数据（消耗等级 / 上下文 / 模态 / 说明）；兜底路由为 Null。
     pub meta: Value,
+    /// 模型归属区域：请求该模型时只用对应区域的账号池与网关。
+    pub region: AccountRegion,
 }
 
 impl GlmModelRoute {
@@ -247,13 +246,58 @@ fn strip_route_prefix(route_id: &str) -> String {
     }
 }
 
-/// 模型路由清单：AutoClaw `settings.json` 的 zhipu 目录 + 静态兜底。
+/// v1.0+: 从请求中提取区域信息（优先从 body，其次从 headers）
+fn extract_region_from_request(body: &Value) -> Option<AccountRegion> {
+    // 优先从请求体中的 region 字段获取
+    if let Some(region_str) = body.get("region").and_then(Value::as_str) {
+        return AccountRegion::from_str(region_str);
+    }
+    
+    // 如果请求体中没有，尝试从 extra.headers 中获取
+    if let Some(extra) = body.get("extra") {
+        if let Some(headers) = extra.get("headers") {
+            if let Some(x_region) = headers.get("x-region").and_then(Value::as_str) {
+                return AccountRegion::from_str(x_region);
+            }
+        }
+    }
+    
+    None  // 未指定区域时返回 None，使用默认行为
+}
+
+/// 国际版静态兜底目录（2026-09-18 抄自本机国际版客户端 settings.json，
+/// 供本机客户端是国内版时仍能看到国际模型；随客户端版本可能变化）。
+const INTERNATIONAL_FALLBACK_ROUTES: [(&str, &str); 6] = [
+    ("zai_auto", "Auto"),
+    ("zai_auto-fast", "Auto-Fast"),
+    ("zaicoding_glm-5.3", "GLM-5.3"),
+    ("zai_glm-5.3-flash", "GLM-5.3-Flash"),
+    ("tdpsk_deepseek-v4-flash-202605", "Deepseek-V4.1-Flash"),
+    ("tdpsk_deepseek-v4-pro-202606", "DeepSeek-V4-Pro"),
+];
+
+/// 国内版静态兜底目录（历史国内客户端 settings.json 实测可用项）。
+const DOMESTIC_FALLBACK_ROUTES: [(&str, &str); 4] = [
+    ("zaicoding_glm-5.3", "GLM-5.3"),
+    ("zai_glm-5.3-flash", "GLM-5.3-Flash"),
+    ("zai_auto", "Auto"),
+    ("zai_auto-fast", "Auto-Fast"),
+];
+
+/// 模型路由清单，按区域标注归属：
+/// - 本机客户端 `settings.json` 的 zhipu 目录 → 归属本机客户端登录账号的
+///   区域（国际客户端下发国际目录、国内客户端下发国内目录）；
+/// - 两个静态兜底表分别补充对应区域缺失的条目（按 region+route_id 去重）。
 pub fn model_routes() -> Vec<GlmModelRoute> {
-    let mut out = Vec::new();
+    let mut out: Vec<GlmModelRoute> = Vec::new();
+    let mut seen: std::collections::HashSet<(AccountRegion, String)> =
+        std::collections::HashSet::new();
     if let Some(dir) = autoclaw_data_dir() {
         if let Ok(text) = std::fs::read_to_string(dir.join("settings.json")) {
             if let Ok(v) = serde_json::from_str::<Value>(&text) {
                 if let Some(entries) = v.pointer("/models/catalog").and_then(Value::as_array) {
+                    let client_region =
+                        crate::modules::autoclaw_accounts::local_autoclaw_region();
                     for entry in entries {
                         if entry.get("provider").and_then(Value::as_str) != Some("zhipu") {
                             continue;
@@ -262,6 +306,9 @@ pub fn model_routes() -> Vec<GlmModelRoute> {
                             continue;
                         };
                         if route_id.is_empty() {
+                            continue;
+                        }
+                        if !seen.insert((client_region, route_id.to_string())) {
                             continue;
                         }
                         out.push(GlmModelRoute {
@@ -273,24 +320,28 @@ pub fn model_routes() -> Vec<GlmModelRoute> {
                                 .unwrap_or_default()
                                 .to_string(),
                             meta: entry.clone(),
+                            region: client_region,
                         });
                     }
                 }
             }
         }
     }
-    if out.is_empty() {
-        for (route_id, alias) in [
-            ("zaicoding_glm-5.3", "GLM-5.3"),
-            ("zai_glm-5.3-flash", "GLM-5.3-Flash"),
-            ("zai_auto", "Auto"),
-            ("zai_auto-fast", "Auto-Fast"),
-        ] {
+    // 静态兜底：settings.json 缺失或条目不足时按区域补充。
+    for (region, table) in [
+        (AccountRegion::International, &INTERNATIONAL_FALLBACK_ROUTES[..]),
+        (AccountRegion::Domestic, &DOMESTIC_FALLBACK_ROUTES[..]),
+    ] {
+        for (route_id, alias) in table {
+            if !seen.insert((region, route_id.to_string())) {
+                continue;
+            }
             out.push(GlmModelRoute {
                 route_id: route_id.to_string(),
                 body_model: strip_route_prefix(route_id),
                 alias: alias.to_string(),
                 meta: Value::Null,
+                region,
             });
         }
     }
@@ -344,6 +395,8 @@ fn upstream_client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| {
         let ua = crate::modules::account_protection::simulated_autoclaw_user_agent();
         reqwest::Client::builder()
+            // 国内上游直连，不继承系统代理（Clash 抖动会掐断流，见 2026-09-18 上午两起断连）
+            .no_proxy()
             .user_agent(ua)
             .build()
             .expect("failed to build glm proxy client")
@@ -399,9 +452,10 @@ async fn send_once(
     payload: &Value,
     token: &str,
     route_model: &str,
+    region: AccountRegion,
 ) -> Result<reqwest::Response, String> {
     upstream_client()
-        .post(&format!("{GLM_PROXY_UPSTREAM}/chat/completions"))
+        .post(region.chat_upstream_url())
         .headers(upstream_headers(token, route_model))
         .json(payload)
         .send()
@@ -418,16 +472,29 @@ static POOL_CURSOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUs
 /// - local_first：本机登录账号优先，失败才用池内其他账号；
 /// - local_only：只用本机登录账号（池内其他账号不参与代理，不消耗其积分）；
 /// - pinned：只用 `pinned_account_id` 指定的账号（严格，失败不换号）。
+/// 
+/// v1.0+: 支持区域隔离，根据请求的 region 过滤账号池
 fn ordered_pool(cfg: &GlmProxyConfig) -> Result<Vec<PoolAccount>, String> {
+    ordered_pool_with_region(cfg, None)
+}
+
+/// 带区域参数的账号池选择（v1.0+ 区域隔离）。
+/// PoolAccount 自带 region，直接过滤——禁止跨区借用对方区域的账号。
+pub fn ordered_pool_with_region(cfg: &GlmProxyConfig, region: Option<AccountRegion>) -> Result<Vec<PoolAccount>, String> {
     let all = pool_accounts();
-    let cooling_count = all
+    let filtered_accounts: Vec<PoolAccount> = match region {
+        Some(r) => all.into_iter().filter(|a| a.region == r).collect(),
+        None => all,
+    };
+    
+    let cooling_count = filtered_accounts
         .iter()
         .filter(|a| crate::modules::account_protection::is_account_cooling(&a.id))
         .count();
 
     match cfg.account_mode.as_str() {
         ACCOUNT_MODE_LOCAL_ONLY => {
-            let local: Vec<PoolAccount> = all.iter().filter(|a| a.is_local()).cloned().collect();
+            let local: Vec<PoolAccount> = filtered_accounts.iter().filter(|a| a.is_local()).cloned().collect();
             if local.is_empty() {
                 return Err(
                     "已选择「只用本机账号」，但未检测到本机 AutoClaw 登录态：请在 AutoClaw 桌面端登录，或改回其他选号策略"
@@ -446,8 +513,8 @@ fn ordered_pool(cfg: &GlmProxyConfig) -> Result<Vec<PoolAccount>, String> {
         }
         ACCOUNT_MODE_LOCAL_FIRST => {
             let mut list: Vec<PoolAccount> =
-                all.iter().filter(|a| a.is_local()).cloned().collect();
-            list.extend(all.iter().filter(|a| !a.is_local()).cloned());
+                filtered_accounts.iter().filter(|a| a.is_local()).cloned().collect();
+            list.extend(filtered_accounts.iter().filter(|a| !a.is_local()).cloned());
             if list.is_empty() {
                 return Err(
                     "AutoClaw 账号池为空：请登录 AutoClaw 桌面端，或在「GLM 代理」页导入账号"
@@ -474,7 +541,7 @@ fn ordered_pool(cfg: &GlmProxyConfig) -> Result<Vec<PoolAccount>, String> {
                         .to_string(),
                 );
             }
-            let hit = all
+            let hit = filtered_accounts
                 .iter()
                 .find(|a| a.id == id)
                 .cloned()
@@ -493,13 +560,13 @@ fn ordered_pool(cfg: &GlmProxyConfig) -> Result<Vec<PoolAccount>, String> {
         }
         // round_robin 及未知历史值：保持原行为（池内轮询）。
         _ => {
-            if all.is_empty() {
+            if filtered_accounts.is_empty() {
                 return Err(
                     "AutoClaw 账号池为空：请登录 AutoClaw 桌面端，或在「GLM 代理」页导入账号"
                         .to_string(),
                 );
             }
-            let active: Vec<PoolAccount> = all
+            let active: Vec<PoolAccount> = filtered_accounts
                 .into_iter()
                 .filter(|a| !crate::modules::account_protection::is_account_cooling(&a.id))
                 .collect();
@@ -515,18 +582,19 @@ fn ordered_pool(cfg: &GlmProxyConfig) -> Result<Vec<PoolAccount>, String> {
 }
 
 /// 单账号尝试：401 刷新该账号登录态重试一次；403 限流等待后重试一次。
+/// 上游 URL 按账号所属区域路由（region.chat_upstream_url）。
 async fn try_send_for_account(
     payload: &Value,
     route: &GlmModelRoute,
     account: &PoolAccount,
 ) -> Result<reqwest::Response, String> {
-    let mut resp = send_once(payload, &account.bearer(), &route.route_id).await?;
+    let mut resp = send_once(payload, &account.bearer(), &route.route_id, account.region).await?;
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
         let new_token = account
             .refresh()
             .await
             .map_err(|e| format!("{}：登录态续期失败（{e}）", account.label))?;
-        resp = send_once(payload, &format!("Bearer {new_token}"), &route.route_id)
+        resp = send_once(payload, &format!("Bearer {new_token}"), &route.route_id, account.region)
             .await
             .map_err(|e| format!("AutoClaw 网关请求失败: {e}"))?;
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
@@ -541,7 +609,7 @@ async fn try_send_for_account(
         }
         // 高峰期限流：等待后重试一次，仍失败则把限流信息透出并触发自适应冷却保护。
         tokio::time::sleep(std::time::Duration::from_millis(900)).await;
-        resp = send_once(payload, &account.bearer(), &route.route_id).await?;
+        resp = send_once(payload, &account.bearer(), &route.route_id, account.region).await?;
         if resp.status() == reqwest::StatusCode::FORBIDDEN {
             let retry_text = resp.text().await.unwrap_or_default();
             let prot_cfg = crate::modules::account_protection::load_protection_config();
@@ -588,8 +656,26 @@ async fn send_upstream_routed(
     ),
     String,
 > {
+    // 区域决定：显式请求区域 > 模型目录归属区域。模型未识别时不会走到这里。
+    send_upstream_routed_with_region(payload, route, Some(route.region)).await
+}
+
+/// 带区域参数的上游请求路由 (v1.0+ 区域隔离)
+async fn send_upstream_routed_with_region(
+    payload: &Value,
+    route: &GlmModelRoute,
+    region: Option<AccountRegion>,
+) -> Result<
+    (
+        reqwest::Response,
+        PoolAccount,
+        crate::modules::model_usage::Measurement,
+        Option<crate::modules::account_protection::ConcurrencyGuard>,
+    ),
+    String,
+> {
     let cfg = load_config();
-    let pool = ordered_pool(&cfg)?;
+    let pool = ordered_pool_with_region(&cfg, region)?;
     let prot_cfg = crate::modules::account_protection::load_protection_config();
     let max_concurrency = if prot_cfg.enabled {
         prot_cfg.max_concurrency_per_account
@@ -668,8 +754,10 @@ fn error_text(status: reqwest::StatusCode, text: &str) -> String {
 }
 
 /// 非流式对话补全：缓冲整个响应并解析为 JSON（OpenAI 格式原样透传）。
+/// v1.0+: 支持从请求体中提取 region 参数进行区域隔离
 pub async fn chat_completions_json(body: Value) -> Result<Value, String> {
     let requested_model = body.get("model").and_then(Value::as_str).unwrap_or("glm-5.3").to_string();
+    
     // 速度优先：慢模型改投到更快的目标模型；多模态请求保持原模型。
     let (effective_model, skipped_multimodal) = match speed_first_for(&requested_model, &body) {
         SpeedFirst::Use(target) => (target, false),
@@ -677,10 +765,13 @@ pub async fn chat_completions_json(body: Value) -> Result<Value, String> {
         SpeedFirst::NotApplicable => (requested_model.clone(), false),
     };
     let route = resolve_route(&effective_model).ok_or_else(|| unknown_model_error(&effective_model))?;
+    // v1.0+ 区域隔离：显式请求区域（body.region / x-region）优先；
+    // 未指定时按模型目录归属区域路由（国际模型走国际池，国内模型走国内池）。
+    let region = extract_region_from_request(&body).or_else(|| Some(route.region));
     let mut payload = body.clone();
     payload["model"] = json!(route.body_model);
     let started = now_ms();
-    let (resp, account, measurement, _guard) = match send_upstream_routed(&payload, &route).await {
+    let (resp, account, measurement, _guard) = match send_upstream_routed_with_region(&payload, &route, region).await {
         Ok(quad) => quad,
         Err(e) => {
             record_and_notify_failure(Some(&route), &requested_model, started, &e, skipped_multimodal);
@@ -993,15 +1084,58 @@ pub(crate) fn record_success(
 }
 
 /// 统一入口：按 body.stream 分派。
+/// 当 AutoClaw 网关不可用（无可用账号/限流/错误）时，自动使用抓取的 ChatGLM Token 进行回退与服务。
 pub async fn chat_completions(body: Value) -> Result<GlmChatCompletion, String> {
     let stream = body
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     if stream {
-        Ok(GlmChatCompletion::Stream(chat_completions_stream(body).await?))
+        match chat_completions_stream(body.clone()).await {
+            Ok(s) => Ok(GlmChatCompletion::Stream(s)),
+            Err(autoclaw_err) => {
+                // 如果有抓取的 ChatGLM token，自动通过 ChatGLM 网页端引擎兜底服务
+                if crate::modules::glm_web::has_usable_token() {
+                    match crate::modules::glm_web::chat_completions(body).await {
+                        Ok(crate::modules::glm_web::GlmChatOutput::Stream(web_stream)) => {
+                            Ok(GlmChatCompletion::Stream(GlmUpstreamStream {
+                                content_type: "text/event-stream".to_string(),
+                                rx: web_stream.rx,
+                            }))
+                        }
+                        Ok(crate::modules::glm_web::GlmChatOutput::Json(val)) => {
+                            Ok(GlmChatCompletion::Json(val))
+                        }
+                        Err(web_err) => {
+                            Err(format!("{autoclaw_err}；且尝试调用抓取的 ChatGLM Token 失败: {web_err}"))
+                        }
+                    }
+                } else {
+                    Err(autoclaw_err)
+                }
+            }
+        }
     } else {
-        Ok(GlmChatCompletion::Json(chat_completions_json(body).await?))
+        match chat_completions_json(body.clone()).await {
+            Ok(val) => Ok(GlmChatCompletion::Json(val)),
+            Err(autoclaw_err) => {
+                if crate::modules::glm_web::has_usable_token() {
+                    match crate::modules::glm_web::chat_completions(body).await {
+                        Ok(crate::modules::glm_web::GlmChatOutput::Json(val)) => {
+                            Ok(GlmChatCompletion::Json(val))
+                        }
+                        Ok(crate::modules::glm_web::GlmChatOutput::Stream(_)) => {
+                            Err("ChatGLM 上游返回了非预期的流式响应".to_string())
+                        }
+                        Err(web_err) => {
+                            Err(format!("{autoclaw_err}；且尝试调用抓取的 ChatGLM Token 失败: {web_err}"))
+                        }
+                    }
+                } else {
+                    Err(autoclaw_err)
+                }
+            }
+        }
     }
 }
 
@@ -1033,7 +1167,8 @@ pub enum GlmChatCompletion {
     Stream(GlmUpstreamStream),
 }
 
-/// OpenAI `/v1/models` 响应。
+/// OpenAI `/v1/models` 响应。同名模型（两区目录都有）按模型目录顺序
+/// 只暴露一个 ID（settings.json 归属的本机区域优先）；`x_region` 标注归属。
 pub fn models_payload() -> Value {
     let mut seen = std::collections::HashSet::new();
     let mut data = Vec::new();
@@ -1044,7 +1179,24 @@ pub fn models_payload() -> Value {
                 "object": "model",
                 "created": 0,
                 "owned_by": "autoclaw",
+                "x_region": route.region.as_str(),
             }));
+        }
+    }
+    if crate::modules::glm_web::has_usable_token() {
+        if let Some(list) = crate::modules::glm_web::models_payload().get("data").and_then(Value::as_array) {
+            for m in list {
+                if let Some(id) = m.get("id").and_then(Value::as_str) {
+                    if seen.insert(id.to_string()) {
+                        data.push(json!({
+                            "id": id,
+                            "object": "model",
+                            "created": 0,
+                            "owned_by": "chatglm",
+                        }));
+                    }
+                }
+            }
         }
     }
     json!({"object": "list", "data": data})
@@ -1171,6 +1323,7 @@ mod tests {
             body_model: "auto".to_string(),
             alias: "Auto".to_string(),
             meta: Value::Null,
+            region: AccountRegion::Domestic,
         };
         // 被改投后失败：要能看出原始请求模型
         let rec = failure_record(Some(&route), "glm-5.3", 1_000, 2_500, "上游 500", false);
@@ -1209,6 +1362,7 @@ mod tests {
             body_model: body_model.to_string(),
             alias: body_model.to_string(),
             meta: Value::Null,
+            region: AccountRegion::Domestic,
         }
     }
 

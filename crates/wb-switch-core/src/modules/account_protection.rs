@@ -241,6 +241,8 @@ pub fn mark_account_cooling(account_id: &str, label: &str, reason: &str, cooldow
     // 桌面 Toast 告警
     let (platform_title, notify_tag) = if account_id.starts_with("loomy:") {
         ("Loomy 账号防护熔断", "loomy_proxy")
+    } else if account_id.starts_with("trae_work_cn:") {
+        ("TRAE 账号防护熔断", "trae_proxy")
     } else {
         ("AutoClaw 账号防护熔断", "glm_proxy")
     };
@@ -392,6 +394,17 @@ pub struct KeepaliveCycleReport {
     pub refreshed_accounts: usize,
     pub cooling_skipped: usize,
     pub failed_accounts: usize,
+    /// TRAE Work CN 巡检计数（与上面 AutoClaw 字段并列，互斥占用）。
+    #[serde(default)]
+    pub trae_total_accounts: usize,
+    #[serde(default)]
+    pub trae_healthy_accounts: usize,
+    #[serde(default)]
+    pub trae_refreshed_accounts: usize,
+    #[serde(default)]
+    pub trae_cooling_skipped: usize,
+    #[serde(default)]
+    pub trae_failed_accounts: usize,
 }
 
 /// 执行一轮 AutoClaw 账号的主动保活巡检：
@@ -531,6 +544,11 @@ pub async fn run_keepalive_cycle() -> KeepaliveCycleReport {
         refreshed_accounts,
         cooling_skipped,
         failed_accounts,
+        trae_total_accounts: 0,
+        trae_healthy_accounts: 0,
+        trae_refreshed_accounts: 0,
+        trae_cooling_skipped: 0,
+        trae_failed_accounts: 0,
     }
 }
 
@@ -637,7 +655,197 @@ pub async fn run_loomy_keepalive_cycle() -> KeepaliveCycleReport {
         refreshed_accounts,
         cooling_skipped,
         failed_accounts,
+        trae_total_accounts: 0,
+        trae_healthy_accounts: 0,
+        trae_refreshed_accounts: 0,
+        trae_cooling_skipped: 0,
+        trae_failed_accounts: 0,
     }
+}
+
+static LAST_TRAE_KEEPALIVE_TS: AtomicI64 = AtomicI64::new(0);
+static NEXT_TRAE_KEEPALIVE_TS: AtomicI64 = AtomicI64::new(0);
+
+/// 执行一轮 TRAE Work CN 账号的主动保活巡检：
+/// 1. 已到期（entry_expired）与冷却期条目跳过；
+/// 2. expiredAt 落入前瞻窗口（默认 60 分钟）的条目先静默续期（不判死，见 trae_accounts F1）；
+/// 3. 只读心跳：credits_stored 额度查询（零积分消耗）；
+/// 4. 心跳失败自动刷新自愈一次；
+/// 5. 账号间 500ms 平滑间隔；连续 2 个以上失败弹一条 toast（category trae-keepalive）。
+pub async fn run_trae_keepalive_cycle() -> KeepaliveCycleReport {
+    let cfg = load_protection_config();
+    let now = now_ms();
+    LAST_TRAE_KEEPALIVE_TS.store(now, Ordering::Relaxed);
+    let next = now + (cfg.keepalive_interval_minutes as i64) * 60 * 1000;
+    NEXT_TRAE_KEEPALIVE_TS.store(next, Ordering::Relaxed);
+
+    let pool = crate::modules::trae_accounts::load_accounts();
+    let trae_total_accounts = pool.len();
+    let mut trae_healthy_accounts = 0usize;
+    let mut trae_refreshed_accounts = 0usize;
+    let mut trae_cooling_skipped = 0usize;
+    let mut trae_failed_accounts = 0usize;
+
+    for entry in pool {
+        let id = entry
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if id.is_empty() {
+            continue;
+        }
+        let label = entry
+            .get("label")
+            .and_then(Value::as_str)
+            .unwrap_or(&id)
+            .to_string();
+        if crate::modules::trae_accounts::entry_expired(&entry) {
+            record_protection_log(&id, &label, "expired_skipped", "条目已到期，需重新导入快照");
+            continue;
+        }
+        if is_account_cooling(&id) {
+            trae_cooling_skipped += 1;
+            record_protection_log(&id, &label, "cooling_skipped", "账号处于冷却期，本次保活跳过");
+            continue;
+        }
+
+        // 1) expiredAt 前瞻：临近过期先静默续期（失败不判死，仅记 lastError）。
+        if let Some(expired_at) = entry.get("expiredAt").and_then(Value::as_str) {
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(expired_at) {
+                let remaining_sec = dt.timestamp() - now_secs();
+                let ahead_sec = (cfg.jwt_refresh_ahead_minutes as i64) * 60;
+                if remaining_sec < ahead_sec {
+                    match crate::modules::trae_accounts::refresh_stored_account(&id).await {
+                        Ok(_) => {
+                            trae_refreshed_accounts += 1;
+                            record_protection_log(
+                                &id,
+                                &label,
+                                "jwt_refreshed",
+                                &format!(
+                                    "Token 剩余 {:.1} 小时，前瞻式静默续期成功",
+                                    remaining_sec as f64 / 3600.0
+                                ),
+                            );
+                        }
+                        Err(e) => {
+                            record_protection_log(
+                                &id,
+                                &label,
+                                "jwt_refresh_failed",
+                                &format!("前瞻式续期失败（不判死）: {e}"),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2) 只读心跳：额度查询（零积分消耗）。
+        let credits = crate::modules::trae_accounts::credits_stored(&id).await;
+        if credits.get("ok").and_then(Value::as_bool) == Some(true) {
+            trae_healthy_accounts += 1;
+            record_protection_log(&id, &label, "heartbeat_ok", "TRAE 额度查询心跳正常，凭证保持活跃");
+        } else {
+            // 3) 心跳失败：刷新自愈一次后复检（credits_stored 内部已带一次续期，这里显式再刷一次）。
+            let err_msg = credits
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("未知异常");
+            record_protection_log(
+                &id,
+                &label,
+                "heartbeat_retry",
+                &format!("TRAE 心跳未通（{err_msg}），尝试刷新自愈..."),
+            );
+            match crate::modules::trae_accounts::refresh_stored_account(&id).await {
+                Ok(_) => {
+                    let retry = crate::modules::trae_accounts::credits_stored(&id).await;
+                    if retry.get("ok").and_then(Value::as_bool) == Some(true) {
+                        trae_healthy_accounts += 1;
+                        trae_refreshed_accounts += 1;
+                        record_protection_log(&id, &label, "recovered", "续期后 TRAE 心跳恢复正常");
+                    } else {
+                        trae_failed_accounts += 1;
+                        record_protection_log(&id, &label, "failed", "续期后 TRAE 心跳仍不可用");
+                    }
+                }
+                Err(e) => {
+                    trae_failed_accounts += 1;
+                    record_protection_log(
+                        &id,
+                        &label,
+                        "failed",
+                        &format!("TRAE 登录态续期失败（不判死）: {e}"),
+                    );
+                }
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    if trae_failed_accounts >= 2 {
+        notify::notify(
+            "trae-keepalive",
+            "TRAE 账号保活巡检异常",
+            &format!(
+                "本轮 {} 个账号中 {} 个保活失败，请检查 TRAE 客户端登录态与网络。",
+                trae_total_accounts, trae_failed_accounts
+            ),
+        );
+    }
+
+    KeepaliveCycleReport {
+        executed_at: now,
+        total_accounts: 0,
+        healthy_accounts: 0,
+        refreshed_accounts: 0,
+        cooling_skipped: 0,
+        failed_accounts: 0,
+        trae_total_accounts,
+        trae_healthy_accounts,
+        trae_refreshed_accounts,
+        trae_cooling_skipped,
+        trae_failed_accounts,
+    }
+}
+
+/// TRAE 保护状态汇总（供 API 与前端面板展示，前缀 trae_work_cn: 隔离）。
+pub fn get_trae_protection_status() -> Value {
+    let cfg = load_protection_config();
+    let all_cooling = get_cooling_accounts();
+    let cooling: Vec<Value> = all_cooling
+        .into_iter()
+        .filter(|a| {
+            a.get("accountId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .starts_with("trae_work_cn:")
+        })
+        .collect();
+    let active_concurrency: HashMap<String, usize> = get_active_concurrency_map()
+        .into_iter()
+        .filter(|(k, _)| k.starts_with("trae_work_cn:"))
+        .collect();
+    let all_logs = get_recent_protection_logs();
+    let logs: Vec<ProtectionLogEntry> = all_logs
+        .into_iter()
+        .filter(|l| l.account_id.starts_with("trae_work_cn:"))
+        .collect();
+    let pool = crate::modules::trae_accounts::load_accounts();
+
+    json!({
+        "config": cfg,
+        "status": if cfg.enabled { "active" } else { "disabled" },
+        "lastKeepaliveAt": LAST_TRAE_KEEPALIVE_TS.load(Ordering::Relaxed),
+        "nextKeepaliveAt": NEXT_TRAE_KEEPALIVE_TS.load(Ordering::Relaxed),
+        "coolingAccounts": cooling,
+        "activeConcurrency": active_concurrency,
+        "poolAccountCount": pool.len(),
+        "recentLogs": logs,
+    })
 }
 
 /// 后台常驻保活协程
@@ -647,6 +855,7 @@ pub fn spawn_protection_loop() {
         tokio::time::sleep(Duration::from_secs(15)).await;
         let _ = run_keepalive_cycle().await;
         let _ = run_loomy_keepalive_cycle().await;
+        let _ = run_trae_keepalive_cycle().await;
 
         loop {
             let cfg = load_protection_config();
@@ -664,6 +873,7 @@ pub fn spawn_protection_loop() {
             if cfg.enabled && cfg.keepalive_enabled {
                 let _ = run_keepalive_cycle().await;
                 let _ = run_loomy_keepalive_cycle().await;
+                let _ = run_trae_keepalive_cycle().await;
             }
         }
     });

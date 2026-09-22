@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use crate::modules::autoclaw_accounts::PoolAccount;
 use crate::modules::config::{http_request, now_ms};
-use crate::modules::platform_checkin::{autoclaw_headers, AUTOCLAW_API_HOST};
+use crate::modules::platform_checkin::autoclaw_headers;
 use crate::modules::stats::reconcile::{self, LedgerEntry};
 
 /// 流水单页条数。实测接口按 `page_size` 如实返回（该账号全量仅 190 条也能一页拿全），
@@ -29,12 +29,14 @@ pub async fn fetch_entries(
     token: &str,
     oldest_needed_ms: i64,
 ) -> Result<Vec<LedgerEntry>, String> {
+    // 流水记在账号所属区域的账本里：按 token 路由网关。
+    let host = crate::modules::autoclaw_accounts::region_for_token(token).api_host();
     let mut candidates: Vec<LedgerEntry> = Vec::new();
     let mut page_token: Option<String> = None;
     let mut prev_oldest: Option<i64> = None;
     for _ in 0..LEDGER_MAX_PAGES {
         let mut url = format!(
-            "{AUTOCLAW_API_HOST}/agent-assetmgr/api/v1/ledgers_std?asset_type=point&wallet_type=all&page_size={LEDGER_PAGE_SIZE}"
+            "{host}/agent-assetmgr/api/v1/ledgers_std?asset_type=point&wallet_type=all&page_size={LEDGER_PAGE_SIZE}"
         );
         if let Some(token) = &page_token {
             url.push_str("&page_token=");

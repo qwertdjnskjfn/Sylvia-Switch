@@ -40,6 +40,13 @@ async fn pump_loomy_anthropic_stream(mut upstream: LoomyUpstreamStream) -> Loomy
         while let Some(chunk_res) = rx.recv().await {
             match chunk_res {
                 Ok(chunk) => {
+                    // 如果是保活注释帧（以 : 开头），直接透传给客户端，保持连接活性
+                    if chunk.starts_with(b":") {
+                        if tx.send(Ok(chunk)).await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
                     let text = super::glm_anthropic::decode_stream_chunk(&mut carry, &chunk);
                     for event in transformer.push(&text) {
                         if tx.send(Ok(Bytes::from(event))).await.is_err() {
