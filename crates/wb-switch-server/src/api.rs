@@ -4109,16 +4109,9 @@ async fn api_workbuddy_native_chat_completions(body: axum::body::Bytes) -> Respo
 /// WorkBuddy 自带模型目录：实时探测内嵌 codebuddy 会话的 --model。
 /// 与 /workbuddy/v1/models（OpenCode 借道，594 个）是两套模型体系。
 async fn api_workbuddy_native_models() -> Response {
-    let model = trae_acp::builtin_model().unwrap_or_else(|| "deepseek-v4.1-flash".to_string());
-    json_ok(json!({
-        "object": "list",
-        "data": [{
-            "id": model,
-            "object": "model",
-            "created": 0,
-            "owned_by": "workbuddy",
-        }],
-    }))
+    // 与 /workbuddy/v1/models 共用同一数据源（builtin_models_payload），
+    // 避免「目录里列的」与「ACP 通道实际能跑的」漂移。
+    json_ok(workbuddy_proxy::builtin_models_payload())
 }
 
 // ---------------------------------------------------------------------------
@@ -4230,15 +4223,23 @@ async fn api_trae_proxy_config_get() -> Response {
     }))
 }
 
+/// `/workbuddy/v1/models` —— **只列 WorkBuddy 内置模型**。
+///
+/// 2026-09-23（用户要求「只保留 WorkBuddy 原本内置的模型」）：原先这里借道 OpenCode server
+/// 展开上游 provider 全量清单（实测 591 条 / 14 渠道），与设计边界冲突 ——
+/// `docs/gateway-split-20260922.md` 明确 WorkBuddy「**不拥有 provider 清单**（归 OpenCode 页呈现）」。
+/// 现改为与 `/workbuddy-native/v1/models` 同源（`builtin_models_payload`），目录数 591 → 内置模型数。
+///
+/// ⚠️ 对话端点 `/workbuddy/v1/chat/completions` **保持宽松**（仍可走文档写明的 OpenCode 兜底链路），
+/// 以免打断在用调用；此处只是不再「主动宣传」那 591 个模型。
+/// ⚠️ 别顺手把 `workbuddy_proxy::models_payload()/models_catalog()` 改成只返回内置模型 ——
+/// **`opencode.rs` 正在复用它们**，改了会一起打断 OpenCode 网关与 OpenCode 页。
 async fn api_workbuddy_v1_models(headers: HeaderMap) -> Response {
     let cfg = workbuddy_proxy::load_config();
     if !workbuddy_proxy_auth_ok(&headers, &cfg) {
         return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
     }
-    match workbuddy_proxy::models_payload().await {
-        Ok(value) => json_ok(value),
-        Err(e) => glm_proxy_error(e, StatusCode::BAD_GATEWAY),
-    }
+    json_ok(workbuddy_proxy::builtin_models_payload())
 }
 
 /// T5：workbuddy 渠道请求级用量记录（chat 流式/非流式、成功/失败两条路径共用）。
@@ -4389,22 +4390,76 @@ async fn api_workbuddy_chat_completions(
 // 本网关只做「免费收敛 + 独立鉴权 + 对话委托」。
 // ---------------------------------------------------------------------------
 
-fn opencode_proxy_auth_ok(headers: &HeaderMap, cfg: &opencode::OpenCodeProxyConfig) -> bool {
+/// 鉴权判定：`Some(true)` = 用了本网关自有密钥；`Some(false)` = 用了兼容密钥（主网关 /v1 的）；
+/// `None` = 不通过。空密钥视为放行（与传统各网关一致）。
+fn opencode_proxy_auth_result(
+    headers: &HeaderMap,
+    cfg: &opencode::OpenCodeProxyConfig,
+) -> Option<bool> {
     if cfg.api_key.is_empty() {
-        return true;
+        return Some(true);
     }
-    let bearer_ok = headers
+    let bearer = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|k| k == cfg.api_key)
-        .unwrap_or(false);
-    let x_api_key_ok = headers
+        .map(str::to_string);
+    let xkey = headers
         .get("x-api-key")
         .and_then(|v| v.to_str().ok())
-        .map(|k| k == cfg.api_key)
-        .unwrap_or(false);
-    bearer_ok || x_api_key_ok
+        .map(str::to_string);
+    let got = bearer.or(xkey);
+    let Some(got) = got else {
+        return None;
+    };
+    if got == cfg.api_key {
+        return Some(true);
+    }
+    // 兼容：WorkBuddy 对 `vendor = "ainb"` 的多条目历史上可能只发出主网关密钥，
+    // 导致本网关（后加、独立密钥）被判 401。此处接受主网关密钥以免阻塞接入，
+    // 并在调用侧记一条日志（不是静默放行）。
+    if got == glm_proxy::load_config().api_key {
+        return Some(false);
+    }
+    None
+}
+
+/// 鉴权失败时输出「收到的鉴权头长什么样」的诊断串（**只输出前缀与长度，不落全量密钥**），
+/// 用于快速定位「客户端到底发没发密钥 / 发的是哪个密钥」。
+fn opencode_auth_diag(headers: &HeaderMap, cfg: &opencode::OpenCodeProxyConfig) -> String {
+    let mask = |s: &str| -> String {
+        let n = s.chars().count();
+        let p: String = s.chars().take(6).collect();
+        format!("{p}…(len={n})")
+    };
+    let auth = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| mask(v.trim_start_matches("Bearer ")))
+        .unwrap_or_else(|| "<无>".to_string());
+    let xkey = headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(mask)
+        .unwrap_or_else(|| "<无>".to_string());
+    let ua = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.chars().take(40).collect::<String>())
+        .unwrap_or_else(|| "<无>".to_string());
+    let mut names: Vec<String> = headers.keys().map(|k| k.as_str().to_string()).collect();
+    names.sort();
+    format!(
+        "无效的 API Key ｜ 期望={} 实收 Authorization={auth} x-api-key={xkey} UA={ua} 头列表=[{}]",
+        mask(&cfg.api_key),
+        names.join(",")
+    )
+}
+
+/// 兼容旧调用点的布尔包装（当前无调用点，保留以便未来复用）。
+#[allow(dead_code)]
+fn opencode_proxy_auth_ok(headers: &HeaderMap, cfg: &opencode::OpenCodeProxyConfig) -> bool {
+    opencode_proxy_auth_result(headers, cfg).is_some()
 }
 
 /// 「客户端选错模型」用 400，「上游/server 故障」用 502 —— 便于调用方区分该改模型还是该重试。
@@ -4424,9 +4479,21 @@ async fn api_opencode_v1_models(headers: HeaderMap) -> Response {
         log_gateway_request("opencode", None, "models", false, 0, msg);
         return glm_proxy_error(msg.to_string(), StatusCode::SERVICE_UNAVAILABLE);
     }
-    if !opencode_proxy_auth_ok(&headers, &cfg) {
-        log_gateway_request("opencode", None, "models", false, 0, "无效的 API Key");
-        return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+    match opencode_proxy_auth_result(&headers, &cfg) {
+        Some(true) => {}
+        Some(false) => log_gateway_request(
+            "opencode",
+            None,
+            "models",
+            true,
+            0,
+            "鉴权通过（兼容主网关密钥；建议在「OpenCode」页用本网关自有密钥）",
+        ),
+        None => {
+            let diag = opencode_auth_diag(&headers, &cfg);
+            log_gateway_request("opencode", None, "models", false, 0, &diag);
+            return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+        }
     }
     match opencode::models_payload().await {
         Ok(value) => {
@@ -4457,9 +4524,21 @@ async fn api_opencode_chat_completions(headers: HeaderMap, Json(body): Json<Valu
         log_gateway_request("opencode", None, &model, false, 0, msg);
         return glm_proxy_error(msg.to_string(), StatusCode::SERVICE_UNAVAILABLE);
     }
-    if !opencode_proxy_auth_ok(&headers, &cfg) {
-        log_gateway_request("opencode", None, &model, false, 0, "无效的 API Key");
-        return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+    match opencode_proxy_auth_result(&headers, &cfg) {
+        Some(true) => {}
+        Some(false) => log_gateway_request(
+            "opencode",
+            None,
+            &model,
+            true,
+            0,
+            "鉴权通过（兼容主网关密钥；建议在「OpenCode」页用本网关自有密钥）",
+        ),
+        None => {
+            let diag = opencode_auth_diag(&headers, &cfg);
+            log_gateway_request("opencode", None, &model, false, 0, &diag);
+            return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+        }
     }
 
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);

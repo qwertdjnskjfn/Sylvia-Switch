@@ -613,6 +613,35 @@ pub async fn models_payload() -> Result<Value, String> {
     Ok(json!({"object": "list", "data": data}))
 }
 
+/// 桌面端未探到内嵌会话时的兜底内置模型（与 `api_workbuddy_native_models` 同源同值）。
+const DEFAULT_BUILTIN_MODEL: &str = "deepseek-v4.1-flash";
+
+/// WorkBuddy **内置模型**目录（桌面端内嵌会话自带，走 WorkBuddy 订阅·经 ACP 转发）。
+///
+/// 🔴 为什么单独抽一个函数，而不是复用 `models_payload()`：
+/// `models_payload()` / `models_catalog()` 是**借道本机 OpenCode server 展开上游 provider 全量清单**
+/// （实测 591 条 / 14 渠道）。那份清单按设计**归 OpenCode 网关**呈现
+/// （见 `docs/gateway-split-20260922.md`：WorkBuddy「不拥有 provider 清单」）。
+/// 而且 **`opencode.rs` 正在复用这两个函数**（`opencode::models_payload()` / `counts()`）——
+/// 所以**绝不能改它们的语义**，否则会一起打断 OpenCode 网关与 OpenCode 页。
+/// WorkBuddy 自己的目录一律走本函数。
+///
+/// 与 `/workbuddy-native/v1/models` 共用同一数据源（`trae_acp::builtin_model()`），
+/// 保证「目录里列的」与「ACP 通道实际能跑的」永远一致。
+pub fn builtin_models_payload() -> Value {
+    let model = crate::modules::trae_acp::builtin_model()
+        .unwrap_or_else(|| DEFAULT_BUILTIN_MODEL.to_string());
+    json!({
+        "object": "list",
+        "data": [{
+            "id": model,
+            "object": "model",
+            "created": 0,
+            "owned_by": "workbuddy",
+        }],
+    })
+}
+
 /// 状态探测。
 pub async fn proxy_status() -> Value {
     let cfg = load_config();

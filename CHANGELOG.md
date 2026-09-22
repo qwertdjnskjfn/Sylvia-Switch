@@ -7,6 +7,97 @@
 
 ---
 
+## 0.1.81 — 2026-09-23
+
+### 变更：WorkBuddy 网关模型目录 591 → 内置模型（用户要求「只保留 WorkBuddy 原本内置的模型」）
+
+**动机**：WorkBuddy 页的「模型目录」显示 **591 个模型条目 / 14 个渠道**
+（openrouter 375、orcarouter 122、unorouter 23、stepfun 系、xiaomi 系、agentrouter…）。
+按 `docs/gateway-split-20260922.md` 的设计边界，**WorkBuddy「不拥有 provider 清单」**——
+那整份清单归「OpenCode 网关」页呈现；WorkBuddy 自己只有**内置模型**
+（桌面端内嵌会话自带，走 WorkBuddy 订阅 · 经 ACP 通道转发）。
+
+**🔴 关键约束（改动前必须知道，否则会误伤 OpenCode）**
+`workbuddy_proxy::models_payload()` 与 `models_catalog()` **正被 `opencode.rs` 复用**
+（`opencode::models_payload()` 取全量再过滤免费、`opencode::counts()` 统计渠道/免费/总数），
+且 `/api/workbuddy-proxy/models` 是 **OpencodePage 的数据源**。
+⇒ **这两个函数的语义一律不许动**，WorkBuddy 的需求另起一条路径。
+
+**改法**
+
+| 位置 | 改动 |
+| --- | --- |
+| `workbuddy_proxy.rs` | 新增 `builtin_models_payload()`：单一来源 `trae_acp::builtin_model()`，回落 `deepseek-v4.1-flash`（与 native 通道同值） |
+| `api.rs::api_workbuddy_v1_models` | `/workbuddy/v1/models` 改用 `builtin_models_payload()`（591 → 内置模型数） |
+| `api.rs::api_workbuddy_native_models` | 复用同一函数，消除「目录」与「ACP 通道」的重复定义 |
+| `gateway_overview.rs` | `fetch_models("workbuddy")` 改用同一函数，总览/侧栏 modelCount 不再显示 591 |
+| `WorkbuddyPage.tsx` | 移除「② 速度优先」「③ 模型目录」两个区块（−132 行）及其全部派生计算；不再拉 `/api/workbuddy-proxy/models`；新增内置模型说明与「→ OpenCode 页」跳转；Hermes 样例默认模型改为内置模型 |
+
+**刻意保留（避免静默打断在用链路）**
+- `/workbuddy/v1/chat/completions` **保持宽松**：仍可走文档写明的 OpenCode 兜底链路，
+  只是不再「主动宣传」那 591 个模型。若日后要彻底只认内置模型，此为一行开关，需用户确认。
+- `/api/workbuddy-proxy/models` 与 `workbuddy_proxy::{models_payload,models_catalog}` **原样不动**
+  （OpenCode 页/网关依赖）。
+
+**验证**：`cargo check --release --all-targets` 0 错误、`tsc --noEmit` 退出码 0；
+部署后实测 `/workbuddy/v1/models` = 内置模型、总览 modelCount 由 591 变为内置模型数、
+`/opencode/v1/models` 仍为 43（免费）、OpenCode 页数据不受影响。
+
+---
+
+## 0.1.80 — 2026-09-23
+
+### 修复：OpenCode 网关 401「无效的 API Key」（WorkBuddy 接入失败）+ 鉴权诊断插桩
+
+**现象**（用户报）：WorkBuddy 调 `POST /opencode/v1/chat/completions`（模型 `opencode/mimo-v2.6-flash-free`）
+→ **401 无效的 API Key**，耗时仅 **28ms**（= 网关本地鉴权就拒了，未到上游）。
+
+**排查（逐步排除，未靠猜）**
+
+1. **密钥一致性**：`opencode_proxy_config.json` / `/api/opencode-proxy/config` / `models.json` 条目
+   三处均为 `fec96d82…`，**完全一致**；直接用该 key 请求 → **200**。⇒ 网关与配置都没问题。
+2. **条目字段结构**：与可用的「本地 GLM-5.3」条目逐字段对比，**无缺失字段**。
+3. **密钥是否真被发出**：实测 `/v1/models`（旧条目用的端点）**确实校验密钥**
+   （正确 key→200、不带→401、乱填→401）⇒ WorkBuddy **会发**密钥 → 排除「没发密钥」。
+4. **密钥存储位置**：`~/.workbuddy` 下**只有 `models.json` 存密钥**（无独立密钥库）
+   ⇒ 排除「从别处取值」。
+5. ⇒ 结论：**WorkBuddy 发出的不是条目里的那个 key**。于是改为**插桩观测**，而非继续猜。
+
+**插桩**：401 时输出「收到的鉴权头长什么样」的诊断串（**只记前缀与长度，不落全量密钥**）：
+
+```
+无效的 API Key ｜ 期望=fec96d…(len=32) 实收 Authorization=xxxx…(len=N) x-api-key=<无> UA=… 头列表=[…]
+```
+
+同时覆盖 `Authorization` 与 `x-api-key` 两种形态，并列出全部头名 —— 便于识别客户端是否用别的头名传密钥。
+
+**修复**：`opencode_proxy_auth_result()` 改为**三态**：
+
+| 返回值 | 含义 |
+| --- | --- |
+| `Some(true)` | 本网关**自有密钥** |
+| `Some(false)` | **兼容密钥**（= `glm_proxy_config.json` 的 key），并记一条**显式日志**（不静默放行） |
+| `None` | 不通过 → 401 + 诊断串 |
+
+空密钥仍按传统放行（与其它网关一致）。
+
+**背景（为什么需要兼容）**：`~/.wb-switch` 下并存**三套互不相同**的密钥 ——
+
+| 文件 | 密钥 |
+| --- | --- |
+| `glm_proxy_config.json` | `07702999…` (32) ← **WorkBuddy 对本地条目实际发的就是这个** |
+| `gateway_api_keys.json` | `gw_live_…` (40) |
+| `opencode_proxy_config.json` | `fec96d82…` (32，本网关自有) |
+
+实测：用 `07702999…` 请求 OpenCode 网关 → 兼容通道放行 → **200**（正文 `COMPAT2`）。
+
+**验证**
+
+- `cargo check -p wb-switch-server` **0 错误**。
+- 鉴权矩阵：自有密钥 → **200**；主网关密钥（兼容通道）→ **200**；乱填 / 不带 → **401**（并落诊断日志）。
+
+---
+
 ## 0.1.79 — 2026-09-23
 
 ### 修复：模型测试的 `tokens 0+0=0` 误导性显示

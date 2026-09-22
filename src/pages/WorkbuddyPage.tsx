@@ -5,27 +5,31 @@
  * **不涉及 TRAE 账号池**（那是 TRAE Work CN 网关的事）；
  * 借道 OpenCode 的 provider 目录归属见「OpenCode 网关」页。
  *
- * 六项能力落点：
+ * 能力落点：
  *   网关状态     → 通道态（direct / opencode-fallback）+ OpenCode server 健康与端口
  *   账号保护/保活 → 保活对象是 OpenCode server 进程：看门狗拉起 + 端口探测 + 恢复中瞬态
  *   扣分账号     → 负缓存/连续失败计数（is_neg_cache_error / last_discovery_ok_ms）
- *   速度优先策略 → 免费模型与 flash 类模型优先（直连接入后替换为真实首字延迟排序）
- *   模型选型参考 → provider × 模型清单（含 reasoning / 上下文）
- *   接入信息     → Base URL / 密钥 / 可用模型 / Hermes 配置样例
+ *   接入信息     → Base URL / 密钥 / 内置模型 / Hermes 配置样例
+ *
+ * 🔴 2026-09-23（用户要求「只保留 WorkBuddy 原本内置的模型」）：
+ *    本页**不再展示**借道 OpenCode server 展开的上游 provider 全量清单（原 591 条 / 14 渠道）——
+ *    按设计边界，provider 清单归「OpenCode 网关」页呈现（见 docs/gateway-split-20260922.md：
+ *    WorkBuddy「不拥有 provider 清单」）。WorkBuddy 侧只保留**内置模型**
+ *    （桌面端内嵌会话自带，走 WorkBuddy 订阅 · 经 ACP 通道转发）。
+ *    对应后端：`/workbuddy/v1/models` 与总览 modelCount 均改用 `builtin_models_payload()`。
+ *    ⚠️ `/api/workbuddy-proxy/models` **保持不变**（它是 OpenCode 页的数据源），
+ *       两个 `workbuddy_proxy::models_payload()/models_catalog()` 也**不许动**（opencode.rs 在复用）。
  *
  * ⚠️ 通道现状（用户 2026-09-22 第 2 项要求）：**以直连优先 + OpenCode 兜底**。
  *    直连协议尚在探测中，故当前通道态标为 `opencode-fallback`；探测通过后置为 `direct`，
  *    回落链路由后端负责，前端仅如实呈现 `channel` 字段。
  */
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   BarChart3,
-  Brain,
   CircleAlert,
-  Cpu,
-  Gauge,
   Loader2,
   RefreshCw,
   Route,
@@ -39,20 +43,10 @@ import { CopyButton } from "@/components/ui/copy-button";
 import { Switch } from "@/components/ui/switch";
 import * as api from "@/lib/api";
 import type { WorkbuddyProxyStatus } from "@/lib/api";
-import {
-  TASK_META,
-  TASK_ORDER,
-  classifyTask,
-  groupByChannel,
-  isFreeModelId,
-  speedScore,
-  stripChannel,
-  type TaskKind,
-} from "@/lib/model-taxonomy";
 import { cn } from "@/lib/utils";
 
 const WB_HERMES_SNIPPET = `model:
-  default: "opencode/mimo-v2.6-flash-free"
+  default: "<内置模型>"
   provider: "custom"
   base_url: "http://127.0.0.1:57890/workbuddy/v1"
   api_key: "<访问密钥>"`;
@@ -71,9 +65,6 @@ function InfoRow({ label, hint, children }: { label: string; hint?: string; chil
 
 export default function WorkbuddyPage() {
   const [wbStatus, setWbStatus] = useState<WorkbuddyProxyStatus | null>(null);
-  const [wbModels, setWbModels] = useState<WorkbuddyProxyStatus["providers"] | null>(null);
-  const [wbError, setWbError] = useState<string | null>(null);
-  const [wbRecovering, setWbRecovering] = useState(false);
   const [wbCfg, setWbCfg] = useState<api.WorkbuddyProxyConfigInfo | null>(null);
   const [nativeModels, setNativeModels] = useState<{ id: string; owned_by: string }[]>([]);
   const [savingKey, setSavingKey] = useState(false);
@@ -83,23 +74,14 @@ export default function WorkbuddyPage() {
 
   const load = useCallback(async () => {
     setLoading(true);
-    const [statusRes, modelsRes, cfgRes, nativeRes] = await Promise.allSettled([
+    // 只取与本页职责相关的三项：通道状态 / 接入配置 / 内置模型。
+    // （上游 provider 全量清单归 OpenCode 页，本页不再拉取。）
+    const [statusRes, cfgRes, nativeRes] = await Promise.allSettled([
       api.getWorkbuddyProxyStatus(),
-      api.getWorkbuddyProxyModels(),
       api.getWorkbuddyProxyConfig(),
       api.getWorkbuddyNativeModels(),
     ]);
     if (statusRes.status === "fulfilled") setWbStatus(statusRes.value);
-    if (modelsRes.status === "fulfilled") {
-      setWbModels(modelsRes.value.providers ?? []);
-      setWbError(null);
-      setWbRecovering(false);
-    } else {
-      const msg = api.asError(modelsRes.reason);
-      setWbError(msg);
-      // 上游恢复中（看门狗拉起窗口）与稳态「读取失败」区分展示。
-      setWbRecovering(/恢复中|未发现|连接|超时|refused|ECONN/i.test(msg));
-    }
     if (cfgRes.status === "fulfilled") setWbCfg(cfgRes.value);
     if (nativeRes.status === "fulfilled") setNativeModels(nativeRes.value.data ?? []);
     setLoading(false);
@@ -135,46 +117,8 @@ export default function WorkbuddyPage() {
     setSavingEnabled(false);
   }, []);
 
-  const wbCount = useMemo(
-    () => wbModels?.reduce((acc, p) => acc + (p.models?.length ?? 0), 0) ?? 0,
-    [wbModels],
-  );
-
-  /** 全部模型（provider/model 形态）。 */
-  const allModels = useMemo(
-    () => (wbModels ?? []).flatMap((p) => (p.models ?? []).map((m) => `${p.id}/${m.id}`)),
-    [wbModels],
-  );
-
-  /**
-   * 速度优先推荐（共享口径）：**每个渠道各取首选**，而不是把 591 条平铺。
-   * 排序依据：① 免费优先 ② 快速档（flash/lightning/mini/nano/…）③ 场景序 → 名称。
-   * 直连接入后此处替换为按真实首字延迟（TTFB）排序。
-   */
-  const channelPicks = useMemo(() => {
-    return groupByChannel(allModels).map(({ channel, ids }) => {
-      const sorted = ids
-        .slice()
-        .sort((a, b) => speedScore(a) - speedScore(b) || a.localeCompare(b));
-      return {
-        channel,
-        total: ids.length,
-        freeCount: ids.filter(isFreeModelId).length,
-        best: sorted[0],
-        alt: sorted[1],
-      };
-    });
-  }, [allModels]);
-
-  /** 全部模型的场景分布（让「591 条」可读化）。 */
-  const taskCounts = useMemo(() => {
-    const c = new Map<TaskKind, number>();
-    for (const id of allModels) {
-      const k = classifyTask(id);
-      c.set(k, (c.get(k) ?? 0) + 1);
-    }
-    return TASK_ORDER.filter((k) => (c.get(k) ?? 0) > 0).map((k) => ({ kind: k, n: c.get(k) ?? 0 }));
-  }, [allModels]);
+  /** 内置模型 ID：后端目录与 ACP 通道同源；桌面端未运行时回落同一默认值。 */
+  const builtinModelId = nativeModels[0]?.id ?? "deepseek-v4.1-flash";
 
   // 通道态由后端下发（direct = 直连；缺省视为 opencode 兜底）。
   // 后端未定义该字段时做安全读取，避免类型耦合。
@@ -209,7 +153,7 @@ export default function WorkbuddyPage() {
         <div className="flex min-w-0 flex-wrap items-center justify-between gap-2 px-1">
           <h2 className="text-[13px] font-medium leading-5">
             <Route className="mr-1 inline size-3.5" />
-            通道状态 · {wbModels?.length ?? 0} 个渠道 / {wbCount} 个模型条目
+            通道状态
           </h2>
           <div className="flex shrink-0 flex-wrap items-center gap-3">
             {channel === "direct" ? (
@@ -254,145 +198,25 @@ export default function WorkbuddyPage() {
           </Alert>
         ) : null}
         <p className="px-1 text-[11px] leading-5 text-muted-foreground">
-          对话端点 <code className="rounded bg-muted px-1">POST /workbuddy/v1/chat/completions</code>，
-          模型 ID 形如 <code className="rounded bg-muted px-1">deepseek/deepseek-v4-flash</code>（provider/model）。
-          当前兜底链路：本机 OpenCode server（独立实例，端口自动发现，未运行时由看门狗经
+          WorkBuddy 侧目录<strong>只暴露内置模型</strong>
+          <code className="mx-1 rounded bg-muted px-1">{builtinModelId}</code>
+          （上游 provider 全量清单按设计归「
+          <Link to="/opencode" className="underline underline-offset-2 hover:text-foreground">
+            OpenCode
+          </Link>
+          」页）。
+          兜底链路仍为本机 OpenCode server（独立实例，端口自动发现，未运行时由看门狗经
           start-serve-4097.bat 拉起）——<strong>保活对象即该 server 进程</strong>；
           直连链路上线后优先走直连，失败自动回落。
         </p>
       </section>
 
-      {/* ② 速度优先（每渠道各取首选）+ 场景分布 */}
-      {channelPicks.length > 0 ? (
-        <section className="mb-10 min-w-0 space-y-2.5" aria-label="WorkBuddy 速度优先">
-          <div className="px-1">
-            <h2 className="text-[13px] font-medium leading-5">
-              <Gauge className="mr-1 inline size-3.5" />
-              速度优先推荐 · {channelPicks.length} 个渠道各取首选
-            </h2>
-            <p className="mt-0.5 text-xs text-muted-foreground">
-              排序依据：① 免费优先 ② 快速档（flash·lightning·mini·nano）③ 场景序 → 名称。
-              直连接入后此处将替换为按真实首字延迟（TTFB）排序。悬停场景标签可看适用任务。
-            </p>
-          </div>
-
-          {/* 场景分布 */}
-          <Card className="min-w-0 gap-0 overflow-hidden rounded-xl py-0 shadow-none">
-            <CardContent className="flex min-w-0 flex-wrap items-center gap-1.5 p-3">
-              <span className="mr-1 text-[11px] text-muted-foreground">全部 {allModels.length} 个模型按任务场景：</span>
-              {taskCounts.map(({ kind, n }) => (
-                <Badge key={kind} variant="secondary" className="shrink-0" title={TASK_META[kind].hint}>
-                  {TASK_META[kind].label} · {n}
-                </Badge>
-              ))}
-            </CardContent>
-          </Card>
-
-          {/* 每渠道首选 */}
-          <Card className="min-w-0 gap-0 overflow-hidden rounded-xl py-0 shadow-none">
-            <div className="divide-y divide-border/50">
-              {channelPicks.map(({ channel, total, freeCount, best, alt }) => (
-                <div
-                  key={channel}
-                  className="flex min-w-0 flex-wrap items-center justify-between gap-2 px-4 py-2.5 sm:px-5"
-                >
-                  <div className="min-w-0 flex-1">
-                    <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-                      <span className="truncate text-[13px] font-medium">{channel}</span>
-                      {channel === "opencode" ? (
-                        <Badge variant="success" className="shrink-0 px-1.5 py-0 text-[10px]">自有 · 直连本机</Badge>
-                      ) : null}
-                      <Badge variant="outline" className="shrink-0 px-1.5 py-0 text-[10px]">
-                        免费 {freeCount}/{total}
-                      </Badge>
-                    </div>
-                    <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-1.5">
-                      <Badge
-                        variant={classifyTask(best) === "safety" ? "destructive" : "outline"}
-                        className="shrink-0 px-1.5 py-0 text-[10px]"
-                        title={TASK_META[classifyTask(best)].hint}
-                      >
-                        {TASK_META[classifyTask(best)].label}
-                      </Badge>
-                      <span className="min-w-0 truncate font-mono text-[11px]" title={best}>
-                        {stripChannel(best)}
-                      </span>
-                      {isFreeModelId(best) ? (
-                        <Badge variant="success" className="shrink-0 px-1.5 py-0 text-[10px]">免费</Badge>
-                      ) : null}
-                      {alt ? (
-                        <span
-                          className="min-w-0 truncate text-[10px] text-muted-foreground"
-                          title={`备选：${alt}`}
-                        >
-                          备选 {stripChannel(alt)}
-                        </span>
-                      ) : null}
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </Card>
-        </section>
-      ) : null}
-
-      {/* ③ 模型目录（provider × model） */}
-      <section className="mb-10 min-w-0 space-y-2.5" aria-label="WorkBuddy 模型目录">
-        <div className="flex min-w-0 flex-wrap items-center justify-between gap-2 px-1">
-          <h2 className="text-[13px] font-medium leading-5">
-            <Cpu className="mr-1 inline size-3.5" />
-            模型目录 · {wbModels?.length ?? 0} 个渠道 / {wbCount} 个模型条目
-          </h2>
-          <span className="text-xs text-muted-foreground">
-            来源：上游 provider 表（当前经 OpenCode server）；条目数 = Σ(各渠道模型数)，同一模型被多渠道提供会各计一次
-          </span>
-        </div>
-        {wbRecovering ? (
-          <Alert variant="default">
-            <Loader2 className="animate-spin" />
-            <AlertTitle>上游恢复中</AlertTitle>
-            <AlertDescription>
-              看门狗正在自动拉起（通常 ≤60 秒），页面每 20 秒自动重试；
-              急用可手动执行 <code className="mx-1 rounded bg-muted px-1">E:\opencode\start-serve-4097.bat</code>。
-            </AlertDescription>
-          </Alert>
-        ) : wbError ? (
-          <Alert variant="warning">
-            <CircleAlert />
-            <AlertTitle>模型目录读取失败</AlertTitle>
-            <AlertDescription>{wbError}</AlertDescription>
-          </Alert>
-        ) : (
-          <div className="grid min-w-0 gap-3 sm:grid-cols-2">
-            {(wbModels ?? []).map((provider) => (
-              <Card key={provider.id} className="min-w-0 gap-0 overflow-hidden rounded-xl py-0 shadow-none">
-                <CardContent className="p-0">
-                  <div className="flex items-center justify-between border-b border-border/50 px-4 py-2.5">
-                    <span className="truncate text-[13px] font-medium">{provider.id}</span>
-                    <Badge variant="outline" className="shrink-0 px-1.5 py-0 text-[10px]">
-                      {provider.models?.length ?? 0} 模型
-                    </Badge>
-                  </div>
-                  <div className="max-h-52 overflow-y-auto">
-                    {(provider.models ?? []).map((model) => (
-                      <div key={model.id} className="flex min-w-0 items-center gap-2 px-4 py-1.5 text-[12px]">
-                        <span className="min-w-0 flex-1 truncate font-mono">{model.id}</span>
-                        {model.reasoning ? <Brain className="size-3 shrink-0 text-muted-foreground" /> : null}
-                        {typeof model.context === "number" ? (
-                          <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">
-                            {model.context}
-                          </span>
-                        ) : null}
-                      </div>
-                    ))}
-                  </div>
-                </CardContent>
-              </Card>
-            ))}
-          </div>
-        )}
-      </section>
+      {/* ② 速度优先 / ③ 模型目录（provider × model）已于 2026-09-23 移除：
+          用户要求「只保留 WorkBuddy 原本内置的模型」。那两块的数据源是借道 OpenCode server
+          展开的上游 provider 全量清单（原 591 条 / 14 渠道），按设计边界归 OpenCode 网关页呈现。
+          对应后端：/workbuddy/v1/models 与总览 modelCount 已改用 builtin_models_payload()。
+          ⚠️ /api/workbuddy-proxy/models 与 workbuddy_proxy::{models_payload,models_catalog}
+             保持不变 —— 它们是 OpenCode 页/网关的数据源，改会一起打断。 */}
 
       {/* ④ 接入信息 · WorkBuddy 内置模型（桌面端会话自带，走 WorkBuddy 订阅） */}
       <section className="mb-10 min-w-0 space-y-2.5" aria-label="WorkBuddy 内置模型接入信息">
@@ -427,10 +251,10 @@ export default function WorkbuddyPage() {
               <pre className="min-w-0 overflow-x-auto rounded-lg bg-muted/60 p-3 text-xs leading-5">
                 {`curl -X POST http://127.0.0.1:57890/workbuddy-native/v1/chat/completions \\
   -H "Content-Type: application/json" \\
-  -d '{"model":"${nativeModels[0]?.id ?? "deepseek-v4.1-flash"}","messages":[{"role":"user","content":"你好"}]}'`}
+  -d '{"model":"${builtinModelId}","messages":[{"role":"user","content":"你好"}]}'`}
               </pre>
               <CopyButton
-                text={`curl -X POST http://127.0.0.1:57890/workbuddy-native/v1/chat/completions -H "Content-Type: application/json" -d '{"model":"${nativeModels[0]?.id ?? "deepseek-v4.1-flash"}","messages":[{"role":"user","content":"你好"}]}'`}
+                text={`curl -X POST http://127.0.0.1:57890/workbuddy-native/v1/chat/completions -H "Content-Type: application/json" -d '{"model":"${builtinModelId}","messages":[{"role":"user","content":"你好"}]}'`}
                 label="调用示例"
               />
             </div>
@@ -465,16 +289,28 @@ export default function WorkbuddyPage() {
                 </Button>
               </div>
             </InfoRow>
-            <InfoRow label="可用模型" hint="provider/model 形态；请求缺省模型为 opencode/mimo-v2.6-flash-free">
-              <span className="text-xs text-muted-foreground">上方列表共 {wbCount} 个，客户端按模型名直接调用</span>
+            <InfoRow
+              label="可用模型"
+              hint="目录只列 WorkBuddy 内置模型；provider/model 形态仍可调用（走 OpenCode 兜底链路）"
+            >
+              <span className="font-mono text-xs">{builtinModelId}</span>
             </InfoRow>
             <div className="mx-4 flex items-start justify-between gap-3 py-3.5 sm:mx-5">
               <p className="mb-0 text-xs text-muted-foreground">Hermes（cli-config.yaml 模型段）：</p>
               <pre className="min-w-0 overflow-x-auto rounded-lg bg-muted/60 p-3 text-xs leading-5">
-                {WB_HERMES_SNIPPET.replace("<访问密钥>", wbCfg?.apiKey ?? "<访问密钥>")}
+                {WB_HERMES_SNIPPET.replace("<内置模型>", builtinModelId).replace(
+                  "<访问密钥>",
+                  wbCfg?.apiKey ?? "<访问密钥>",
+                )}
               </pre>
               {wbCfg ? (
-                <CopyButton text={WB_HERMES_SNIPPET.replace("<访问密钥>", wbCfg.apiKey)} label="配置示例" />
+                <CopyButton
+                  text={WB_HERMES_SNIPPET.replace("<内置模型>", builtinModelId).replace(
+                    "<访问密钥>",
+                    wbCfg.apiKey,
+                  )}
+                  label="配置示例"
+                />
               ) : null}
             </div>
           </CardContent>

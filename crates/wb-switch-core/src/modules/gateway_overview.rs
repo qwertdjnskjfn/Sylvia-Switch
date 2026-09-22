@@ -145,9 +145,10 @@ async fn fetch_models(gateway: &str) -> Result<Vec<Value>, String> {
         "glm" => crate::modules::glm_proxy::models_payload(),
         // ── 2026-09-22 三拆新增 ──
         "trae-work-cn" => crate::modules::trae_proxy::models_payload().await,
-        "workbuddy" => crate::modules::workbuddy_proxy::models_payload()
-            .await
-            .unwrap_or_else(|_| json!({ "data": [] })),
+        // 2026-09-23：WorkBuddy **只暴露内置模型** —— 上游 provider 全量清单（原 591 条 / 14 渠道）
+        // 按设计归 OpenCode 网关呈现（见 docs/gateway-split-20260922.md）。总览的 modelCount
+        // 必须与 WorkBuddy 页一致，否则侧栏仍显示 591。OpenCode 侧继续用 models_payload()。
+        "workbuddy" => crate::modules::workbuddy_proxy::builtin_models_payload(),
         // OpenCode 网关只暴露免费模型，故总览里的 modelCount 即为免费数
         "opencode" => crate::modules::opencode::models_payload()
             .await
