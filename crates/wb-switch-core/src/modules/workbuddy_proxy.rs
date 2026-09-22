@@ -642,6 +642,71 @@ pub fn builtin_models_payload() -> Value {
     })
 }
 
+/// **每渠道各取 1 个代表模型**（2026-09-23：用户要求「WorkBuddy 里的 14 个模型」）。
+///
+/// 背景与取舍（改动前务必读完，否则会走回头路）：
+/// - WorkBuddy 网关借道本机 OpenCode server 能拿到 **14 个渠道 / 591 个模型**；
+///   用户先嫌 591 太多（要求只留内置），随后又要「14 个」。
+/// - 实测 WorkBuddy 侧**不存在「14 个内置模型」这个集合**：客户端产品配置共 76 个模型
+///   （51 个无 url 走订阅、25 个是自定义接入），native ACP 通道只有 1 个；
+///   唯一稳定等于 14 的就是**渠道数**。
+/// ⇒ 折中：每个渠道保留 1 个代表，既覆盖全部 14 个渠道、又保持目录精简（约 14 条）。
+///
+/// 选取口径与页面「速度优先」一致：① 免费优先 ② 快速档 ③ 名称升序。
+/// 上游不可达 / 目录为空时回落 `builtin_models_payload()`（内置模型），保证目录永不为空。
+///
+/// ⚠️ 与 `builtin_models_payload()` 的分工：
+///    - `/workbuddy-native/v1/models`（ACP 通道）→ **只列内置模型**（那才是真正能走订阅的）；
+///    - `/workbuddy/v1/models`（代理目录）    → 本函数（每渠道代表）。
+pub async fn channel_pick_models_payload() -> Value {
+    let mut data = Vec::new();
+    if let Ok(catalog) = models_catalog().await {
+        if let Some(providers) = catalog.get("providers").and_then(Value::as_array) {
+            for provider in providers {
+                let pid = provider.get("id").and_then(Value::as_str).unwrap_or("unknown");
+                let mut ids: Vec<String> = provider
+                    .get("models")
+                    .and_then(Value::as_array)
+                    .map(|ms| {
+                        ms.iter()
+                            .filter_map(|m| m.get("id").and_then(Value::as_str).map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if ids.is_empty() {
+                    continue;
+                }
+                ids.sort_by(|a, b| pick_score(a).cmp(&pick_score(b)).then_with(|| a.cmp(b)));
+                data.push(json!({
+                    "id": format!("{pid}/{}", ids[0]),
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": pid,
+                }));
+            }
+        }
+    }
+    if data.is_empty() {
+        return builtin_models_payload();
+    }
+    json!({ "object": "list", "data": data })
+}
+
+/// 代表模型排序分：**免费(0) < 快速档(1) < 其它(2)**。
+/// 免费判定复用 `opencode::is_free_model`，与 OpenCode 网关和前端口径一致。
+fn pick_score(id: &str) -> u8 {
+    if crate::modules::opencode::is_free_model(id) {
+        return 0;
+    }
+    let l = id.to_ascii_lowercase();
+    for kw in ["flash", "lite", "lightning", "mini", "nano", "turbo", "fast", "small"] {
+        if l.contains(kw) {
+            return 1;
+        }
+    }
+    2
+}
+
 /// 状态探测。
 pub async fn proxy_status() -> Value {
     let cfg = load_config();
@@ -944,4 +1009,46 @@ pub async fn chat_completions_stream(
 
 fn truncate(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pick_score_prefers_free_then_speed() {
+        // 免费优先（与 opencode::is_free_model 同口径）
+        assert_eq!(pick_score("mimo-v2.6-flash-free"), 0);
+        assert_eq!(pick_score("some/model:free"), 0);
+        assert_eq!(pick_score("qwen/qwen3-8b:0"), 0);
+        // 其次快速档
+        assert_eq!(pick_score("deepseek-v4-flash"), 1);
+        assert_eq!(pick_score("glm-5.3-turbo"), 1);
+        assert_eq!(pick_score("MiniMax-M2-Lightning"), 1);
+        // 其余
+        assert_eq!(pick_score("claude-opus-4-8"), 2);
+        assert_eq!(pick_score("kimi-k3-1"), 2);
+    }
+
+    #[test]
+    fn pick_score_is_total_and_deterministic() {
+        // 排序必须能给出全序：免费 < 快速 < 其它，同档按名称
+        let mut ids = vec![
+            "z-plain",
+            "a-free-model",
+            "b-flash",
+            "a-free-2",
+        ];
+        ids.sort_by(|a, b| pick_score(a).cmp(&pick_score(b)).then_with(|| a.cmp(b)));
+        assert_eq!(ids, vec!["a-free-2", "a-free-model", "b-flash", "z-plain"]);
+    }
+
+    #[test]
+    fn builtin_models_payload_always_has_exactly_one_entry() {
+        let v = builtin_models_payload();
+        let data = v.get("data").and_then(Value::as_array).unwrap();
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].get("owned_by").and_then(Value::as_str), Some("workbuddy"));
+        assert!(!data[0].get("id").and_then(Value::as_str).unwrap_or_default().is_empty());
+    }
 }

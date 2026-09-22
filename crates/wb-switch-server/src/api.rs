@@ -4239,7 +4239,9 @@ async fn api_workbuddy_v1_models(headers: HeaderMap) -> Response {
     if !workbuddy_proxy_auth_ok(&headers, &cfg) {
         return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
     }
-    json_ok(workbuddy_proxy::builtin_models_payload())
+    // 每渠道各取 1 个代表（约 14 条）；
+    // 严格内置模型走 `/workbuddy-native/v1/models`（builtin_models_payload）。
+    json_ok(workbuddy_proxy::channel_pick_models_payload().await)
 }
 
 /// T5：workbuddy 渠道请求级用量记录（chat 流式/非流式、成功/失败两条路径共用）。

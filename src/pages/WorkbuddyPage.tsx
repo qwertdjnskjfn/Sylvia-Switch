@@ -16,7 +16,8 @@
  *    按设计边界，provider 清单归「OpenCode 网关」页呈现（见 docs/gateway-split-20260922.md：
  *    WorkBuddy「不拥有 provider 清单」）。WorkBuddy 侧只保留**内置模型**
  *    （桌面端内嵌会话自带，走 WorkBuddy 订阅 · 经 ACP 通道转发）。
- *    对应后端：`/workbuddy/v1/models` 与总览 modelCount 均改用 `builtin_models_payload()`。
+ *    对应后端：`/workbuddy/v1/models` 与总览 modelCount 均走 `channel_pick_models_payload()`
+ *    （每渠道各 1 个代表）；`/workbuddy-native/v1/models` 走 `builtin_models_payload()`（严格内置）。
  *    ⚠️ `/api/workbuddy-proxy/models` **保持不变**（它是 OpenCode 页的数据源），
  *       两个 `workbuddy_proxy::models_payload()/models_catalog()` 也**不许动**（opencode.rs 在复用）。
  *
@@ -198,13 +199,14 @@ export default function WorkbuddyPage() {
           </Alert>
         ) : null}
         <p className="px-1 text-[11px] leading-5 text-muted-foreground">
-          WorkBuddy 侧目录<strong>只暴露内置模型</strong>
-          <code className="mx-1 rounded bg-muted px-1">{builtinModelId}</code>
-          （上游 provider 全量清单按设计归「
+          WorkBuddy 侧目录为<strong>每个渠道各保留 1 个代表模型</strong>
+          （免费 · 快速档优先，渠道数与上游一致；全量清单按设计归「
           <Link to="/opencode" className="underline underline-offset-2 hover:text-foreground">
             OpenCode
           </Link>
-          」页）。
+          」页）。真正走订阅的<strong>内置模型</strong>
+          <code className="mx-1 rounded bg-muted px-1">{builtinModelId}</code>
+          在下方「接入信息 · WorkBuddy 内置模型」单独列出。
           兜底链路仍为本机 OpenCode server（独立实例，端口自动发现，未运行时由看门狗经
           start-serve-4097.bat 拉起）——<strong>保活对象即该 server 进程</strong>；
           直连链路上线后优先走直连，失败自动回落。
@@ -212,9 +214,11 @@ export default function WorkbuddyPage() {
       </section>
 
       {/* ② 速度优先 / ③ 模型目录（provider × model）已于 2026-09-23 移除：
-          用户要求「只保留 WorkBuddy 原本内置的模型」。那两块的数据源是借道 OpenCode server
+          用户嫌「591 条 / 14 渠道」整表太多，要求精简为每渠道 1 个代表（约 14 条）。
+          那两块的数据源是借道 OpenCode server
           展开的上游 provider 全量清单（原 591 条 / 14 渠道），按设计边界归 OpenCode 网关页呈现。
-          对应后端：/workbuddy/v1/models 与总览 modelCount 已改用 builtin_models_payload()。
+          对应后端：/workbuddy/v1/models 与总览 modelCount 走 channel_pick_models_payload()
+          （每渠道各 1 个代表，约 14 条），不再整表列出。
           ⚠️ /api/workbuddy-proxy/models 与 workbuddy_proxy::{models_payload,models_catalog}
              保持不变 —— 它们是 OpenCode 页/网关的数据源，改会一起打断。 */}
 
@@ -291,7 +295,7 @@ export default function WorkbuddyPage() {
             </InfoRow>
             <InfoRow
               label="可用模型"
-              hint="目录只列 WorkBuddy 内置模型；provider/model 形态仍可调用（走 OpenCode 兜底链路）"
+              hint="每渠道各 1 个代表（免费·快速优先）；provider/model 形态仍可调用其它模型（走 OpenCode 兜底链路）"
             >
               <span className="font-mono text-xs">{builtinModelId}</span>
             </InfoRow>

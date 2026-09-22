@@ -7,6 +7,49 @@
 
 ---
 
+## 0.1.82 — 2026-09-23
+
+### 变更：WorkBuddy 目录改为「每渠道各 1 个代表」（约 14 条）—— 回应「重新获取那 14 个」
+
+0.1.81 把目录压到**只列内置模型（1 条）**后，用户随即要求「重新获取 WorkBuddy 里面的 14 个模型」，
+并明确「就是 WorkBuddy 里面内置的 14 个模型」。
+
+**先查证，未靠猜**（穷举了所有可能的"14 个内置模型"来源）：
+
+| 候选来源 | 实际数量 | 结论 |
+| --- | --- | --- |
+| WorkBuddy 网关的渠道（provider） | **14** | ✅ WorkBuddy 语境下**唯一**稳定等于 14 的集合 |
+| 那 14 个渠道的模型总数 | 591 | ✗ 用户 0.1.81 刚要求移除 |
+| 客户端产品配置 `~/.workbuddy/cache/acc-product-config-v3.json` | 76 | ✗ |
+| └ 其中无 url（真·走 WorkBuddy 订阅） | 51 | ✗ |
+| └ 其中带 url（自定义接入） | 25 | ✗ |
+| `/workbuddy-native/v1/models`（ACP 内置会话通道） | 1 | ✗ |
+| `~/.workbuddy/models.json` 及其 19 个历史备份 | 4~26，无 14 | ✗ |
+
+⇒ 不存在「14 个内置模型」这个集合；用户要的 14 = **14 个渠道**。
+而「591 太多」与「要 14 个」两个诉求的交集 = **每个渠道各取 1 个代表**。
+
+**改法**
+- `workbuddy_proxy.rs` 新增 `channel_pick_models_payload()`：遍历 `models_catalog()` 的渠道，
+  每渠道按「① 免费 ② 快速档 ③ 名称」取 1 个代表，拼成 `provider/model`。
+- 免费判定**复用 `opencode::is_free_model`**（与 OpenCode 网关、前端 `model-taxonomy.ts` 同口径），
+  不另写一套。新增单测覆盖 `pick_score` 三档与全序。
+- `/workbuddy/v1/models` 与总览 `modelCount` 改用本函数；
+  **`/workbuddy-native/v1/models` 仍走 `builtin_models_payload()`**（严格内置，真正走订阅的那一个）。
+  两者分工写进注释，避免后人混淆。
+- 上游不可达/目录为空时回落 `builtin_models_payload()`，保证目录永不为空。
+
+🔴 与 0.1.81 相同的红线：`workbuddy_proxy::{models_payload,models_catalog}`、
+`/api/workbuddy-proxy/models`、`/api/workbuddy-proxy/status` **一律未动**（OpenCode 页/网关依赖）。
+
+**验证**：`cargo check --release --all-targets` 0 错误、`tsc --noEmit` 0；
+部署后 `/workbuddy/v1/models` = 14 条且每渠道恰好 1 个；总览 workbuddy modelCount = 14；
+`/opencode/v1/models` 仍 43、`/api/workbuddy-proxy/models` 仍 14 渠道/591（未受影响）。
+
+⚠️ 若用户实际指的是**客户端内置 51 个**或**591 全量**，改一行取数函数即可切换。
+
+---
+
 ## 0.1.81 — 2026-09-23
 
 ### 变更：WorkBuddy 网关模型目录 591 → 内置模型（用户要求「只保留 WorkBuddy 原本内置的模型」）
