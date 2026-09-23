@@ -937,6 +937,38 @@ export interface GrokPoolOverview {
   accounts: GrokPoolAccount[];
 }
 
+/**
+ * 「注册机」状态（GET /api/grok/register/status）。
+ * 注册机 = Grok 融合网关驱动的专用 Chrome 实例（独立 profile、CDP 端口 19233）。
+ * 注意：该接口是只读探测，不触发注册、不启动浏览器；注册功能默认关闭、零自动触发。
+ */
+export interface GrokRegisterStatus {
+  /** idle = 待启动/已关闭；open = 已手动打开；captured = 已抓取入池 */
+  phase: "idle" | "open" | "captured" | string;
+  /** 专用 Chrome 实例是否在运行（CDP 19233 实时探测） */
+  browserRunning: boolean;
+  cdpPort: number;
+  profileDir: string;
+  registerUrl: string;
+  manualOpenCount: number;
+  lastOpenedAt: number | null;
+  lastCapturedAt: number | null;
+  /** unknown = 无 token 文件；not_logged_in = 未登录（可注册）；logged_in = 已登录 */
+  loginState: "unknown" | "not_logged_in" | "logged_in" | string;
+  /** sso cookie 前 8 位 + "…"；未登录为 null */
+  ssoPreview: string | null;
+  cookieCount: number | null;
+  /** 抓取并入池后的账号 ID（固定 grok_register）；未入池为 null */
+  poolAccountId: string | null;
+  /** 入池账号当前 status（ok/error/...）；未入池为 null */
+  poolAccountStatus: string | null;
+  /** 恒 false：注册机无任何启动/后台自动触发逻辑 */
+  autoTrigger: boolean;
+  autoTriggerNote: string;
+  /** 按 phase/loginState 组合给出的中文人话说明 */
+  message: string;
+}
+
 export interface GrokTestResult {
   ok: boolean;
   reply: string;

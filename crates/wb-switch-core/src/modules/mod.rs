@@ -16,6 +16,7 @@ pub mod glm_proxy;
 pub mod glm_web;
 pub mod grok;
 pub mod grok_pool;
+pub mod grok_register;
 pub mod kimi;
 pub mod loomy;
 pub mod loomy_anthropic;

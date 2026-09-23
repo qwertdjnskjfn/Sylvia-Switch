@@ -21,6 +21,10 @@
 //! - 失败重试：单轮内指数退避 ×3，轮次失败不写盘不覆盖旧值；
 //! - 浏览器生命周期：常驻（非 headless，便于用户随时补登录），崩溃
 //!   自动拉起；`open_login_window` 供前端触发登录窗口。
+//!
+//! 该实例即「注册机」（术语见 CHANGELOG，不得改名）：用户在其中人工完成 grok.com
+//! 新账号注册，注册成果由 `grok_register` 模块抓取后写入账号池。两处功能共用同一
+//! 实例、同一 profile 与同一 CDP 端口。
 
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -165,7 +169,7 @@ async fn cdp_alive(port: u16) -> bool {
 }
 
 /// 确保专用 Chrome 在跑：已存活则复用；否则拉起（分离进程）。
-async fn ensure_browser(cfg: &GrokSsoConfig) -> Result<u16, String> {
+pub(crate) async fn ensure_browser(cfg: &GrokSsoConfig) -> Result<u16, String> {
     if cdp_alive(CDP_PORT).await {
         return Ok(CDP_PORT);
     }
@@ -377,7 +381,7 @@ pub async fn ensure_grok_page() -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 /// 从 CDP 抓 grok.com 的全部 cookie（含 httpOnly 的 sso / sso-rw）。
-async fn fetch_grok_cookies() -> Result<Vec<Value>, String> {
+pub(crate) async fn fetch_grok_cookies() -> Result<Vec<Value>, String> {
     let result = cdp_call(
         "Network.getCookies",
         json!({"urls": [GROK_URL, "https://accounts.x.ai"]}),

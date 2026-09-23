@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use wb_switch_core::modules::{
     account, account_protection, auth_file, channel_health, checkin, config, credit_usage, credits, export_import,
     autoclaw_accounts, glm_proxy, loomy, loomy_proxy, model_probe, model_usage, oauth, platform_checkin, platform_switch, process, refresh,
-    gateway_admin, gateway_overview, glm_web, grok, grok_pool, kimi, qoder, qwen, qwen_mcp, qwen_web, grok_sso, miaoshou, session, switch, token_stats, toolcall_monitor, travel, update, trae_acp, trae_accounts, trae_proxy, trae_proxy_config, workbuddy_proxy, opencode,
+    gateway_admin, gateway_overview, glm_web, grok, grok_pool, grok_register, kimi, qoder, qwen, qwen_mcp, qwen_web, grok_sso, miaoshou, session, switch, token_stats, toolcall_monitor, travel, update, trae_acp, trae_accounts, trae_proxy, trae_proxy_config, workbuddy_proxy, opencode,
 };
 
 /// 服务实际绑定端口（main.rs serve 启动时写入），供端点展示使用。
@@ -193,6 +193,11 @@ pub fn router() -> Router {
         .route("/api/grok-sso/status", get(api_grok_sso_status))
         .route("/api/grok-sso/sync", post(api_grok_sso_sync))
         .route("/api/grok-sso/open-login", post(api_grok_sso_open_login))
+        // 注册机（专用 Chrome 实例）：仅手动触发，无任何启动/后台自动逻辑
+        .route("/api/grok/register/status", get(api_grok_register_status))
+        .route("/api/grok/register/open", post(api_grok_register_open))
+        .route("/api/grok/register/capture", post(api_grok_register_capture))
+        .route("/api/grok/register/close", post(api_grok_register_close))
         .route("/api/gateway/keys", get(api_gateway_keys_list).post(api_gateway_key_create))
         .route("/api/gateway/keys/delete", post(api_gateway_key_delete))
         .route("/api/gateway/logs", get(api_gateway_logs))
@@ -3997,6 +4002,30 @@ async fn api_grok_sso_sync() -> Response {
 
 async fn api_grok_sso_open_login() -> Response {
     json_ok(grok_sso::open_login_window().await)
+}
+
+// ---------------------------------------------------------------------------
+// 注册机（Grok 账号注册专用 Chrome 实例；仅手动触发，零自动）
+// ---------------------------------------------------------------------------
+
+/// 只读状态探测：不启动浏览器、不触发注册。
+async fn api_grok_register_status() -> Response {
+    json_ok(grok_register::status())
+}
+
+/// 手动打开注册机：用户点击入口是唯一启动方式。
+async fn api_grok_register_open() -> Response {
+    json_ok(grok_register::open().await)
+}
+
+/// 抓取注册成果：以固定 ID `grok_register` upsert 写入账号池。
+async fn api_grok_register_capture() -> Response {
+    json_ok(grok_register::capture().await)
+}
+
+/// 关闭注册机：只结束命令行带 grok-chrome-profile 的 Chrome 进程。
+async fn api_grok_register_close() -> Response {
+    json_ok(grok_register::close().await)
 }
 
 // ---------------------------------------------------------------------------

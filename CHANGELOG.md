@@ -7,6 +7,89 @@
 
 ---
 
+## 1.0.0 — 2026-09-24
+
+> 版本号升级至 1.0.0：两个 crate（core / server）同步 bump（历史教训：只 bump 一个会导致
+> 界面徽标与 /api/version 错位）；`update::APP_VERSION` 取自 core 的 `CARGO_PKG_VERSION`，
+> /api/version、侧栏徽标、底栏版本行同步显示 1.0.0。
+
+### 新增：Grok 融合网关『注册机』功能模块
+
+「注册机」= Grok 融合网关所驱动的那个**专用 Chrome 实例**的称呼。术语 0.1.50 已由用户
+记入 CHANGELOG（原话：「没开注册机，Chrome 却总自动打开 grok.com 去注册」），
+本次保持术语一致，一律使用「注册机」，不得改名。
+
+注册机的使命：用户在该实例里**人工完成** grok.com 新账号注册（邮箱验证等步骤由本人
+操作），注册成果（sso / sso-rw cookie）被抓取后写入 Grok 融合网关账号池，成为
+web 通道可用账号。
+
+三条硬性需求与落实点：
+
+1. **功能界面**：Grok 融合网关页新增「注册机 · Grok 账号注册专用浏览器」卡片
+   （位于「SSO Cookie 自动同步」卡片之后）——手动打开入口按钮 + 状态展示区
+   （注册机状态 / 专用浏览器 / CDP 端口 / 当前登录态 / sso 预览 / cookie 数 /
+   手动打开次数 / 最近打开）+「工作原理」折叠面板。默认未展开态**不请求任何接口**，
+   只有点击入口后界面才加载并启动专用浏览器。
+2. **原理说明三处落地**：① GrokPage「工作原理」折叠面板（面向用户的内置说明）；
+   ② `grok_register.rs` 模块 doc 注释（面向维护者）；
+   ③ `workbuddy-switch/docs/grok-register-machine.md`（完整版文档，含使用步骤、
+   落点文件与排障）。
+3. **零自动触发**：注册功能默认关闭（`phase` 初始 `idle`）；模块不注册任何后台循环，
+   `main.rs` 无 register 相关 `spawn` 调用点；UI 面板默认不加载；
+   `GET /api/grok/register/status` 只读探测，不触发注册、不启动浏览器
+   （返回体 `autoTrigger` 恒 `false`）。
+
+零自动触发由 4 个守卫测试证明（`grok_register.rs` 内 `mod tests`）：
+
+| 测试 | 断言 |
+| --- | --- |
+| `default_state_is_idle_and_zero` | 无状态文件时 `phase == "idle"`、`manualOpenCount == 0`、`lastOpenedAt == null` |
+| `no_background_loop_registered` | `include_str!` 读自身源码，不含 `tokio::spawn` / `fn spawn_` / `loop {` |
+| `status_is_read_only` | `status()` 返回体含 `autoTrigger == false`，不强制启动浏览器 |
+| `capture_without_browser_fails_cleanly` | 无浏览器环境 `capture()` 返回 `ok == false` 且 `status` 为 `not_registered` 或错误类，不 panic |
+
+### 新增 API 一览表
+
+| 方法 | 路径 | 作用 |
+| --- | --- | --- |
+| GET | `/api/grok/register/status` | 只读状态探测（不启动浏览器） |
+| POST | `/api/grok/register/open` | 手动打开注册机（启动专用 Chrome 并打开注册页） |
+| POST | `/api/grok/register/capture` | 抓取注册成果，以固定 ID `grok_register` upsert 入池 |
+| POST | `/api/grok/register/close` | 关闭注册机（只结束带该 profile 命令行参数的 Chrome 进程） |
+
+handler 一律薄封装（`json_ok(grok_register::status())` 等），命名 `api_grok_register_*`。
+前端配套：`src/lib/types.ts` 新增 `GrokRegisterStatus`；`src/lib/api.ts` 新增
+`getGrokRegisterStatus` / `openGrokRegister` / `captureGrokRegister` /
+`closeGrokRegister`（沿用现有 `call()` 双通道模式）。
+
+### 新增文件清单
+
+| 文件 | 说明 |
+| --- | --- |
+| `crates/wb-switch-core/src/modules/grok_register.rs` | 注册机模块（全部逻辑 + 4 个守卫测试） |
+| `workbuddy-switch/docs/grok-register-machine.md` | 内置说明文档（完整版） |
+
+存量文件改动：`crates/wb-switch-core/src/modules/mod.rs`（`pub mod grok_register;`）、
+`crates/wb-switch-core/src/modules/grok_sso.rs`（`ensure_browser` / `fetch_grok_cookies`
+可见性改 `pub(crate)`——仅可见性不改逻辑；doc 注释补一句「该实例即『注册机』」）、
+`crates/wb-switch-server/src/api.rs`（4 路由 + 4 handler）、`src/lib/api.ts`、
+`src/lib/types.ts`、`src/pages/GrokPage.tsx`。
+
+### 验证
+
+门禁命令清单（由 workflow 统一执行）：
+
+```bash
+cargo check -p wb-switch-core -p wb-switch-server
+cargo test -p wb-switch-core grok_register -- --nocapture
+cd workbuddy-switch && node node_modules/typescript/bin/tsc --noEmit
+grep -rn "grok_register" crates/wb-switch-server/src/main.rs              # 期望 0 命中
+grep -rn "tokio::spawn\|fn spawn_\|loop {" crates/wb-switch-core/src/modules/grok_register.rs  # 期望 0 命中
+```
+
+⚠️ 运行结果以本条目并入时的门禁为准：core crate 另有 4 个既有环境性失败，与注册机无关，
+只 gate 注册机自身测试。
+
 ## 0.1.89 — 2026-09-24
 
 ### 清理：tool_calls 命中时 content 残留代码块头部 UI 文案

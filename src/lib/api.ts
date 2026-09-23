@@ -56,6 +56,7 @@ import type {
   GrokPoolOverview,
   GrokPoolPolicy,
   GrokPoolSnapshot,
+  GrokRegisterStatus,
 } from "./types";
 import type { ChannelDetail, ChannelHealthOverview } from "@/lib/channel-health-types";
 import type { ModelTestRequest, ModelTestResult } from "@/lib/model-test-types";
@@ -178,6 +179,11 @@ const ROUTES: Record<string, Route> = {
   get_grok_sso_status: { method: "GET", path: "/api/grok-sso/status" },
   sync_grok_sso: { method: "POST", path: "/api/grok-sso/sync" },
   open_grok_sso_login: { method: "POST", path: "/api/grok-sso/open-login" },
+  // 注册机（专用 Chrome 实例，仅手动触发；status 为只读探测，不启动浏览器）
+  get_grok_register_status: { method: "GET", path: "/api/grok/register/status" },
+  open_grok_register: { method: "POST", path: "/api/grok/register/open" },
+  capture_grok_register: { method: "POST", path: "/api/grok/register/capture" },
+  close_grok_register: { method: "POST", path: "/api/grok/register/close" },
   get_gateway_keys: { method: "GET", path: "/api/gateway/keys" },
   create_gateway_key: { method: "POST", path: "/api/gateway/keys" },
   delete_gateway_key: { method: "POST", path: "/api/gateway/keys/delete" },
@@ -844,6 +850,35 @@ export async function syncGrokSso(): Promise<{
 
 export async function openGrokSsoLogin(): Promise<{ ok: boolean; port?: number; message?: string; error?: string }> {
   return call("open_grok_sso_login");
+}
+
+// ---- 注册机（专用 Chrome 实例；仅手动触发，零自动）----
+
+/** 只读状态探测：不触发注册、不启动浏览器。 */
+export async function getGrokRegisterStatus(): Promise<GrokRegisterStatus> {
+  return call("get_grok_register_status");
+}
+
+/** 手动打开注册机：启动专用 Chrome 并打开 grok.com 注册页（未登录时即注册页）。 */
+export async function openGrokRegister(): Promise<GrokRegisterStatus> {
+  return call("open_grok_register");
+}
+
+/** 抓取注册成果：读取专用实例的 sso/sso-rw cookie，以固定 ID grok_register 写入账号池。 */
+export async function captureGrokRegister(): Promise<{
+  ok: boolean;
+  status: string;
+  accountId?: string;
+  accountName?: string;
+  cookieCount?: number;
+  error?: string;
+}> {
+  return call("capture_grok_register");
+}
+
+/** 关闭注册机：只结束带该 profile 目录的 Chrome 进程，不影响日常浏览器。 */
+export async function closeGrokRegister(): Promise<GrokRegisterStatus> {
+  return call("close_grok_register");
 }
 
 export async function grokAddAccount(input: {

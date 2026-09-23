@@ -20,6 +20,10 @@ import {
   Sparkles,
   Trash2,
   Zap,
+  BookOpen,
+  Download,
+  UserPlus,
+  X,
 } from "lucide-react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -38,7 +42,7 @@ import * as api from "@/lib/api";
 import { GatewayAdminSection } from "@/components/gateway/GatewayAdminSection";
 import { CartesianGrid, Line, LineChart, XAxis, YAxis } from "recharts";
 import { ChartContainer, ChartTooltip, ChartTooltipContent, type ChartConfig } from "@/components/ui/chart";
-import type { GrokAccountInfo, GrokTestResult, GrokPoolOverview, GrokPoolPolicy, GrokPoolSnapshot } from "@/lib/types";
+import type { GrokAccountInfo, GrokTestResult, GrokPoolOverview, GrokPoolPolicy, GrokPoolSnapshot, GrokRegisterStatus } from "@/lib/types";
 
 const GROK_MODELS = [
   { id: "grok-4.6", name: "Grok 4.6", desc: "最新旗舰（需 Build 通道账号；Web 通道自动回落 Grok 4）", badge: "最新" },
@@ -51,6 +55,10 @@ const GROK_MODELS = [
   { id: "grok-2-mini", name: "Grok 2 Mini", desc: "旧代轻量版", badge: "旧代" },
 ];
 
+// 注册机「零自动触发」说明：与后端 status.autoTriggerNote 保持一致，后端未返回该字段时兜底展示
+const REGISTER_AUTO_TRIGGER_NOTE =
+  "注册机无任何启动/后台自动触发逻辑；仅在你手动点击「打开注册机」后才会启动专用浏览器";
+
 export default function GrokPage() {
   const [accounts, setAccounts] = useState<GrokAccountInfo[]>([]);
   const [loading, setLoading] = useState(false);
@@ -60,6 +68,12 @@ export default function GrokPage() {
   // SSO 自动同步状态
   const [ssoStatus, setSsoStatus] = useState<Record<string, unknown> | null>(null);
   const [ssoBusy, setSsoBusy] = useState<string | null>(null);
+
+  // 注册机状态（功能默认关闭、零自动触发：面板默认不加载，仅手动点击入口后才请求接口）
+  const [registerOpen, setRegisterOpen] = useState(false);
+  const [registerStatus, setRegisterStatus] = useState<GrokRegisterStatus | null>(null);
+  const [registerBusy, setRegisterBusy] = useState<string | null>(null);
+  const [showRegisterPrinciple, setShowRegisterPrinciple] = useState(false);
 
   // 添加账号弹窗状态
   const [showAdd, setShowAdd] = useState(false);
@@ -318,6 +332,83 @@ export default function GrokPage() {
     }
   };
 
+  // ---- 注册机（专用 Chrome 实例；仅手动触发，零自动）----
+
+  // 只读刷新状态：仅在用户点击后调用；该接口不触发注册、不启动浏览器
+  const refreshRegisterStatus = useCallback(async () => {
+    try {
+      setRegisterStatus(await api.getGrokRegisterStatus());
+    } catch (e) {
+      setMsg({ type: "err", text: api.asError(e) });
+    }
+  }, []);
+
+  // 入口：手动打开注册机（启动专用 Chrome 并打开 grok.com；未登录时即注册页）
+  const openRegister = async () => {
+    setRegisterBusy("open");
+    try {
+      const res = await api.openGrokRegister();
+      // 后端可能以 200 + {ok:false} 体返回失败；失败只走 msg 报错、不展开面板
+      const raw = res as unknown as Record<string, unknown>;
+      if (raw.ok === false) {
+        setMsg({ type: "err", text: String(raw.error || raw.message || "打开注册机失败") });
+        return;
+      }
+      setRegisterOpen(true);
+      await refreshRegisterStatus();
+      setMsg({ type: "ok", text: "注册机已启动：请在专用 Chrome 窗口里按 grok.com 流程完成新账号注册，完成后点「抓取注册成果」。" });
+    } catch (e) {
+      setMsg({ type: "err", text: api.asError(e) });
+    } finally {
+      setRegisterBusy(null);
+    }
+  };
+
+  // 抓取注册成果：读取 sso/sso-rw cookie，以固定 ID grok_register 写入账号池
+  const captureRegister = async () => {
+    setRegisterBusy("capture");
+    try {
+      const res = await api.captureGrokRegister();
+      if (res.ok) {
+        // 抓取成功即刷新账号池列表，让 grok_register 账号立即可见
+        await loadAccounts();
+        await refreshRegisterStatus();
+        setMsg({
+          type: "ok",
+          text: `注册成果已抓取：${res.cookieCount ?? "?"} 个 cookie，已写入 Grok 账号池（${res.accountId || "grok_register"} · ${res.accountName || "注册机注册账号"}）`,
+        });
+      } else if (res.status === "not_registered") {
+        setMsg({ type: "err", text: "注册机里还没有可抓取的登录态：请先在注册机窗口里完成 grok.com 注册并登录。" });
+      } else {
+        setMsg({ type: "err", text: `抓取失败：${res.error || res.status}` });
+      }
+    } catch (e) {
+      setMsg({ type: "err", text: api.asError(e) });
+    } finally {
+      setRegisterBusy(null);
+    }
+  };
+
+  // 关闭注册机：只结束带该 profile 目录的 Chrome 进程，不影响日常浏览器
+  const closeRegister = async () => {
+    setRegisterBusy("close");
+    try {
+      const res = await api.closeGrokRegister();
+      // 同 openRegister：兼容 200 + {ok:false} 的失败体
+      const raw = res as unknown as Record<string, unknown>;
+      if (raw.ok === false) {
+        setMsg({ type: "err", text: String(raw.error || raw.message || "关闭注册机失败") });
+        return;
+      }
+      setRegisterStatus(res);
+      setMsg({ type: "ok", text: "注册机已关闭：专用 Chrome 实例已结束，日常浏览器不受影响。" });
+    } catch (e) {
+      setMsg({ type: "err", text: api.asError(e) });
+    } finally {
+      setRegisterBusy(null);
+    }
+  };
+
   return (
     <div className="mx-auto max-w-5xl space-y-6 pb-12">
       {/* 顶部标题栏 */}
@@ -440,6 +531,171 @@ export default function GrokPage() {
               <span className="tabular-nums">{String(ssoStatus?.cookieCount ?? "—")}</span>
             </div>
           </div>
+        </CardContent>
+      </Card>
+
+      {/* 注册机（专用 Chrome 实例；默认关闭，仅手动打开，零自动触发） */}
+      <Card className="border-primary/20 bg-primary/[0.02] shadow-sm">
+        <CardHeader className="pb-3">
+          <CardTitle className="flex items-center gap-2 text-sm font-semibold">
+            <UserPlus className="size-4" />
+            注册机 · Grok 账号注册专用浏览器
+            <Badge variant="outline" className="border-emerald-500/30 bg-emerald-500/10 px-1.5 py-0 text-[10px] text-emerald-600">
+              仅手动 · 零自动触发
+            </Badge>
+          </CardTitle>
+          <CardDescription className="text-xs">
+            注册机是网关专用的一个 Chrome 实例：独立 profile（不影响日常 Chrome）、固定 CDP 调试端口 19233；
+            未登录时打开 grok.com 即是注册页，人工完成注册后可一键抓取成果写入账号池。
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          {!registerOpen ? (
+            /* 未展开态（默认）：只渲染入口按钮，此态不请求任何接口 */
+            <div className="space-y-2">
+              <Button
+                size="sm"
+                className="h-8 gap-1 text-xs"
+                disabled={registerBusy !== null}
+                onClick={() => void openRegister()}
+              >
+                {registerBusy === "open" ? <Loader2 className="size-3.5 animate-spin" /> : <UserPlus className="size-3.5" />}
+                {registerBusy === "open" ? "正在打开注册机…" : "打开注册机（手动）"}
+              </Button>
+              <p className="text-xs text-muted-foreground">
+                注册功能默认关闭：只有点击上面的按钮才会启动专用浏览器，网关不会在开机、后台循环或任何计划任务中自动拉起它。
+              </p>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {/* 操作按钮行（打开注册机重复点击幂等：复用同一注册机实例） */}
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  size="sm"
+                  className="h-8 gap-1 text-xs"
+                  disabled={registerBusy !== null}
+                  onClick={() => void openRegister()}
+                >
+                  {registerBusy === "open" ? <Loader2 className="size-3.5 animate-spin" /> : <UserPlus className="size-3.5" />}
+                  打开注册机
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-8 gap-1 text-xs"
+                  disabled={registerBusy !== null}
+                  onClick={() => void captureRegister()}
+                >
+                  {registerBusy === "capture" ? <Loader2 className="size-3.5 animate-spin" /> : <Download className="size-3.5" />}
+                  抓取注册成果
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-8 gap-1 text-xs"
+                  disabled={registerBusy !== null}
+                  onClick={() => void closeRegister()}
+                >
+                  {registerBusy === "close" ? <Loader2 className="size-3.5 animate-spin" /> : <X className="size-3.5" />}
+                  关闭注册机
+                </Button>
+              </div>
+
+              {/* 状态网格（样式对齐 SSO 卡片） */}
+              <div className="grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
+                <div>
+                  <span className="text-muted-foreground">注册机状态：</span>
+                  {registerStatus?.phase === "captured" ? (
+                    <Badge variant="outline" className="border-emerald-500/30 bg-emerald-500/10 px-1.5 py-0 text-[10px] text-emerald-600">成果已入池</Badge>
+                  ) : registerStatus?.phase === "open" ? (
+                    <Badge variant="outline" className="border-emerald-500/30 bg-emerald-500/10 px-1.5 py-0 text-[10px] text-emerald-600">运行中</Badge>
+                  ) : (
+                    <Badge variant="outline" className="px-1.5 py-0 text-[10px] text-muted-foreground">待启动</Badge>
+                  )}
+                </div>
+                <div>
+                  <span className="text-muted-foreground">专用浏览器：</span>
+                  {registerStatus?.browserRunning ? (
+                    <span className="font-medium text-emerald-600">运行中</span>
+                  ) : (
+                    <span className="text-muted-foreground">未启动</span>
+                  )}
+                </div>
+                <div>
+                  <span className="text-muted-foreground">CDP 端口：</span>
+                  <span className="font-mono tabular-nums">{registerStatus?.cdpPort ?? 19233}</span>
+                </div>
+                <div>
+                  <span className="text-muted-foreground">当前登录态：</span>
+                  {registerStatus?.loginState === "logged_in" ? (
+                    <span className="font-medium text-emerald-600">已登录</span>
+                  ) : registerStatus?.loginState === "not_logged_in" ? (
+                    <span className="font-medium text-amber-600">未登录 · 可注册</span>
+                  ) : (
+                    <span className="text-muted-foreground">未知</span>
+                  )}
+                </div>
+                <div>
+                  <span className="text-muted-foreground">sso 预览：</span>
+                  <span className="font-mono">{registerStatus?.ssoPreview || "—"}</span>
+                </div>
+                <div>
+                  <span className="text-muted-foreground">cookie 数：</span>
+                  <span className="tabular-nums">{registerStatus?.cookieCount ?? "—"}</span>
+                </div>
+                <div>
+                  <span className="text-muted-foreground">手动打开次数：</span>
+                  <span className="tabular-nums">{registerStatus?.manualOpenCount ?? 0}</span>
+                </div>
+                <div>
+                  <span className="text-muted-foreground">最近打开：</span>
+                  <span>{registerStatus?.lastOpenedAt ? new Date(registerStatus.lastOpenedAt).toLocaleString("zh-CN") : "—"}</span>
+                </div>
+              </div>
+
+              {/* 自动触发说明行：后端原文 + 醒目的零自动标记 */}
+              <div className="rounded-lg border bg-muted/20 p-2.5 text-xs text-muted-foreground">
+                <span className="font-medium text-emerald-600">✓ 无启动/后台自动触发</span>
+                <span className="mx-1.5">·</span>
+                {registerStatus?.autoTriggerNote || REGISTER_AUTO_TRIGGER_NOTE}
+                {registerStatus?.message && <div className="mt-1">{registerStatus.message}</div>}
+              </div>
+
+              {/* 「工作原理」折叠面板：内置原理说明全文（与 docs/grok-register-machine.md 一致） */}
+              <div className="rounded-lg border border-purple-500/20 bg-purple-500/[0.03] p-3">
+                <button
+                  type="button"
+                  onClick={() => setShowRegisterPrinciple(!showRegisterPrinciple)}
+                  className="flex w-full items-center justify-between text-[11px] font-semibold text-purple-600"
+                >
+                  <div className="flex items-center gap-1.5">
+                    <BookOpen className="size-3.5" />
+                    <span>注册机工作原理</span>
+                  </div>
+                  {showRegisterPrinciple ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
+                </button>
+                {showRegisterPrinciple && (
+                  <div className="mt-2.5 space-y-2 text-[11px] leading-relaxed text-muted-foreground">
+                    <p>注册机是 Grok 融合网关专用的一个 Chrome 实例：独立 profile（<code className="rounded bg-muted px-1 py-0.5 font-mono">~/.wb-switch/grok-chrome-profile</code>，与你日常用的 Chrome 完全隔离）、固定调试端口 19233、非 headless 常驻窗口。</p>
+                    <p className="font-medium text-foreground">执行流程：</p>
+                    <ol className="list-inside list-decimal space-y-1">
+                      <li><strong>手动启动</strong>：你点击「打开注册机」——这是注册机唯一的启动方式，网关不会在开机、后台循环或任何计划任务中自动拉起它。</li>
+                      <li><strong>打开注册页</strong>：注册机以调试模式启动 Chrome 并打开 <code className="rounded bg-muted px-1 py-0.5 font-mono">https://grok.com</code>；未登录时该页面就是注册页。</li>
+                      <li><strong>人工注册</strong>：在注册机窗口里按 grok.com 的流程完成新账号注册（填邮箱、验证码等由你本人操作；注册机不代填、不自动提交）。</li>
+                      <li><strong>抓取成果</strong>：注册完成后点「抓取注册成果」，网关经 CDP 的 <code className="rounded bg-muted px-1 py-0.5 font-mono">Network.getCookies</code> 读取该实例的 sso / sso-rw 等 cookie（含 httpOnly），拼成账号凭证写入 Grok 账号池（账号 ID <code className="rounded bg-muted px-1 py-0.5 font-mono">grok_register</code>）。</li>
+                      <li><strong>入池即用</strong>：该账号随即参与 web 通道的轮询调度；之后每次同步/保活都会经同一实例续期，无需重复注册。</li>
+                    </ol>
+                    <p className="font-medium text-foreground">设计纪律：</p>
+                    <ul className="list-inside list-disc space-y-1">
+                      <li><strong>零自动触发</strong>：模块不注册任何后台循环（无 30 分钟同步、无保活、无体检会启动它）；<code className="rounded bg-muted px-1 py-0.5 font-mono">status</code> 接口只读探测，不会启动浏览器。</li>
+                      <li><strong>会话隔离</strong>：专用 profile 不影响日常 Chrome；多个功能共用同一实例，手动「立即同步」会把你当前的登录态写回 autosync 账号。</li>
+                      <li><strong>进程精准</strong>：「关闭注册机」只结束带该 profile 目录命令行参数的 Chrome 进程，绝不误杀日常浏览器。</li>
+                    </ul>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
         </CardContent>
       </Card>
 
