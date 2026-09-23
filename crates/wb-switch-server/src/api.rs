@@ -4546,11 +4546,12 @@ async fn api_opencode_chat_completions(headers: HeaderMap, Json(body): Json<Valu
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     if stream {
         match opencode::chat_completions_stream(body).await {
-            Ok(upstream) => {
+            // 0.1.85：fallback 可能已换模型，日志与 SSE 帧都以 actual 为准
+            Ok((upstream, actual)) => {
                 log_gateway_request(
                     "opencode",
                     None,
-                    &model,
+                    &actual,
                     true,
                     started.elapsed().as_millis() as u64,
                     "",

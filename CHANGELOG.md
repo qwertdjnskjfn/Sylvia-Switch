@@ -7,6 +7,167 @@
 
 ---
 
+## 0.1.85 — 2026-09-23
+
+### 新功能：OpenCode 网关自动 fallback —— 上游 5xx / 连接断开自动换下一个可用模型
+
+#### 需求
+免费池模型随时段波动（0.1.84 实测：同一模型 14:45 还 200、14:54 就 502），
+调用方拿到 502 后只能手工换模型重试。本次把「换模型」做进网关：
+**上游 502 或连接被断时，按已验证可用清单自动重试下一个模型；全部失败返回明确错误；
+最终响应回显实际使用的模型名称。**
+
+#### 触发条件（严格按需求：仅服务端故障 / 连接断开）
+| 错误签名 | 是否换模型 | 说明 |
+| --- | --- | --- |
+| `提交消息失败 5xx …`（502 最常见，500/503 同理） | ✅ | opencode server 转述上游/provider 故障 |
+| `提交消息失败: error sending request …` | ✅ | 连接被断 —— 实证多为上游限流→FK bug→断连（0.1.84），换模型有用 |
+| `提交消息失败 4xx …`（如 400 unknown model） | ❌ | 请求本身有问题，换模型无意义 |
+| `messages 不能为空` 等输入错误 | ❌ | 原样返回，不烧 fallback 链 |
+| 服务发现失败（server 没起） | ❌ | 换模型无意义，快速失败 |
+| `等待回复超时` | ❌ | 保守：多为排队，避免误杀慢模型 |
+
+> 状态码只认「提交消息失败」后的状态位（5xx 才换），错误正文里出现 502 字样不误伤。
+> 实测构造：请求不存在的免费 id `opencode/zzz-nonexistent-free` → server 回 500 → 自动回退到链首 mimo。
+
+#### 候选顺序（去重、保序、仅免费）
+1. **用户显式指定的模型**（尊重调用方选择，免费校验已过）；
+2. **已验证可用链**（内置 `VERIFIED_FALLBACK_CHAIN`，0.1.84 逐个实调 200 且正文非空）：
+   `opencode/mimo-v2.6-flash-free` → `openrouter/nex-agi/nex-n2.5-pro:free` →
+   `ling-3.0-flash-fin` → `north-mini-code` → `ling-3.0-flash-vl` →
+   `nemotron-3-super-120b` → `nemotron-3-ultra-550b` → `lfm-2.5-2.6b`（均 openrouter `:free`）；
+3. **当前免费目录其余模型**（第一批走完才拉一次 `/provider` 目录兜底，Happy Path 零额外开销；
+   按用户决策**不设尝试上限**，全目录兜底）。
+
+Happy Path 零损耗：第一批 = 用户指定 + 内置链，纯本地构造无网络请求；
+目录只在「链全部 502/断连」后才拉一次。
+
+#### 模型回显
+- 非流式：响应 `model` = 实际使用的模型（workbuddy_proxy 按 body 回显，天然正确）；
+- 流式：`chat_completions_stream` 返回 `(流, 实际模型)`，SSE 每帧 `model` 与网关日志
+  （`gateway_request_logs`）都以实际模型为准 —— 流式日志此前后 requested，0.1.85 起修正。
+
+#### 配置（仅配置文件，`~/.wb-switch/opencode_proxy_config.json`）
+| 字段 | 默认 | 说明 |
+| --- | --- | --- |
+| `fallback_enabled` | `true` | 关闭后退化为 0.1.84 行为（只试用户指定模型） |
+| `fallback_chain` | 空 = 内置链 | 自定义链，非 `free` 条目会被过滤（网关只提供免费模型） |
+
+旧配置文件缺省两个字段 → 默认开 + 内置链，向后兼容；保存时回写，不会被 UI 保存抹掉。
+
+#### 改动
+- `opencode.rs`：`VERIFIED_FALLBACK_CHAIN` / `resolve_fallback_chain` / `build_attempt_chain`
+  / `is_retryable_upstream_error`（复用 `workbuddy_proxy::is_connect_error`，提权 `pub(crate)`）
+  / `chat_completions_json` 改逐模型循环 + 全失败汇总错误（含尝试清单与 0.1.84 建议文案）；
+  空模型时由链首顶替旧的「取目录第一个」（server 不可达也能选模型）；
+  `proxy_status` 增 `fallbackEnabled` / `fallbackChain` 只读诊断。
+  新增 6 个单测（链构造去重保序 / 触发判定 / 自定义链过滤 / 错误装饰）。
+- `workbuddy_proxy.rs`：仅 `is_connect_error` 提权 `pub(crate)`，**零行为变更**
+  （串行锁 / models_payload / models_catalog / 定向重试等红线未动）。
+- `api.rs`：流式分支适配 `(stream, actual)`，日志记实际模型；错误路径未动（仍 502）。
+
+#### 验证（2026-09-23 16:4x 上线后实测）
+- `cargo test -p wb-switch-core --lib`：**319 passed, 0 failed**（含 7 个新测试：
+  链构造去重保序 / 空模型 / 触发判定 5xx·4xx·连接·超时 / 自定义链过滤 / 汇总错误格式 / 错误装饰）；
+- `cargo check -p wb-switch-core -p wb-switch-server --all-targets`：**0 错误**；
+- `npm run build`（tsc && vite build）：**通过**；
+- `deploy.py --expect-version 0.1.85`：**两次部署均断言通过**（停机 1.0–1.1s；0.1.85 上线后
+  `/api/version` 自证 version=0.1.85 buildTime=16:40:33）；
+- e2e（`tools/e2e_opencode_fallback.py`，全部实调）：
+
+| # | 场景 | 结果 |
+| --- | --- | --- |
+| 1 | 正常指定 `opencode/mimo-v2.6-flash-free` | ✅ 200，回显指定模型，正文非空 |
+| 2 | 不指定模型（链首顶替） | ✅ 200，回显 `opencode/mimo-v2.6-flash-free` |
+| 3 | 指定必败模型 `opencode/zzz-nonexistent-free`（server 回 500） | ✅ **自动回退到链首 mimo**，回显实际模型 |
+| 4 | `stream:true` 同上 | ✅ 200，SSE 每帧 `model` = mimo，`[DONE]` 正常 |
+| 5 | 自定义链只放必败模型 → 强制走目录兜底层 | ✅ 200，回显目录首个可用模型 `opencode/ling-3.0-flash-fin-free` |
+| 6 | 临时 `fallback_enabled=false` + 必败模型 | ✅ 502 + 明确错误（提交失败原文 + 额度/限流建议），配置字段生效 |
+| 7 | 非免费模型 `opencode/some-paid-model` | ✅ 仍 400 拒绝（契约无回归） |
+| 8 | `tools/monitor.py` 巡检 | ✅ **ALL GREEN**（进程/端口/版本自证/404 JSON） |
+
+- 网关日志 `gateway_request_logs.json`：上述 fallback 成功请求均以**实际模型**入账
+  （非流式原本就记 actual；流式路径 0.1.85 起从记 requested 修正为记 actual）。
+
+> 注：「全部失败汇总错误」这条分支线上无法构造（需要所有免费模型同时失败），
+> 由单测 `all_failed_error_lists_chain_and_last_error` 覆盖格式；其错误装饰与单候选
+> 失败路径已由场景 6 实测。
+
+#### 已知限制
+- 最坏情况（全目录逐个 502）请求耗时可达数分钟 —— 用户决策「不设上限」换全目录兜底；
+  若嫌久可后续加时限或上限（一处 const 即可）。
+- fallback 期间每个失败模型都会「建会话→删会话」，opencode server 的 FK bug 场景下
+  可能留下孤儿 session（0.1.84 既存现象，非本次引入）。
+
+---
+
+## 0.1.84 — 2026-09-23
+
+### 修复：OpenCode 502「提交消息失败」真相 = 上游免费额度/限流（不是网络故障）+ 报错带可操作建议
+
+#### 现象与误导性
+用户报 `错误码 3007`，服务端原文：
+```
+502 提交消息失败: error sending request for url (http://127.0.0.1:4097/session/.../message)
+category: network
+```
+**看起来像网络/连接故障，实际完全不是。**
+
+#### 根因（读 opencode server 自己的日志才看清）
+`E:\opencode\opencode-serve.log` 显示，FK 报错**之前**总有这些上游错误：
+
+```
+AI_APICallError: Your balance is empty (remaining: $0.000000), so this request cannot proceed
+AI_APICallError: This model is rate limited right now.
+AI_APICallError: Too many requests. The free tier allows 1 request(s) ...
+→ 然后 EffectDrizzleQueryError / SQLiteError: FOREIGN KEY constraint failed（insert into "message"）
+→ 再然后连接被断，客户端只看到 error sending request
+```
+
+**链路**：上游 provider（共享免费池）返回**余额为空/限流** → opencode server 想把错误消息写库 →
+触发它**自己的 FK bug**（`message.session_id` 指向不存在的 session 行）→ 服务端异常、连接被断 →
+reqwest 只能报 `error sending request`。⇒ 这是 **opencode server 的 bug + 上游免费额度耗尽**
+共同造成的，**不是网络问题，也不在本网关**。
+
+#### 免费额度是「按模型、随时段波动」的（实测结论）
+同一批模型在不同时间命运完全不同：
+
+| 模型 | 14:45 | 14:47 | 14:52 | 14:54 |
+| --- | --- | --- | --- | --- |
+| `opencode/nemotron-3.5-lightning-free` | ✅ 200 | — | ✅ 200 | ❌ 502 |
+| `unorouter/deepseek-v4-flash:free` | — | ❌ 502 | ❌ 502 | — |
+| `orcarouter/deepseek/deepseek-v4-flash-free` | — | — | — | ❌ 502 |
+| `openrouter/google/gemma-4-31b-it:free` | — | — | — | ❌ 502 |
+| `opencode/mimo-v2.6-flash-free`、`openrouter/*`（多数） | ✅ | ✅ | ✅ | ✅ |
+
+⇒ **`opencode`/`unorouter`/`orcarouter` 这几个"原生免费池"额度很紧**；
+`openrouter` 渠道（自有免费池较大）明显更稳。
+
+#### 改动
+
+1. **报错带可操作建议**（`opencode.rs`）：命中「提交消息失败」时追加真实根因与建议 ——
+   上游免费额度/限流所致，换个免费模型（先 `GET /opencode/v1/models` 取当前可用清单）或稍后重试。
+   （不再让用户误以为网络断了。）
+2. **替换踩限流的条目**（`~/.workbuddy/models.json`）：
+   `unorouter/deepseek-v4-flash:free` → **`openrouter/liquid/lfm-2.5-2.6b:free`**（实测 200 · 9.8s）。
+   替换前后都**逐个实调验证**（不看状态码、还要求正文非空）。
+3. （0.1.83 已随本版一并说明）`workbuddy_proxy` 转发加**进程级串行化** + **会话落库确认**
+   + **定向重试一次** —— 这三项是卫生改进，虽非本次根因，但能减少并发突发下的失败面。
+
+#### 验证
+- 8 个条目逐个实调：**7 个 200 且正文非空**（唯一失败者已换成可用模型）。
+- `cargo check -p core -p server` **0 错误**。
+- 报错文案：对限流模型返回 502 时，错误体含「多为上游免费额度/限流」+ 建议换模型。
+
+#### 给用户的口径
+**不是网关坏了，是"免费模型"本身有额度限制**。挑模型时优先用这些当前稳定的：
+`opencode/mimo-v2.6-flash-free`、`openrouter/inclusionai/ling-3.0-flash-fin:free`、
+`openrouter/cohere/north-mini-code:free`、`openrouter/inclusionai/ling-3.0-flash-vl:free`、
+`openrouter/nvidia/nemotron-3-super-120b-a12b:free`、
+`openrouter/nvidia/nemotron-3-ultra-550b-a55b:free`、
+`openrouter/nex-agi/nex-n2.5-pro:free`、`openrouter/liquid/lfm-2.5-2.6b:free`。
+
+---
 ## 0.1.82 — 2026-09-23
 
 ### 变更：WorkBuddy 目录改为「每渠道各 1 个代表」（约 14 条）—— 回应「重新获取那 14 个」

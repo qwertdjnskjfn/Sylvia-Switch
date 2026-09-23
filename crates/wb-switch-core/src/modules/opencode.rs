@@ -4,8 +4,11 @@
 //! - 与 **WorkBuddy 网关同级且相互独立**：独立路由 `/opencode/v1`、独立密钥与配置文件；
 //! - 但**共用同一个本机 OpenCode server 进程**（端口自动发现，看门狗由 `workbuddy_proxy`
 //!   统一管理，避免两个网关各自拉起一个 server 互相抢端口）；
-//! - 因此本模块只做三件事：**① 免费模型收敛 ② 独立密钥 ③ 对话委托**，
+//! - 因此本模块只做四件事：**① 免费模型收敛 ② 独立密钥 ③ 对话委托 ④ 自动 fallback**，
 //!   不重复实现 server 发现/健康检查/消息提交。
+//! - ④ 自动 fallback（0.1.85）：上游 5xx / 连接断开时，按「用户指定模型 →
+//!   已验证可用链 → 当前免费目录其余」自动换下一个模型重试；全部失败返回带
+//!   尝试清单的明确错误。成功响应的 `model` 字段回显**实际使用**的模型。
 //!
 //! 「仅免费」判定与前端 `src/lib/model-taxonomy.ts::isFreeModelId` **保持同口径**
 //! （id 含 `free` / 以 `:0` 或 `/0` 结尾 / 含 `zero`，忽略大小写），
@@ -21,6 +24,22 @@ use crate::modules::workbuddy_proxy::{self, WorkbuddyUpstreamStream};
 
 const CONFIG_FILE: &str = "opencode_proxy_config.json";
 
+/// 已验证可用的免费模型 fallback 链（顺序即优先级）。
+/// 来源：CHANGELOG 0.1.84 逐个实调（2026-09-23，200 且正文非空），
+/// 与「给用户的口径」一致：先 `opencode/mimo-v2.6-flash-free`，再
+/// `openrouter/nex-agi/nex-n2.5-pro:free`，其余按实测稳定性排后。
+/// 可被 `opencode_proxy_config.json` 的 `fallback_chain` 覆盖（仍过滤仅免费）。
+const VERIFIED_FALLBACK_CHAIN: &[&str] = &[
+    "opencode/mimo-v2.6-flash-free",
+    "openrouter/nex-agi/nex-n2.5-pro:free",
+    "openrouter/inclusionai/ling-3.0-flash-fin:free",
+    "openrouter/cohere/north-mini-code:free",
+    "openrouter/inclusionai/ling-3.0-flash-vl:free",
+    "openrouter/nvidia/nemotron-3-super-120b-a12b:free",
+    "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+    "openrouter/liquid/lfm-2.5-2.6b:free",
+];
+
 // ---------------------------------------------------------------------------
 // 配置（~/.wb-switch/opencode_proxy_config.json）—— 与 WorkBuddy / TRAE 密钥彻底分开
 // ---------------------------------------------------------------------------
@@ -29,6 +48,10 @@ const CONFIG_FILE: &str = "opencode_proxy_config.json";
 pub struct OpenCodeProxyConfig {
     pub enabled: bool,
     pub api_key: String,
+    /// 上游 502 / 连接断开时，是否按 fallback 链自动换模型重试（默认 true，0.1.85 新增）。
+    pub fallback_enabled: bool,
+    /// 自定义 fallback 链；空 = 用内置 `VERIFIED_FALLBACK_CHAIN`。仅接受免费模型 id。
+    pub fallback_chain: Vec<String>,
 }
 
 fn config_path() -> PathBuf {
@@ -46,10 +69,27 @@ pub fn load_config() -> OpenCodeProxyConfig {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
+            // 旧配置文件缺省 → 开 fallback + 内置链（行为与 0.1.85 默认一致）
+            fallback_enabled: v
+                .get("fallback_enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            fallback_chain: v
+                .get("fallback_chain")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
         .unwrap_or(OpenCodeProxyConfig {
             enabled: true,
             api_key: String::new(),
+            fallback_enabled: true,
+            fallback_chain: Vec::new(),
         });
     // 首次使用自动生成密钥并落盘（用户无需手填即可接入）
     if cfg.api_key.is_empty() {
@@ -63,6 +103,8 @@ pub fn save_config(cfg: &OpenCodeProxyConfig) -> Result<(), String> {
     let body = json!({
         "enabled": cfg.enabled,
         "api_key": cfg.api_key,
+        "fallback_enabled": cfg.fallback_enabled,
+        "fallback_chain": cfg.fallback_chain,
         "updatedAt": now_ms(),
     });
     atomic_write(&config_path(), &body.to_string()).map_err(|e| format!("写入 OpenCode 配置失败: {e}"))
@@ -75,6 +117,106 @@ pub fn save_config(cfg: &OpenCodeProxyConfig) -> Result<(), String> {
 pub fn is_free_model(id: &str) -> bool {
     let l = id.to_ascii_lowercase();
     l.contains("free") || l.ends_with(":0") || l.ends_with("/0") || l.contains("zero")
+}
+
+// ---------------------------------------------------------------------------
+// 自动 fallback（0.1.85）：上游 502 / 连接断开 → 按已验证模型链换下一个重试
+// ---------------------------------------------------------------------------
+
+/// fallback 链解析：配置自定义链（过滤仅免费）优先，为空则用内置已验证链。
+fn resolve_fallback_chain(cfg: &OpenCodeProxyConfig) -> Vec<String> {
+    if cfg.fallback_chain.is_empty() {
+        VERIFIED_FALLBACK_CHAIN
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        cfg.fallback_chain
+            .iter()
+            .filter(|id| is_free_model(id))
+            .cloned()
+            .collect()
+    }
+}
+
+/// 当前免费目录 id 清单（fallback 兜底批用）；抓取失败返回空
+/// （只影响兜底，不影响主链，请求仍可完成）。
+async fn free_catalog_ids() -> Vec<String> {
+    models_payload()
+        .await
+        .ok()
+        .and_then(|v| v.get("data").and_then(Value::as_array).cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|m| m.get("id").and_then(Value::as_str).map(String::from))
+        .collect()
+}
+
+/// 追加到候选链（去重、保序、跳过空 id）。
+fn push_unique(out: &mut Vec<String>, id: &str) {
+    if id.is_empty() || out.iter().any(|x| x == id) {
+        return;
+    }
+    out.push(id.to_string());
+}
+
+/// 本次请求的模型尝试顺序：① 用户显式指定（免费校验已过）→ ② fallback 链 → ③ 免费目录其余。
+fn build_attempt_chain(requested: &str, chain: &[String], free_catalog: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    push_unique(&mut out, requested);
+    for id in chain {
+        push_unique(&mut out, id);
+    }
+    for id in free_catalog {
+        push_unique(&mut out, id);
+    }
+    out
+}
+
+/// 是否「换一个模型可能有用」的上游失败：提交消息失败 + (5xx | 连接类签名)。
+/// - `提交消息失败 5xx …`：opencode server 转述上游/provider 故障（502 为实测最常见形态，
+///   500/503 等同理——都是服务端侧问题，换模型可能有用）；
+/// - `提交消息失败: error sending request …`：无状态码 = 连接被断 —— 实证多为上游免费池
+///   限流 → opencode server FK bug → 断连（CHANGELOG 0.1.84），换模型确实有用。
+/// 4xx（如 400 unknown model）是请求本身的问题，换模型无意义 → 不重试。
+/// 其余（messages 为空 / 服务发现失败 / 等待回复超时 / …）同样不重试。
+fn is_retryable_upstream_error(msg: &str) -> bool {
+    let Some(rest) = msg.split("提交消息失败").nth(1) else {
+        return false;
+    };
+    let token = rest.trim_start().split_whitespace().next().unwrap_or("");
+    if token.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        // 形如 "502 Bad Gateway"：只认状态码位，5xx 才换（正文里出现 502 字样不误伤）
+        return token.starts_with('5');
+    }
+    // 无状态码 → 连接类失败（FK bug 链路的最终表现）
+    workbuddy_proxy::is_connect_error(msg)
+}
+
+/// 0.1.84 的可操作建议原样保留：提交失败多为上游免费额度/限流，别让用户误以为网络断了。
+fn decorate_upstream_error(e: String) -> String {
+    if e.contains("提交消息失败") {
+        format!(
+            "{e}\\n\\n【多为上游免费额度/限流】这些模型走各 provider 的共享免费池，会随时段波动。\\n\
+             建议：换个免费模型（先 GET /opencode/v1/models 取当前可用清单），或稍后重试。"
+        )
+    } else {
+        e
+    }
+}
+
+/// 全部候选失败时的汇总错误：带**尝试清单**（按序）+ 最后一次错误原文 + 建议。
+/// 单测覆盖（线上无法构造「所有免费模型同时失败」的灾难场景）。
+fn all_failed_error(tried: &[String], last_err: String) -> String {
+    format!(
+        "OpenCode 网关 fallback 全部失败（已按序尝试 {} 个模型：{}）。\\n\\
+         最后一次错误：{}\\n\\n\
+         【多为上游免费额度/限流】这些模型走各 provider 的共享免费池，会随时段波动。\\n\
+         建议：稍后重试，或 GET /opencode/v1/models 取当前可用清单后手动指定。",
+        tried.len(),
+        tried.join(" → "),
+        last_err
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -131,6 +273,11 @@ async fn counts() -> (usize, usize, usize) {
 // ---------------------------------------------------------------------------
 
 /// 非流式对话。**非免费模型一律拒绝**（本网关的契约就是「只提供免费模型」）。
+///
+/// 0.1.85 起带**自动 fallback**：上游 5xx / 连接断开时，按「用户指定模型 →
+/// 已验证可用链 → 当前免费目录其余」的顺序自动换下一个模型重试；全部失败时
+/// 返回带尝试清单的明确错误。成功响应的 `model` 字段天然回显**实际使用**的模型
+/// （workbuddy_proxy 按 body 里的 model 回显），调用侧无需猜。
 pub async fn chat_completions_json(mut body: Value) -> Result<Value, String> {
     let requested = body
         .get("model")
@@ -146,32 +293,84 @@ pub async fn chat_completions_json(mut body: Value) -> Result<Value, String> {
         ));
     }
 
-    if requested.is_empty() {
-        // 未指定模型 → 自动选第一个免费模型（降低接入门槛）
-        let list = models_payload().await?;
-        match list.pointer("/data/0/id").and_then(Value::as_str) {
-            Some(first) => {
-                body["model"] = json!(first);
+    let cfg = load_config();
+    let chain = if cfg.fallback_enabled {
+        resolve_fallback_chain(&cfg)
+    } else {
+        Vec::new()
+    };
+    // 第一批候选：用户指定 + fallback 链（纯本地，零网络开销）。
+    // 未指定模型时由链首顶替旧的「取目录第一个免费模型」——server 不可达也能选模型。
+    let mut candidates = build_attempt_chain(&requested, &chain, &[]);
+    if candidates.is_empty() {
+        return Err(
+            "未指定模型，且未发现任何免费模型（请确认本机 OpenCode server 在运行，\
+             或在 opencode_proxy_config.json 配置 fallback_chain）"
+                .to_string(),
+        );
+    }
+
+    let mut tried: Vec<String> = Vec::new();
+    let mut last_err = String::new();
+    let mut catalog_loaded = false;
+    let mut idx = 0usize;
+    loop {
+        if idx >= candidates.len() {
+            // 当前批次走完且最后一个错误可降级 → 拉一次当前免费目录兜底（其余免费模型）。
+            // 只拉一次；拉不到或没有新模型就收尾（防止无 catalog 时反复探测）。
+            if cfg.fallback_enabled && !catalog_loaded && is_retryable_upstream_error(&last_err) {
+                catalog_loaded = true;
+                for id in free_catalog_ids().await {
+                    if !tried.contains(&id) {
+                        candidates.push(id);
+                    }
+                }
+                if idx >= candidates.len() {
+                    break;
+                }
+                continue;
             }
-            None => {
-                return Err(
-                    "未指定模型，且未发现任何免费模型（请确认本机 OpenCode server 在运行）".to_string(),
-                )
+            break;
+        }
+        let model = candidates[idx].clone();
+        idx += 1;
+        body["model"] = json!(model.as_str());
+        tried.push(model);
+        match workbuddy_proxy::chat_completions_json(body.clone()).await {
+            // 成功即返回：响应 model 字段 = 本次实际使用的模型（回显由 workbuddy_proxy 按 body 完成）
+            Ok(value) => return Ok(value),
+            Err(e) => {
+                last_err = e;
+                if !is_retryable_upstream_error(&last_err) {
+                    // 不可降级错误（输入错误 / 服务发现失败等）原样直出，不烧 fallback 链
+                    return Err(decorate_upstream_error(last_err));
+                }
+                // 可降级：继续下一个候选
             }
         }
     }
 
-    workbuddy_proxy::chat_completions_json(body).await
+    if tried.len() <= 1 {
+        // 只试了一个模型（fallback 关闭等场景）→ 保持旧行为：原始错误直出
+        return Err(decorate_upstream_error(last_err));
+    }
+    Err(all_failed_error(&tried, last_err))
 }
 
 /// 流式对话：OpenCode 的 message 提交是 fire-and-poll（无逐 token 流），
 /// 故与 WorkBuddy 网关同策略——聚合完成后合成 SSE 帧（含末尾 usage 帧）。
-pub async fn chat_completions_stream(body: Value) -> Result<WorkbuddyUpstreamStream, String> {
+///
+/// 0.1.85：返回 `(流, 实际模型名)` —— 内部可能已 fallback 到别的模型，
+/// SSE 帧与网关日志都以**实际使用**的模型为准。
+pub async fn chat_completions_stream(
+    body: Value,
+) -> Result<(WorkbuddyUpstreamStream, String), String> {
     let completion = chat_completions_json(body).await?;
     let model = completion
         .get("model")
-        .cloned()
-        .unwrap_or(json!("opencode"));
+        .and_then(Value::as_str)
+        .unwrap_or("opencode")
+        .to_string();
     let content = completion
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
@@ -180,6 +379,8 @@ pub async fn chat_completions_stream(body: Value) -> Result<WorkbuddyUpstreamStr
     let usage = completion.get("usage").cloned().unwrap_or(Value::Null);
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, String>>(16);
+    // model 会被 spawn 任务（SSE 帧）移走，返回给调用方（网关日志）用克隆件
+    let model_out = model.clone();
     tokio::spawn(async move {
         let id = format!("chatcmpl-opencode-{}", now_ms());
         let frame = |delta: Value, finish: Option<&str>| {
@@ -226,7 +427,7 @@ pub async fn chat_completions_stream(body: Value) -> Result<WorkbuddyUpstreamStr
             .await;
         let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
     });
-    Ok(WorkbuddyUpstreamStream { rx })
+    Ok((WorkbuddyUpstreamStream { rx }, model_out))
 }
 
 // ---------------------------------------------------------------------------
@@ -248,6 +449,9 @@ pub async fn proxy_status() -> Value {
         "freeModelCount": free,
         // 该网关只暴露免费模型，页面可直接展示这个数
         "exposedModelCount": free,
+        // 0.1.85：fallback 诊断（只读）。关闭时为 []，开启时 = 生效链（内置或自定义）。
+        "fallbackEnabled": cfg.fallback_enabled,
+        "fallbackChain": if cfg.fallback_enabled { resolve_fallback_chain(&cfg) } else { Vec::new() },
     })
 }
 
@@ -260,4 +464,118 @@ pub fn config_info(bound_port: u16) -> Value {
         "apiKey": cfg.api_key,
         "note": "仅回环；独立密钥，与 WorkBuddy / TRAE 网关不共用",
     })
+}
+
+// ---------------------------------------------------------------------------
+// 单测（fallback 链构造与触发判定 —— 纯函数，无网络）
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chain(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn attempt_chain_orders_requested_then_fallback_then_catalog_no_dupes() {
+        let got = build_attempt_chain(
+            "opencode/mimo-v2.6-flash-free", // 与链首重复 → 只出现一次
+            &chain(&[
+                "opencode/mimo-v2.6-flash-free",
+                "openrouter/nex-agi/nex-n2.5-pro:free",
+            ]),
+            &chain(&[
+                "openrouter/liquid/lfm-2.5-2.6b:free",
+                "unorouter/gpt-5.5:free",
+                "openrouter/nex-agi/nex-n2.5-pro:free", // 目录里重复 → 去重
+            ]),
+        );
+        assert_eq!(
+            got,
+            vec![
+                "opencode/mimo-v2.6-flash-free".to_string(),
+                "openrouter/nex-agi/nex-n2.5-pro:free".to_string(),
+                "openrouter/liquid/lfm-2.5-2.6b:free".to_string(),
+                "unorouter/gpt-5.5:free".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn attempt_chain_empty_requested_starts_with_chain_head() {
+        let got = build_attempt_chain("", &chain(&["opencode/mimo-v2.6-flash-free"]), &[]);
+        assert_eq!(got, vec!["opencode/mimo-v2.6-flash-free".to_string()]);
+    }
+
+    #[test]
+    fn attempt_chain_all_empty_is_empty() {
+        assert!(build_attempt_chain("", &[], &[]).is_empty());
+    }
+
+    #[test]
+    fn retryable_error_matches_5xx_and_connect_drop_only() {
+        // 触发：5xx（502 为实测最常见，500/503 同理）+ 连接被断（FK bug 链路的最终表现）
+        assert!(is_retryable_upstream_error(
+            "提交消息失败 502 Bad Gateway: AI_APICallError: Your balance is empty"
+        ));
+        assert!(is_retryable_upstream_error(
+            "提交消息失败 500 Internal Server Error: Unexpected server error"
+        ));
+        assert!(is_retryable_upstream_error(
+            "提交消息失败: error sending request for url (http://127.0.0.1:4097/session/s1/message)"
+        ));
+        // 不触发：4xx（请求本身有问题）/ 输入错误 / 服务发现失败 / 等待超时 / 正文含 502 字样
+        assert!(!is_retryable_upstream_error(
+            "提交消息失败 400 Bad Request: unknown model"
+        ));
+        assert!(!is_retryable_upstream_error(
+            "提交消息失败 400: model 502 not found in catalog"
+        ));
+        assert!(!is_retryable_upstream_error("messages 不能为空"));
+        assert!(!is_retryable_upstream_error(
+            "未发现 OpenCode server 进程（未在监听端口）"
+        ));
+        assert!(!is_retryable_upstream_error("等待回复超时（模型可能排队中或不可用）"));
+    }
+
+    #[test]
+    fn resolve_chain_prefers_custom_free_only_and_falls_back_to_builtin() {
+        // 自定义链仅留免费 id（付费条目被过滤，与网关「仅免费」契约一致）
+        let cfg = OpenCodeProxyConfig {
+            enabled: true,
+            api_key: String::new(),
+            fallback_enabled: true,
+            fallback_chain: chain(&["openrouter/zzz:free", "opencode/paid-pro-max"]),
+        };
+        assert_eq!(resolve_fallback_chain(&cfg), chain(&["openrouter/zzz:free"]));
+        // 空自定义链 → 内置已验证链（mimo 为首）
+        let cfg2 = OpenCodeProxyConfig {
+            fallback_chain: Vec::new(),
+            ..cfg.clone()
+        };
+        let builtin = resolve_fallback_chain(&cfg2);
+        assert_eq!(builtin.first().unwrap(), "opencode/mimo-v2.6-flash-free");
+        assert_eq!(builtin.len(), VERIFIED_FALLBACK_CHAIN.len());
+    }
+
+    #[test]
+    fn decorate_only_appends_hint_to_submit_failures() {
+        assert!(!decorate_upstream_error("messages 不能为空".into()).contains("多为上游免费额度"));
+        assert!(decorate_upstream_error("提交消息失败 502: x".into()).contains("多为上游免费额度"));
+    }
+
+    #[test]
+    fn all_failed_error_lists_chain_and_last_error() {
+        let msg = all_failed_error(
+            &chain(&["opencode/aaa-free", "opencode/bbb-free"]),
+            decorate_upstream_error("提交消息失败 502: x".into()),
+        );
+        assert!(msg.contains("fallback 全部失败"));
+        assert!(msg.contains("已按序尝试 2 个模型"));
+        assert!(msg.contains("opencode/aaa-free → opencode/bbb-free"));
+        assert!(msg.contains("最后一次错误：提交消息失败 502"));
+        assert!(msg.contains("多为上游免费额度/限流"));
+    }
 }

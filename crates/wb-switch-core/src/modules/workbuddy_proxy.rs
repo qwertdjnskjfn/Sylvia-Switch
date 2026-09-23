@@ -481,7 +481,8 @@ pub fn invalidate_cached_port() {
 }
 
 /// 判断错误串是否为连接类失败（端口拒听/连接被拒），用于触发 G4 重发现。
-fn is_connect_error(msg: &str) -> bool {
+/// 0.1.85 起 `pub(crate)`：OpenCode 网关的 fallback 触发判定复用同一签名，不另写一套。
+pub(crate) fn is_connect_error(msg: &str) -> bool {
     msg.contains("error sending request")
         || msg.contains("Connection refused")
         || msg.contains("tcp connect")
@@ -772,7 +773,44 @@ fn flatten_messages(messages: &[Value]) -> String {
 }
 
 /// 非流式对话补全：建会话 → 发消息 → 轮询取 assistant 回复。
+/// OpenCode server 1.18.21 的已知竞态：并发「建会话 + 立即提交消息」时，server 端
+/// `insert into "message"` 会因 **session 行尚未落库** 而报
+/// `SQLiteError: FOREIGN KEY constraint failed`，而该失败在客户端被 reqwest 报成
+/// `error sending request`（**极具误导性，看着像网络故障，实际是 DB 外键失败**）。
+/// 2026-09-23 实测复现：WorkBuddy 自动重试造成 8 次连续失败（同一秒内建多个会话）。
+///
+/// 对策（三管齐下，都在本网关侧，无需改 opencode）：
+/// 1. **串行化**：整个转发用进程级异步锁串起来，消掉同一时刻的建会话/提交突发；
+/// 2. **确认落库**：建完会话先轮询 `GET /session/{id}`（实测可立即 200）再提交；
+/// 3. **定向重试**：仅命中「提交失败 + FK/连接异常」签名时重试一次 ——
+///    此时 server 侧根本没生成内容，重试不会造成重复投递。
+static CHAT_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// 「提交消息失败且疑似 session 竞态」的判定（用于定向重试，不殃及其它错误）。
+fn is_session_race_error(msg: &str) -> bool {
+    msg.contains("提交消息失败")
+        && (msg.contains("error sending request") || msg.contains("FOREIGN KEY"))
+}
+
 pub async fn chat_completions_json(body: Value) -> Result<Value, String> {
+    let _guard = CHAT_SERIAL.lock().await;
+    match chat_completions_once(body.clone()).await {
+        Ok(value) => Ok(value),
+        Err(e) if is_session_race_error(&e) => {
+            notify::notify(
+                "workbuddy",
+                "OpenCode 会话竞态，已自动重试",
+                &truncate(&e, 160),
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            chat_completions_once(body).await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// 单次转发（建会话 → 确认落库 → 提交消息 → 轮询取回复）。
+async fn chat_completions_once(body: Value) -> Result<Value, String> {
     let port = discover_server().await?;
     let base = format!("http://127.0.0.1:{port}");
     let model = body.get("model").and_then(Value::as_str).unwrap_or("opencode/mimo-v2.6-flash-free");
@@ -828,6 +866,9 @@ pub async fn chat_completions_json(body: Value) -> Result<Value, String> {
         .and_then(Value::as_str)
         .ok_or_else(|| "创建会话失败：响应缺少 id".to_string())?
         .to_string();
+    // 2a) 确认 session 已落库再提交，规避「message 外键指向的 session 行不存在」
+    //     （表现为提交失败 + error sending request，见上方 CHAT_SERIAL 注释）。
+    wait_session_ready(client, &base, &session_id).await;
     // 2) 提交消息（fire-and-poll：POST 立即返回，回复异步产出）。
     let payload = json!({
         "parts": [{"type": "text", "text": prompt}],
@@ -940,6 +981,26 @@ pub async fn chat_completions_json(body: Value) -> Result<Value, String> {
         .send()
         .await;
     Err("等待回复超时（模型可能排队中或不可用）".to_string())
+}
+
+/// 轮询确认 session 已可查（`GET /session/{id}` → 200），最多约 1.2 秒。
+/// 始终查不到也放行 —— 由后续既有错误路径兜底，这里只是把落库窗口让出来，
+/// 顺带把"会话根本没建成"与"server 抽了"两种情况错开。
+async fn wait_session_ready(client: &reqwest::Client, base: &str, session_id: &str) {
+    for _ in 0..8 {
+        let ok = matches!(
+            client
+                .get(format!("{base}/session/{session_id}"))
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await,
+            Ok(resp) if resp.status().is_success()
+        );
+        if ok {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
 }
 
 /// 流式响应封装（OpenAI chunk SSE 字节流）。
