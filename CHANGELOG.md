@@ -7,6 +7,40 @@
 
 ---
 
+## 0.1.89 — 2026-09-24
+
+### 清理：tool_calls 命中时 content 残留代码块头部 UI 文案
+
+0.1.88 实测拿到 `tool_calls` 时，`content` 会剩下 `'JSON复制已复制'`
+（代码块的语言标签 + 复制按钮文案）。本次新增 `strip_code_block_chrome()` 剥离。
+
+写法上**不硬编码整条文案**（换个语言/版本就失效），而是：
+1. 反复剥离「复制类词」（`已复制/复制/已拷贝/拷贝/Copied/Copy`）；
+2. **只有剥到过复制词**，才继续剥末尾的「语言标签」（`JSON`/`Python`/`Bash`/`C++`）。
+
+🔴 第 2 步的前置条件很关键：否则会误伤以英文单词结尾的正文
+（如 `Let me check` 会被剥成 `Let me`）。已加回归断言。
+
+### 改进：提高模型对 JSON 格式的遵守率（首尾各放一次约定）
+
+0.1.88 实测**遵守率不稳定**：同一 payload 两次，一次回 JSON、一次直接自然语言作答。
+格式约定原本只放在 prompt 开头的 `[AVAILABLE_TOOLS]` 块里，
+而模型对**靠近输出位置**的指令更敏感。
+
+本次在会话末尾追加一条短提醒：
+
+```
+[REMINDER] If you need to call a tool, reply ONLY with the JSON block
+described in [AVAILABLE_TOOLS]. Do not output anything else.
+```
+
+⚠️ 这是**概率改进而非保证**：模型仍可能直接作答。
+不遵守时退化为纯文本（`finish_reason=stop`），**不会报错**，客户端无从察觉。
+
+### 单测（新增 2 个，共 12 个）
+`reminder_is_appended_at_the_end_when_tools_present` /
+`strip_code_block_chrome_removes_ui_labels_only`
+
 ## 0.1.88 — 2026-09-24
 
 ### 修复：模型按约定回了工具调用 JSON，网关却识别成 `null`

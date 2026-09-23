@@ -553,6 +553,51 @@ fn sniff_tool_calls(text: &str) -> (Option<Vec<Value>>, Option<(usize, usize)>) 
     }
 }
 
+/// 去掉代码块头部的 UI 文案（实测 `JSON复制已复制`、`PythonCopy` 之类：
+/// 语言标签 + 复制按钮文案）。只剥**开头/结尾那一串**，保留真正的正文。
+///
+/// 注意：不硬编码整条文案（换个语言/版本就失效），而是反复剥离
+/// 「复制类词」再剥「语言标签」，对中英文 UI 都成立。
+fn strip_code_block_chrome(s: &str) -> String {
+    const COPY_WORDS: [&str; 6] = ["已复制", "复制", "已拷贝", "拷贝", "Copied", "Copy"];
+    let mut out = s.trim_end().to_string();
+    let mut removed_any = false;
+    loop {
+        let mut changed = false;
+        for w in COPY_WORDS {
+            if out.ends_with(w) {
+                out.truncate(out.len() - w.len());
+                out = out.trim_end().to_string();
+                changed = true;
+                removed_any = true;
+                break;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // 没有复制类文案 → 不是代码块头部，原样返回。
+    // 这一步很关键：否则会误伤以英文单词结尾的正文（如 "Let me check"）。
+    if !removed_any {
+        return out.trim().to_string();
+    }
+    // 语言标签：剥离复制词后末尾残留的短标识（JSON / Python / Bash / C++）
+    let tail: String = out
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '#' | '-' | '.' | '_'))
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    if !tail.is_empty() && tail.len() <= 12 && tail.len() <= out.len() {
+        out.truncate(out.len() - tail.len());
+        out = out.trim_end().to_string();
+    }
+    out.trim().to_string()
+}
+
 fn push_turn(buf: &mut String, label: &str, text: &str) {
     if !buf.is_empty() {
         buf.push_str("\n\n");
@@ -630,6 +675,20 @@ fn extract_prompt_from_messages(messages: &[Value], tools: Option<&[Value]>) -> 
                 _ => "User",
             };
             push_turn(&mut conversation_text, role_label, &content);
+        }
+    }
+
+    // v1.6.2：格式约定**再追加到末尾**。
+    // 实测只放在开头时遵守率不稳定（同一 payload 时而回 JSON、时而直接作答），
+    // 模型对靠近输出位置的指令更敏感，所以首尾各放一次。
+    if let Some(list) = tools {
+        if !list.is_empty() {
+            if !conversation_text.is_empty() {
+                conversation_text.push_str("\n\n");
+            }
+            conversation_text.push_str(
+                "[REMINDER] If you need to call a tool, reply ONLY with the JSON block described in [AVAILABLE_TOOLS]. Do not output anything else.",
+            );
         }
     }
 
@@ -752,13 +811,18 @@ pub async fn chat_completions_unified(payload: Value) -> Result<GrokChatOutput, 
                     (None, None)
                 };
                 let finish_reason = if tool_calls.is_some() { "tool_calls" } else { "stop" };
-                // 已被解析成 tool_calls 的 JSON 块从正文里摘掉，避免客户端重复处理
+                // 已被解析成 tool_calls 的 JSON 块从正文里摘掉，避免客户端重复处理；
+                // 顺带剥掉代码块头部 UI 文案（如 "JSON复制已复制"）。
                 let content_out = match span {
                     Some((s, e)) if e + 1 <= final_message_content.len() => {
-                        let mut stripped = String::new();
-                        stripped.push_str(&final_message_content[..s]);
-                        stripped.push_str(&final_message_content[e + 1..]);
-                        stripped.trim().to_string()
+                        let head = strip_code_block_chrome(&final_message_content[..s]);
+                        let tail = final_message_content[e + 1..].trim().to_string();
+                        match (head.is_empty(), tail.is_empty()) {
+                            (true, true) => String::new(),
+                            (true, false) => tail,
+                            (false, true) => head,
+                            (false, false) => format!("{}\n\n{}", head, tail),
+                        }
                     }
                     _ => final_message_content.clone(),
                 };
@@ -1175,6 +1239,30 @@ mod tests {
         );
         assert!(calls[0].to_string().contains("深圳"), "参数应保留: {}", calls[0]);
         assert!(span.is_some(), "应返回区间以便从正文摘除");
+    }
+
+    #[test]
+    fn reminder_is_appended_at_the_end_when_tools_present() {
+        // 格式约定首尾各放一次：开头是 [AVAILABLE_TOOLS]，末尾是 [REMINDER]
+        let tools = vec![json!({"type": "function", "function": {"name": "get_time"}})];
+        let (sys, conv) = extract_prompt_from_messages(
+            &msgs(json!([{"role": "user", "content": "深圳几点"},
+                         {"role": "assistant", "content": "稍等"}])),
+            Some(&tools),
+        );
+        assert!(sys.contains("[AVAILABLE_TOOLS]"), "开头应有工具定义");
+        assert!(conv.ends_with("[AVAILABLE_TOOLS]. Do not output anything else."),
+            "末尾应有 REMINDER: {conv}");
+    }
+
+    #[test]
+    fn strip_code_block_chrome_removes_ui_labels_only() {
+        assert_eq!(strip_code_block_chrome("JSON复制已复制"), "");
+        assert_eq!(strip_code_block_chrome("PythonCopy"), "");
+        assert_eq!(strip_code_block_chrome("Bash已复制"), "");
+        // 真正的正文要保留（含以英文单词结尾的）
+        assert_eq!(strip_code_block_chrome("好的，我来查一下。"), "好的，我来查一下。");
+        assert_eq!(strip_code_block_chrome("Let me check"), "Let me check");
     }
 
     #[test]
