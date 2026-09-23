@@ -1335,16 +1335,53 @@ pub async fn ui_chat(prompt: &str) -> Result<String, ChatError> {
         let state = match eval_js(
             r#"(() => {
                 const bubbles = [...document.querySelectorAll('.message-bubble')];
-                const texts = bubbles.map(b => b.textContent.trim());
+                // v1.6.0：正文只取 .response-content-markdown。
+                // 气泡 textContent 会把思考面板（"工作了 Ns"/"执行了 N 次搜索"/
+                // "N sources"）拼进来，实测这些 UI 文案会泄漏为正文（2026-09-24 实证）。
+                // 该容器不存在时（页面改版）回退气泡全文，保证不比旧版更差。
+                const body = (b) => {
+                    const md = b.querySelector('.response-content-markdown');
+                    const t = md ? (md.textContent || '').trim() : '';
+                    return t || (b.textContent || '').trim();
+                };
+                const texts = bubbles.map(body);
+                const raw = bubbles.map(b => (b.textContent || '').trim());
                 // 生成中：存在"停止"按钮（实测 aria-label='停止模型响应'）。
                 const generating = [...document.querySelectorAll('button')].some(
                     x => /停止/.test(x.getAttribute('aria-label') || ''));
-                // 占位文案：思考/工作阶段的临时提示，出现时不视为完整回复。
-                const lastText = (texts[texts.length - 1] || '').trim();
-                const placeholder = /^(工作|思考|Analyzing|Thinking|Working)/.test(lastText) && lastText.length <= 48;
-                // 找到包含本次 prompt 的 user 气泡下标（prompt 截断到 80 字做锚）。
-                const anchor = texts.findIndex(t => t.includes(window.__uiPromptAnchor || ''));
-                const reply = anchor >= 0 && anchor + 1 < texts.length ? texts[anchor + 1] : '';
+                // 占位文案：仅在「干净正文尚未产出」时才算占位。
+                // 旧逻辑拿气泡全文判定，正文短（如"收到"）而思考面板残留时
+                // 会被永久判为占位 → 240s 超时；现在以正文是否为空为准。
+                const lastText = (raw[raw.length - 1] || '').trim();
+                const lastBody = (texts[texts.length - 1] || '').trim();
+                const placeholder = lastBody.length === 0
+                    && /^(工作|思考|Analyzing|Thinking|Working)/.test(lastText)
+                    && lastText.length <= 48;
+                // v1.6.1：定位本次回复 —— 优先用语义 data-testid。
+                // 不能用纯文本锚点做主手段：页面会把缩进空格渲染成 \xa0（NBSP），
+                // 而注入的 [AVAILABLE_TOOLS] 里有 JSON 缩进 → 原样字符串匹配失配
+                // → anchor=-1 → 完成判定永不触发 → 240s 超时（0.1.86 实证）。
+                let anchor = -1;
+                let reply_idx = -1;
+                const role = (i) => bubbles[i].getAttribute('data-testid') || '';
+                for (let i = bubbles.length - 1; i >= 0; i--) {
+                    if (role(i) === 'user-message') { anchor = i; break; }
+                }
+                if (anchor >= 0) {
+                    for (let i = anchor + 1; i < bubbles.length; i++) {
+                        if (role(i) === 'assistant-message') { reply_idx = i; break; }
+                    }
+                }
+                // 兜底：data-testid 改版时退回文本锚点，但先归一化空白（含 NBSP）
+                if (reply_idx < 0) {
+                    const norm = (s) => (s || '').replace(/\s+/g, ' ');
+                    const key = norm(window.__uiPromptAnchor || '');
+                    if (key) {
+                        const ai = raw.findIndex(t => norm(t).includes(key));
+                        if (ai >= 0 && ai + 1 < texts.length) { anchor = ai; reply_idx = ai + 1; }
+                    }
+                }
+                const reply = reply_idx >= 0 ? texts[reply_idx] : '';
                 // 限流错误文案出现在气泡外（body 全文），出现且 user 气泡已存在 =
                 // 本条消息被限流，不会再有 assistant 回复。
                 const limited = /使用人数较多|请稍后再试|升级你的订阅/.test(document.body.innerText);

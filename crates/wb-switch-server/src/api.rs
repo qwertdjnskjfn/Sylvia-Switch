@@ -1555,6 +1555,17 @@ async fn api_grok_chat_completions(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
+            // v1.6.0：伪工具调用的 tool_calls 与 finish_reason 透出（流式）
+            let tool_calls = value
+                .pointer("/choices/0/message/tool_calls")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let finish = value
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str)
+                .unwrap_or("stop")
+                .to_string();
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, String>>(16);
             tokio::spawn(async move {
                 let frame = |delta: Value, finish: Option<&str>| {
@@ -1574,6 +1585,21 @@ async fn api_grok_chat_completions(
                 if !content.is_empty() {
                     let _ = tx.send(Ok(axum::body::Bytes::from(format!("data: {}\n\n", frame(json!({"content": content}), None))))).await;
                 }
+                // v1.6.0：工具调用 delta 帧（与 qwen_web.rs:1289 同款形状）
+                for (i, tc) in tool_calls.iter().enumerate() {
+                    let _ = tx.send(Ok(axum::body::Bytes::from(format!("data: {}\n\n", frame(json!({
+                        "tool_calls": [{
+                            "index": i,
+                            "id": tc.get("id").cloned().unwrap_or(Value::Null),
+                            "type": "function",
+                            "function": {
+                                "name": tc.pointer("/function/name").cloned().unwrap_or(Value::Null),
+                                "arguments": tc.pointer("/function/arguments").cloned().unwrap_or(json!("{}")),
+                            },
+                        }],
+                    }), None))))).await;
+                }
+                let _ = tx.send(Ok(axum::body::Bytes::from(format!("data: {}\n\n", frame(json!({}), Some(finish.as_str())))))).await;
                 let _ = tx.send(Ok(axum::body::Bytes::from("data: [DONE]\n\n"))).await;
             });
             let stream = futures_util::stream::unfold(rx, |mut rx| async move {

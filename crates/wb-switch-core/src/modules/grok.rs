@@ -504,9 +504,80 @@ fn pick_available_account() -> Result<Value, String> {
 }
 
 /// 从 OpenAI messages 列表解析出最新用户提示词和历史上下文
-fn extract_prompt_from_messages(messages: &[Value]) -> (String, String) {
+/// 从网页抓取的回复里嗅探工具调用，返回 (工具调用, 该 JSON 块在原文中的字节区间)。
+///
+/// 为什么要包一层：`glm_web::try_extract_tool_calls` 依赖 `{"tool_calls"` 字面量
+/// （花括号紧贴引号）或 ```json 围栏。而 Grok 网页端把回复渲染成代码块后，
+/// textContent 是**美化过的多行 JSON**，且前面带代码块头部 UI 文案
+/// （实测前缀 `JSON复制已复制`），两种策略都会失配 —— 0.1.87 实证：模型确实
+/// 按约定回了 JSON，但识别成 `null`。
+/// 这里先「剥前缀 + 括号配平截取」得到一个干净 JSON 对象，再交给共享嗅探器。
+fn sniff_tool_calls(text: &str) -> (Option<Vec<Value>>, Option<(usize, usize)>) {
+    if let Some(calls) = crate::modules::glm_web::try_extract_tool_calls(text) {
+        return (Some(calls), None);
+    }
+    let start = match text.find('{') {
+        Some(i) => i,
+        None => return (None, None),
+    };
+    let mut depth: i32 = 0;
+    let mut in_str = false;
+    let mut esc = false;
+    let mut end: Option<usize> = None;
+    for (off, ch) in text[start..].char_indices() {
+        if esc {
+            esc = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_str => esc = true,
+            '"' => in_str = !in_str,
+            '{' if !in_str => depth += 1,
+            '}' if !in_str => {
+                depth -= 1;
+                if depth <= 0 {
+                    end = Some(start + off);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let end = match end {
+        Some(e) => e,
+        None => return (None, None),
+    };
+    match crate::modules::glm_web::try_extract_tool_calls(&text[start..=end]) {
+        Some(calls) => (Some(calls), Some((start, end))),
+        None => (None, None),
+    }
+}
+
+fn push_turn(buf: &mut String, label: &str, text: &str) {
+    if !buf.is_empty() {
+        buf.push_str("\n\n");
+    }
+    buf.push_str(&format!("{}: {}", label, text));
+}
+
+fn extract_prompt_from_messages(messages: &[Value], tools: Option<&[Value]>) -> (String, String) {
     let mut system_prompt = String::new();
     let mut conversation_text = String::new();
+
+    // v1.6.0：工具定义注入（伪工具调用，协议与 glm_web.rs:469 完全一致）。
+    // web 通道没有 tools 参数入口：只能把工具定义写进 prompt，
+    // 再从回复文本里嗅探回标准 tool_calls（见下方 try_extract_tool_calls）。
+    if let Some(list) = tools {
+        if !list.is_empty() {
+            let tools_json =
+                serde_json::to_string_pretty(list).unwrap_or_else(|_| "[]".to_string());
+            system_prompt.push_str("[AVAILABLE_TOOLS]\nYou have access to the following tools:\n");
+            system_prompt.push_str(&tools_json);
+            system_prompt.push_str(
+                "\n\nWhen you need to call one or more tools, you MUST respond ONLY with a JSON block in the following format:\n```json\n{\n  \"tool_calls\": [\n    {\n      \"name\": \"<tool_name>\",\n      \"arguments\": { /* arguments object */ }\n    }\n  ]\n}\n```\nIf no tool call is needed, respond directly with plain text.\n[/AVAILABLE_TOOLS]",
+            );
+        }
+    }
 
     for m in messages {
         let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
@@ -524,20 +595,41 @@ fn extract_prompt_from_messages(messages: &[Value]) -> (String, String) {
             String::new()
         };
 
+        // 兼容 assistant 历史携带 tool_calls（伪工具调用的多轮回环）
+        if let Some(tcs) = m.get("tool_calls").and_then(Value::as_array) {
+            if !tcs.is_empty() {
+                let summary = serde_json::to_string(tcs).unwrap_or_default();
+                push_turn(
+                    &mut conversation_text,
+                    "Assistant",
+                    &format!("[TOOL_CALLS: {summary}]"),
+                );
+                continue;
+            }
+        }
+
+        // 兼容工具结果回灌（role: "tool"）
+        if role == "tool" {
+            let tid = m.get("tool_call_id").and_then(Value::as_str).unwrap_or("");
+            push_turn(
+                &mut conversation_text,
+                "User",
+                &format!("[TOOL_RESULT id={tid}]: {content}"),
+            );
+            continue;
+        }
+
         if role == "system" {
             if !system_prompt.is_empty() {
                 system_prompt.push('\n');
             }
             system_prompt.push_str(&content);
         } else {
-            if !conversation_text.is_empty() {
-                conversation_text.push_str("\n\n");
-            }
             let role_label = match role {
                 "assistant" => "Assistant",
                 _ => "User",
             };
-            conversation_text.push_str(&format!("{}: {}", role_label, content));
+            push_turn(&mut conversation_text, role_label, &content);
         }
     }
 
@@ -564,7 +656,9 @@ pub async fn chat_completions_unified(payload: Value) -> Result<GrokChatOutput, 
         .cloned()
         .unwrap_or_default();
 
-    let (system_prompt, prompt) = extract_prompt_from_messages(&messages);
+    // v1.6.0：tools 参数在此进入 —— web 通道没有原生入口，只能注入 prompt。
+    let tools = payload.get("tools").and_then(Value::as_array).cloned();
+    let (system_prompt, prompt) = extract_prompt_from_messages(&messages, tools.as_deref());
 
     // 账号挑选与单次重试
     let mut last_err = String::new();
@@ -649,6 +743,34 @@ pub async fn chat_completions_unified(payload: Value) -> Result<GrokChatOutput, 
                     content
                 };
 
+                // v1.6.0：伪工具调用嗅探 —— **仅在请求带 tools 时**启用。
+                // 不带 tools 时绝不嗅探，否则正文里恰好出现的 JSON 会被误判成
+                // 工具调用并让客户端去执行（glm_web.rs:531 同款解析器）。
+                let (tool_calls, span) = if tools.is_some() {
+                    sniff_tool_calls(&final_message_content)
+                } else {
+                    (None, None)
+                };
+                let finish_reason = if tool_calls.is_some() { "tool_calls" } else { "stop" };
+                // 已被解析成 tool_calls 的 JSON 块从正文里摘掉，避免客户端重复处理
+                let content_out = match span {
+                    Some((s, e)) if e + 1 <= final_message_content.len() => {
+                        let mut stripped = String::new();
+                        stripped.push_str(&final_message_content[..s]);
+                        stripped.push_str(&final_message_content[e + 1..]);
+                        stripped.trim().to_string()
+                    }
+                    _ => final_message_content.clone(),
+                };
+                let mut message = json!({
+                    "role": "assistant",
+                    "content": content_out,
+                    "reasoning_content": if reasoning.is_empty() { Value::Null } else { json!(reasoning) }
+                });
+                if let Some(tc) = &tool_calls {
+                    message["tool_calls"] = json!(tc);
+                }
+
                 let result_json = json!({
                     "id": completion_id,
                     "object": "chat.completion",
@@ -656,12 +778,8 @@ pub async fn chat_completions_unified(payload: Value) -> Result<GrokChatOutput, 
                     "model": model,
                     "choices": [{
                         "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": final_message_content,
-                            "reasoning_content": if reasoning.is_empty() { Value::Null } else { json!(reasoning) }
-                        },
-                        "finish_reason": "stop"
+                        "message": message,
+                        "finish_reason": finish_reason
                     }],
                     "usage": {
                         "prompt_tokens": prompt.len() / 3,
@@ -949,5 +1067,120 @@ pub async fn test_chat(
             let _ = &selected_id;
             Err(format!("Grok 试调失败: {e}"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn msgs(v: Value) -> Vec<Value> {
+        v.as_array().cloned().unwrap_or_default()
+    }
+
+    #[test]
+    fn no_tools_means_no_injection() {
+        let (sys, conv) =
+            extract_prompt_from_messages(&msgs(json!([{"role": "user", "content": "hi"}])), None);
+        assert!(!sys.contains("AVAILABLE_TOOLS"), "无 tools 时不应注入: {sys}");
+        assert_eq!(conv, "User: hi");
+    }
+
+    #[test]
+    fn empty_tools_array_is_ignored() {
+        let (sys, _) =
+            extract_prompt_from_messages(&msgs(json!([{"role": "user", "content": "hi"}])), Some(&[]));
+        assert!(!sys.contains("AVAILABLE_TOOLS"));
+    }
+
+    #[test]
+    fn tools_are_injected_into_system_prompt() {
+        let tools = vec![json!({"type": "function", "function": {"name": "get_time"}})];
+        let (sys, _) = extract_prompt_from_messages(
+            &msgs(json!([{"role": "user", "content": "hi"}])),
+            Some(&tools),
+        );
+        assert!(sys.contains("[AVAILABLE_TOOLS]"));
+        assert!(sys.contains("get_time"), "工具名应在注入块里: {sys}");
+        assert!(sys.contains("[/AVAILABLE_TOOLS]"));
+        assert!(sys.contains("tool_calls"), "应给出约定的 JSON 格式示例");
+    }
+
+    #[test]
+    fn tool_calls_and_tool_result_history_are_preserved() {
+        let (_, conv) = extract_prompt_from_messages(
+            &msgs(json!([
+                {"role": "user", "content": "几点"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "c1", "type": "function",
+                     "function": {"name": "get_time", "arguments": "{\"city\":\"sz\"}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "c1", "content": "00:42"}
+            ])),
+            None,
+        );
+        assert!(conv.contains("Assistant: [TOOL_CALLS:"), "got: {conv}");
+        assert!(conv.contains("get_time"), "got: {conv}");
+        assert!(
+            conv.contains("User: [TOOL_RESULT id=c1]: 00:42"),
+            "got: {conv}"
+        );
+    }
+
+    #[test]
+    fn injected_block_roundtrips_through_the_sniffer() {
+        // 注入块要求模型只回 JSON；验证「模型照做后的输出」能被
+        // glm_web 的嗅探器还原成标准 tool_calls（伪工具调用闭环）。
+        let tools = vec![json!({"type": "function", "function": {"name": "get_time"}})];
+        let (sys, _) = extract_prompt_from_messages(
+            &msgs(json!([{"role": "user", "content": "几点"}])),
+            Some(&tools),
+        );
+        assert!(sys.contains("get_time"));
+
+        let reply = "```json\n{\"tool_calls\":[{\"name\":\"get_time\",\"arguments\":{\"city\":\"深圳\"}}]}\n```";
+        let calls = crate::modules::glm_web::try_extract_tool_calls(reply)
+            .expect("应嗅探到工具调用");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].pointer("/function/name").and_then(Value::as_str),
+            Some("get_time")
+        );
+        assert!(calls[0].get("id").is_some(), "应自动补 call_id");
+    }
+
+    #[test]
+    fn plain_text_reply_is_not_mistaken_for_tool_call() {
+        // 关键回归防护：普通回答绝不能被误判成工具调用
+        assert!(crate::modules::glm_web::try_extract_tool_calls("深圳现在 00:42").is_none());
+        assert!(crate::modules::glm_web::try_extract_tool_calls("9.9 更大。").is_none());
+    }
+
+    #[test]
+    fn sniffer_handles_web_code_block_chrome_and_pretty_json() {
+        // 0.1.87 实证：Grok 网页端把回复渲染成代码块，textContent 带 UI 头部文案
+        // 且 JSON 是美化的多行 —— 共享嗅探器的三种策略全部失配。
+        let raw = "JSON复制已复制{\n  \"tool_calls\": [\n    {\n      \"name\": \"get_time\",\n      \"arguments\": {\n        \"city\": \"深圳\"\n      }\n    }\n  ]\n}";
+        assert!(
+            crate::modules::glm_web::try_extract_tool_calls(raw).is_none(),
+            "共享嗅探器确实认不出这个形状（这正是要修的场景）"
+        );
+        let (calls, span) = sniff_tool_calls(raw);
+        let calls = calls.expect("包一层后应能识别");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].pointer("/function/name").and_then(Value::as_str),
+            Some("get_time")
+        );
+        assert!(calls[0].to_string().contains("深圳"), "参数应保留: {}", calls[0]);
+        assert!(span.is_some(), "应返回区间以便从正文摘除");
+    }
+
+    #[test]
+    fn sniffer_ignores_braces_in_ordinary_answers() {
+        // 正文里有花括号但不是工具调用时，绝不能误判
+        let (calls, _) = sniff_tool_calls("集合 {1, 2} 的元素个数是 2。");
+        assert!(calls.is_none());
     }
 }

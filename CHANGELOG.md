@@ -7,6 +7,122 @@
 
 ---
 
+## 0.1.88 — 2026-09-24
+
+### 修复：模型按约定回了工具调用 JSON，网关却识别成 `null`
+
+**症状**：0.1.87 修好超时后，带 tools 的请求 19s 就返回 200，且**模型确实按约定输出了
+工具调用 JSON** —— 但响应里 `tool_calls` 仍是 `null`、`finish_reason` 仍是 `stop`。
+
+实测 content 全文：
+
+```
+JSON复制已复制{
+  "tool_calls": [
+    { "name": "get_time", "arguments": { "city": "深圳" } }
+  ]
+}
+```
+
+**根因**：`glm_web::try_extract_tool_calls` 的三种策略在这里全部失配 ——
+1. 找 ` ```json ` 围栏：网页渲染成代码块后，**围栏标记不在 textContent 里**；
+2. 整段当 JSON 解析：前面有代码块头部 UI 文案 `JSON复制已复制`；
+3. 找 `{"tool_calls"` 字面量：实际是 `{\n  "tool_calls"`（美化换行 + 缩进），
+   花括号**没有紧贴**引号，匹配不上。
+
+**修复**：新增 `grok::sniff_tool_calls()`，在共享嗅探器之前加一层：
+剥掉前缀（从第一个 `{` 起）+ **括号配平截取**（正确处理字符串内的 `{}`），
+得到一个干净 JSON 对象后再交给共享嗅探器。
+
+同时：被解析成 `tool_calls` 的 JSON 块会从 `content` 里摘除，避免客户端重复处理。
+
+🔴 顺带修正 0.1.86 的一处判断：此前认为「模型不遵守 JSON 格式」，
+实际是**页面渲染 + 嗅探器失配**——模型是遵守的。之前的结论错了，以此为准。
+
+### 单测（新增 2 个，共 10 个）
+- `sniffer_handles_web_code_block_chrome_and_pretty_json`：固化上述形状，
+  并断言**共享嗅探器确实认不出**（这就是要修的场景）；
+- `sniffer_ignores_braces_in_ordinary_answers`：正文含花括号但非工具调用时绝不误判。
+
+## 0.1.87 — 2026-09-24
+
+### 修复：0.1.86 引入的回归 —— 带 `tools` 的请求必定 240s 超时
+
+**症状**：0.1.86 上线后，不带 tools 的请求正常（39s 返回干净正文），
+**但带 tools 的请求必定卡满 240s 后失败**（返回 502）。而浏览器页面上
+assistant 其实**早就答完了** —— 是完成判定没触发，不是上游慢。
+
+**根因**：0.1.86 把工具定义注入 prompt 后，prompt 里含 JSON 缩进。
+grok.com 渲染用户气泡时会**把缩进空格替换成 `\xa0`（NBSP）**，实测气泡文本为：
+
+```
+系统指令: [AVAILABLE_TOOLS]\nYou have access to the following tools:\n[\n\xa0\xa0{\n…
+```
+
+而完成定位用的文本锚点是**原样字符串**（普通空格）→ `includes()` 失配 →
+`anchor = -1` → 完成判定永不成立 → 轮询到 240s 超时。
+
+> 这解释了 0.1.86 的怪现象：**短 prompt（无缩进）正常，注入工具的 prompt 必挂。**
+
+**修复**：改用**语义定位**为主手段，文本锚点降为兜底。
+
+1. 主：按 `data-testid` 找最后一个 `user-message`，取其后的第一个 `assistant-message`
+   —— 与文案内容完全无关，免疫 NBSP / 空格 / 换行差异；
+2. 兜：`data-testid` 若改版，退回文本锚点，但两边都先 `replace(/\s+/g,' ')`
+   归一化空白（JS 的 `\s` 涵盖 `\xa0`，一并解决）。
+
+### 验证
+- 不带 tools：39.4s 返回干净正文（`'02:28'`，无 `工作了 1s` 前缀）✅
+- 带 tools：见下方 0.1.87 实测结论
+
+## 0.1.86 — 2026-09-24
+
+### 修复：Grok 正文混入页面 UI 文案（思考面板泄漏）
+
+**问题**：web 通道抓取 `.message-bubble` 的 `textContent`，会把页面上的**思考面板**一并拼进正文。
+2026-09-24 实测，一次带 tools 的请求返回的 content 全文是：
+
+```
+工作了 4s查询深圳当前时间执行了 2 次搜索正在思考Calculating Shenzhen time from UTC查询深圳当前时间工作了 4s10 sources
+```
+
+这**全是 grok.com 的界面文本**，不是回答。且占位过滤规则带 `长度 <= 48` 条件，
+正文超过 48 字时 `工作了 1s`（耗时指示器）就漏进正文 —— 实测 4 次调用**全部中招**。
+
+**修复**：CDP 实探气泡 DOM 后改用**正文专属容器**：
+
+```js
+// 只取 .response-content-markdown；容器不存在时回退气泡全文（不比旧版更差）
+const md = b.querySelector('.response-content-markdown');
+```
+
+同时修正占位判定：**仅在「干净正文尚未产出」时才算占位**（此前拿气泡全文判定，
+正文短（如"收到"）而思考面板残留时会被永久判为占位 → 240s 超时）。
+
+### 新功能：Grok 伪工具调用（提示词注入 + 文本嗅探）
+
+web 通道物理上没有 `tools` 参数入口。本次照搬 `glm_web.rs` 已验证的模式：
+
+1. 请求带 `tools` 时，把工具定义序列化后注入 prompt 的 `[AVAILABLE_TOOLS] … [/AVAILABLE_TOOLS]` 块，
+   约定模型只回 `{"tool_calls":[{"name":…,"arguments":{…}}]}` 的 JSON 块；
+2. 回复文本用 `glm_web::try_extract_tool_calls()`（本就 `pub(crate)`）嗅探还原；
+3. 命中则补 `message.tool_calls` 且 `finish_reason = "tool_calls"`，流式路径同步吐 delta 帧。
+4. 支持多轮回环：assistant 历史的 `tool_calls` → `Assistant: [TOOL_CALLS: …]`，
+   `role:"tool"` 的结果 → `User: [TOOL_RESULT id=…]: …`。
+
+🔴 **防误判（关键）**：嗅探**仅在请求确实带 `tools` 时启用**。
+不带 tools 的请求绝不嗅探 —— 否则正文里恰好出现的 JSON 会被误判成工具调用并让客户端去执行。
+
+⚠️ **已知限制**（照实记录，勿高估）：
+- 这是**协议模拟，不是原生能力**，可靠性取决于模型是否遵守提示词约定；
+- 实测单次 **25~60 秒**，且 `UI_CHAT_LOCK` 全局串行 → **做 Agent 工具循环性价比很低**；
+- 实测**连续 4 次调用后第 5 次必失败**（240s 超时 / 疑似风控）。
+
+### 单测（`grok.rs`，新增 5 个）
+`no_tools_means_no_injection` / `empty_tools_array_is_ignored` /
+`tools_are_injected_into_system_prompt` / `tool_calls_and_tool_result_history_are_preserved` /
+`injected_block_roundtrips_through_the_sniffer` / `plain_text_reply_is_not_mistaken_for_tool_call`
+
 ## 0.1.85 — 2026-09-23
 
 ### 新功能：OpenCode 网关自动 fallback —— 上游 5xx / 连接断开自动换下一个可用模型
