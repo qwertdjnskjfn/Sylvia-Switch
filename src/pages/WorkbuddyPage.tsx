@@ -113,7 +113,8 @@ function PoolNumberField({
         defaultValue={value}
         disabled={disabled}
         onBlur={(e) => {
-          // 清空失焦不提交（避免误写 0；后端对 <=0 按「走默认」处理）
+          // 清空失焦不提交（避免误写；后端对 <=0 多数字段按「走默认」处理，
+          // 仅「余额巡检间隔」的 0 = 关闭巡检（core 侧 workbuddy_gateway.rs normalized））
           if (e.target.value.trim() === "") return;
           const v = Number(e.target.value);
           if (Number.isFinite(v) && v !== value) onCommit(v);
@@ -569,6 +570,8 @@ export default function WorkbuddyPage() {
                                 {a.region === "cn" ? "国服" : a.region === "intl" ? "国际" : a.region}
                               </Badge>
                             </td>
+                            {/* 积分 / 到期由余额巡检回填（workbuddy_gateway.rs balance_patrol_once）；
+                                巡检前 credits=0 / credit_expires_at=0，两列显「—」（增补 §2.3，逻辑已有容错） */}
                             <td className="px-3 py-2 tabular-nums">{a.credits > 0 ? a.credits : "—"}</td>
                             <td className="px-3 py-2 text-muted-foreground">{fmtPoolTs(a.credit_expires_at)}</td>
                             <td className="px-3 py-2">
@@ -753,6 +756,13 @@ export default function WorkbuddyPage() {
                 网关 Key（<code className="mx-1 rounded bg-muted px-1">gw_live_…</code>开头）统一在「网关管理」页创建 /
                 复制；本页不持有、不展示完整密钥
               </span>
+            </InfoRow>
+            {/* 三协议接入说明（增补契约 §2.3 / §3：responses 与 messages 和 chat 同路由组、同鉴权口径） */}
+            <InfoRow label="支持协议" hint="同一 Base URL 与网关 Key，三种协议共用选号 / 冷却 / 熔断口径">
+              <div className="text-xs leading-5 text-muted-foreground">
+                <p>/workbuddy-pool/v1 同时支持 OpenAI Chat / Responses / Anthropic Messages 三协议。</p>
+                <p>Codex CLI 配 wire_api=&quot;responses&quot;；Claude Code 用 /v1/messages。</p>
+              </div>
             </InfoRow>
           </CardContent>
         </Card>

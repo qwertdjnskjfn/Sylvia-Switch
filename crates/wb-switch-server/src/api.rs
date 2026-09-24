@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use wb_switch_core::modules::{
     account, account_protection, auth_file, channel_health, checkin, config, credit_usage, credits, export_import,
     autoclaw_accounts, glm_proxy, loomy, loomy_proxy, model_probe, model_usage, oauth, platform_checkin, platform_switch, process, refresh,
-    gateway_admin, gateway_overview, glm_web, grok, grok_pool, grok_register, kimi, qoder, qwen, qwen_mcp, qwen_web, grok_sso, miaoshou, session, switch, token_stats, toolcall_monitor, travel, update, trae_acp, trae_accounts, trae_proxy, trae_proxy_config, workbuddy_proxy, workbuddy_errors, workbuddy_gateway, workbuddy_upstream, opencode,
+    gateway_admin, gateway_overview, glm_web, grok, grok_pool, grok_register, kimi, qoder, qwen, qwen_mcp, qwen_web, grok_sso, miaoshou, session, switch, token_stats, toolcall_monitor, travel, update, trae_acp, trae_accounts, trae_proxy, trae_proxy_config, workbuddy_proxy, workbuddy_errors, workbuddy_gateway, workbuddy_protocols, workbuddy_upstream, opencode,
 };
 
 /// 服务实际绑定端口（main.rs serve 启动时写入），供端点展示使用。
@@ -292,6 +292,17 @@ pub fn router() -> Router {
         .route(
             "/workbuddy-pool/v1/config",
             post(api_workbuddy_pool_config_save),
+        )
+        // P2 协议补全（契约增补 §3）：同一池、同一份选号循环，多两个协议入口。
+        // 鉴权口径同 chat/completions（对外烧池内额度的入口都要网关 key），
+        // 走 `workbuddy_pool_auth_ok`，失败 401。
+        .route(
+            "/workbuddy-pool/v1/responses",
+            post(api_workbuddy_pool_responses),
+        )
+        .route(
+            "/workbuddy-pool/v1/messages",
+            post(api_workbuddy_pool_messages),
         )
         // OpenCode 网关：本机 OpenCode server 的免费模型专用入口（独立密钥）
         .route("/opencode/v1/models", get(api_opencode_v1_models))
@@ -4482,9 +4493,13 @@ async fn api_workbuddy_chat_completions(
 // 本期绝不内联切流。
 //
 // 本段只做薄接线：网关 key 鉴权 → 粘性键 → 选号循环（≤3 次换号）→ token 惰性
-// 刷新 → chat_stream → 错误分级换号 / 成功流式转发 / 非流式本地聚合。
+// 刷新 → chat_stream → 错误分级换号 / 成功聚合 → 按协议渲染。
 // 选号算法、冷却矩阵、粘性 TTL、出站头族、脱敏全部下沉 core 的
 // workbuddy_gateway 与 workbuddy_upstream（契约 §13 钉定签名）。
+//
+// P2 起（契约增补）三个协议入口共用同一份选号循环 `workbuddy_pool_dispatch`：
+// chat（OpenAI）/ responses（Codex CLI）/ messages（Claude Code），差异只在
+// 进 dispatch 前的协议转换与出 dispatch 后的渲染。
 // ---------------------------------------------------------------------------
 
 /// 选号循环上限：一次请求最多换 3 次号（契约 §13「≤3 次换号」）。
@@ -4511,8 +4526,8 @@ const WB_POOL_MODES: [&str; 3] = ["balance", "rotate", "pinned"];
 /// 配置字段（契约 §13 的 `GatewayConfig` 无该项），与 grok/kimi/qoder 三个
 /// 池网关保持一致。返回 `(是否通过, key id)`，key id 供请求日志归属。
 ///
-/// 只给 chat/completions 用：models/status/config 是管理三端点、免 key
-/// （见路由注册处的鉴权策略注释）。
+/// 只给三个对话入口用（chat / responses / messages，鉴权口径完全一致）；
+/// models/status/config 是管理三端点、免 key（见路由注册处的鉴权策略注释）。
 fn workbuddy_pool_auth_ok(headers: &HeaderMap) -> (bool, Option<String>) {
     gateway_key_status(headers)
 }
@@ -4659,60 +4674,63 @@ impl Drop for WorkbuddyPoolLease {
     }
 }
 
-/// WorkBuddy 多账号池对话补全（OpenAI 兼容；cloud 上游 + 账号池）。
+/// 共享 dispatch 的聚合产物（契约增补 §1 钉定字段，一字不多一字不少）。
 ///
-/// 流程（契约 §13）：网关 key 鉴权 → 粘性键 → 选号循环（≤3 次换号）→
-/// token 惰性刷新 → `chat_stream` → 错误分级换号 / 成功流式转发。
+/// 三个协议 handler 都由它渲染各自的响应形态：
+/// - chat：OpenAI `chat.completion` / `chat.completion.chunk` 帧；
+/// - Responses：`response` 对象 / `response.*` 事件帧；
+/// - Messages：Anthropic `message` / Anthropic SSE 帧。
+///
+/// 为什么出口是聚合产物而不是原始流：出站体被 `prepare_body` 强制 `stream:true`，
+/// 上游恒以 SSE 回；而三个协议的流式帧序列各不相同（OpenAI `data:` 帧 / Responses
+/// 事件序列 / Anthropic 事件序列），「聚合一次 + 各自渲染」比「三种转发器」少两条
+/// 会各自漂移的代码路径（增补 §1 对 Responses/Messages 的流式同样定义为
+/// 「先聚合上游再按事件序吐帧」）。
+struct WorkbuddyPoolReply {
+    /// 助手正文全文（上游 `delta.content` 累加）。
+    content: String,
+    /// 推理段全文（上游 `delta.reasoning_content` 累加；空串 = 上游没吐思考）。
+    reasoning: String,
+    /// 工具调用（按上游 index 升序；空数组 = 本次没有工具调用）。
+    tool_calls: Vec<Value>,
+    /// 上游 usage 原样透出（None = 上游没给，渲染层各自补默认值，不谎报 0）。
+    usage: Option<Value>,
+    /// 实际生效的模型名（上游帧带的优先，其次请求的，最后 `workbuddy`）。
+    model_used: String,
+    /// 命中的账号 uid（只供观测/排障，不进任何响应体）。
+    uid: String,
+}
+
+/// WorkBuddy 多账号池的**共享 dispatch**（契约增补 §1「选号循环共享化」）。
+///
+/// 入参 `payload` 是**已转换成内部 chat 形态**的请求体：chat handler 直接送客户端
+/// body，Responses / Messages 两个新 handler 先用
+/// `workbuddy_protocols::{responses,anthropic}_req_to_chat` 转一道再进来。因此
+/// 粘性键、脱敏、选号、租约、刷新、错误分级只有这一份实现，三个协议共用。
+///
+/// 流程（契约 §13 + 增补 §1）：粘性键 → 选号循环（≤3 次换号）→ token 惰性刷新
+/// → `chat_stream` → 错误分级换号 / 成功则聚合成 [`WorkbuddyPoolReply`]。
 ///
 /// 错误分级（契约 §4）：
 /// - `ContextTooLong` / `SessionDead`：`note_error` 记账后**直接回 4xx**，不换号；
 /// - 其余 kind：`note_error` 记账 + uid 加入 tried，继续换号；
 /// - 传输层失败（`chat_stream` 返回 `Err`）：只换号，不喂熔断。
 ///
-/// 成功分支：`note_success` + 粘性绑定；`stream=true` 时把上游 SSE 的 `data:`
-/// 帧原样管道转发（不做逐帧重建），否则本地聚合成单条 OpenAI JSON。
-async fn api_workbuddy_pool_chat_completions(
-    headers: HeaderMap,
-    body: axum::body::Bytes,
-) -> Response {
+/// `Err` 一侧的 `(StatusCode, String)` 已是面向客户端的最终状态码与文案，三个
+/// handler 拿到后只需 `glm_proxy_error`，不必再判错误类型。
+/// `key_id` 只用于观测日志归属（`log_gateway_request`，增补 §2.2）。
+async fn workbuddy_pool_dispatch(
+    payload: &Value,
+    key_id: Option<&str>,
+) -> Result<WorkbuddyPoolReply, (StatusCode, String)> {
     let started = std::time::Instant::now();
-    let (auth_ok, key_id) = workbuddy_pool_auth_ok(&headers);
-    if !auth_ok {
-        log_gateway_request(
-            "workbuddy-pool",
-            key_id.as_deref(),
-            "—",
-            false,
-            0,
-            "无效的 API Key",
-        );
-        return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
-    }
-    // 刻意用 Bytes 而非 `Json` extractor：畸形 body 也要能走到鉴权/参数逻辑并回
-    // 400 JSON，不被 axum 的 422 抢答（与 trae_acp_chat_response 同口径，
-    // 本文件 4130 行起的注释）。
-    let Ok(payload) = serde_json::from_slice::<Value>(&body) else {
-        log_gateway_request(
-            "workbuddy-pool",
-            key_id.as_deref(),
-            "—",
-            false,
-            0,
-            "请求体不是合法 JSON",
-        );
-        return glm_proxy_error("请求体不是合法 JSON".to_string(), StatusCode::BAD_REQUEST);
-    };
     let model = payload
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or("workbuddy")
         .to_string();
-    let want_stream = payload
-        .get("stream")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
     let cfg = workbuddy_gateway::load_config();
-    let sticky_key = workbuddy_pool_sticky_key(&payload);
+    let sticky_key = workbuddy_pool_sticky_key(payload);
     let mut sticky_uid = if sticky_key.is_empty() {
         None
     } else {
@@ -4799,13 +4817,14 @@ async fn api_workbuddy_pool_chat_completions(
                     let latency = started.elapsed().as_millis() as u64;
                     log_gateway_request(
                         "workbuddy-pool",
-                        key_id.as_deref(),
+                        key_id,
                         &model,
                         false,
                         latency,
                         &friendly,
                     );
-                    return glm_proxy_error(friendly, fatal);
+                    // 明确错误直接回客户端（不换号），由 handler 包成错误响应。
+                    return Err((fatal, friendly));
                 }
                 last_err = Some(if friendly.is_empty() {
                     format!("上游返回 {status}")
@@ -4834,59 +4853,36 @@ async fn api_workbuddy_pool_chat_completions(
                 let latency = started.elapsed().as_millis() as u64;
                 log_gateway_request(
                     "workbuddy-pool",
-                    key_id.as_deref(),
+                    key_id,
                     &model,
                     true,
                     latency,
                     "",
                 );
-                if want_stream {
-                    // SSE data: 帧原样管道转发：不解析、不逐帧重建，chunk 边界与帧
-                    // 边界不对齐也无害（客户端按 SSE 规范自行拼帧）。
-                    // 读块走 upstream 的 read_stream_chunk：每次读块套 60s 空闲超时，
-                    // 上游卡住不产数据时断流报错（否则该账号的在途租约会被一个永不
-                    // 产出的流永久占住）。租约 move 进流的状态：流结束（EOF）或被
-                    // drop（客户端断开）时 Drop 归还，整个转发期间名额持续被占用。
-                    let stream = futures_util::stream::unfold((resp, lease), |state| async move {
-                        let (mut resp, lease) = state;
-                        match workbuddy_upstream::read_stream_chunk(
-                            &mut resp,
-                            workbuddy_upstream::CHAT_IDLE_TIMEOUT,
-                        )
-                        .await
-                        {
-                            Ok(Some(chunk)) => Some((Ok(chunk), (resp, lease))),
-                            Ok(None) => None,
-                            Err(e) => {
-                                Some((Err(format!("WorkBuddy 上游流中断: {e}")), (resp, lease)))
-                            }
-                        }
-                    });
-                    return (
-                        StatusCode::OK,
-                        [(header::CONTENT_TYPE, "text/event-stream".to_string())],
-                        axum::body::Body::from_stream(stream),
-                    )
-                        .into_response();
-                }
-                // 非流式：行读上游 SSE 聚合成单条 OpenAI JSON
-                return match workbuddy_pool_aggregate(
+                // 租约 move 进聚合：读流期间在途名额持续被占用，聚合结束（含读流
+                // 出错提前返回）时 Drop 归还 —— 与 P1 chat handler 的非流式路径
+                // 同一口径（那时 `lease` 由 handler 持有到聚合返回）。
+                return match workbuddy_pool_aggregate_reply(
                     workbuddy_upstream::ChatOutcome::Stream(resp),
                     &model,
+                    &uid,
+                    lease,
                 )
                 .await
                 {
-                    Ok(value) => json_ok(value),
+                    Ok(reply) => Ok(reply),
                     Err(e) => {
+                        // 上游 200 但没吐出有效数据帧（空流 / 只有 [DONE]）：已记过
+                        // 一条成功日志，这里补一条失败日志（与 P1 的两条日志同形态）。
                         log_gateway_request(
                             "workbuddy-pool",
-                            key_id.as_deref(),
+                            key_id,
                             &model,
                             false,
                             started.elapsed().as_millis() as u64,
                             &e,
                         );
-                        glm_proxy_error(e, StatusCode::BAD_GATEWAY)
+                        Err((StatusCode::BAD_GATEWAY, e))
                     }
                 };
             }
@@ -4903,13 +4899,410 @@ async fn api_workbuddy_pool_chat_completions(
     };
     log_gateway_request(
         "workbuddy-pool",
-        key_id.as_deref(),
+        key_id,
         &model,
         false,
         started.elapsed().as_millis() as u64,
         &msg,
     );
-    glm_proxy_error(msg, StatusCode::SERVICE_UNAVAILABLE)
+    Err((StatusCode::SERVICE_UNAVAILABLE, msg))
+}
+
+/// WorkBuddy 多账号池对话补全（OpenAI 兼容；cloud 上游 + 账号池）。
+///
+/// 本 handler 只做**薄接线**（增补 §1：chat 改调共享 dispatch）：网关 key 鉴权 →
+/// 解析 body → [`workbuddy_pool_dispatch`] → 按 `stream` 渲染。选号/换号/租约/
+/// 刷新/错误分级全部在 dispatch 内，与 Responses、Messages 两个 handler 共用同一
+/// 份实现（契约 §13 + 增补 §1）。
+///
+/// 错误分级（契约 §4）见 [`workbuddy_pool_dispatch`] 的文档；成功分支的
+/// `note_success` + 粘性绑定同样在 dispatch 内完成。
+async fn api_workbuddy_pool_chat_completions(
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let (auth_ok, key_id) = workbuddy_pool_auth_ok(&headers);
+    if !auth_ok {
+        log_gateway_request(
+            "workbuddy-pool",
+            key_id.as_deref(),
+            "—",
+            false,
+            0,
+            "无效的 API Key",
+        );
+        return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+    }
+    // 刻意用 Bytes 而非 `Json` extractor：畸形 body 也要能走到鉴权/参数逻辑并回
+    // 400 JSON，不被 axum 的 422 抢答（与 trae_acp_chat_response 同口径，
+    // 本文件 4130 行起的注释）。
+    let Ok(payload) = serde_json::from_slice::<Value>(&body) else {
+        log_gateway_request(
+            "workbuddy-pool",
+            key_id.as_deref(),
+            "—",
+            false,
+            0,
+            "请求体不是合法 JSON",
+        );
+        return glm_proxy_error("请求体不是合法 JSON".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let want_stream = payload
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    match workbuddy_pool_dispatch(&payload, key_id.as_deref()).await {
+        Ok(reply) if want_stream => workbuddy_pool_sse(&workbuddy_pool_chat_frames(&reply)),
+        Ok(reply) => json_ok(workbuddy_pool_chat_value(&reply)),
+        Err((status, msg)) => glm_proxy_error(msg, status),
+    }
+}
+
+/// POST /workbuddy-pool/v1/responses：OpenAI Responses API
+/// （Codex CLI `wire_api="responses"`）入口（增补 §3）。
+///
+/// 鉴权口径同 chat（`workbuddy_pool_auth_ok`，失败 401）：它和 chat/completions
+/// 一样是把池内额度烧出去的对外入口；models/status/config 则是免 key 的管理三端点
+/// （理由见路由注册处的鉴权策略注释）。
+///
+/// 流程：`workbuddy_protocols::responses_req_to_chat` 把 `input`/`instructions`/
+/// `tools`/`stream` 转成内部 chat payload → [`workbuddy_pool_dispatch`] →
+/// 非流式 `responses_resp_from_text` 合成 response 对象；流式按
+/// `responses_stream_frames` 的固定事件序吐帧（上游本就是一次性聚合，没有逐 token
+/// 增量可转，口径同 `workbuddy_proxy.rs:1014-1069` 的合成 chunk 策略）。
+async fn api_workbuddy_pool_responses(headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    let (auth_ok, key_id) = workbuddy_pool_auth_ok(&headers);
+    if !auth_ok {
+        log_gateway_request(
+            "workbuddy-pool",
+            key_id.as_deref(),
+            "—",
+            false,
+            0,
+            "无效的 API Key",
+        );
+        return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+    }
+    // 同 chat：用 Bytes 收畸形 body，回 400 JSON 而不是 axum 的 422。
+    let Ok(payload) = serde_json::from_slice::<Value>(&body) else {
+        log_gateway_request(
+            "workbuddy-pool",
+            key_id.as_deref(),
+            "—",
+            false,
+            0,
+            "请求体不是合法 JSON",
+        );
+        return glm_proxy_error("请求体不是合法 JSON".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let want_stream = payload
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut chat = workbuddy_protocols::responses_req_to_chat(&payload);
+    // Responses 的 `model` 就是上游模型名（OpenAI 侧没有 Claude 槽位概念），
+    // 缺失时兜底 workbuddy；转换层不回填也要保证上游拿得到模型名。
+    let model = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("workbuddy")
+        .to_string();
+    workbuddy_pool_set_model(&mut chat, &model);
+    match workbuddy_pool_dispatch(&chat, key_id.as_deref()).await {
+        Ok(reply) if want_stream => {
+            let usage = reply.usage.clone().unwrap_or(Value::Null);
+            workbuddy_pool_sse(&workbuddy_protocols::responses_stream_frames(
+                &reply.model_used,
+                &reply.content,
+                &usage,
+            ))
+        }
+        Ok(reply) => {
+            let usage = reply.usage.clone().unwrap_or(Value::Null);
+            json_ok(workbuddy_protocols::responses_resp_from_text(
+                &reply.model_used,
+                &reply.content,
+                &reply.reasoning,
+                &usage,
+            ))
+        }
+        Err((status, msg)) => glm_proxy_error(msg, status),
+    }
+}
+
+/// POST /workbuddy-pool/v1/messages：Anthropic Messages API（Claude Code /
+/// CC Switch）入口（增补 §3）。鉴权口径同 chat（失败 401）。
+///
+/// 流程：`anthropic_slot_to_model` 把 Claude 槽位名映射成上游模型名 →
+/// `anthropic_req_to_chat` 转内部 chat payload（system/messages blocks/tools/
+/// max_tokens/stop_sequences 全部归一）→ [`workbuddy_pool_dispatch`] →
+/// 非流式 `anthropic_resp_from_text`（带 tools 时从聚合出的 `tool_calls` 嗅探出
+/// `tool_use` 块）；流式按 `anthropic_stream_frames` 吐帧。
+///
+/// 响应体回显**请求里的槽位名**而不是上游真实模型名：Anthropic 客户端按自己请求的
+/// 模型做记录/展示，回写上游名会让界面上出现「我问的不是这个模型」。上游真实模型
+/// 用于选号/冷却/日志（dispatch 内已按映射后的模型记账，口径同 opencode 网关的
+/// 「日志以 actual 为准」）。
+async fn api_workbuddy_pool_messages(headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    let (auth_ok, key_id) = workbuddy_pool_auth_ok(&headers);
+    if !auth_ok {
+        log_gateway_request(
+            "workbuddy-pool",
+            key_id.as_deref(),
+            "—",
+            false,
+            0,
+            "无效的 API Key",
+        );
+        return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+    }
+    // 同 chat：用 Bytes 收畸形 body，回 400 JSON 而不是 axum 的 422。
+    let Ok(payload) = serde_json::from_slice::<Value>(&body) else {
+        log_gateway_request(
+            "workbuddy-pool",
+            key_id.as_deref(),
+            "—",
+            false,
+            0,
+            "请求体不是合法 JSON",
+        );
+        return glm_proxy_error("请求体不是合法 JSON".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let want_stream = payload
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let slot = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let mapped = workbuddy_protocols::anthropic_slot_to_model(
+        &slot,
+        &workbuddy_pool_claude_slots(),
+    );
+    // 缺 model（槽位空串）时兜底 workbuddy —— 与 responses 入口的 unwrap_or 口径一致，
+    // 否则空模型名会直达上游（大概率 400）。Anthropic 协议要求 model 必填，这是边界兜底。
+    let mapped = if mapped.trim().is_empty() {
+        "workbuddy".to_string()
+    } else {
+        mapped
+    };
+    let mut chat = workbuddy_protocols::anthropic_req_to_chat(&payload);
+    workbuddy_pool_set_model(&mut chat, &mapped);
+    // 请求带 tools 时，上游可能把 tool_calls 当纯文本吐出（与 grok.rs:552 同款场景）：
+    // 经 anthropic_sniff_tool_calls 补齐为 tool_use 块，Claude 客户端才不会只收到
+    // 一段含 JSON 的正文。结构化 tool_calls 已由 dispatch 聚合。
+    let has_tools = chat
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+    match workbuddy_pool_dispatch(&chat, key_id.as_deref()).await {
+        Ok(mut reply) if want_stream => {
+            let mut tool_calls = reply.tool_calls.clone();
+            if has_tools && tool_calls.is_empty() {
+                if let Some(calls) = workbuddy_protocols::anthropic_sniff_tool_calls(&reply.content) {
+                    tool_calls = calls;
+                    reply.content = String::new();
+                }
+            }
+            let usage = reply.usage.clone().unwrap_or(Value::Null);
+            // content 空而有 reasoning 时降级为正文（与 responses_resp_from_text
+            // 同款口径：思考型模型只出 reasoning 时不丢内容——2026-09-24 E2E
+            // 实测 haiku→kimi-k2.7 槽位出现过）。
+            let stream_text = if reply.content.is_empty() && !reply.reasoning.is_empty() {
+                reply.reasoning.clone()
+            } else {
+                reply.content.clone()
+            };
+            workbuddy_pool_sse(&workbuddy_protocols::anthropic_stream_frames(
+                &slot, &stream_text, &usage,
+            ))
+        }
+        Ok(mut reply) => {
+            let mut tool_calls = reply.tool_calls.clone();
+            if has_tools && tool_calls.is_empty() {
+                if let Some(calls) = workbuddy_protocols::anthropic_sniff_tool_calls(&reply.content) {
+                    tool_calls = calls;
+                    reply.content = String::new();
+                }
+            }
+            let usage = reply.usage.clone().unwrap_or(Value::Null);
+            json_ok(workbuddy_protocols::anthropic_resp_from_text(
+                &slot,
+                &reply.content,
+                &tool_calls,
+                &usage,
+            ))
+        }
+        Err((status, msg)) => glm_proxy_error(msg, status),
+    }
+}
+
+/// Claude 槽位名 → 上游模型名的默认映射表（增补 §1「映射表配置化」的路由层一侧）。
+///
+/// 取值对齐参考实现 `go-gateway/internal/server/claude_alias_test.go` 的槽位默认值
+/// （同一个 WorkBuddy cloud 上游的模型名）。**未命中的模型名原样透传**（
+/// `anthropic_slot_to_model` 的 pinned 语义），所以「一键接入」直写真实模型名的
+/// 客户端零损耗；槽位默认值要按账号实际可用模型调整时只改这一张表。
+fn workbuddy_pool_claude_slots() -> Value {
+    json!({
+        "claude-sonnet-4-5": "deepseek-v4-flash",
+        "claude-opus-4-1": "glm-5.2",
+        "claude-haiku-4-5": "kimi-k2.7",
+        "claude-fable-5": "minimax-m3",
+    })
+}
+
+/// 把模型名写进转换出的 chat payload。
+///
+/// 两个协议转换函数（`responses_req_to_chat` / `anthropic_req_to_chat`）的 pinned
+/// 职责里都没提回填 `model`，而上游缺模型名会直接 400 —— 路由层显式补齐，
+/// 转换层以后真回了也只是同值覆盖。
+fn workbuddy_pool_set_model(chat: &mut Value, model: &str) {
+    if let Some(obj) = chat.as_object_mut() {
+        obj.insert("model".to_string(), json!(model));
+    }
+}
+
+/// 聚合产物 → OpenAI 非流式 `chat.completion`。
+///
+/// 口径同 P1 的聚合器输出：消息体带 role/content，
+/// 有推理段时补 `reasoning_content`，有工具调用时补 `tool_calls` 并把 finish_reason
+/// 抬成 `tool_calls`，`usage` 上游给了才带（缺失不谎报 0）。
+///
+/// `id`/`created` 本地生成（`chatcmpl-wbpool-<now_ms>` / `now_ms()/1000`）：聚合
+/// 产物按增补 §1 只回模型名，不回上游帧的 id，而这两个值对客户端都是不透明的。
+fn workbuddy_pool_chat_value(reply: &WorkbuddyPoolReply) -> Value {
+    let has_tools = !reply.tool_calls.is_empty();
+    let finish_reason = if has_tools { "tool_calls" } else { "stop" };
+    let mut message = json!({ "role": "assistant", "content": reply.content });
+    if !reply.reasoning.is_empty() {
+        message["reasoning_content"] = json!(reply.reasoning);
+    }
+    if has_tools {
+        message["tool_calls"] = json!(reply.tool_calls);
+    }
+    let mut out = json!({
+        "id": format!("chatcmpl-wbpool-{}", config::now_ms()),
+        "object": "chat.completion",
+        "created": config::now_ms() / 1000,
+        "model": reply.model_used,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason,
+        }],
+    });
+    if let Some(u) = &reply.usage {
+        out["usage"] = u.clone();
+    }
+    out
+}
+
+/// 聚合产物 → OpenAI 流式 SSE 帧（每帧 `data: {json}\n\n`，`data: [DONE]` 收尾）。
+///
+/// 合成 chunk 的口径仿 `workbuddy_proxy.rs:1014-1069 chat_completions_stream`
+/// （OpenCode 侧本就是一次性聚合后手搓三帧）：role 帧 → 推理帧（有才吐）→
+/// content 帧 → tool_calls 帧（每个调用一帧）→ 收尾帧（finish_reason + usage）。
+///
+/// 为什么 chat 流式也走聚合：dispatch 是三个协议共用的同一份选号循环，出口按增补
+/// §1 统一为聚合产物，各协议的流式帧由各自的渲染函数生成；上游 200 但没吐有效帧
+/// 时 dispatch 已经回 502，不会给客户端吐一条假流。
+fn workbuddy_pool_chat_frames(reply: &WorkbuddyPoolReply) -> Vec<String> {
+    /// 一帧 OpenAI `chat.completion.chunk`（usage 只在收尾帧带）。
+    fn frame(
+        id: &str,
+        created: i64,
+        model: &str,
+        delta: Value,
+        finish: Option<&str>,
+        usage: Option<&Value>,
+    ) -> String {
+        let mut chunk = json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        });
+        if let Some(u) = usage {
+            chunk["usage"] = u.clone();
+        }
+        format!("data: {chunk}\n\n")
+    }
+
+    let id = format!("chatcmpl-wbpool-{}", config::now_ms());
+    let created = config::now_ms() / 1000;
+    let mut frames = vec![frame(
+        &id,
+        created,
+        &reply.model_used,
+        json!({"role": "assistant"}),
+        None,
+        None,
+    )];
+    if !reply.reasoning.is_empty() {
+        frames.push(frame(
+            &id,
+            created,
+            &reply.model_used,
+            json!({"reasoning_content": reply.reasoning}),
+            None,
+            None,
+        ));
+    }
+    if !reply.content.is_empty() {
+        frames.push(frame(
+            &id,
+            created,
+            &reply.model_used,
+            json!({"content": reply.content}),
+            None,
+            None,
+        ));
+    }
+    // BTreeMap 已按 index 升序，逐个工具调用一帧（多个并行调用不串槽）。
+    for call in &reply.tool_calls {
+        frames.push(frame(
+            &id,
+            created,
+            &reply.model_used,
+            json!({"tool_calls": [call]}),
+            None,
+            None,
+        ));
+    }
+    let finish = if reply.tool_calls.is_empty() {
+        "stop"
+    } else {
+        "tool_calls"
+    };
+    frames.push(frame(
+        &id,
+        created,
+        &reply.model_used,
+        json!({}),
+        Some(finish),
+        reply.usage.as_ref(),
+    ));
+    frames.push("data: [DONE]\n\n".to_string());
+    frames
+}
+
+/// 帧序列 → `text/event-stream` 响应（三个协议的流式出口共用）。
+///
+/// 一次性整体写出而不是逐帧转流：三个协议的流式都是「聚合成型后吐帧」，没有逐 token
+/// 增量可转（同源取舍见 `workbuddy_proxy.rs:1014-1069`）；客户端按 SSE 规范自行
+/// 拼帧，观感与逐帧推送一致。
+fn workbuddy_pool_sse(frames: &[String]) -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/event-stream".to_string())],
+        axum::body::Body::from(frames.concat()),
+    )
+        .into_response()
 }
 
 /// 取流式 tool_call 分片的 index：兼容数字 / 字符串数字 / 缺省三种上游形态
@@ -4964,7 +5357,7 @@ fn workbuddy_pool_merge_tool_call(merged: &mut Value, delta: &serde_json::Map<St
     }
 }
 
-/// 非流式聚合器：把上游 SSE 的 delta 帧累加成一条完整消息。
+/// 上游 SSE 聚合器：把 delta 帧累加成 [`WorkbuddyPoolReply`] 的字段。
 ///
 /// 解析段仿 `grok::chat_completions_unified`（core grok.rs:800-890）：按行取
 /// `data:` 帧 → JSON 解析 → 指针取值累加；另兼容 tool_calls 的 index 合并与
@@ -4974,10 +5367,6 @@ struct WorkbuddyPoolAggregate {
     requested_model: String,
     /// 上游帧带的模型名：优先于 requested_model 回填（上游可能改写模型名）。
     upstream_model: String,
-    id: String,
-    created: i64,
-    role: String,
-    finish_reason: String,
     content: String,
     reasoning: String,
     usage: Option<Value>,
@@ -4990,10 +5379,6 @@ impl WorkbuddyPoolAggregate {
         Self {
             requested_model: model.to_string(),
             upstream_model: String::new(),
-            id: String::new(),
-            created: 0,
-            role: "assistant".to_string(),
-            finish_reason: "stop".to_string(),
             content: String::new(),
             reasoning: String::new(),
             usage: None,
@@ -5018,19 +5403,9 @@ impl WorkbuddyPoolAggregate {
             return true; // 解析失败静默跳过（不计有效事件）
         };
         self.valid_events += 1;
-        if let Some(v) = chunk.get("id").and_then(Value::as_str) {
-            if self.id.is_empty() {
-                self.id = v.to_string();
-            }
-        }
         if let Some(v) = chunk.get("model").and_then(Value::as_str) {
             if !v.is_empty() && self.upstream_model.is_empty() {
                 self.upstream_model = v.to_string();
-            }
-        }
-        if let Some(v) = chunk.get("created").and_then(Value::as_i64) {
-            if self.created == 0 {
-                self.created = v;
             }
         }
         if let Some(u) = chunk.get("usage") {
@@ -5045,19 +5420,9 @@ impl WorkbuddyPoolAggregate {
             let Some(c) = choice.as_object() else {
                 continue;
             };
-            if let Some(fr) = c.get("finish_reason").and_then(Value::as_str) {
-                if !fr.is_empty() {
-                    self.finish_reason = fr.to_string();
-                }
-            }
             let Some(delta) = c.get("delta").and_then(Value::as_object) else {
                 continue;
             };
-            if let Some(role) = delta.get("role").and_then(Value::as_str) {
-                if !role.is_empty() {
-                    self.role = role.to_string();
-                }
-            }
             if let Some(text) = delta.get("content").and_then(Value::as_str) {
                 self.content.push_str(text);
             }
@@ -5081,37 +5446,16 @@ impl WorkbuddyPoolAggregate {
         true
     }
 
-    /// 合成单条 OpenAI chat.completion JSON。
-    fn into_completion(self) -> Result<Value, String> {
+    /// 合成共享 dispatch 的聚合产物（增补 §1 的 [`WorkbuddyPoolReply`]）。
+    ///
+    /// OpenAI 特有的 id/created/finish_reason/role 不在这里出：三个协议各渲染一遍
+    /// 的话同一份语义要写三份（必然漂移），统一在渲染层按协议生成。
+    fn into_reply(self, uid: &str) -> Result<WorkbuddyPoolReply, String> {
         if self.valid_events == 0 {
             // 上游 200 但没有任何有效数据帧（空流 / 只有 [DONE]）：不合成空 content
             // 的假成功（口径同参考实现 sse.rs:189）。
             return Err("上游流未返回任何有效数据帧".to_string());
         }
-        let has_tools = !self.tool_calls.is_empty();
-        let finish_reason = if has_tools {
-            "tool_calls".to_string()
-        } else {
-            self.finish_reason
-        };
-        let mut message = json!({ "role": self.role, "content": self.content });
-        if !self.reasoning.is_empty() {
-            message["reasoning_content"] = json!(self.reasoning);
-        }
-        if has_tools {
-            // BTreeMap 按 index 升序输出，多个并行工具调用不串槽。
-            message["tool_calls"] = Value::Array(self.tool_calls.into_values().collect());
-        }
-        let id = if self.id.is_empty() {
-            format!("chatcmpl-wbpool-{}", config::now_ms())
-        } else {
-            self.id
-        };
-        let created = if self.created == 0 {
-            config::now_ms() / 1000
-        } else {
-            self.created
-        };
         let model = if self.upstream_model.is_empty() {
             if self.requested_model.is_empty() {
                 "workbuddy".to_string()
@@ -5121,36 +5465,35 @@ impl WorkbuddyPoolAggregate {
         } else {
             self.upstream_model
         };
-        let mut out = json!({
-            "id": id,
-            "object": "chat.completion",
-            "created": created,
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "message": message,
-                "finish_reason": finish_reason,
-            }],
-        });
-        if let Some(u) = self.usage {
-            out["usage"] = u;
-        }
-        Ok(out)
+        Ok(WorkbuddyPoolReply {
+            content: self.content,
+            reasoning: self.reasoning,
+            // BTreeMap 按 index 升序输出，多个并行工具调用不串槽。
+            tool_calls: self.tool_calls.into_values().collect(),
+            usage: self.usage,
+            model_used: model,
+            uid: uid.to_string(),
+        })
     }
 }
 
-/// 非流式聚合：reqwest 行读上游 SSE，累加 content / reasoning_content /
-/// tool_calls 后合成 OpenAI JSON。
+/// 非流式聚合（三个协议共用）：reqwest 行读上游 SSE，累加 content /
+/// reasoning_content / tool_calls 后合成 [`WorkbuddyPoolReply`]。
 ///
 /// 参数收 `ChatOutcome` 而不是裸 `reqwest::Response`：server crate 不直接依赖
 /// reqwest，写不出后者的类型签名（`ChatOutcome` 在依赖链里可命名）。
 /// 读块同样走 `read_stream_chunk`（60s 空闲超时），与流式转发路径同一套断流口径；
 /// chunk 边界与 SSE 帧边界不对齐，必须自己按 `\n` 切行（跨 chunk 的半行留在缓冲里），
 /// 按字节累积再逐行 `from_utf8_lossy`，避免多字节字符被 chunk 边界切断后乱码。
-async fn workbuddy_pool_aggregate(
+///
+/// `_lease` 的所有权在这里交接（P1 的 chat handler 是自己在栈上持有到聚合返回）：
+/// 读流期间在途名额持续被占用，函数返回（含读流出错）时 Drop 恰好归还一次。
+async fn workbuddy_pool_aggregate_reply(
     outcome: workbuddy_upstream::ChatOutcome,
     model: &str,
-) -> Result<Value, String> {
+    uid: &str,
+    _lease: WorkbuddyPoolLease,
+) -> Result<WorkbuddyPoolReply, String> {
     // 只应在成功分支进入；Error 变体是兜底（理论上到不了）。
     let mut resp = match outcome {
         workbuddy_upstream::ChatOutcome::Stream(resp) => resp,
@@ -5180,7 +5523,7 @@ async fn workbuddy_pool_aggregate(
         let line = String::from_utf8_lossy(&buf);
         agg.feed_line(line.trim_end_matches(['\r', '\n']));
     }
-    agg.into_completion()
+    agg.into_reply(uid)
 }
 
 /// GET /workbuddy-pool/v1/models：池内首个可用账号的 `fetch_models`，
@@ -5286,7 +5629,12 @@ async fn api_workbuddy_pool_config_save(Json(body): Json<Value>) -> Response {
         cfg.sanitize_enabled = v;
     }
     if let Some(v) = body.get("balanceRefreshMinutes").and_then(Value::as_u64) {
-        cfg.balance_refresh_minutes = v.max(WB_POOL_BALANCE_REFRESH_MIN_MINUTES);
+        // 0 = 关闭巡检（core normalized 与 patrol_interval_ms 均认 0）；其余钳 [5, 1440]
+        cfg.balance_refresh_minutes = if v == 0 {
+            0
+        } else {
+            v.clamp(WB_POOL_BALANCE_REFRESH_MIN_MINUTES, 1440)
+        };
     }
     if let Err(e) = workbuddy_gateway::save_config(&cfg) {
         return json_err(e, StatusCode::INTERNAL_SERVER_ERROR);

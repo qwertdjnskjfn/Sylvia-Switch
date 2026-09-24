@@ -29,6 +29,14 @@
 //! - `~/.wb-switch/workbuddy_gateway_config.json`：池配置（PATCH 即写即生效）。
 //! - `~/.wb-switch/workbuddy_gateway_state.json`：池运行态（原子写 + 启动加载）。
 //!
+//! # 余额巡检（增补 §2.1）
+//!
+//! 只读维护循环：启动后 60s 首轮，之后每 `balance_refresh_minutes` 分钟
+//! （0 = 关闭）对池内账号逐个调 `workbuddy_upstream::user_resource` 回填
+//! `credits` / `credit_expires_at`（驱动到期分层选号）。不写 accounts.json、
+//! 不改账号状态；单账号失败静默跳过（巡检失败 ≠ 账号故障，不罚号）；
+//! 禁用 / error 账号跳过；账号间隔 300ms。
+//!
 //! # 路由层接线约定（供 api.rs 薄接线参考）
 //!
 //! 粘性入口的「按 model 过滤」由路由层把 sticky uid 放进 `tried` 实现：
@@ -37,10 +45,11 @@
 //! 失败则 `sticky_clear(key)` 解绑；未命中直接 `pick_account(model, &[])`。
 //! 因为 `pick_account` 的统一候选过滤（健康 / 模型冷却 / 在途 / tried）对粘性号一视同仁。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 
 use chrono::{Datelike, Local, TimeZone, Timelike};
 use serde::{Deserialize, Serialize};
@@ -50,6 +59,7 @@ use crate::modules::account::get_str;
 use crate::modules::config::{accounts_file, atomic_write, norm_ts, now_ms, store_dir};
 use crate::modules::platform_checkin::{account_platform, PLATFORM_WORKBUDDY};
 use crate::modules::workbuddy_errors::{self, ErrKind};
+use crate::modules::workbuddy_upstream;
 
 // ---------------------------------------------------------------------------
 // 常量
@@ -70,6 +80,8 @@ const MODEL_RATE_FALLBACK_MS: i64 = 600_000;
 const NOT_FOUND_COOLDOWN_MS: i64 = 60_000;
 /// 粘性 TTL 缺省：60 分钟滚动（契约 P1 §3）。
 const DEFAULT_STICKY_TTL_MS: i64 = 60 * 60 * 1000;
+/// 巡检间隔下限（分钟）：非 0 值最小 5 分钟（增补 §2.1：clamp 放开 0，其余 >=5）。
+const BALANCE_REFRESH_MIN_MINUTES: u64 = 5;
 
 // ---------------------------------------------------------------------------
 // 契约 §13 钉定结构：池账号条目 / 池配置
@@ -118,7 +130,7 @@ pub struct GatewayConfig {
     pub sticky_ttl_ms: i64,
     /// 出站脱敏开关（P3 默认开）。
     pub sanitize_enabled: bool,
-    /// 余额巡检间隔（分钟，驱动分层选号）。
+    /// 余额巡检间隔（分钟，驱动分层选号）；0 = 关闭巡检（增补 §2.1）。
     pub balance_refresh_minutes: u64,
 }
 
@@ -145,6 +157,8 @@ impl Default for GatewayConfig {
 impl GatewayConfig {
     /// 钳制非法值（PATCH 配置与读盘共用）：mode 白名单外回落 balance、
     /// `<=0` 的阈值/时长视为未设置走默认、封顶不小于基础值。
+    /// 例外：`balance_refresh_minutes` 的 0 = 关闭巡检（增补 §2.1，合法值不回落），
+    /// 其余钳到 [5, 24*60] 分钟。
     fn normalized(mut self) -> Self {
         let d = GatewayConfig::default();
         self.mode = match self.mode.trim() {
@@ -168,8 +182,13 @@ impl GatewayConfig {
         } else {
             d.sticky_ttl_ms
         };
-        self.balance_refresh_minutes =
-            clamp_u64(self.balance_refresh_minutes, d.balance_refresh_minutes, 1, 24 * 60);
+        // 增补 §2.1：0 = 关闭巡检（不回落默认）；其余钳到 [5, 24*60] 分钟。
+        self.balance_refresh_minutes = if self.balance_refresh_minutes == 0 {
+            0
+        } else {
+            self.balance_refresh_minutes
+                .clamp(BALANCE_REFRESH_MIN_MINUTES, 24 * 60)
+        };
         self
     }
 }
@@ -348,20 +367,24 @@ fn pool_accounts_from_json(text: &str) -> Option<Vec<PoolAccount>> {
     Some(arr.iter().filter_map(pool_account_from_value).collect())
 }
 
+/// 账号库记录的 uid 口径（auth_raw.uid → 顶层 uid → id；桥接 / 回写 / 巡检共用）。
+fn account_uid(acc: &Value) -> Option<String> {
+    acc.get("auth_raw")
+        .and_then(|r| r.get("uid"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+        .or_else(|| get_str(acc, "uid"))
+        .or_else(|| get_str(acc, "id"))
+}
+
 /// 单条账号库记录 → 池条目（纯函数）。
 fn pool_account_from_value(acc: &Value) -> Option<PoolAccount> {
     if account_platform(acc) != PLATFORM_WORKBUDDY {
         return None;
     }
     let access_token = get_str(acc, "access_token")?;
-    let uid = acc
-        .get("auth_raw")
-        .and_then(|r| r.get("uid"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .filter(|s| !s.is_empty())
-        .or_else(|| get_str(acc, "uid"))
-        .or_else(|| get_str(acc, "id"))?;
+    let uid = account_uid(acc)?;
     let domain = get_str(acc, "domain").unwrap_or_default();
     let region = if domain.ends_with(".ai") { "intl" } else { "cn" };
     Some(PoolAccount {
@@ -377,17 +400,12 @@ fn pool_account_from_value(acc: &Value) -> Option<PoolAccount> {
     })
 }
 
-/// 记录是否匹配 uid（auth_raw.uid → 顶层 uid → id，与桥接口径一致）。
+/// 记录是否匹配 uid（口径与桥接一致，见 account_uid）。
 fn account_matches_uid(acc: &Value, uid: &str) -> bool {
     if uid.is_empty() {
         return false;
     }
-    acc.get("auth_raw")
-        .and_then(|r| r.get("uid"))
-        .and_then(Value::as_str)
-        == Some(uid)
-        || get_str(acc, "uid").as_deref() == Some(uid)
-        || get_str(acc, "id").as_deref() == Some(uid)
+    account_uid(acc).as_deref() == Some(uid)
 }
 
 /// token 刷新成功后回写账号库（契约 §11：按「过期时间较新者」回写；
@@ -1147,6 +1165,17 @@ impl Pool {
         self.dirty = true;
     }
 
+    /// 巡检目标快照：过滤禁用（session 死亡出池）与账号库 error 标记后的凭证列表。
+    /// 纯过滤无 IO，且**不在锁内 await**：快照完即放锁，HTTP 巡检期间不阻塞
+    /// chat 选号路径（pool 锁是请求路径的热锁）。
+    fn patrol_targets(&self, errored: &HashSet<String>) -> Vec<PoolAccount> {
+        self.entries
+            .iter()
+            .filter(|e| patrol_should_check(e.disabled, errored.contains(&e.acc.uid)))
+            .map(|e| e.acc.clone())
+            .collect()
+    }
+
     // -----------------------------------------------------------------------
     // 选号
     // -----------------------------------------------------------------------
@@ -1650,6 +1679,143 @@ pub fn release(uid: &str) {
 /// 巡检回填余额与到期日（驱动分层选号）。
 pub fn set_credits(uid: &str, credits: i64, credit_expires_at: i64) {
     with_pool(|p| p.set_credits(uid, credits, credit_expires_at));
+}
+
+// ---------------------------------------------------------------------------
+// 余额巡检（增补契约 §2.1）
+// ---------------------------------------------------------------------------
+
+/// 巡检单账号间隔（ms）：对上游计费 RPC 限速，避免突发（增补 §2.1）。
+const PATROL_ACCOUNT_GAP_MS: u64 = 300;
+/// 巡检首轮延迟（s）：启动后 60s 再做首轮（避开启动 / 登录同步高峰，增补 §2.1）。
+const PATROL_FIRST_DELAY_SECS: u64 = 60;
+/// 巡检关闭（配置 0）时的空转探测间隔（s）：循环不退出，按此间隔重读配置，
+/// PATCH 改回非 0 后下一轮即恢复，无需重启进程。
+const PATROL_IDLE_POLL_SECS: u64 = 60;
+
+/// 巡检账号过滤纯计算核心：禁用（session 死亡出池）与账号库标记 error 的账号跳过。
+/// 巡检是只读维护，对已知坏号发请求无谓；单账号请求失败本身不罚号（见
+/// [`balance_patrol_once`] 的静默跳过）。
+fn patrol_should_check(disabled: bool, errored: bool) -> bool {
+    !disabled && !errored
+}
+
+/// 巡检间隔纯计算核心：`0 = 关闭`（返回 None）；其余钳到 [5, 24*60] 分钟后转 ms。
+/// `load_config` 已做同款钳制，这里防御性重钳（配置可能来自未经 normalized 的来源）。
+fn patrol_interval_ms(minutes: u64) -> Option<u64> {
+    if minutes == 0 {
+        return None;
+    }
+    Some(minutes.clamp(BALANCE_REFRESH_MIN_MINUTES, 24 * 60) * 60_000)
+}
+
+/// 账号库中标记 `status == "error"` 的 WorkBuddy uid 集合（纯计算核心）。
+/// 口径对齐账号库错误标记约定（grok.rs:474 / grok_sso.rs:788）；非数组 / 损坏
+/// 输入返回空集（巡检不因此中断，只放过）。
+fn errored_uids_from_json(text: &str) -> HashSet<String> {
+    let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(text) else {
+        return HashSet::new();
+    };
+    arr.iter()
+        .filter(|acc| {
+            account_platform(acc) == PLATFORM_WORKBUDDY
+                && acc.get("status").and_then(Value::as_str) == Some("error")
+        })
+        .filter_map(|acc| account_uid(acc))
+        .collect()
+}
+
+/// 读账号库取 error 标记 uid 集合（文件缺失 / 损坏 → 空集）。
+fn patrol_errored_uids() -> HashSet<String> {
+    std::fs::read_to_string(accounts_file())
+        .ok()
+        .map(|t| errored_uids_from_json(&t))
+        .unwrap_or_default()
+}
+
+/// 对池内每个账号刷新余额与到期日（增补 §2.1：只读上游，不写 accounts.json、
+/// 不改账号状态）。跳过禁用 / error 账号；单账号失败静默跳过（巡检失败 ≠
+/// 账号故障，不罚号、不喂熔断）；账号间隔 300ms 防突发。
+///
+/// 返回 `{checked, updated, failed}`：checked = 实际请求过的账号数（跳过的不计），
+/// updated = 回填成功数，failed = 静默失败数（checked = updated + failed）。
+pub async fn balance_patrol_once() -> Value {
+    let errored = patrol_errored_uids();
+    // 快照在锁内完成（sync + 过滤 + clone），HTTP 期间不持锁。
+    let targets = with_pool(|p| p.patrol_targets(&errored));
+    let mut checked = 0i64;
+    let mut updated = 0i64;
+    let mut failed = 0i64;
+    let mut errors: Vec<String> = Vec::new();
+    for (i, acc) in targets.iter().enumerate() {
+        if i > 0 {
+            tokio::time::sleep(Duration::from_millis(PATROL_ACCOUNT_GAP_MS)).await;
+        }
+        checked += 1;
+        match workbuddy_upstream::user_resource(acc).await {
+            // set_credits 内部 with_pool：sync + 回填 + flush（内存 + 状态文件）。
+            Ok((credits, expires_at)) => {
+                set_credits(&acc.uid, credits, expires_at);
+                updated += 1;
+            }
+            // 不罚号、不记熔断（巡逻失败≠账号故障）；原因进 errors[] 供观测。
+            Err(e) => {
+                failed += 1;
+                errors.push(format!("{}: {}", acc.uid.chars().take(8).collect::<String>(), e));
+            }
+        }
+    }
+    json!({
+        "checked": checked,
+        "updated": updated,
+        "failed": failed,
+        "errors": errors,
+    })
+}
+
+/// 巡检循环（增补 §2.1）：启动后 60s 首轮，之后每 `balance_refresh_minutes` 分钟；
+/// 配置为 0 = 关闭。间隔每轮现读（PATCH 热更新即写即生效，对齐 save_config 口径）。
+pub fn spawn_balance_patrol_loop() {
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(PATROL_FIRST_DELAY_SECS)).await;
+        loop {
+            match patrol_interval_ms(load_config().balance_refresh_minutes) {
+                Some(interval) => {
+                    let r = balance_patrol_once().await;
+                    // 观测：走 gateway_admin 记录（eprintln 会被 launcher 的 stdio:ignore
+                    // 吞掉，线上等于瞎子——2026-09-24 E2E 排查实测）。每轮一条汇总 +
+                    // 每失败账号一条原因（failed>0 时），默认 15 分钟一轮不刷屏。
+                    let g = |k: &str| r.get(k).and_then(Value::as_i64).unwrap_or(0);
+                    crate::modules::gateway_admin::record_request(json!({
+                        "gateway": "workbuddy-pool",
+                        "kind": "balance_patrol",
+                        "ok": g("failed") == 0,
+                        "at": now_ms(),
+                        "latencyMs": 0,
+                        "error": format!(
+                            "[wb-gateway] balance patrol: checked {}, updated {}, failed {}",
+                            g("checked"), g("updated"), g("failed")
+                        ),
+                    }));
+                    for e in r.get("errors").and_then(Value::as_array).cloned().unwrap_or_default() {
+                        crate::modules::gateway_admin::record_request(json!({
+                            "gateway": "workbuddy-pool",
+                            "kind": "balance_patrol_error",
+                            "ok": false,
+                            "at": now_ms(),
+                            "latencyMs": 0,
+                            "error": e.as_str().unwrap_or("").to_string(),
+                        }));
+                    }
+                    tokio::time::sleep(Duration::from_millis(interval)).await;
+                }
+                None => {
+                    // 0 = 关闭：循环不退出（配置可 PATCH 热改回），空转重读配置。
+                    tokio::time::sleep(Duration::from_secs(PATROL_IDLE_POLL_SECS)).await;
+                }
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -2625,7 +2791,10 @@ mod tests {
         assert!(c.breaker_max_secs >= c.breaker_base_secs);
         assert_eq!(c.max_in_flight, 0, "0 = 不限，不钳到默认");
         assert_eq!(c.sticky_ttl_ms, d.sticky_ttl_ms);
-        assert_eq!(c.balance_refresh_minutes, d.balance_refresh_minutes);
+        assert_eq!(
+            c.balance_refresh_minutes, 0,
+            "增补 §2.1：0 = 关闭巡检，不回落默认"
+        );
 
         // 缺失 / 损坏文件 → 默认
         assert_eq!(load_config_at(&dir.join("nope.json")), d);
@@ -2647,5 +2816,122 @@ mod tests {
         p.apply_config(&GatewayConfig::default());
         assert_eq!(STICKY_TTL_MS.load(Ordering::Relaxed), DEFAULT_STICKY_TTL_MS);
         STICKY_TTL_MS.store(prev, Ordering::Relaxed);
+    }
+
+    // -----------------------------------------------------------------------
+    // 余额巡检（增补 §2.1；无网络：只测纯函数化核心与状态迁移）
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn patrol_filters_disabled_and_errored_accounts() {
+        // 纯函数核心：disabled / error 跳过，正常账号巡检。
+        assert!(patrol_should_check(false, false), "正常账号应巡检");
+        assert!(!patrol_should_check(true, false), "禁用号跳过");
+        assert!(!patrol_should_check(false, true), "error 标记账号跳过");
+        assert!(!patrol_should_check(true, true));
+
+        // 池快照过滤：disabled 条目（session 死亡）与 errored uid 都不进 targets。
+        let mut p = mk_pool();
+        p.upsert(mk_acc("u-ok"));
+        p.upsert(mk_acc("u-dead"));
+        p.upsert(mk_acc("u-err"));
+        p.note_error("u-dead", "", ErrKind::SessionDead, "");
+        let errored: HashSet<String> = ["u-err".to_string()].into_iter().collect();
+        let targets = p.patrol_targets(&errored);
+        let uids: Vec<&str> = targets.iter().map(|a| a.uid.as_str()).collect();
+        assert_eq!(uids, vec!["u-ok"], "只有正常账号进巡检: {uids:?}");
+        // 无 error 标记 → 不过滤
+        assert_eq!(p.patrol_targets(&HashSet::new()).len(), 2, "无 error 标记只滤 disabled");
+
+        // error 标记来自账号库文本（uid 口径与桥接一致，只认 WorkBuddy 平台）。
+        let set = errored_uids_from_json(
+            &json!([
+                {"id":"a","access_token":"at","status":"error","auth_raw":{"uid":"u-err"}},
+                {"id":"b","access_token":"at","status":"ok","auth_raw":{"uid":"u-ok"}},
+                {"id":"c","access_token":"at","domain":"www.workbuddy.cn","status":"error","uid":"u-top"},
+                {"id":"d","platform":"autoclaw","access_token":"at","status":"error","auth_raw":{"uid":"u-other"}}
+            ])
+            .to_string(),
+        );
+        assert!(set.contains("u-err"), "status==error 的 WorkBuddy 账号进跳过集");
+        assert!(!set.contains("u-ok"), "非 error 账号不进跳过集");
+        assert!(set.contains("u-top"), "顶层 uid 口径兼容");
+        assert!(!set.contains("u-other"), "非 WorkBuddy 平台账号不进跳过集");
+        assert!(errored_uids_from_json("not json").is_empty(), "损坏输入 → 空集");
+        assert!(errored_uids_from_json("{}").is_empty(), "非数组 → 空集");
+    }
+
+    #[test]
+    fn patrol_interval_zero_disables_and_clamps() {
+        // 增补 §2.1：0 = 关闭；其余钳 [5, 24*60] 分钟。
+        assert_eq!(patrol_interval_ms(0), None, "0 = 关闭巡检");
+        assert_eq!(patrol_interval_ms(15), Some(15 * 60_000));
+        assert_eq!(patrol_interval_ms(5), Some(5 * 60_000), "下限 5 分钟");
+        assert_eq!(patrol_interval_ms(3), Some(5 * 60_000), "<5 钳到下限");
+        assert_eq!(patrol_interval_ms(99_999), Some(24 * 60 * 60_000), "封顶 24h");
+        // load_config 的 normalized 同口径：0 保持 0（不回落默认 15），非 0 钳 [5, 1440]。
+        let cfg = GatewayConfig {
+            balance_refresh_minutes: 0,
+            ..Default::default()
+        }
+        .normalized();
+        assert_eq!(cfg.balance_refresh_minutes, 0, "0 = 关闭，不回落默认");
+        let cfg = GatewayConfig {
+            balance_refresh_minutes: 2,
+            ..Default::default()
+        }
+        .normalized();
+        assert_eq!(cfg.balance_refresh_minutes, 5, "非 0 钳到下限 5");
+        let cfg = GatewayConfig {
+            balance_refresh_minutes: 30,
+            ..Default::default()
+        }
+        .normalized();
+        assert_eq!(cfg.balance_refresh_minutes, 30, "合法值原样");
+    }
+
+    #[test]
+    fn patrol_backfill_changes_pick_tier() {
+        // 巡检回填前后选号分层的变化（到期分层键 = credit_expires_at 所在日）。
+        let mut p = mk_pool();
+        p.set_min_pick_gap_ms(0); // 关闭防撞号，走纯加权
+        let mut poor = mk_acc("poor");
+        poor.credits = 10;
+        let mut rich = mk_acc("rich");
+        rich.credits = 1000;
+        p.upsert(poor);
+        p.upsert(rich);
+        // 恒抽签 0 → 取权重最高者
+        p.set_random_source(Some(Box::new(|_| 0)));
+
+        // 回填前：无到期信息 → 不分层，权重含 credits 项 → 高积分号优先。
+        assert_eq!(p.pick("m", &[]).unwrap().uid, "rich", "回填前按 credits 加权选号");
+
+        // 巡检回填：poor 的额度最早到期 → 到期分层生效，优先烧快过期的。
+        let now = now_ms();
+        p.set_credits("poor", 10, now + 2 * 86_400_000);
+        p.set_credits("rich", 1000, now + 30 * 86_400_000);
+        let mut counts: HashMap<String, i64> = HashMap::new();
+        for _ in 0..20 {
+            if let Some(a) = p.pick("m", &[]) {
+                *counts.entry(a.uid).or_insert(0) += 1;
+            }
+        }
+        assert_eq!(
+            counts.get("poor").copied().unwrap_or(0),
+            20,
+            "回填后应固定选最早到期档: {counts:?}"
+        );
+        assert!(!counts.contains_key("rich"), "较晚档不应被选中: {counts:?}");
+
+        // user_resource 可能只返回 credits（到期未知）：0 不清已有到期日。
+        p.set_credits("poor", 999, 0);
+        let e = &p.entries[*p.by_uid.get("poor").unwrap()];
+        assert_eq!(e.acc.credits, 999);
+        assert_eq!(
+            e.acc.credit_expires_at,
+            now + 2 * 86_400_000,
+            "credit_expires_at 0 = 未知，不清到期日"
+        );
     }
 }

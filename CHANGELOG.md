@@ -7,6 +7,64 @@
 
 ---
 
+## 1.0.3 — 2026-09-24
+
+### 新增：WorkBuddy 网关重构 P2+P3（Responses/Messages 双协议 + 余额巡检 + 观测）
+
+契约增补：`docs/workbuddy-gateway-refactor-p2p3-contract.md`（接口钉定 7 个函数签名）。
+
+**P2 · 协议补全**（新增 `modules/workbuddy_protocols.rs`，1964 行 / 77 个纯函数单测）
+
+- OpenAI Responses（Codex CLI `wire_api="responses"`）：`input`/`instructions` ↔ messages
+  互转（含 function_call/function_call_output 历史）、非流式 response 对象、流式事件
+  全序帧（response.created → … → response.completed → `[DONE]`）；
+- Anthropic Messages（Claude Code / CC Switch）：system 三形态、content blocks 互换
+  （text/image/tool_use/tool_result）、tools `input_schema`→`parameters`、
+  `stop_sequences`→`stop`、非流式 message 对象、流式事件序列
+  （message_start → … → message_stop）、Claude 槽位名 → 上游模型名映射表；
+- 新路由 `POST /workbuddy-pool/v1/responses` 与 `/workbuddy-pool/v1/messages`（key 鉴权，
+  与 chat 同口径）；chat handler 选号循环抽为共享 `workbuddy_pool_dispatch`
+  （行为零变化，WorkbuddyPoolReply 六字段）；
+- 请求带 tools 时经 `anthropic_sniff_tool_calls` 嗅探文本态 tool_calls，转 tool_use 块
+  （与 grok.rs:552 同款场景）。
+
+**P3 · 工程件**
+
+- 余额巡检：`balance_patrol_once` + `spawn_balance_patrol_loop`（启动 60s 首轮、间隔可配、
+  **0=关闭**；只读上游不写账号库、不罚号、单账号 300ms），驱动到期分层选号；
+- 观测：chat/responses/messages 三 handler 统一 `log_gateway_request("workbuddy-pool", …)`；
+- 前端接入信息补三协议说明（Codex wire_api / Claude Code `/v1/messages`）。
+
+**主会话修复（工作流交付核对后发现）**：配置 PATCH 的 `balanceRefreshMinutes` 原先把 0 钳成
+5（core 与巡环已认 0=关，HTTP 入口漏改，已放开）；messages 入口缺 model 时兜底
+`workbuddy`（与 responses 一致，防空模型名直达上游）；交付核对员「环境缺工具链」为误报
+（未按契约 §7 环境前缀跑 cargo，主会话实测三门禁全过）。
+
+**主会话修复（三协议真实 E2E 中发现，均有回归测试固化）**：
+
+- 🔴 `anthropic_slot_to_model` 只按短关键词（opus/sonnet/...）查表，路由层映射表用全名键
+  → 槽位名原样透传上游 400。改为全名精确键优先 + 短键兜底，两种表风格都认；
+- 🔴 账单响应信封是 `{"Response":{"Data":{...}}}` 大写两层（`rpc_do_json` 剥掉最外层
+  data），结构体字段小写 + serde 大小写敏感 = 静默失配 → credits 恒 0。加 rename +
+  真实信封形态回归测试；
+- 🔴 billing 端点对**无 User-Agent** 请求直接 403 code=10085「请求不合法」（reqwest 默认
+  不发 UA；chat 走 apply_common 有 UA 所以只坑 billing）→ `apply_billing` 补 CLI UA；
+- Responses / Messages 非流式响应补 usage 透传（原钉定签名漏参，流式本就有）；
+- Messages 流式补 reasoning 兜底（思考型模型只出 reasoning 时不丢内容）；
+- 巡逻观测从 eprintln（被 launcher stdio:ignore 吞掉）改走 `gateway_admin::record_request`，
+  每轮汇总 + 每失败账号原因进网关日志——本次 403 就是这么定位的。
+
+### 测试与验证
+
+- 门禁：`cargo check`（两 crate）、`cargo test -p wb-switch-core workbuddy`（**193 个测试**：
+  P0 37 + 池 49 + 上游 27 + 协议 77，另巡检 3）、`tsc --noEmit` 全部通过；
+- 工作流独立评审未发现需修复的问题；E2E（部署后主会话实测）：chat 回归 / Responses
+  非流式（usage 12/5/17 真实）/ Responses 流式（事件序列+聚合）/ Messages 非流式
+  （usage 18/4）/ Messages 流式（6 帧+聚合）/ Messages+tools（嗅探出 tool_use 块）/
+  巡检 credits 回填（3176/2996，到期 2026-10-22/21）全部通过。
+
+---
+
 ## 1.0.2 — 2026-09-24
 
 ### 新增：WorkBuddy 网关重构 P0+P1（错误分类矩阵 + 多账号 cloud 池）

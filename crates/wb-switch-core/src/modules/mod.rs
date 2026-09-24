@@ -42,6 +42,7 @@ pub mod workbuddy_proxy;
 pub mod workbuddy_errors;
 pub mod workbuddy_gateway;
 pub mod workbuddy_upstream;
+pub mod workbuddy_protocols;
 pub mod process;
 pub mod refresh;
 pub mod session;

@@ -214,6 +214,10 @@ fn apply_billing(req: reqwest::RequestBuilder, acc: &PoolAccount) -> reqwest::Re
     }
     // PoolAccount 无 enterprise_id：X-Enterprise-Id / X-Tenant-Id 恒缺（参考同结构）。
     req = req.header("X-Domain", domain_for(&acc.region));
+    // 🔴 User-Agent 必须带：billing 端点对「无 UA」请求直接 403 code=10085
+    // 「请求不合法」（2026-09-24 E2E 实测：空 UA 精确复现，带上 CLI UA 即通；
+    // reqwest 默认不发 UA，chat 走 apply_common 有 UA 所以只坑了 billing/巡检）。
+    req = req.header("User-Agent", CLIENT_UA);
     req
 }
 
@@ -1192,13 +1196,13 @@ fn parse_expiry_unix(v: &Value) -> i64 {
 
 #[derive(Debug, Default, Deserialize)]
 struct ResourceResp {
-    #[serde(default)]
+    #[serde(default, rename = "Response")]
     response: ResourceResponse,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct ResourceResponse {
-    #[serde(default)]
+    #[serde(default, rename = "Data")]
     data: ResourceData,
 }
 
@@ -1716,6 +1720,36 @@ mod tests {
         let (credits, soonest) = aggregate_credits(&pkgs);
         assert_eq!(credits, 150);
         assert_eq!(soonest, 1_700_000_000);
+    }
+
+    /// 回归：账单响应信封是 {"data":{"Response":{"Data":{...}}}} 大写两层
+    /// （2026-09-24 E2E 实测 credits 恒 0 的根因——结构体字段小写+serde 大小写
+    /// 敏感=静默失配）。用真实形态的信封反序列化，防止再漂。
+    #[test]
+    fn resource_envelope_parses_pascal_case_layers() {
+        // rpc_do_json 返回的是内层 data（{"Response":{"Data":{...}}}）；
+        // 完整信封还有最外层 {"code":0,...,"data":<此物>}（由 ApiEnvelope 剥掉）。
+        let body = json!({
+            "Response": {
+                "Data": {
+                    "TotalCount": 2,
+                    "Accounts": [
+                        {"CapacityRemain": 100, "DeductionEndTime": 1_800_000_000_000i64},
+                        {"CapacityRemain": 50, "DeductionEndTime": 1_700_000_000i64}
+                    ]
+                }
+            }
+        });
+        let parsed: ResourceResp = serde_json::from_value(body).expect("信封应可解析");
+        let accounts = &parsed.response.data.accounts;
+        assert_eq!(accounts.len(), 2, "两层大写失配会静默变空数组（旧 bug）");
+        let (credits, soonest) = aggregate_credits(accounts);
+        assert_eq!(credits, 150);
+        assert_eq!(soonest, 1_700_000_000);
+        // 小写旧形态（防御）：rename 后不再兼容小写键——确认行为是空而非 panic
+        let legacy = json!({"response": {"data": {"Accounts": [{"CapacityRemain": 9}]}}});
+        let p2: ResourceResp = serde_json::from_value(legacy).unwrap_or_default();
+        assert!(p2.response.data.accounts.is_empty(), "小写键不再命中（rename 后口径）");
     }
 
     #[test]

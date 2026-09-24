@@ -194,6 +194,8 @@ async fn serve(args: &[String]) {
     wb_switch_core::modules::grok_sso::spawn_keepalive_loop();
     // v1.5.0：账号池健康体检循环（默认每 2 小时轮转 1 个账号，策略可调）。
     wb_switch_core::modules::grok_pool::spawn_health_check_loop();
+    // WorkBuddy 多账号网关：余额巡检循环（启动后 60s 首轮，之后每 balance_refresh_minutes 分钟；0 = 关闭）。
+    wb_switch_core::modules::workbuddy_gateway::spawn_balance_patrol_loop();
 
     axum::serve(listener, app).await.unwrap();
 }
