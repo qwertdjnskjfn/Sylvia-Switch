@@ -371,8 +371,30 @@ pub async fn ensure_grok_page() -> Result<(), String> {
             .send()
             .await;
     }
-    // 等页面就绪。
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // 轮询等 page target 出现（替代固定 sleep 2s；target 未就绪时后续
+    // eval_js 会报「无 grok.com 页面」，让调用方多跑一轮容错）。
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Ok(list) = cdp_http_client()
+            .get(format!("http://127.0.0.1:{CDP_PORT}/json"))
+            .send()
+            .await
+        {
+            if let Ok(list) = list.json::<Vec<Value>>().await {
+                let has_grok = list.iter().any(|t| {
+                    t.get("type").and_then(Value::as_str) == Some("page")
+                        && t.get("url")
+                            .and_then(Value::as_str)
+                            .map(|u| u.starts_with(GROK_URL))
+                            .unwrap_or(false)
+                });
+                if has_grok {
+                    return Ok(());
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
     Ok(())
 }
 
@@ -435,8 +457,29 @@ async fn trigger_renewal() -> Result<(), String> {
         json!({"url": "https://grok.com/discover", "transitionType": "link"}),
     )
     .await;
-    // 等页面加载完成（服务端 Set-Cookie 在响应头里，通常 2-5 秒内完成）。
-    tokio::time::sleep(Duration::from_secs(6)).await;
+    // 轮询等页面加载完成（替代固定 sleep 6s）：Set-Cookie 随响应头下发，
+    // readyState=complete 即已写入；完成后再留 1s 余量防 SPA 迟续签。
+    // 旧固定 6s 在页面 2-3s 就绪时纯浪费 ~3-4s/轮。
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let ready = cdp_call_on(
+            ws_url,
+            "Runtime.evaluate",
+            json!({"expression": "document.readyState", "returnByValue": true}),
+        )
+        .await
+        .ok()
+        .and_then(|v| {
+            v.pointer("/result/value")
+                .and_then(Value::as_str)
+                .map(String::from)
+        });
+        if ready.as_deref() == Some("complete") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
     Ok(())
 }
 
@@ -1045,15 +1088,33 @@ impl std::fmt::Display for ChatError {
 /// 锁覆盖「切号 + 对话」全过程，串行化请求。
 static UI_CHAT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// 带账号路由的 UI 驱动对话（v1.5.0）：
-/// 驻留期内复用当前账号；需要切号时按 cookie 指纹短路，命中则跳过注入。
-pub async fn ui_chat_with_account(
-    account_id: &str,
-    cookie_string: &str,
-    prompt: &str,
-) -> Result<String, ChatError> {
-    // 串行化：同一时刻只允许一个对话操作浏览器。
-    let _chat_guard = UI_CHAT_LOCK.lock().await;
+/// 浏览器就绪互斥锁（v1.0.0 性能改造）。
+///
+/// 与 UI_CHAT_LOCK 分工：ENSURE_LOCK 只保护「拉起浏览器 + 开 grok tab」这段
+/// 启动动作（浏览器未运行时最长约 20s）。拆开后，排队的请求不必每个都串行
+/// 等一遍启动——启动只做一次，其余请求直接在就绪的浏览器上排队切号/对话。
+static ENSURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// 排队等 UI_CHAT_LOCK 的上限（秒）：超过即失败，避免请求无限堆积
+/// （旧行为 5 个请求最坏要等 5×60s 且无上限，客户端全部挂死）。
+const LOCK_WAIT_SECS: u64 = 120;
+
+/// 生成停滞上限（秒）：生成中但「正文 + 思考面板」全文长时间无变化视为卡死，
+/// 点「停止」收尾返回部分回复，而不是拖满 240s 总超时。
+const STALL_LIMIT_SECS: u64 = 90;
+
+/// 点「停止」按钮收尾当前生成（aria-label 含「停止」，实测值为「停止模型响应」）。
+const STOP_GENERATION_JS: &str = r#"(() => {
+    const b = [...document.querySelectorAll('button')].find(
+        x => /停止/.test(x.getAttribute('aria-label') || ''));
+    if (!b) return 0;
+    b.click();
+    return 1;
+})()"#;
+
+/// 确保专用浏览器在跑且有 grok.com 页面（ENSURE_LOCK 保护；幂等）。
+async fn ensure_browser_ready() -> Result<(), ChatError> {
+    let _guard = ENSURE_LOCK.lock().await;
     let cfg = load_config();
     ensure_browser(&cfg)
         .await
@@ -1061,6 +1122,28 @@ pub async fn ui_chat_with_account(
     ensure_grok_page()
         .await
         .map_err(|e| ChatError::new(ChatErrorKind::Infra, e))?;
+    Ok(())
+}
+
+/// 带账号路由的 UI 驱动对话（v1.5.0）：
+/// 驻留期内复用当前账号；需要切号时按 cookie 指纹短路，命中则跳过注入。
+pub async fn ui_chat_with_account(
+    account_id: &str,
+    cookie_string: &str,
+    prompt: &str,
+) -> Result<String, ChatError> {
+    // 先就绪（启动动作不占对话锁），再串行化对话。
+    ensure_browser_ready().await?;
+    let _chat_guard =
+        match tokio::time::timeout(Duration::from_secs(LOCK_WAIT_SECS), UI_CHAT_LOCK.lock()).await {
+            Ok(g) => g,
+            Err(_) => {
+                return Err(ChatError::new(
+                    ChatErrorKind::Infra,
+                    format!("等待浏览器排队超时（{LOCK_WAIT_SECS} 秒）：上游繁忙，请稍后重试"),
+                ))
+            }
+        };
 
     let need_switch = {
         let guard = RESIDENT.lock().unwrap();
@@ -1130,10 +1213,9 @@ pub struct ProbeOutcome {
 /// 复用 UI_CHAT_LOCK 串行化，避免与真实对话/保活抢浏览器（实测并发会互相踩）。
 /// 注入成功但页面无输入框 → 视为登录态失效（sso 过期）。
 pub async fn probe_account(cookie_string: &str) -> Result<ProbeOutcome, String> {
+    // 就绪动作不占对话锁（与 ui_chat_with_account 同一套两段锁）。
+    ensure_browser_ready().await.map_err(|e| e.message)?;
     let _guard = UI_CHAT_LOCK.lock().await;
-    let cfg = load_config();
-    ensure_browser(&cfg).await?;
-    ensure_grok_page().await?;
 
     let target_fp = extract_sso_fingerprint(cookie_string);
     if target_fp.is_empty() {
@@ -1332,8 +1414,13 @@ pub async fn ui_chat(prompt: &str) -> Result<String, ChatError> {
     //    回复被截断的根因。现在要求：不再生成 && 有回复文本 && 非占位。
     let deadline = Instant::now() + Duration::from_secs(240);
     let mut last_stable: Option<String> = None;
+    // 进展签名（正文 + 气泡全文尾）：两者都长时间不变才判定卡死。
+    // 思考面板（"工作了 Ns"/"执行了 N 次搜索"）在合法深推时会持续变化，
+    // 不能只看正文——否则长思考会被误杀。
+    let mut last_sig = String::new();
+    let mut last_change = Instant::now();
     loop {
-        tokio::time::sleep(Duration::from_millis(3000)).await;
+        tokio::time::sleep(Duration::from_millis(2000)).await;
         // 导航过渡期 target URL 会短暂离开 grok.com，eval_js 可能报
         // 「无 grok.com 页面」——跳过本轮继续轮询，而不是中断整个 chat。
         let state = match eval_js(
@@ -1389,7 +1476,10 @@ pub async fn ui_chat(prompt: &str) -> Result<String, ChatError> {
                 // 限流错误文案出现在气泡外（body 全文），出现且 user 气泡已存在 =
                 // 本条消息被限流，不会再有 assistant 回复。
                 const limited = /使用人数较多|请稍后再试|升级你的订阅/.test(document.body.innerText);
-                return JSON.stringify({ anchor, reply: reply.slice(-4000), limited, generating, placeholder });
+                // rawTail：最后一个气泡的全量 textContent 尾部（含思考面板）。
+                // 停滞判定用它区分「卡死」与「长思考中」——后者面板时间在持续变化。
+                const rawTail = (raw[raw.length - 1] || '').slice(-200);
+                return JSON.stringify({ anchor, reply: reply.slice(-4000), rawTail, limited, generating, placeholder });
             })()"#,
         )
         .await
@@ -1423,6 +1513,22 @@ pub async fn ui_chat(prompt: &str) -> Result<String, ChatError> {
             }
             // 关键：只要仍在生成中，或末尾是思考占位文案，就继续等 —— 否则会
             // 把 '工作... 1s' 之类的中间态当成最终回复返回（旧版截断 bug）。
+            let sig = format!(
+                "{last}|{}",
+                parsed.get("rawTail").and_then(Value::as_str).unwrap_or("")
+            );
+            if sig != last_sig {
+                last_sig = sig;
+                last_change = Instant::now();
+            }
+            // 停滞取消：生成中但「正文 + 思考面板」全文长时间无变化 → 点「停止」
+            // 收尾。点完后 generating 消失，后续轮次按正常完成判定返回；若按钮
+            // 异常仍在，最多每 STALL_LIMIT_SECS 重点一次，最终由 240s deadline
+            // 兜底返回部分回复。相比旧行为（一律拖满 240s）显著缩短卡死耗时。
+            if generating && last_change.elapsed() > Duration::from_secs(STALL_LIMIT_SECS) {
+                let _ = eval_js(STOP_GENERATION_JS).await;
+                last_change = Instant::now();
+            }
             if !generating && !placeholder && last_stable.as_deref() == Some(last) {
                 return Ok(last.to_string());
             }

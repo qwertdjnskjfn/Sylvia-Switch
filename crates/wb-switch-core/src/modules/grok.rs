@@ -461,6 +461,22 @@ pub enum GrokChatOutput {
     Stream(reqwest::Response),
 }
 
+/// 账号当前是否可被调度（选号层与容量守卫的同一事实来源）。
+///
+/// 判定规则（v1.5.0 起）：
+/// - `enabled` 未被手动禁用；
+/// - 不在冷却期（`cooldownUntil <= now`）；
+/// - `status == "error"` 的账号过了 `errorRetryAt` 指数退避期后才重新纳入
+///   （历史无该字段 = retry_at=0 → 立即纳入，实现"假 error 自愈"）。
+pub(crate) fn is_account_available(a: &Value, now: i64) -> bool {
+    let enabled = a.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+    let cooldown = a.get("cooldownUntil").and_then(Value::as_i64).unwrap_or(0);
+    let errored = a.get("status").and_then(Value::as_str) == Some("error");
+    let retry_at = a.get("errorRetryAt").and_then(Value::as_i64).unwrap_or(0);
+    let blocked_by_error = errored && retry_at > now;
+    enabled && cooldown <= now && !blocked_by_error
+}
+
 /// 调度选出一个可用的 Grok 账号
 fn pick_available_account() -> Result<Value, String> {
     let accounts = load_accounts();
@@ -471,18 +487,19 @@ fn pick_available_account() -> Result<Value, String> {
     let now = now_ms();
     let candidates: Vec<&Value> = accounts
         .iter()
-        .filter(|a| {
-            let enabled = a.get("enabled").and_then(Value::as_bool).unwrap_or(true);
-            let cooldown = a.get("cooldownUntil").and_then(Value::as_i64).unwrap_or(0);
-            // v1.5.0：error 账号不再永久跳过 —— 过了 errorRetryAt 退避期后重新
-            // 纳入候选尝试，成功即自动恢复。历史无 errorRetryAt 字段的账号
-            // （retry_at=0）会被立即纳入，实现"假 error 自愈"。
-            let errored = a.get("status").and_then(Value::as_str) == Some("error");
-            let retry_at = a.get("errorRetryAt").and_then(Value::as_i64).unwrap_or(0);
-            let blocked_by_error = errored && retry_at > now;
-            enabled && cooldown <= now && !blocked_by_error
-        })
+        .filter(|a| is_account_available(a, now))
         .collect();
+
+    // C2 容量守卫：可用数低于策略下限时暂停调度（体检循环不受影响——池越浅
+    // 越需要体检找回死账号）。默认 min=1 时仅「无可用账号」触发，与旧语义一致。
+    let cap = crate::modules::grok_pool::capacity_guard_state();
+    if cap.get("belowMin").and_then(Value::as_bool) == Some(true) {
+        let floor = cap.get("minPoolSize").and_then(Value::as_i64).unwrap_or(1);
+        let available = cap.get("available").and_then(Value::as_i64).unwrap_or(0);
+        return Err(format!(
+            "账号池可用数（{available}）低于容量下限（{floor}），已按策略暂停调度；请补充账号或在「策略」中调整下限"
+        ));
+    }
 
     if candidates.is_empty() {
         return Err("所有 Grok 账号当前均处于冷却或禁用状态，请稍后重试或补充新账号".to_string());
@@ -501,6 +518,26 @@ fn pick_available_account() -> Result<Value, String> {
 
     let idx = ROUND_ROBIN_INDEX.fetch_add(1, Ordering::Relaxed) % candidates.len();
     Ok(candidates[idx].clone())
+}
+
+/// 换号重试的退避时间（毫秒）；`None` = 不重试。
+///
+/// 最多 1 次换号重试（attempt>=1 一律 None）。分级依据：
+/// - `Invalid`（cookie 为空等数据问题）重试无意义；
+/// - `NotLoggedIn`/`RateLimited` 退避 300ms —— 账号侧冷却/errorRetryAt 已由
+///   mark_account_* 负责，这里只控换号节奏；
+/// - `Timeout`/`Infra` 退避 600ms —— 瞬时抖动，略长的退避避免连续撞击。
+fn retry_backoff_ms(kind: crate::modules::grok_sso::ChatErrorKind, attempt: u32) -> Option<u64> {
+    if attempt >= 1 {
+        return None;
+    }
+    match kind {
+        crate::modules::grok_sso::ChatErrorKind::Invalid => None,
+        crate::modules::grok_sso::ChatErrorKind::NotLoggedIn => Some(300),
+        crate::modules::grok_sso::ChatErrorKind::RateLimited => Some(300),
+        crate::modules::grok_sso::ChatErrorKind::Timeout => Some(600),
+        crate::modules::grok_sso::ChatErrorKind::Infra => Some(600),
+    }
 }
 
 /// 从 OpenAI messages 列表解析出最新用户提示词和历史上下文
@@ -719,9 +756,11 @@ pub async fn chat_completions_unified(payload: Value) -> Result<GrokChatOutput, 
     let tools = payload.get("tools").and_then(Value::as_array).cloned();
     let (system_prompt, prompt) = extract_prompt_from_messages(&messages, tools.as_deref());
 
-    // 账号挑选与单次重试
+    // 账号挑选与换号重试（最多 1 次换号重试；退避按错误类型分级，
+    // 见 retry_backoff_ms）。build 通道的错误此前被 `?` 直接吞掉不重试，
+    // 现在与 web 通道统一走 ChatError 分类。
     let mut last_err = String::new();
-    for attempt in 0..2 {
+    for attempt in 0..2u32 {
         let account = match pick_available_account() {
             Ok(acc) => acc,
             Err(e) => return Err(e),
@@ -731,16 +770,16 @@ pub async fn chat_completions_unified(payload: Value) -> Result<GrokChatOutput, 
         let provider = account.get("provider").and_then(Value::as_str).unwrap_or("web");
         let token = account.get("token").and_then(Value::as_str).unwrap_or_default();
 
-        let req_res = match provider {
-            "build" => {
-                let resp = send_build_request(&account_id, token, &model, &payload).await?;
-                let status = resp.status().as_u16();
-                let body = resp.text().await.unwrap_or_default();
-                Ok(crate::modules::grok::WebReply { status, body })
-            }
-            _ => {
-                send_web_request(&account_id, token, &model, &system_prompt, &prompt).await
-            }
+        let req_res: Result<WebReply, crate::modules::grok_sso::ChatError> = match provider {
+            "build" => match send_build_request(&account_id, token, &model, &payload).await {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let body = resp.text().await.unwrap_or_default();
+                    Ok(crate::modules::grok::WebReply { status, body })
+                }
+                Err(e) => Err(e),
+            },
+            _ => send_web_request(&account_id, token, &model, &system_prompt, &prompt).await,
         };
 
         match req_res {
@@ -854,11 +893,20 @@ pub async fn chat_completions_unified(payload: Value) -> Result<GrokChatOutput, 
 
                 return Ok(GrokChatOutput::Json(result_json));
             }
-            Err(e) => {
-                last_err = e;
-                if attempt == 0 {
-                    tokio::time::sleep(Duration::from_millis(300)).await;
-                    continue;
+            Err(chat_err) => {
+                eprintln!(
+                    "[grok] 请求失败 ({:?}, attempt={}/1): {}",
+                    chat_err.kind, attempt, chat_err.message
+                );
+                let channel = if provider == "build" { "Build" } else { "Web" };
+                last_err = format!("Grok {channel} 通道失败：{}", chat_err.message);
+                match retry_backoff_ms(chat_err.kind, attempt) {
+                    Some(ms) => {
+                        tokio::time::sleep(Duration::from_millis(ms)).await;
+                        continue;
+                    }
+                    // 不重试（数据问题或已用完重试额度）：直接带着错误收尾。
+                    None => break,
                 }
             }
         }
@@ -880,7 +928,8 @@ async fn send_build_request(
     token: &str,
     model: &str,
     payload: &Value,
-) -> Result<reqwest::Response, String> {
+) -> Result<reqwest::Response, crate::modules::grok_sso::ChatError> {
+    use crate::modules::grok_sso::{ChatError, ChatErrorKind};
     let client = http_client();
     let url = format!("{}/v1/chat/completions", GROK_BUILD_BASE);
 
@@ -904,20 +953,29 @@ async fn send_build_request(
         .json(&upstream_payload)
         .send()
         .await
-        .map_err(|e| format!("Grok Build 连接失败: {e}"))?;
+        .map_err(|e| ChatError::new(ChatErrorKind::Infra, format!("Grok Build 连接失败: {e}")))?;
 
     let status = resp.status();
     if status.as_u16() == 429 {
         mark_account_cooldown(account_id, 60, "遇到 429 请求频率限制");
-        return Err("Grok Build 账号遇到 429 频率限制，已自动冷却调度".to_string());
+        return Err(ChatError::new(
+            ChatErrorKind::RateLimited,
+            "Grok Build 账号遇到 429 频率限制，已自动冷却调度",
+        ));
     }
     if status.as_u16() == 401 || status.as_u16() == 403 {
         mark_account_error(account_id, "Grok Build API Key 无效或权限不足");
-        return Err("Grok Build 凭据无效或已失效".to_string());
+        return Err(ChatError::new(
+            ChatErrorKind::NotLoggedIn,
+            "Grok Build 凭据无效或已失效",
+        ));
     }
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
-        return Err(format!("Grok Build 上游错误 ({}): {}", status, text));
+        return Err(ChatError::new(
+            ChatErrorKind::Infra,
+            format!("Grok Build 上游错误 ({}): {}", status, text.chars().take(200).collect::<String>()),
+        ));
     }
 
     Ok(resp)
@@ -944,7 +1002,7 @@ async fn send_web_request(
     model: &str,
     system_prompt: &str,
     prompt: &str,
-) -> Result<WebReply, String> {
+) -> Result<WebReply, crate::modules::grok_sso::ChatError> {
     // 注：直连路径已移除；model / is_thinking_model 等参数不再使用（Web 模型由页面决定）。
     let _ = model;
     let cookie_val = normalize_web_cookie(token);
@@ -988,7 +1046,7 @@ async fn send_web_request(
                     mark_account_cooldown(account_id, secs, &chat_err.message);
                 }
             }
-            Err(format!("Grok Web UI 驱动失败：{}", chat_err.message))
+            Err(chat_err)
         }
     }
 }
@@ -1052,14 +1110,18 @@ pub async fn test_chat(
         .and_then(Value::as_str)
         .unwrap_or_default();
 
-    let chat_res = match provider.as_str() {
-        "build" => {
-            let resp = send_build_request(&selected_id, token, actual_model, &payload).await?;
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            Ok(crate::modules::grok::WebReply { status, body })
-        }
-        _ => send_web_request(&selected_id, token, actual_model, "", prompt).await,
+    let chat_res: Result<WebReply, String> = match provider.as_str() {
+        "build" => match send_build_request(&selected_id, token, actual_model, &payload).await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let body = resp.text().await.unwrap_or_default();
+                Ok(crate::modules::grok::WebReply { status, body })
+            }
+            Err(e) => Err(e.to_string()),
+        },
+        _ => send_web_request(&selected_id, token, actual_model, "", prompt)
+            .await
+            .map_err(|e| e.to_string()),
     };
 
     let duration_ms = start.elapsed().as_millis() as u64;
@@ -1141,6 +1203,37 @@ mod tests {
 
     fn msgs(v: Value) -> Vec<Value> {
         v.as_array().cloned().unwrap_or_default()
+    }
+
+    /// 可用性矩阵：选号层与容量守卫共用 is_account_available，
+    /// 五种状态组合必须逐一符合预期（含 error 退避期边界）。
+    #[test]
+    fn is_account_available_matrix() {
+        let now = 1_000_000i64;
+        let mk = |enabled: bool, cooldown: i64, status: &str, retry_at: i64| {
+            json!({"enabled": enabled, "cooldownUntil": cooldown, "status": status, "errorRetryAt": retry_at})
+        };
+        assert!(is_account_available(&mk(true, 0, "ok", 0), now), "普通可用账号");
+        assert!(is_account_available(&mk(true, now, "cooldown", 0), now), "冷却恰好到期可用");
+        assert!(!is_account_available(&mk(true, now + 1, "cooldown", 0), now), "冷却中不可用");
+        assert!(!is_account_available(&mk(false, 0, "ok", 0), now), "手动禁用不可用");
+        assert!(!is_account_available(&mk(true, 0, "error", now + 1), now), "error 退避期内不可用");
+        assert!(is_account_available(&mk(true, 0, "error", now), now), "error 退避恰好到期可用（假 error 自愈）");
+        assert!(is_account_available(&json!({}), now), "缺字段的老账号默认可用");
+    }
+
+    /// 重试矩阵：Invalid 不重试；attempt>=1 一律不重试；
+    /// 其余按类型分级退避（换号节奏由 mark_account_* 的冷却负责）。
+    #[test]
+    fn retry_backoff_matrix() {
+        use crate::modules::grok_sso::ChatErrorKind::*;
+        assert_eq!(retry_backoff_ms(Invalid, 0), None, "数据问题重试无意义");
+        assert_eq!(retry_backoff_ms(NotLoggedIn, 0), Some(300));
+        assert_eq!(retry_backoff_ms(RateLimited, 0), Some(300));
+        assert_eq!(retry_backoff_ms(Timeout, 0), Some(600));
+        assert_eq!(retry_backoff_ms(Infra, 0), Some(600));
+        assert_eq!(retry_backoff_ms(Timeout, 1), None, "最多 1 次换号重试");
+        assert_eq!(retry_backoff_ms(Infra, 2), None);
     }
 
     #[test]

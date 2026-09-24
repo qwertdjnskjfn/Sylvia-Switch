@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use wb_switch_core::modules::{
     account, account_protection, auth_file, channel_health, checkin, config, credit_usage, credits, export_import,
     autoclaw_accounts, glm_proxy, loomy, loomy_proxy, model_probe, model_usage, oauth, platform_checkin, platform_switch, process, refresh,
-    gateway_admin, gateway_overview, glm_web, grok, grok_pool, grok_register, kimi, qoder, qwen, qwen_mcp, qwen_web, grok_sso, miaoshou, session, switch, token_stats, toolcall_monitor, travel, update, trae_acp, trae_accounts, trae_proxy, trae_proxy_config, workbuddy_proxy, opencode,
+    gateway_admin, gateway_overview, glm_web, grok, grok_pool, grok_register, kimi, qoder, qwen, qwen_mcp, qwen_web, grok_sso, miaoshou, session, switch, token_stats, toolcall_monitor, travel, update, trae_acp, trae_accounts, trae_proxy, trae_proxy_config, workbuddy_proxy, workbuddy_errors, workbuddy_gateway, workbuddy_upstream, opencode,
 };
 
 /// 服务实际绑定端口（main.rs serve 启动时写入），供端点展示使用。
@@ -267,6 +267,32 @@ pub fn router() -> Router {
         .route("/api/trae-proxy/config", get(api_trae_proxy_config_get))
         .route("/workbuddy/v1/chat/completions", post(api_workbuddy_chat_completions))
         .route("/workbuddy/v1/models", get(api_workbuddy_v1_models))
+        // WorkBuddy 多账号池网关（cloud 上游 + 账号池）：独立路由组，与存量
+        // /workbuddy/v1（OpenCode 借道）、/workbuddy-native/v1（ACP）互不影响
+        // （契约 docs/workbuddy-gateway-refactor-contract.md §12 切-cutover 策略）。
+        //
+        // 🔑 鉴权策略（组内统一口径，避免「有的要 key 有的不要」的漂移）：
+        //   - chat/completions：**要网关 key**（契约 §13 路由表唯一标注鉴权的端点；
+        //     它是真正对外的 OpenAI 兼容入口，会把账号池额度烧出去）。
+        //   - models / status / config：**免 key** 的管理三端点。契约 §13 对其余三行
+        //     均未标注鉴权；且 webui 面板的 `httpCall`（src/lib/api.ts:287-311）只发
+        //     Content-Type、**不带 Authorization 头**，status/config 是面板唯一数据源
+        //     （WorkbuddyPage.tsx:163 loadPool / :183 patchWorkbuddyPoolConfig），
+        //     要 key 会直接把面板打成全空。
+        //   - 与既有惯例对齐：/api/* 管理端点（如 /api/grok/pool/policy 本文件 1730 行、
+        //     /api/workbuddy-proxy/config 本文件 4252 行）一律免 key；服务仅绑
+        //     127.0.0.1（main.rs:153），无 CORS 层且写端点用 `Json` 提取器
+        //     （跨源 JSON POST = 非简单请求 → preflight 必被拦，浏览器页面摸不到）。
+        .route(
+            "/workbuddy-pool/v1/chat/completions",
+            post(api_workbuddy_pool_chat_completions),
+        )
+        .route("/workbuddy-pool/v1/models", get(api_workbuddy_pool_models))
+        .route("/workbuddy-pool/v1/status", get(api_workbuddy_pool_status))
+        .route(
+            "/workbuddy-pool/v1/config",
+            post(api_workbuddy_pool_config_save),
+        )
         // OpenCode 网关：本机 OpenCode server 的免费模型专用入口（独立密钥）
         .route("/opencode/v1/models", get(api_opencode_v1_models))
         .route(
@@ -303,10 +329,14 @@ pub fn router() -> Router {
 }
 
 /// 需要记录访问日志的路径前缀（模型网关与管理 API）。静态资源（dist/assets 等）不记。
+///
+/// `/workbuddy-pool/` 必须单独列：它不以 `/workbuddy/` 开头（连字符不是斜杠），
+/// 漏掉会让池网关「请求没到 handler 就失败」的请求（413/422/鉴权前拒绝）无日志可查。
 fn is_logged_path(path: &str) -> bool {
     let prefixes = [
         "/v1/", "/qwen/", "/qwen-flash/", "/qoder/", "/kimi/", "/glmweb/",
         "/grok/", "/loomy/", "/cuckoo/", "/trae/", "/api/", "/workbuddy/",
+        "/workbuddy-pool/",
     ];
     prefixes.iter().any(|p| path.starts_with(p))
 }
@@ -1705,6 +1735,8 @@ async fn api_grok_pool_policy_get() -> Response {
         "rateLimitPenalty": p.rate_limit_penalty,
         "timeoutPenalty": p.timeout_penalty,
         "fatalPenalty": p.fatal_penalty,
+        "minPoolSize": p.min_pool_size,
+        "pauseWhenBelowMin": p.pause_when_below_min,
     }))
 }
 
@@ -1720,6 +1752,8 @@ async fn api_grok_pool_policy_set(Json(body): Json<Value>) -> Response {
     if let Some(v) = body.get("rateLimitPenalty").and_then(Value::as_i64) { p.rate_limit_penalty = v.clamp(0, 100); }
     if let Some(v) = body.get("timeoutPenalty").and_then(Value::as_i64) { p.timeout_penalty = v.clamp(0, 100); }
     if let Some(v) = body.get("fatalPenalty").and_then(Value::as_i64) { p.fatal_penalty = v.clamp(0, 100); }
+    if let Some(v) = body.get("minPoolSize").and_then(Value::as_u64) { p.min_pool_size = (v as usize).clamp(1, 100); }
+    if let Some(v) = body.get("pauseWhenBelowMin").and_then(Value::as_bool) { p.pause_when_below_min = v; }
     match grok_pool::save_policy(&p) {
         Ok(_) => json_ok(json!({"ok": true})),
         Err(e) => json_err(e, StatusCode::INTERNAL_SERVER_ERROR),
@@ -4438,6 +4472,829 @@ async fn api_workbuddy_chat_completions(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// WorkBuddy 多账号池网关（/workbuddy-pool/v1/*）—— cloud 上游 + 账号池
+//
+// 契约 docs/workbuddy-gateway-refactor-contract.md §12：新池走**独立路由组**，
+// 存量 /workbuddy/v1（OpenCode 借道）与 /workbuddy-native/v1（ACP）原样不动，
+// 本期绝不内联切流。
+//
+// 本段只做薄接线：网关 key 鉴权 → 粘性键 → 选号循环（≤3 次换号）→ token 惰性
+// 刷新 → chat_stream → 错误分级换号 / 成功流式转发 / 非流式本地聚合。
+// 选号算法、冷却矩阵、粘性 TTL、出站头族、脱敏全部下沉 core 的
+// workbuddy_gateway 与 workbuddy_upstream（契约 §13 钉定签名）。
+// ---------------------------------------------------------------------------
+
+/// 选号循环上限：一次请求最多换 3 次号（契约 §13「≤3 次换号」）。
+const WB_POOL_MAX_PICKS: usize = 3;
+
+/// token 惰性刷新阈值：距过期不足 5 分钟先刷新再发车（契约 §13 refresh_if_needed）。
+const WB_POOL_REFRESH_SKEW_MS: i64 = 5 * 60 * 1000;
+
+/// 粘性 TTL 边界（契约 §5：60min 滚动）；config PATCH 的 clamp 用。
+const WB_POOL_STICKY_TTL_MIN_MS: i64 = 60_000;
+const WB_POOL_STICKY_TTL_MAX_MS: i64 = 3_600_000;
+
+/// 余额巡检间隔下限（契约 §5：默认 15 分钟）。
+const WB_POOL_BALANCE_REFRESH_MIN_MINUTES: u64 = 5;
+
+/// 池模式枚举（契约 §5：均衡 / 烧号 / 指定）。
+const WB_POOL_MODES: [&str; 3] = ["balance", "rotate", "pinned"];
+
+/// 网关 key 鉴权：`Authorization: Bearer` 或 `x-api-key`，命中「网关专用 Key」
+/// 或 GLM 主密钥即放行。
+///
+/// 双头接受与 `glm_proxy_auth_ok`（本文件 786 行）同口径；密钥来源走网关 key
+/// 体系（`gateway_key_status`，本文件 1986 行）—— 池网关没有自己的 api_key
+/// 配置字段（契约 §13 的 `GatewayConfig` 无该项），与 grok/kimi/qoder 三个
+/// 池网关保持一致。返回 `(是否通过, key id)`，key id 供请求日志归属。
+///
+/// 只给 chat/completions 用：models/status/config 是管理三端点、免 key
+/// （见路由注册处的鉴权策略注释）。
+fn workbuddy_pool_auth_ok(headers: &HeaderMap) -> (bool, Option<String>) {
+    gateway_key_status(headers)
+}
+
+/// system 字段拍平为纯文本：兼容字符串与 block 数组两种客户端形态
+/// （口径同参考实现 go-gateway/internal/server/messages.go:156 anthropicSystemText）。
+fn workbuddy_pool_system_text(body: &Value) -> String {
+    match body.get("system") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// 首条 user 消息文本（content 为字符串或 block 数组都取 text）。
+fn workbuddy_pool_first_user_text(body: &Value) -> String {
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+        return String::new();
+    };
+    for m in messages {
+        if m.get("role").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        return match m.get("content") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Array(blocks)) => blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        };
+    }
+    String::new()
+}
+
+/// 粘性键：客户端显式 `conversation_id` 优先，否则用 system + 首条 user 文本派生。
+///
+/// 口径同参考实现 go-gateway/internal/session/session.go:302 ExtractKey（顶层
+/// `conversation_id` → `metadata.conversation_id` → `metadata.user_id`）与
+/// session.go:335 SessionKeyFromSeed（FNV-1a 64 位折叠成 `seed-<hex>`）。
+///
+/// 为什么种子只取「system + 首条 user」而不是整段 messages：多轮对话里 messages
+/// 越滚越长，用全量做种子会让同一会话每轮键都不同，粘性恒不命中；只取首轮内容
+/// 才能让同一会话全程命中同一账号（契约 §3 粘性）。
+/// 两者都取不到时返回空串 = 本次请求不做粘性。
+fn workbuddy_pool_sticky_key(body: &Value) -> String {
+    if let Some(v) = body.get("conversation_id").and_then(Value::as_str) {
+        if !v.is_empty() {
+            return v.to_string();
+        }
+    }
+    if let Some(meta) = body.get("metadata").and_then(Value::as_object) {
+        for k in ["conversation_id", "user_id"] {
+            if let Some(v) = meta.get(k).and_then(Value::as_str) {
+                if !v.is_empty() {
+                    return v.to_string();
+                }
+            }
+        }
+    }
+    let system = workbuddy_pool_system_text(body);
+    let first_user = workbuddy_pool_first_user_text(body);
+    if system.is_empty() && first_user.is_empty() {
+        return String::new();
+    }
+    let seed = format!("{system}\u{0}{first_user}");
+    // FNV-1a 64 位：与参考实现同算法（偏移基/质数一致），跨进程稳定 → 同一会话
+    // 在服务重启后仍命中同一账号。
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in seed.as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("seed-{hash:x}")
+}
+
+/// 请求侧 / 凭证侧的明确错误 → 直接回给客户端的状态码（**不换号**）。
+///
+/// - `ContextTooLong`：同一请求体发给任何账号都同样失败，换号只会把整个请求体
+///   重传 N 遍（参考实现 forward.go:211-233 的结论）；契约 §4 要求立即 400。
+/// - `SessionDead`：账号 OAuth 会话已失效（12153），继续换号重发会让客户端以为
+///   是请求本身的问题；回 401 提示重新登录该账号。
+/// 其余 kind 返回 None = 记账后继续换号。
+fn workbuddy_pool_fatal_status(kind: workbuddy_errors::ErrKind) -> Option<StatusCode> {
+    use workbuddy_errors::ErrKind;
+    match kind {
+        ErrKind::ContextTooLong => Some(StatusCode::BAD_REQUEST),
+        ErrKind::SessionDead => Some(StatusCode::UNAUTHORIZED),
+        _ => None,
+    }
+}
+
+/// 配置对外形状（camelCase，与前端既有配置端点一致）；status 与 config PATCH
+/// 的响应共用，避免两处字段漂移。
+fn workbuddy_pool_config_json(cfg: &workbuddy_gateway::GatewayConfig) -> Value {
+    json!({
+        "mode": cfg.mode,
+        "pinnedUid": cfg.pinned_uid,
+        "softRateBaseSecs": cfg.soft_rate_base_secs,
+        "softRateMaxSecs": cfg.soft_rate_max_secs,
+        "breakerThreshold": cfg.breaker_threshold,
+        "breakerBaseSecs": cfg.breaker_base_secs,
+        "breakerMaxSecs": cfg.breaker_max_secs,
+        "maxInFlight": cfg.max_in_flight,
+        "stickyTtlMs": cfg.sticky_ttl_ms,
+        "sanitizeEnabled": cfg.sanitize_enabled,
+        "balanceRefreshMinutes": cfg.balance_refresh_minutes,
+    })
+}
+
+/// 在途租约守卫：Drop 时自动归还账号的在途名额。
+///
+/// 为什么用守卫而不是手写 `release`：出口有五六条（刷新失败 / 上游 4xx 致命 /
+/// 上游 4xx 换号 / 传输层失败 / 非流式聚合完成），漏一条就把该账号的在途名额
+/// 永久漏掉（`max_in_flight` 之下这个账号再也不可选，只能重启服务）。
+/// 参考实现 forward.go:93-105 用 `defer` + `handedOff` 标志解决同一问题；
+/// Rust 侧不需要那个标志 —— **把租约 move 进流的状态就是所有权移交**，
+/// 流结束（EOF）或被 drop（客户端断开）时 Drop 自然归还，恰好一次。
+struct WorkbuddyPoolLease {
+    uid: String,
+}
+
+impl WorkbuddyPoolLease {
+    /// 占用租约；名额已满（并发打满 `max_in_flight`）返回 None = 换号。
+    fn acquire(uid: &str) -> Option<Self> {
+        if workbuddy_gateway::acquire(uid) {
+            Some(Self {
+                uid: uid.to_string(),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for WorkbuddyPoolLease {
+    fn drop(&mut self) {
+        workbuddy_gateway::release(&self.uid);
+    }
+}
+
+/// WorkBuddy 多账号池对话补全（OpenAI 兼容；cloud 上游 + 账号池）。
+///
+/// 流程（契约 §13）：网关 key 鉴权 → 粘性键 → 选号循环（≤3 次换号）→
+/// token 惰性刷新 → `chat_stream` → 错误分级换号 / 成功流式转发。
+///
+/// 错误分级（契约 §4）：
+/// - `ContextTooLong` / `SessionDead`：`note_error` 记账后**直接回 4xx**，不换号；
+/// - 其余 kind：`note_error` 记账 + uid 加入 tried，继续换号；
+/// - 传输层失败（`chat_stream` 返回 `Err`）：只换号，不喂熔断。
+///
+/// 成功分支：`note_success` + 粘性绑定；`stream=true` 时把上游 SSE 的 `data:`
+/// 帧原样管道转发（不做逐帧重建），否则本地聚合成单条 OpenAI JSON。
+async fn api_workbuddy_pool_chat_completions(
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let started = std::time::Instant::now();
+    let (auth_ok, key_id) = workbuddy_pool_auth_ok(&headers);
+    if !auth_ok {
+        log_gateway_request(
+            "workbuddy-pool",
+            key_id.as_deref(),
+            "—",
+            false,
+            0,
+            "无效的 API Key",
+        );
+        return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+    }
+    // 刻意用 Bytes 而非 `Json` extractor：畸形 body 也要能走到鉴权/参数逻辑并回
+    // 400 JSON，不被 axum 的 422 抢答（与 trae_acp_chat_response 同口径，
+    // 本文件 4130 行起的注释）。
+    let Ok(payload) = serde_json::from_slice::<Value>(&body) else {
+        log_gateway_request(
+            "workbuddy-pool",
+            key_id.as_deref(),
+            "—",
+            false,
+            0,
+            "请求体不是合法 JSON",
+        );
+        return glm_proxy_error("请求体不是合法 JSON".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let model = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("workbuddy")
+        .to_string();
+    let want_stream = payload
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let cfg = workbuddy_gateway::load_config();
+    let sticky_key = workbuddy_pool_sticky_key(&payload);
+    let mut sticky_uid = if sticky_key.is_empty() {
+        None
+    } else {
+        workbuddy_gateway::sticky_get(&sticky_key)
+    };
+
+    let mut tried: Vec<String> = Vec::new();
+    let mut last_err: Option<String> = None;
+
+    for _ in 0..WB_POOL_MAX_PICKS {
+        // 选号：粘性号优先。契约 §13 只钉了 `pick_account(model, tried)`，没有
+        // 「按 uid 选号」入口 —— 把**其余全部账号**当 tried 传进去，等价于只放行
+        // 粘性号，且池内的冷却/熔断/在途判定仍然生效（`pick_account` 对 tried 一律
+        // 跳过，含全冷却兜底路径）。选不中即解绑，回到常规选号。
+        let picked = match sticky_uid.as_deref() {
+            Some(uid) if !tried.iter().any(|t| t == uid) => {
+                let others: Vec<String> = workbuddy_gateway::load_pool_accounts()
+                    .into_iter()
+                    .map(|a| a.uid)
+                    .filter(|u| u != uid)
+                    .collect();
+                match workbuddy_gateway::pick_account(&model, &others) {
+                    Some(acc) => Some(acc),
+                    None => {
+                        workbuddy_gateway::sticky_clear(&sticky_key);
+                        sticky_uid = None;
+                        workbuddy_gateway::pick_account(&model, &tried)
+                    }
+                }
+            }
+            _ => workbuddy_gateway::pick_account(&model, &tried),
+        };
+        let Some(mut acc) = picked else {
+            break;
+        };
+        let uid = acc.uid.clone();
+        tried.push(uid.clone());
+
+        // 在途租约：选中即占名额（`max_in_flight` 的执行者；池内选号本就会跳过
+        // 占满的账号，这里防的是「选中到占用之间」的并发窗口）。占不到就换号。
+        let Some(lease) = WorkbuddyPoolLease::acquire(&uid) else {
+            if sticky_uid.as_deref() == Some(uid.as_str()) {
+                workbuddy_gateway::sticky_clear(&sticky_key);
+                sticky_uid = None;
+            }
+            continue;
+        };
+
+        // token 惰性刷新：距过期不足 5 分钟先刷；成功则回写账号库（按过期较新者）
+        // 并记一次成功，失败换号继续。
+        if acc.expires_at > 0 && acc.expires_at < config::now_ms() + WB_POOL_REFRESH_SKEW_MS {
+            match workbuddy_upstream::refresh_token(&acc).await {
+                Ok((token, expires_at)) => {
+                    acc.access_token = token;
+                    acc.expires_at = expires_at;
+                    workbuddy_gateway::writeback_tokens(&uid, &acc.access_token, expires_at);
+                    workbuddy_gateway::note_success(&uid);
+                }
+                Err(e) => {
+                    // 刷新失败只有一句文案（无 status/body），用 classify 从文案里
+                    // 认 12153/session 失效等标记：SessionDead 会标需重登出池，
+                    // 纯网络失败（code=-1）判 None 不标（契约 §4）。
+                    let kind = workbuddy_errors::classify(0, &e);
+                    workbuddy_gateway::note_error(&uid, &model, kind, &e);
+                    last_err = Some(format!("token 刷新失败：{e}"));
+                    if sticky_uid.as_deref() == Some(uid.as_str()) {
+                        workbuddy_gateway::sticky_clear(&sticky_key);
+                        sticky_uid = None;
+                    }
+                    continue;
+                }
+            }
+        }
+
+        let out_body =
+            workbuddy_upstream::prepare_body(&payload, &acc.region, cfg.sanitize_enabled);
+        match workbuddy_upstream::chat_stream(&acc, &out_body).await {
+            // 上游 >=400：body 已按 ErrKind 分类
+            Ok(workbuddy_upstream::ChatOutcome::Error { status, body }) => {
+                let kind = workbuddy_errors::classify(status, &body);
+                let friendly = workbuddy_errors::friendly_message(kind, status, &body);
+                workbuddy_gateway::note_error(&uid, &model, kind, &body);
+                if let Some(fatal) = workbuddy_pool_fatal_status(kind) {
+                    let latency = started.elapsed().as_millis() as u64;
+                    log_gateway_request(
+                        "workbuddy-pool",
+                        key_id.as_deref(),
+                        &model,
+                        false,
+                        latency,
+                        &friendly,
+                    );
+                    return glm_proxy_error(friendly, fatal);
+                }
+                last_err = Some(if friendly.is_empty() {
+                    format!("上游返回 {status}")
+                } else {
+                    friendly
+                });
+                if sticky_uid.as_deref() == Some(uid.as_str()) {
+                    workbuddy_gateway::sticky_clear(&sticky_key);
+                    sticky_uid = None;
+                }
+            }
+            // 传输层失败（超时/连接被拒/DNS）：只换号，不喂熔断（契约 §4）
+            Err(e) => {
+                last_err = Some(e);
+                if sticky_uid.as_deref() == Some(uid.as_str()) {
+                    workbuddy_gateway::sticky_clear(&sticky_key);
+                    sticky_uid = None;
+                }
+            }
+            // 2xx SSE
+            Ok(workbuddy_upstream::ChatOutcome::Stream(resp)) => {
+                workbuddy_gateway::note_success(&uid);
+                if !sticky_key.is_empty() {
+                    workbuddy_gateway::sticky_set(&sticky_key, &uid);
+                }
+                let latency = started.elapsed().as_millis() as u64;
+                log_gateway_request(
+                    "workbuddy-pool",
+                    key_id.as_deref(),
+                    &model,
+                    true,
+                    latency,
+                    "",
+                );
+                if want_stream {
+                    // SSE data: 帧原样管道转发：不解析、不逐帧重建，chunk 边界与帧
+                    // 边界不对齐也无害（客户端按 SSE 规范自行拼帧）。
+                    // 读块走 upstream 的 read_stream_chunk：每次读块套 60s 空闲超时，
+                    // 上游卡住不产数据时断流报错（否则该账号的在途租约会被一个永不
+                    // 产出的流永久占住）。租约 move 进流的状态：流结束（EOF）或被
+                    // drop（客户端断开）时 Drop 归还，整个转发期间名额持续被占用。
+                    let stream = futures_util::stream::unfold((resp, lease), |state| async move {
+                        let (mut resp, lease) = state;
+                        match workbuddy_upstream::read_stream_chunk(
+                            &mut resp,
+                            workbuddy_upstream::CHAT_IDLE_TIMEOUT,
+                        )
+                        .await
+                        {
+                            Ok(Some(chunk)) => Some((Ok(chunk), (resp, lease))),
+                            Ok(None) => None,
+                            Err(e) => {
+                                Some((Err(format!("WorkBuddy 上游流中断: {e}")), (resp, lease)))
+                            }
+                        }
+                    });
+                    return (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "text/event-stream".to_string())],
+                        axum::body::Body::from_stream(stream),
+                    )
+                        .into_response();
+                }
+                // 非流式：行读上游 SSE 聚合成单条 OpenAI JSON
+                return match workbuddy_pool_aggregate(
+                    workbuddy_upstream::ChatOutcome::Stream(resp),
+                    &model,
+                )
+                .await
+                {
+                    Ok(value) => json_ok(value),
+                    Err(e) => {
+                        log_gateway_request(
+                            "workbuddy-pool",
+                            key_id.as_deref(),
+                            &model,
+                            false,
+                            started.elapsed().as_millis() as u64,
+                            &e,
+                        );
+                        glm_proxy_error(e, StatusCode::BAD_GATEWAY)
+                    }
+                };
+            }
+        }
+    }
+
+    // 选号耗尽（池内账号全部冷却/在途/已出池）或 3 次换号仍失败：
+    // 一律 503（账号池耗尽的语义，客户端据此稍后重试），文案带最后一次失败原因。
+    let detail = last_err.unwrap_or_default();
+    let msg = if detail.is_empty() {
+        "无可用账号（池内账号全部冷却/在途或已出池）".to_string()
+    } else {
+        format!("无可用账号：{detail}")
+    };
+    log_gateway_request(
+        "workbuddy-pool",
+        key_id.as_deref(),
+        &model,
+        false,
+        started.elapsed().as_millis() as u64,
+        &msg,
+    );
+    glm_proxy_error(msg, StatusCode::SERVICE_UNAVAILABLE)
+}
+
+/// 取流式 tool_call 分片的 index：兼容数字 / 字符串数字 / 缺省三种上游形态
+/// （口径同参考实现 upstream/sse.rs:239 index_of_tool_call —— 只认数字时多个
+/// 并行工具调用会被静默合并进槽位 0）。
+fn workbuddy_pool_tool_call_index(call: &serde_json::Map<String, Value>) -> i64 {
+    match call.get("index") {
+        Some(Value::Number(n)) => n
+            .as_i64()
+            .or_else(|| n.as_f64().map(|f| f as i64))
+            .unwrap_or(0),
+        Some(Value::String(s)) => s.trim().parse::<i64>().ok().filter(|&n| n >= 0).unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// 把流式 tool_call 片段合并到累计对象：id/type/function.name 直覆盖，
+/// function.arguments 拼接（口径同参考实现 upstream/sse.rs:252 merge_tool_call_delta）。
+fn workbuddy_pool_merge_tool_call(merged: &mut Value, delta: &serde_json::Map<String, Value>) {
+    let Some(m) = merged.as_object_mut() else {
+        return;
+    };
+    if let Some(v) = delta.get("id").and_then(Value::as_str) {
+        if !v.is_empty() {
+            m.insert("id".to_string(), Value::String(v.to_string()));
+        }
+    }
+    if let Some(v) = delta.get("type").and_then(Value::as_str) {
+        if !v.is_empty() {
+            m.insert("type".to_string(), Value::String(v.to_string()));
+        }
+    }
+    let Some(df) = delta.get("function").and_then(Value::as_object) else {
+        return;
+    };
+    if m.get("function").and_then(Value::as_object).is_none() {
+        m.insert("function".to_string(), Value::Object(serde_json::Map::new()));
+    }
+    let Some(mf) = m.get_mut("function").and_then(Value::as_object_mut) else {
+        return;
+    };
+    if let Some(v) = df.get("name").and_then(Value::as_str) {
+        if !v.is_empty() {
+            mf.insert("name".to_string(), Value::String(v.to_string()));
+        }
+    }
+    if let Some(v) = df.get("arguments").and_then(Value::as_str) {
+        if !v.is_empty() {
+            let prev = mf.get("arguments").and_then(Value::as_str).unwrap_or("");
+            mf.insert("arguments".to_string(), Value::String(format!("{prev}{v}")));
+        }
+    }
+}
+
+/// 非流式聚合器：把上游 SSE 的 delta 帧累加成一条完整消息。
+///
+/// 解析段仿 `grok::chat_completions_unified`（core grok.rs:800-890）：按行取
+/// `data:` 帧 → JSON 解析 → 指针取值累加；另兼容 tool_calls 的 index 合并与
+/// `usage` 透出（参考实现 upstream/sse.rs:83 aggregate）。
+struct WorkbuddyPoolAggregate {
+    /// 客户端请求的模型名：上游帧没带 model 时回填，避免响应里出现空模型。
+    requested_model: String,
+    /// 上游帧带的模型名：优先于 requested_model 回填（上游可能改写模型名）。
+    upstream_model: String,
+    id: String,
+    created: i64,
+    role: String,
+    finish_reason: String,
+    content: String,
+    reasoning: String,
+    usage: Option<Value>,
+    valid_events: usize,
+    tool_calls: std::collections::BTreeMap<i64, Value>,
+}
+
+impl WorkbuddyPoolAggregate {
+    fn new(model: &str) -> Self {
+        Self {
+            requested_model: model.to_string(),
+            upstream_model: String::new(),
+            id: String::new(),
+            created: 0,
+            role: "assistant".to_string(),
+            finish_reason: "stop".to_string(),
+            content: String::new(),
+            reasoning: String::new(),
+            usage: None,
+            valid_events: 0,
+            tool_calls: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// 喂一行 SSE（已去掉行尾换行）；遇到 `data: [DONE]` 返回 false = 可停止读取。
+    fn feed_line(&mut self, line: &str) -> bool {
+        let Some(payload) = line.strip_prefix("data:") else {
+            return true; // 注释行 / 空行 / event: 行：忽略
+        };
+        let payload = payload.trim();
+        if payload == "[DONE]" {
+            return false; // 上游显式结束，之后的数据一律忽略
+        }
+        if payload.is_empty() {
+            return true;
+        }
+        let Ok(chunk) = serde_json::from_str::<Value>(payload) else {
+            return true; // 解析失败静默跳过（不计有效事件）
+        };
+        self.valid_events += 1;
+        if let Some(v) = chunk.get("id").and_then(Value::as_str) {
+            if self.id.is_empty() {
+                self.id = v.to_string();
+            }
+        }
+        if let Some(v) = chunk.get("model").and_then(Value::as_str) {
+            if !v.is_empty() && self.upstream_model.is_empty() {
+                self.upstream_model = v.to_string();
+            }
+        }
+        if let Some(v) = chunk.get("created").and_then(Value::as_i64) {
+            if self.created == 0 {
+                self.created = v;
+            }
+        }
+        if let Some(u) = chunk.get("usage") {
+            if u.is_object() {
+                self.usage = Some(u.clone());
+            }
+        }
+        let Some(choices) = chunk.get("choices").and_then(Value::as_array) else {
+            return true;
+        };
+        for choice in choices {
+            let Some(c) = choice.as_object() else {
+                continue;
+            };
+            if let Some(fr) = c.get("finish_reason").and_then(Value::as_str) {
+                if !fr.is_empty() {
+                    self.finish_reason = fr.to_string();
+                }
+            }
+            let Some(delta) = c.get("delta").and_then(Value::as_object) else {
+                continue;
+            };
+            if let Some(role) = delta.get("role").and_then(Value::as_str) {
+                if !role.is_empty() {
+                    self.role = role.to_string();
+                }
+            }
+            if let Some(text) = delta.get("content").and_then(Value::as_str) {
+                self.content.push_str(text);
+            }
+            if let Some(r) = delta.get("reasoning_content").and_then(Value::as_str) {
+                self.reasoning.push_str(r);
+            }
+            if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                for call in calls {
+                    let Some(call) = call.as_object() else {
+                        continue;
+                    };
+                    let idx = workbuddy_pool_tool_call_index(call);
+                    let slot = self
+                        .tool_calls
+                        .entry(idx)
+                        .or_insert_with(|| json!({ "index": idx }));
+                    workbuddy_pool_merge_tool_call(slot, call);
+                }
+            }
+        }
+        true
+    }
+
+    /// 合成单条 OpenAI chat.completion JSON。
+    fn into_completion(self) -> Result<Value, String> {
+        if self.valid_events == 0 {
+            // 上游 200 但没有任何有效数据帧（空流 / 只有 [DONE]）：不合成空 content
+            // 的假成功（口径同参考实现 sse.rs:189）。
+            return Err("上游流未返回任何有效数据帧".to_string());
+        }
+        let has_tools = !self.tool_calls.is_empty();
+        let finish_reason = if has_tools {
+            "tool_calls".to_string()
+        } else {
+            self.finish_reason
+        };
+        let mut message = json!({ "role": self.role, "content": self.content });
+        if !self.reasoning.is_empty() {
+            message["reasoning_content"] = json!(self.reasoning);
+        }
+        if has_tools {
+            // BTreeMap 按 index 升序输出，多个并行工具调用不串槽。
+            message["tool_calls"] = Value::Array(self.tool_calls.into_values().collect());
+        }
+        let id = if self.id.is_empty() {
+            format!("chatcmpl-wbpool-{}", config::now_ms())
+        } else {
+            self.id
+        };
+        let created = if self.created == 0 {
+            config::now_ms() / 1000
+        } else {
+            self.created
+        };
+        let model = if self.upstream_model.is_empty() {
+            if self.requested_model.is_empty() {
+                "workbuddy".to_string()
+            } else {
+                self.requested_model
+            }
+        } else {
+            self.upstream_model
+        };
+        let mut out = json!({
+            "id": id,
+            "object": "chat.completion",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": message,
+                "finish_reason": finish_reason,
+            }],
+        });
+        if let Some(u) = self.usage {
+            out["usage"] = u;
+        }
+        Ok(out)
+    }
+}
+
+/// 非流式聚合：reqwest 行读上游 SSE，累加 content / reasoning_content /
+/// tool_calls 后合成 OpenAI JSON。
+///
+/// 参数收 `ChatOutcome` 而不是裸 `reqwest::Response`：server crate 不直接依赖
+/// reqwest，写不出后者的类型签名（`ChatOutcome` 在依赖链里可命名）。
+/// 读块同样走 `read_stream_chunk`（60s 空闲超时），与流式转发路径同一套断流口径；
+/// chunk 边界与 SSE 帧边界不对齐，必须自己按 `\n` 切行（跨 chunk 的半行留在缓冲里），
+/// 按字节累积再逐行 `from_utf8_lossy`，避免多字节字符被 chunk 边界切断后乱码。
+async fn workbuddy_pool_aggregate(
+    outcome: workbuddy_upstream::ChatOutcome,
+    model: &str,
+) -> Result<Value, String> {
+    // 只应在成功分支进入；Error 变体是兜底（理论上到不了）。
+    let mut resp = match outcome {
+        workbuddy_upstream::ChatOutcome::Stream(resp) => resp,
+        workbuddy_upstream::ChatOutcome::Error { status, body } => {
+            let kind = workbuddy_errors::classify(status, &body);
+            return Err(workbuddy_errors::friendly_message(kind, status, &body));
+        }
+    };
+    let mut agg = WorkbuddyPoolAggregate::new(model);
+    let mut buf: Vec<u8> = Vec::new();
+    'read: while let Some(chunk) = workbuddy_upstream::read_stream_chunk(
+        &mut resp,
+        workbuddy_upstream::CHAT_IDLE_TIMEOUT,
+    )
+    .await?
+    {
+        buf.extend_from_slice(&chunk);
+        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let raw: Vec<u8> = buf.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(&raw);
+            if !agg.feed_line(line.trim_end_matches(['\r', '\n'])) {
+                break 'read;
+            }
+        }
+    }
+    if !buf.is_empty() {
+        let line = String::from_utf8_lossy(&buf);
+        agg.feed_line(line.trim_end_matches(['\r', '\n']));
+    }
+    agg.into_completion()
+}
+
+/// GET /workbuddy-pool/v1/models：池内首个可用账号的 `fetch_models`，
+/// 全部失败（含池为空）回落 WorkBuddy 内置模型表，保证客户端始终拿得到目录。
+///
+/// 免网关 key（与 status/config 同属管理三端点，理由见路由注册处的鉴权策略注释）：
+/// 契约 §13 路由表只对 chat/completions 标注「鉴权(网关 key)」，且本文件 WorkBuddy
+/// 家族另外两个模型目录端点（`/workbuddy-native/v1/models` 本文件 256 行、
+/// `/api/workbuddy-proxy/models` 本文件 262 行）同样免 key。
+async fn api_workbuddy_pool_models() -> Response {
+    let mut last_err = String::new();
+    for acc in workbuddy_gateway::load_pool_accounts() {
+        match workbuddy_upstream::fetch_models(&acc).await {
+            Ok(payload) => {
+                log_gateway_request("workbuddy-pool", None, "models", true, 0, "");
+                return json_ok(payload);
+            }
+            Err(e) => last_err = e,
+        }
+    }
+    log_gateway_request("workbuddy-pool", None, "models", false, 0, &last_err);
+    json_ok(workbuddy_proxy::builtin_models_payload())
+}
+
+/// GET /workbuddy-pool/v1/status：池状态 + 当前配置（grok 式 `pool_status()` +
+/// `load_config()` 合并成一份 JSON，前端一个请求拿全）。
+///
+/// ⚠️ 必须**扁平**返回（契约 §13「pool_status() + config」= 同层合并），不要在池数据
+/// 外面套 `{"pool": ...}` 信封：前端 `WorkbuddyPage.tsx:163` 拿到响应体直接
+/// `setPoolStatus(res)`，随后 :476/:481/:487/:493/:499/:525 读 `poolStatus.total` /
+/// `.healthy` / `.cooling` / `.modelCooling` / `.breaker` / `.accounts`（类型见
+/// `api.ts:1175 WorkbuddyPoolStatusResponse extends WorkbuddyPoolStatus`，这些字段
+/// 声明在**响应体顶层**）。套信封会让五个计数器恒显「—」、账号表恒显「暂无账号」。
+/// 同 Grok 池的既有约定：`api_grok_pool_overview`（本文件 1700 行）也是
+/// `json_ok(grok_pool::pool_overview())` 扁平返回。
+async fn api_workbuddy_pool_status() -> Response {
+    let cfg = workbuddy_gateway::load_config();
+    let mut out = workbuddy_gateway::pool_status();
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert("config".to_string(), workbuddy_pool_config_json(&cfg));
+        // 访问密钥：面板「接入信息」区块展示用（前端 `poolStatus.apiKey`，缺省则显示
+        // 「未获取到」门槛说明）。取 GLM 主密钥 —— 本路由组的鉴权接受它或网关专用 Key
+        // （`gateway_key_status`）。与 `/api/glm-proxy/config`（本文件 5621 行）同一
+        // 口径：本服务仅绑 127.0.0.1，不构成新的暴露面。
+        obj.insert(
+            "apiKey".to_string(),
+            json!(glm_proxy::load_config().api_key),
+        );
+    }
+    json_ok(out)
+}
+
+/// POST /workbuddy-pool/v1/config：PATCH 配置（clamp 边界同契约 §5），保存后返回新配置。
+///
+/// 边界：mode 枚举校验（非法值整体拒绝，不静默改写模式）、soft_rate_max >= base、
+/// breaker_max >= base、breaker_threshold >= 1、sticky_ttl 60_000..3_600_000、
+/// balance_refresh_minutes >= 5。
+async fn api_workbuddy_pool_config_save(Json(body): Json<Value>) -> Response {
+    let mut cfg = workbuddy_gateway::load_config();
+    if let Some(mode) = body.get("mode").and_then(Value::as_str) {
+        if !WB_POOL_MODES.contains(&mode) {
+            return json_err(
+                format!("mode 仅支持 {}（收到 {mode}）", WB_POOL_MODES.join(" / ")),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+        cfg.mode = mode.to_string();
+    }
+    if let Some(v) = body.get("pinnedUid").and_then(Value::as_str) {
+        cfg.pinned_uid = v.trim().to_string();
+    }
+    if let Some(v) = body.get("softRateBaseSecs").and_then(Value::as_u64) {
+        cfg.soft_rate_base_secs = v;
+    }
+    if let Some(v) = body.get("softRateMaxSecs").and_then(Value::as_u64) {
+        cfg.soft_rate_max_secs = v;
+    }
+    // 上限不得低于下限：否则指数退避永远到不了顶，语义自相矛盾。
+    if cfg.soft_rate_max_secs < cfg.soft_rate_base_secs {
+        cfg.soft_rate_max_secs = cfg.soft_rate_base_secs;
+    }
+    if let Some(v) = body.get("breakerThreshold").and_then(Value::as_i64) {
+        cfg.breaker_threshold = v.max(1);
+    }
+    if let Some(v) = body.get("breakerBaseSecs").and_then(Value::as_u64) {
+        cfg.breaker_base_secs = v;
+    }
+    if let Some(v) = body.get("breakerMaxSecs").and_then(Value::as_u64) {
+        cfg.breaker_max_secs = v;
+    }
+    if cfg.breaker_max_secs < cfg.breaker_base_secs {
+        cfg.breaker_max_secs = cfg.breaker_base_secs;
+    }
+    // max_in_flight 不 clamp：core 侧 0 = 不限（workbuddy_gateway.rs:121），
+    // 强行抬到 1 会把「不限」变成「只允许 1 个在途」。
+    if let Some(v) = body.get("maxInFlight").and_then(Value::as_i64) {
+        cfg.max_in_flight = v.max(0);
+    }
+    if let Some(v) = body.get("stickyTtlMs").and_then(Value::as_i64) {
+        cfg.sticky_ttl_ms = v.clamp(WB_POOL_STICKY_TTL_MIN_MS, WB_POOL_STICKY_TTL_MAX_MS);
+    }
+    if let Some(v) = body.get("sanitizeEnabled").and_then(Value::as_bool) {
+        cfg.sanitize_enabled = v;
+    }
+    if let Some(v) = body.get("balanceRefreshMinutes").and_then(Value::as_u64) {
+        cfg.balance_refresh_minutes = v.max(WB_POOL_BALANCE_REFRESH_MIN_MINUTES);
+    }
+    if let Err(e) = workbuddy_gateway::save_config(&cfg) {
+        return json_err(e, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    json_ok(json!({
+        "ok": true,
+        "config": workbuddy_pool_config_json(&cfg),
+    }))
 }
 
 // ---------------------------------------------------------------------------

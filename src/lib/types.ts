@@ -915,6 +915,10 @@ export interface GrokPoolPolicy {
   rateLimitPenalty: number;
   timeoutPenalty: number;
   fatalPenalty: number;
+  /** 池容量下限：可用账号数低于该值即触发容量守卫（告警 + 可选暂停调度） */
+  minPoolSize: number;
+  /** 低于容量下限时暂停调度（选号直接失败并给出原因）；关闭时仅告警不暂停 */
+  pauseWhenBelowMin: boolean;
 }
 
 export interface GrokPoolSnapshot {
@@ -927,12 +931,24 @@ export interface GrokPoolSnapshot {
   risk: { low: number; medium: number; high: number };
 }
 
+export interface GrokPoolCapacity {
+  /** 容量下限（>=1） */
+  minPoolSize: number;
+  /** 是否启用「低于下限暂停调度」 */
+  pauseWhenBelowMin: boolean;
+  /** 当前可用账号数（与选号层同一判定：启用 + 未冷却 + error 退避期已过） */
+  available: number;
+  /** 是否已低于下限（pauseWhenBelowMin 开启时才为真） */
+  belowMin: boolean;
+}
+
 export interface GrokPoolOverview {
   total: number;
   ok: number;
   errored: number;
   cooling: number;
   risk: { low: number; medium: number; high: number };
+  capacity: GrokPoolCapacity;
   policy: Partial<GrokPoolPolicy>;
   accounts: GrokPoolAccount[];
 }
@@ -1055,6 +1071,103 @@ export interface MiaoshouCheckinResult {
   id: string;
   ok: boolean;
   result: string;
-  error?: string | null;
+  error?: string;
+}
+
+// ---- WorkBuddy 多账号网关（cloud 账号池 · /workbuddy-pool/v1）----
+// 字段名与后端实际输出逐字对齐（勿改）：池状态与 accounts[] 由
+// workbuddy_gateway.rs:1504-1529 `pool_status()` 以 snake_case 输出；
+// GatewayConfig 由 api.rs:4599-4613 `workbuddy_pool_config_json` 以 camelCase 输出。
+// token 类字段一律不出现；uid 在状态里已脱敏（仅前 8 位）。
+
+/** 单个账号的模型级冷却明细（后端 `model_cools[]` 元素，snake_case）。 */
+export interface WorkbuddyModelCooling {
+  /** 被冷却的模型名 */
+  model: string;
+  /** 冷却截止（ms epoch） */
+  until: number;
+  /** 剩余冷却秒数 */
+  remaining_sec: number;
+  /** 冷却原因（含模型名与重置时间的人话文案） */
+  reason: string;
+  /** true = 到期时间取自上游文案解析；false = 回退固定软冷却时长 */
+  reset_at_parsed: boolean;
+}
+
+/** 账号池条目（脱敏视图；不含 access_token / refresh_token）。 */
+export interface WorkbuddyPoolAccount {
+  /** 账号 uid（状态脱敏：仅前 8 位 + "…"） */
+  uid: string;
+  /** 昵称；账号库缺省为空串 */
+  nickname: string;
+  /** 账号区域："cn"（国服）| "intl"（国际版） */
+  region: string;
+  /** 积分余额；0 = 未知（尚未巡检） */
+  credits: number;
+  /** 积分到期日（ms epoch）；0 = 未知 */
+  credit_expires_at: number;
+  /** 账号级冷却类型："soft_rate" | "hard_credit"；空串 = 不在冷却期 */
+  cooldown_kind: string;
+  /** 账号级冷却截止（ms epoch）；0 = 不在冷却期 */
+  until: number;
+  /** 熔断截止（ms epoch）；0 = 未熔断 */
+  breaker_until: number;
+  /** 在途请求数 */
+  in_flight: number;
+  /** 模型级冷却明细（仅这些模型不可用，换模型仍可用） */
+  model_cools: WorkbuddyModelCooling[];
+  /** 最近被选中时刻（ms epoch）；0 = 从未使用 */
+  last_used: number;
+  /** session 死亡（12153）→ 已出池，需人工重登 */
+  disabled: boolean;
+  /** 出池 / 冷却原因（后端备注） */
+  reason: string;
+  /** 累计成功次数 */
+  success_count: number;
+  /** 累计错误次数 */
+  err_total: number;
+}
+
+/** 池状态总览（契约 §13 pool_status()：五个计数 + 账号明细，snake_case）。 */
+export interface WorkbuddyPoolStatus {
+  /** 账号库中 WorkBuddy 账号总数 */
+  total: number;
+  /** 可用账号数（未冷却 / 未熔断 / 未出池） */
+  healthy: number;
+  /** 账号级冷却中的数量 */
+  cooling: number;
+  /** 有模型级冷却的账号数量（uid+model 维度计数不在此列） */
+  model_cooling: number;
+  /** 熔断中的账号数量 */
+  breaker: number;
+  /** 账号明细（脱敏） */
+  accounts: WorkbuddyPoolAccount[];
+}
+
+/** 网关配置（契约 §13 GatewayConfig；api.rs:4599 输出为 camelCase，
+ *  PATCH /workbuddy-pool/v1/config 请求体同键名）。 */
+export interface WorkbuddyGatewayConfig {
+  /** 选号模式：balance（均衡分层）| rotate（烧号轮询）| pinned（指定账号） */
+  mode: "balance" | "rotate" | "pinned";
+  /** pinned 模式固定的账号 uid（完整值，状态表展示的是脱敏值） */
+  pinnedUid: string;
+  /** 软限流冷却基础秒数（429 普通限流，指数退避起点） */
+  softRateBaseSecs: number;
+  /** 软限流冷却上限秒数（指数退避封顶） */
+  softRateMaxSecs: number;
+  /** 熔断触发阈值（连续失败次数） */
+  breakerThreshold: number;
+  /** 熔断基础冷却秒数 */
+  breakerBaseSecs: number;
+  /** 熔断冷却上限秒数（指数增长封顶） */
+  breakerMaxSecs: number;
+  /** 单账号最大在途请求数；0 = 不限 */
+  maxInFlight: number;
+  /** 会话粘性 TTL（毫秒；conversation_id 绑号） */
+  stickyTtlMs: number;
+  /** 出站脱敏开关（请求体指纹字段清洗，默认开） */
+  sanitizeEnabled: boolean;
+  /** 余额巡检间隔（分钟；驱动到期分层） */
+  balanceRefreshMinutes: number;
 }
 

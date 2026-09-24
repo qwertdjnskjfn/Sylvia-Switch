@@ -57,6 +57,8 @@ import type {
   GrokPoolPolicy,
   GrokPoolSnapshot,
   GrokRegisterStatus,
+  WorkbuddyPoolStatus,
+  WorkbuddyGatewayConfig,
 } from "./types";
 import type { ChannelDetail, ChannelHealthOverview } from "@/lib/channel-health-types";
 import type { ModelTestRequest, ModelTestResult } from "@/lib/model-test-types";
@@ -229,6 +231,12 @@ const ROUTES: Record<string, Route> = {
   get_workbuddy_proxy_config: { method: "GET", path: "/api/workbuddy-proxy/config" },
   save_workbuddy_proxy_config: { method: "POST", path: "/api/workbuddy-proxy/config" },
   get_workbuddy_native_models: { method: "GET", path: "/workbuddy-native/v1/models" },
+  // WorkBuddy 多账号网关（cloud 账号池 · 2026-09-24 重构新增，独立路由组；
+  // 存量 /workbuddy/v1 与 /workbuddy-native/v1 原样不动）
+  get_workbuddy_pool_status: { method: "GET", path: "/workbuddy-pool/v1/status" },
+  patch_workbuddy_pool_config: { method: "POST", path: "/workbuddy-pool/v1/config" },
+  get_workbuddy_pool_models: { method: "GET", path: "/workbuddy-pool/v1/models" },
+  workbuddy_pool_chat: { method: "POST", path: "/workbuddy-pool/v1/chat/completions" },
   // OpenCode 网关（2026-09-22 三拆新增，独立密钥）
   get_opencode_proxy_status: { method: "GET", path: "/api/opencode-proxy/status" },
   get_opencode_proxy_config: { method: "GET", path: "/api/opencode-proxy/config" },
@@ -1157,6 +1165,55 @@ export async function saveWorkbuddyProxyConfig(patch: {
   regenerateKey?: boolean;
 }): Promise<WorkbuddyProxyConfigInfo> {
   return httpCall("save_workbuddy_proxy_config", patch);
+}
+
+/* -------------------------------------------------------------------------- */
+/* WorkBuddy 多账号网关（cloud 账号池 · /workbuddy-pool/v1 · 2026-09-24 重构）   */
+/* -------------------------------------------------------------------------- */
+
+/** GET /workbuddy-pool/v1/status 响应信封（api.rs:5208-5215）：池状态嵌套在
+ *  `pool` 下，配置在顶层 `config`（camelCase）；一个请求拿全。 */
+export interface WorkbuddyPoolStatusResponse {
+  ok?: boolean;
+  pool: WorkbuddyPoolStatus;
+  config?: WorkbuddyGatewayConfig;
+}
+
+/** 池状态总览（total/healthy/cooling/model_cooling/breaker + 账号明细）。 */
+export async function getWorkbuddyPoolStatus(): Promise<WorkbuddyPoolStatusResponse> {
+  return call("get_workbuddy_pool_status");
+}
+
+/** PATCH 网关配置（热更新，即写即生效；字段为 camelCase，缺省字段不修改）。 */
+export async function patchWorkbuddyPoolConfig(
+  patch: Partial<WorkbuddyGatewayConfig>,
+): Promise<{ ok: boolean; config?: WorkbuddyGatewayConfig }> {
+  return call("patch_workbuddy_pool_config", patch as Record<string, unknown>);
+}
+
+/** 池内模型目录（首个可用账号的上游目录，失败回落内置表）。 */
+export async function getWorkbuddyPoolModels(): Promise<{
+  object: string;
+  data: { id: string; object?: string; created?: number; owned_by?: string }[];
+}> {
+  return call("get_workbuddy_pool_models");
+}
+
+/** 多账号网关试调（OpenAI 兼容；非流式聚合返回，错误已按分级表换号重试）。 */
+export async function workbuddyPoolChat(input: {
+  model: string;
+  messages: Array<{ role: string; content: string }>;
+  stream?: boolean;
+}): Promise<{
+  id?: string;
+  choices?: Array<{
+    message?: { role?: string; content?: string; reasoning_content?: string };
+    finish_reason?: string | null;
+  }>;
+  usage?: unknown;
+  error?: { message?: string };
+}> {
+  return call("workbuddy_pool_chat", input as unknown as Record<string, unknown>);
 }
 
 /** TRAE 反代接入配置（密钥复用 Loomy 代理）。 */

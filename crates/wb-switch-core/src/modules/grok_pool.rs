@@ -43,6 +43,10 @@ pub struct PoolPolicy {
     pub timeout_penalty: i64,
     /// 致命失效一次的健康分扣分
     pub fatal_penalty: i64,
+    /// 池容量下限：可用账号数低于该值即触发容量守卫（告警 + 可选暂停调度）
+    pub min_pool_size: usize,
+    /// 低于容量下限时暂停调度（chat/test 选号直接失败并给出可读原因）
+    pub pause_when_below_min: bool,
 }
 
 impl Default for PoolPolicy {
@@ -58,6 +62,9 @@ impl Default for PoolPolicy {
             rate_limit_penalty: 10,
             timeout_penalty: 8,
             fatal_penalty: 30,
+            // 容量守卫默认值与现状语义兼容：min=1 时仅「无可用账号」触发。
+            min_pool_size: 1,
+            pause_when_below_min: true,
         }
     }
 }
@@ -82,6 +89,8 @@ pub fn load_policy() -> PoolPolicy {
             rate_limit_penalty: v.get("rateLimitPenalty").and_then(Value::as_i64).unwrap_or(d.rate_limit_penalty),
             timeout_penalty: v.get("timeoutPenalty").and_then(Value::as_i64).unwrap_or(d.timeout_penalty),
             fatal_penalty: v.get("fatalPenalty").and_then(Value::as_i64).unwrap_or(d.fatal_penalty),
+            min_pool_size: v.get("minPoolSize").and_then(Value::as_u64).unwrap_or(d.min_pool_size as u64) as usize,
+            pause_when_below_min: v.get("pauseWhenBelowMin").and_then(Value::as_bool).unwrap_or(d.pause_when_below_min),
         })
         .unwrap_or(d)
 }
@@ -102,6 +111,8 @@ pub fn save_policy(p: &PoolPolicy) -> Result<(), String> {
         "rateLimitPenalty": p.rate_limit_penalty,
         "timeoutPenalty": p.timeout_penalty,
         "fatalPenalty": p.fatal_penalty,
+        "minPoolSize": p.min_pool_size,
+        "pauseWhenBelowMin": p.pause_when_below_min,
         "updatedAt": now_ms(),
     }))
     .map_err(|e| e.to_string())?;
@@ -361,6 +372,38 @@ pub fn history() -> Value {
 }
 
 // ---------------------------------------------------------------------------
+// C2 容量守卫层
+// ---------------------------------------------------------------------------
+
+/// 纯计算：给定账号列表/策略/时刻，返回 (可用数, 是否低于下限)。
+/// 抽出为纯函数以便单测（不读盘、无环境依赖）。
+pub(crate) fn compute_capacity(accounts: &[Value], policy: &PoolPolicy, now: i64) -> (usize, bool) {
+    let available = accounts
+        .iter()
+        .filter(|a| crate::modules::grok::is_account_available(a, now))
+        .count();
+    let floor = policy.min_pool_size.max(1);
+    (available, policy.pause_when_below_min && available < floor)
+}
+
+/// 容量守卫状态（供总览展示与选号层裁决）。
+///
+/// 可用性判定复用 `grok::is_account_available`（与选号层同一事实来源，
+/// 避免两处漂移）。`belowMin` 仅在 `pauseWhenBelowMin` 开启时才算真——
+/// 关闭时池浅只告警不暂停。
+pub fn capacity_guard_state() -> Value {
+    let policy = load_policy();
+    let accounts = crate::modules::grok::load_accounts();
+    let (available, below_min) = compute_capacity(&accounts, &policy, now_ms());
+    json!({
+        "minPoolSize": policy.min_pool_size.max(1),
+        "pauseWhenBelowMin": policy.pause_when_below_min,
+        "available": available,
+        "belowMin": below_min,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // C2 告警层
 // ---------------------------------------------------------------------------
 
@@ -372,6 +415,7 @@ static LAST_ALERT: std::sync::Mutex<Option<Value>> = std::sync::Mutex::new(None)
 ///
 /// 触发条件：
 /// - 可用账号数低于策略阈值（默认 1，即无可用账号）
+/// - 可用账号数低于容量下限 minPoolSize（pauseWhenBelowMin 开启时）
 /// - 高风险账号占比超阈值
 /// - 单账号被限流（由调用方直接在 mark 时告警，此处不重复）
 pub fn evaluate_alerts(overview: &Value) {
@@ -395,6 +439,19 @@ pub fn evaluate_alerts(overview: &Value) {
             "Grok 账号池告急",
             &format!("当前无可用账号（共 {total} 个，{errored} 个异常），请检查账号池或补充新账号。"),
         );
+    }
+
+    // 条件 2：低于容量下限（pauseWhenBelowMin 开启时调度已暂停，需尽快补充）。
+    if let Some(cap) = overview.get("capacity") {
+        if cap.get("belowMin").and_then(Value::as_bool) == Some(true) {
+            let floor = cap.get("minPoolSize").and_then(Value::as_i64).unwrap_or(1);
+            let available = cap.get("available").and_then(Value::as_i64).unwrap_or(0);
+            crate::modules::notify::notify(
+                "grok-pool-capacity",
+                "Grok 账号池低于容量下限",
+                &format!("当前可用账号 {available} 个，低于容量下限 {floor}，调度已暂停；请补充账号或在策略中调整下限。"),
+            );
+        }
     }
 
     // 条件 2：高风险账号过半。
@@ -474,6 +531,7 @@ pub fn pool_overview() -> Value {
         "errored": errored,
         "cooling": cooling,
         "risk": {"low": low, "medium": medium, "high": high},
+        "capacity": capacity_guard_state(),
         "policy": {
             "autoCheckEnabled": policy.auto_check_enabled,
             "checkIntervalMinutes": policy.check_interval_minutes,
@@ -484,4 +542,67 @@ pub fn pool_overview() -> Value {
         },
         "accounts": details,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn acc(id: &str, enabled: bool, cooldown_until: i64, status: &str, error_retry_at: i64) -> Value {
+        json!({
+            "id": id,
+            "enabled": enabled,
+            "cooldownUntil": cooldown_until,
+            "status": status,
+            "errorRetryAt": error_retry_at,
+        })
+    }
+
+    /// 容量矩阵：可用性判定必须与选号层一致（启用+未冷却+error 退避期已过），
+    /// 且 belowMin 只在 pauseWhenBelowMin 开启时才为真。
+    #[test]
+    fn capacity_matrix_matches_availability() {
+        let now = 1_000_000i64;
+        let accounts = vec![
+            acc("a", true, 0, "ok", 0),                    // 可用
+            acc("b", true, now + 60_000, "cooldown", 0),   // 冷却中 → 不可用
+            acc("c", false, 0, "ok", 0),                   // 手动禁用 → 不可用
+            acc("d", true, 0, "error", now + 60_000),      // error 退避期内 → 不可用
+            acc("e", true, 0, "error", now - 1),           // 退避期已过 → 可用（假 error 自愈）
+        ];
+        let mut p = PoolPolicy::default();
+
+        // 开启暂停：2 个可用 < 下限 3 → 触发守卫。
+        p.min_pool_size = 3;
+        p.pause_when_below_min = true;
+        let (available, below) = compute_capacity(&accounts, &p, now);
+        assert_eq!(available, 2);
+        assert!(below);
+
+        // 关闭暂停：池浅只告警，不判 belowMin。
+        p.pause_when_below_min = false;
+        let (available2, below2) = compute_capacity(&accounts, &p, now);
+        assert_eq!(available2, 2);
+        assert!(!below2);
+
+        // 下限降到 2：恰好达标 → 不触发。
+        p.min_pool_size = 2;
+        p.pause_when_below_min = true;
+        let (_, below3) = compute_capacity(&accounts, &p, now);
+        assert!(!below3);
+
+        // 空池 + min=0（被钳到 1）→ 必然低于下限。
+        p.min_pool_size = 0;
+        let (av0, below0) = compute_capacity(&[], &p, now);
+        assert_eq!(av0, 0);
+        assert!(below0);
+
+        // 默认策略与旧语义兼容：min=1 时仅「无可用账号」触发。
+        let d = PoolPolicy::default();
+        assert_eq!(d.min_pool_size, 1);
+        assert!(d.pause_when_below_min);
+        let (av_ok, below_ok) = compute_capacity(&accounts, &d, now);
+        assert_eq!(av_ok, 2);
+        assert!(!below_ok);
+    }
 }

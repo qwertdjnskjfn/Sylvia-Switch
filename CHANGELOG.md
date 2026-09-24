@@ -7,6 +7,98 @@
 
 ---
 
+## 1.0.2 — 2026-09-24
+
+### 新增：WorkBuddy 网关重构 P0+P1（错误分类矩阵 + 多账号 cloud 池）
+
+契约：`docs/workbuddy-gateway-refactor-contract.md`（工作区根目录）。参考实现：
+`_workbuddy-gateway-ref/momo0410-switch-gateway/`（GitHub 调研后克隆，生态内 Go/Rust 双版本）。
+调研结论：WorkBuddy 反代生态已成型（panel ★815 / codebuddy2api ★277 / hub ★250 等），
+本仓是独有的「本地 ACP」路线；本次把生态验证过的「云 API 多账号池」补上。
+
+**P0 · 错误分类（新增 `modules/workbuddy_errors.rs`，1168 行）**
+
+- `ErrKind` 十分类 + `classify(status, body)`：判定顺序 402 → 额度耗尽码 14018
+  （嵌套 `error.data.code`，HTTP 是 429，不先拦会误判软冷却无限重试）→ 25 个中英硬标记词
+  （含国际版复数 Credits）→ 12153 session 失效 → 429（先 6004 模型级限流再软限流）→
+  11115 上下文超长三路判定（业务码 + extError.code + 中英文案，不按 status 门控）→ 404 → 5xx → 4xx；
+- `parse_reset_time`：正则抓重置时刻，无后缀按上游 CST（+8）解释，只接受未来时刻；
+  `friendly_message` 一句中文可读原因；
+- 37 个单测 / 146 条 assert 固化判定顺序与时区矩阵。
+
+**P1 · 多账号 cloud 池（新增 `modules/workbuddy_gateway.rs` + `workbuddy_upstream.rs`）**
+
+- 凭证桥：`~/.wb-switch/accounts.json`（唯一真源、只读）→ 池条目，token 刷新按过期较新者回写；
+- 选号：到期日分层（先烧快过期额度，确定性行为）→ 档内加权 Top5（tiered 去 credits 项）→
+  防惊群 → LRU 双键兜底；hard 冷却号不进兜底；
+- 冷却分级：SoftRate 600s 起指数退避 / HardCredit 至次日 04:00 / **ModelRate 按 uid+model**
+  （选号/兜底/粘性三入口过滤、不喂熔断器、重置时间从报错解析、持久化）；熔断指数增长；
+  在途租约；会话粘性 TTL 滚动；
+- 上游客户端：双区域端点（cn: copilot.tencent.com / intl: www.workbuddy.ai）、官方头族
+  （🔴 X-Refresh-Token 只出现在 refresh 端点，测试固化）、INTL 首条补 system（防 400 11128）、
+  强制 stream、tool_choice 归一化、chat_stream 首字节/idle 双超时；
+- 状态持久化 `workbuddy_gateway_state.json`（原子写、启动加载）。
+
+**新路由组 `/workbuddy-pool/v1/*`**（chat/completions 流式+非流式、models、status、config），
+鉴权 + 粘性 + ≤3 次换号循环；**存量 `/workbuddy/v1` 与 `/workbuddy-native/v1` 零改动**（增量式
+cutover）。前端 WorkbuddyPage 新增「多账号网关（cloud）」区块（池总览/账号表/配置面板）。
+
+### 测试与验证
+
+- 三门禁全过：`cargo check`（两 crate）、`cargo test -p wb-switch-core workbuddy`（112 个测试：
+  workbuddy_errors 37 + workbuddy_gateway 49 + workbuddy_upstream 26）、`tsc --noEmit`；
+- 独立评审（未参与实现者）确认并修复 5 个问题（测试拼写/前后端契约漂移/鉴权一致性等）；
+- 主会话独立抽验：classify 判定顺序、X-Refresh-Token 红线、存量路由零改动、池状态脱敏。
+
+---
+
+## 1.0.1 — 2026-09-24
+
+### 新增：Grok 账号池容量守卫 + web 通道性能优化
+
+契约：`docs/grok-pool-guard-perf-contract.md`（工作区根目录）。
+
+**一、账号池容量守卫（`grok_pool.rs` / `grok.rs`）**
+
+- 策略新增两个字段（`grok_pool_policy.json`）：`minPoolSize`（容量下限，默认 1）、
+  `pauseWhenBelowMin`（低于下限时暂停调度，默认 true）。默认值与旧语义兼容：
+  min=1 时仅「无可用账号」触发，错误文案比原来更明确。
+- 选号层 `pick_available_account` 接入守卫：可用数低于下限时直接失败并提示
+  「请补充账号或在策略中调整下限」，不再让请求打空转；**体检循环不暂停**
+  （池越浅越需要体检找回死账号）。
+- 可用性判定抽取为 `grok::is_account_available`（选号层与容量守卫同一事实来源，
+  消除两处漂移）；`pool_overview()` 新增 `capacity` 对象，策略面板新增两个控件，
+  低于下限时账号池卡片顶部显示告警条。
+- 告警层新增「低于容量下限」条件（notify 类别 `grok-pool-capacity`，10 分钟节流）。
+
+**二、web 通道性能优化（`grok_sso.rs` / `grok.rs`）**
+
+- 固定 sleep 改有界轮询：`ensure_grok_page` 开 tab 后轮询 target 就绪（省 ~1.7s）；
+  `trigger_renewal` 轮询 `readyState=complete` + 1s 余量替代固定 6s（典型省 ~3-4s/轮）。
+- 停滞取消：轮询间隔 3000ms→2000ms；新增「生成中但正文+思考面板全文超过 90s 无变化」
+  判定（思考面板在合法深推时会持续变化，不会误杀长思考）→ 点「停止」收尾返回部分回复，
+  卡死场景从拖满 240s 缩短到 ~90s 出头。
+- 锁范围缩减：新增 `ENSURE_LOCK` 只保护「拉起浏览器 + 开 tab」启动动作，
+  `UI_CHAT_LOCK` 只覆盖「切号 + 对话」——排队请求不必每个都串行等一遍浏览器启动；
+  新增排队超时 120s（旧行为 5 个请求最坏等 5×60s 且无上限）。
+- 重试卫生：`send_web_request` / `send_build_request` 错误统一为 `ChatError`（携带
+  错误类型；build 通道此前的错误被 `?` 直接吞掉不重试，现已纳入换号重试）；
+  退避策略纯函数化 `retry_backoff_ms`：Invalid 不重试，NotLoggedIn/RateLimited 300ms，
+  Timeout/Infra 600ms，最多 1 次换号重试。
+
+**明确不做**：多浏览器实例真并行（放大对 grok.com 的自动化会话面，需单独决策）；
+任何自动化注册/建号能力；体检循环暂停。
+
+### 测试与验证
+
+- 新增 3 个矩阵测试全过：`is_account_available_matrix`（五种账号状态组合）、
+  `retry_backoff_matrix`（六种重试分支）、`capacity_matrix_matches_availability`
+  （可用数/belowMin/暂停开关/下限钳制/默认兼容）。
+- 门禁：`cargo check -p wb-switch-core -p wb-switch-server`、`cargo test -p wb-switch-core grok`
+  （19 个测试全过，含注册机 4 个守卫测试无回归）、`tsc --noEmit` 全部通过。
+
+---
+
 ## 1.0.0 — 2026-09-24
 
 > 版本号升级至 1.0.0：两个 crate（core / server）同步 bump（历史教训：只 bump 一个会导致

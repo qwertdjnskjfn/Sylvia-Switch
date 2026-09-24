@@ -31,9 +31,12 @@ import { Link } from "react-router-dom";
 import {
   BarChart3,
   CircleAlert,
+  Cloud,
   Loader2,
   RefreshCw,
   Route,
+  Settings,
+  Users,
 } from "lucide-react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -41,9 +44,11 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { CopyButton } from "@/components/ui/copy-button";
+import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import * as api from "@/lib/api";
 import type { WorkbuddyProxyStatus } from "@/lib/api";
+import type { WorkbuddyGatewayConfig, WorkbuddyPoolStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 const WB_HERMES_SNIPPET = `model:
@@ -51,6 +56,73 @@ const WB_HERMES_SNIPPET = `model:
   provider: "custom"
   base_url: "http://127.0.0.1:57890/workbuddy/v1"
   api_key: "<访问密钥>"`;
+
+/** 多账号网关（cloud）Base URL：契约 §12 独立路由组 /workbuddy-pool/v1。 */
+const WB_POOL_BASE_URL = "http://127.0.0.1:57890/workbuddy-pool/v1";
+
+/** ms epoch → 简短日期时间；0/缺省 = 未知。 */
+function fmtPoolTs(ms: number | null | undefined): string {
+  if (!ms || ms <= 0) return "—";
+  return new Date(ms).toLocaleString("zh-CN", {
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+/** 冷却剩余秒数 → 人话；<=0 返回空串。 */
+function fmtPoolRemain(sec: number | null | undefined): string {
+  if (sec == null || sec <= 0) return "";
+  if (sec >= 3600) return `${Math.floor(sec / 3600)} 小时 ${Math.floor((sec % 3600) / 60)} 分`;
+  if (sec >= 60) return `${Math.floor(sec / 60)} 分 ${sec % 60} 秒`;
+  return `${sec} 秒`;
+}
+
+/** 账号级冷却类型 → 中文标签（后端 CoolKind 仅 soft_rate / hard_credit 两值，
+ *  见 workbuddy_gateway.rs:474-475；熔断是独立的 breaker_until，不走 cooldown_kind）。 */
+function poolCoolKindLabel(kind: string): string {
+  switch (kind) {
+    case "soft_rate":
+      return "软限流";
+    case "hard_credit":
+      return "余额耗尽";
+    default:
+      return kind || "冷却";
+  }
+}
+
+/** 配置面板数字字段：失焦且值有变化才 PATCH（对齐 GrokPage 策略面板模式）。 */
+function PoolNumberField({
+  label,
+  value,
+  onCommit,
+  disabled,
+}: {
+  label: string;
+  value: number;
+  onCommit: (v: number) => void;
+  disabled?: boolean;
+}) {
+  return (
+    <div>
+      <label className="text-xs text-muted-foreground">{label}</label>
+      <Input
+        type="number"
+        min={0}
+        defaultValue={value}
+        disabled={disabled}
+        onBlur={(e) => {
+          // 清空失焦不提交（避免误写 0；后端对 <=0 按「走默认」处理）
+          if (e.target.value.trim() === "") return;
+          const v = Number(e.target.value);
+          if (Number.isFinite(v) && v !== value) onCommit(v);
+        }}
+        className="mt-1 h-8 text-xs"
+      />
+    </div>
+  );
+}
 
 function InfoRow({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
   return (
@@ -72,6 +144,51 @@ export default function WorkbuddyPage() {
   const [savingEnabled, setSavingEnabled] = useState(false);
   const [wbMsg, setWbMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
   const [loading, setLoading] = useState(true);
+
+  // ---- 多账号网关（cloud 账号池）----
+  const [poolStatus, setPoolStatus] = useState<WorkbuddyPoolStatus | null>(null);
+  const [poolCfg, setPoolCfg] = useState<WorkbuddyGatewayConfig | null>(null);
+  const [poolLoading, setPoolLoading] = useState(false);
+  const [poolBusy, setPoolBusy] = useState(false);
+  const [poolMsg, setPoolMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
+
+  /** 池状态为只读 GET；随挂载加载一次，不触发任何 chat 请求
+   *  （chat 只在用户显式操作时发生，本页不提供自动调用入口）。
+   *  后端响应是 { ok, pool, config } 信封（api.rs:5208-5215），池数据在 pool 下。 */
+  const loadPool = useCallback(async (showError = false) => {
+    setPoolLoading(true);
+    try {
+      const res = await api.getWorkbuddyPoolStatus();
+      if (res?.pool) setPoolStatus(res.pool);
+      if (res.config) setPoolCfg(res.config);
+    } catch (e) {
+      // 首屏自动加载容错（与 GrokPage 账号池一致）；手动刷新才把错误透出
+      if (showError) setPoolMsg({ type: "err", text: api.asError(e) });
+    } finally {
+      setPoolLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadPool();
+  }, [loadPool]);
+
+  /** PATCH 配置（热更新即写即生效），保存后回拉状态刷新面板。 */
+  const patchPoolCfg = useCallback(
+    async (patch: Partial<WorkbuddyGatewayConfig>) => {
+      setPoolBusy(true);
+      try {
+        await api.patchWorkbuddyPoolConfig(patch);
+        await loadPool();
+        setPoolMsg({ type: "ok", text: "配置已保存，即时生效" });
+      } catch (e) {
+        setPoolMsg({ type: "err", text: api.asError(e) });
+      } finally {
+        setPoolBusy(false);
+      }
+    },
+    [loadPool],
+  );
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -317,6 +434,326 @@ export default function WorkbuddyPage() {
                 />
               ) : null}
             </div>
+          </CardContent>
+        </Card>
+      </section>
+
+      {/* ⑥ 多账号网关（cloud）：账号池总览 / 账号表 / 配置面板 / 接入信息。
+          存量 /workbuddy/v1 与 /workbuddy-native/v1 区块保持原样，本区块走独立路由组
+          /workbuddy-pool/v1（契约 §12）；样式对齐 GrokPage 账号池卡片。
+          数据形状以后端为准：status 为 { ok, pool, config } 信封（api.rs:5208-5215），
+          pool/accounts 字段 snake_case（workbuddy_gateway.rs:1504-1529），config 为
+          camelCase（api.rs:4599-4613）；改字段前先核对这两处。 */}
+      <section className="mb-10 min-w-0 space-y-2.5" aria-label="WorkBuddy 多账号网关">
+        <div className="flex min-w-0 flex-wrap items-center justify-between gap-2 px-1">
+          <h2 className="text-[13px] font-medium leading-5">
+            <Cloud className="mr-1 inline size-3.5" />
+            多账号网关（cloud）
+          </h2>
+          <div className="flex shrink-0 flex-wrap items-center gap-3">
+            {poolMsg ? (
+              <span className={cn("text-xs", poolMsg.type === "ok" ? "text-primary" : "text-destructive")}>
+                {poolMsg.text}
+              </span>
+            ) : null}
+            <Button
+              className="shrink-0"
+              variant="outline"
+              size="sm"
+              onClick={() => void loadPool(true)}
+              disabled={poolLoading}
+            >
+              {poolLoading ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+              刷新
+            </Button>
+          </div>
+        </div>
+        <Card className="min-w-0 gap-0 overflow-hidden rounded-xl py-0 shadow-none">
+          <CardContent className="p-0">
+            {/* 池总览：五个计数（total/healthy/cooling/model_cooling/breaker） */}
+            <div className="grid grid-cols-2 gap-2 p-4 sm:grid-cols-5 sm:p-5">
+              <div className="rounded-lg border p-2.5">
+                <div className="text-xs text-muted-foreground">账号总数</div>
+                <div className="mt-0.5 text-lg font-semibold tabular-nums">{poolStatus?.total ?? "—"}</div>
+              </div>
+              <div className="rounded-lg border p-2.5">
+                <div className="text-xs text-muted-foreground">可用</div>
+                <div className="mt-0.5 text-lg font-semibold tabular-nums text-emerald-600">
+                  {poolStatus?.healthy ?? "—"}
+                </div>
+              </div>
+              <div className="rounded-lg border p-2.5">
+                <div className="text-xs text-muted-foreground">账号冷却</div>
+                <div className="mt-0.5 text-lg font-semibold tabular-nums text-amber-600">
+                  {poolStatus?.cooling ?? "—"}
+                </div>
+              </div>
+              <div className="rounded-lg border p-2.5">
+                <div className="text-xs text-muted-foreground">模型冷却</div>
+                <div className="mt-0.5 text-lg font-semibold tabular-nums text-amber-600">
+                  {poolStatus?.model_cooling ?? "—"}
+                </div>
+              </div>
+              <div className="rounded-lg border p-2.5">
+                <div className="text-xs text-muted-foreground">熔断</div>
+                <div className="mt-0.5 text-lg font-semibold tabular-nums text-rose-500">
+                  {poolStatus?.breaker ?? "—"}
+                </div>
+              </div>
+            </div>
+
+            {/* 容量告警：有账号不可用（低于容量）或全冷却时出 amber 条 */}
+            {poolStatus && poolStatus.total > 0 && poolStatus.healthy < poolStatus.total ? (
+              <div className="px-4 pb-3 sm:px-5">
+                <Alert variant="warning" className="py-2.5">
+                  <CircleAlert className="size-4" />
+                  <AlertTitle className="text-xs font-medium">
+                    {poolStatus.healthy === 0 ? "账号池全部不可用（全冷却）" : "账号池低于容量"}
+                  </AlertTitle>
+                  <AlertDescription className="text-xs">
+                    {poolStatus.healthy === 0
+                      ? `${poolStatus.total} 个账号全部处于冷却 / 熔断 / 出池状态，/workbuddy-pool/v1 的 chat 请求会直接失败；可等待冷却恢复，或在账号库补充 WorkBuddy 账号。`
+                      : `${poolStatus.total} 个账号中 ${poolStatus.total - poolStatus.healthy} 个暂不可用（冷却 / 熔断 / 出池），当前可用 ${poolStatus.healthy} 个；高峰期可能换号失败，建议补充账号。`}
+                  </AlertDescription>
+                </Alert>
+              </div>
+            ) : null}
+
+            {/* 账号表：昵称 / 区域 / 积分 / 到期 / 冷却状态 / 模型冷却明细 */}
+            <div className="px-4 pb-4 sm:px-5">
+              {poolLoading && !poolStatus ? (
+                <p className="py-6 text-center text-xs text-muted-foreground">加载中…</p>
+              ) : (poolStatus?.accounts.length ?? 0) === 0 ? (
+                <div className="flex flex-col items-center justify-center rounded-xl border border-dashed py-8 text-center">
+                  <Users className="size-8 text-muted-foreground/50" />
+                  <p className="mt-2 text-sm font-medium">账号池暂无账号</p>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    账号库（~/.wb-switch/accounts.json）里的 WorkBuddy OAuth 账号会自动进入池子，请先到「账号」页添加
+                  </p>
+                </div>
+              ) : (
+                <div className="overflow-hidden rounded-xl border">
+                  <table className="w-full text-xs">
+                    <thead className="bg-muted/40 text-muted-foreground">
+                      <tr>
+                        <th className="px-3 py-2 text-left font-medium">账号</th>
+                        <th className="px-3 py-2 text-left font-medium">区域</th>
+                        <th className="px-3 py-2 text-left font-medium">积分</th>
+                        <th className="px-3 py-2 text-left font-medium">到期</th>
+                        <th className="px-3 py-2 text-left font-medium">冷却状态</th>
+                        <th className="px-3 py-2 text-left font-medium">模型冷却明细</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y">
+                      {poolStatus?.accounts.map((a) => {
+                        // 后端只给绝对截止时刻（workbuddy_gateway.rs:1504-1520）：
+                        // 冷却/熔断状态由 until / breaker_until / disabled 现场推导，
+                        // 剩余秒数按渲染时刻现算（快照数据，误差在刷新周期内可接受）。
+                        const nowMs = Date.now();
+                        const cools = a.model_cools ?? [];
+                        const coolingActive = a.until > nowMs;
+                        const breakerActive = a.breaker_until > nowMs;
+                        const coolRemainSec = coolingActive
+                          ? Math.max(0, Math.round((a.until - nowMs) / 1000))
+                          : 0;
+                        return (
+                          <tr key={a.uid} className="hover:bg-muted/30">
+                            <td className="px-3 py-2 font-medium">
+                              <div className="flex flex-col">
+                                <span>{a.nickname || a.uid}</span>
+                                <span className="font-mono text-[10px] text-muted-foreground">{a.uid}</span>
+                              </div>
+                            </td>
+                            <td className="px-3 py-2">
+                              <Badge variant="outline" className="h-5 text-[10px]">
+                                {a.region === "cn" ? "国服" : a.region === "intl" ? "国际" : a.region}
+                              </Badge>
+                            </td>
+                            <td className="px-3 py-2 tabular-nums">{a.credits > 0 ? a.credits : "—"}</td>
+                            <td className="px-3 py-2 text-muted-foreground">{fmtPoolTs(a.credit_expires_at)}</td>
+                            <td className="px-3 py-2">
+                              {a.disabled ? (
+                                <Badge
+                                  variant="outline"
+                                  className="h-5 border-rose-500/30 bg-rose-500/10 text-[10px] text-rose-600"
+                                >
+                                  出池 · 需重登
+                                </Badge>
+                              ) : breakerActive ? (
+                                <Badge
+                                  variant="outline"
+                                  className="h-5 border-rose-500/30 bg-rose-500/10 text-[10px] text-rose-600"
+                                >
+                                  熔断中
+                                </Badge>
+                              ) : coolingActive ? (
+                                <Badge
+                                  variant="outline"
+                                  className="h-5 border-amber-500/30 bg-amber-500/10 text-[10px] text-amber-600"
+                                >
+                                  {poolCoolKindLabel(a.cooldown_kind)}
+                                  {coolRemainSec > 0 ? ` · ${fmtPoolRemain(coolRemainSec)}` : ""}
+                                </Badge>
+                              ) : (
+                                <Badge
+                                  variant="outline"
+                                  className="h-5 border-emerald-500/30 bg-emerald-500/10 text-[10px] text-emerald-600"
+                                >
+                                  可用
+                                </Badge>
+                              )}
+                            </td>
+                            <td className="px-3 py-2">
+                              {cools.length === 0 ? (
+                                <span className="text-muted-foreground">—</span>
+                              ) : (
+                                <div className="space-y-0.5">
+                                  {cools.slice(0, 3).map((mc) => (
+                                    <div key={mc.model} className="font-mono text-[11px]" title={mc.reason}>
+                                      {mc.model}
+                                      <span className="ml-1 font-sans text-muted-foreground">
+                                        剩 {fmtPoolRemain(mc.remaining_sec)}
+                                      </span>
+                                    </div>
+                                  ))}
+                                  {cools.length > 3 ? (
+                                    <div className="text-[11px] text-muted-foreground">等 {cools.length - 3} 个模型…</div>
+                                  ) : null}
+                                </div>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+
+            {/* 配置面板：onBlur/onChange 走 PATCH 热更新 */}
+            {poolCfg ? (
+              <div className="border-t px-4 py-4 sm:px-5">
+                <div className="mb-3 flex items-center gap-2">
+                  <Settings className="size-3.5 text-muted-foreground" />
+                  <span className="text-xs font-medium">网关配置</span>
+                  {poolBusy ? <Loader2 className="size-3.5 animate-spin text-muted-foreground" /> : null}
+                </div>
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                  <div>
+                    <label className="text-xs text-muted-foreground">选号模式</label>
+                    <select
+                      value={poolCfg.mode}
+                      disabled={poolBusy}
+                      onChange={(e) =>
+                        void patchPoolCfg({ mode: e.target.value as WorkbuddyGatewayConfig["mode"] })
+                      }
+                      className="mt-1 block w-full rounded-md border border-input bg-background px-3 py-1.5 text-xs shadow-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+                    >
+                      <option value="balance">均衡（到期分层 + 档内加权）</option>
+                      <option value="rotate">烧号（轮询）</option>
+                      <option value="pinned">指定账号</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-xs text-muted-foreground">
+                      固定账号 uid（pinned 模式生效；需完整 uid——状态表中的 uid 已脱敏，完整值见账号库 accounts.json）
+                    </label>
+                    <Input
+                      defaultValue={poolCfg.pinnedUid}
+                      disabled={poolBusy}
+                      placeholder="账号 uid"
+                      onBlur={(e) => {
+                        const v = e.target.value.trim();
+                        if (v !== poolCfg.pinnedUid) void patchPoolCfg({ pinnedUid: v });
+                      }}
+                      className="mt-1 h-8 text-xs"
+                    />
+                  </div>
+                  <PoolNumberField
+                    label="单账号在途上限"
+                    value={poolCfg.maxInFlight}
+                    disabled={poolBusy}
+                    onCommit={(v) => void patchPoolCfg({ maxInFlight: v })}
+                  />
+                  <PoolNumberField
+                    label="软限流冷却 · 基础（秒）"
+                    value={poolCfg.softRateBaseSecs}
+                    disabled={poolBusy}
+                    onCommit={(v) => void patchPoolCfg({ softRateBaseSecs: v })}
+                  />
+                  <PoolNumberField
+                    label="软限流冷却 · 封顶（秒）"
+                    value={poolCfg.softRateMaxSecs}
+                    disabled={poolBusy}
+                    onCommit={(v) => void patchPoolCfg({ softRateMaxSecs: v })}
+                  />
+                  <PoolNumberField
+                    label="熔断阈值（连续失败次数）"
+                    value={poolCfg.breakerThreshold}
+                    disabled={poolBusy}
+                    onCommit={(v) => void patchPoolCfg({ breakerThreshold: v })}
+                  />
+                  <PoolNumberField
+                    label="熔断冷却 · 基础（秒）"
+                    value={poolCfg.breakerBaseSecs}
+                    disabled={poolBusy}
+                    onCommit={(v) => void patchPoolCfg({ breakerBaseSecs: v })}
+                  />
+                  <PoolNumberField
+                    label="熔断冷却 · 封顶（秒）"
+                    value={poolCfg.breakerMaxSecs}
+                    disabled={poolBusy}
+                    onCommit={(v) => void patchPoolCfg({ breakerMaxSecs: v })}
+                  />
+                  <PoolNumberField
+                    label="会话粘性 TTL（毫秒）"
+                    value={poolCfg.stickyTtlMs}
+                    disabled={poolBusy}
+                    onCommit={(v) => void patchPoolCfg({ stickyTtlMs: v })}
+                  />
+                  <PoolNumberField
+                    label="余额巡检间隔（分钟）"
+                    value={poolCfg.balanceRefreshMinutes}
+                    disabled={poolBusy}
+                    onCommit={(v) => void patchPoolCfg({ balanceRefreshMinutes: v })}
+                  />
+                  <label className="flex items-center gap-2 self-end pb-1.5 text-xs">
+                    <input
+                      type="checkbox"
+                      checked={poolCfg.sanitizeEnabled}
+                      disabled={poolBusy}
+                      onChange={(e) => void patchPoolCfg({ sanitizeEnabled: e.target.checked })}
+                      className="rounded border-input text-primary focus:ring-primary"
+                    />
+                    出站脱敏（请求体指纹字段清洗）
+                  </label>
+                </div>
+                <p className="mt-3 text-[11px] leading-5 text-muted-foreground">
+                  配置为 PATCH 热更新（即写即生效）。模型级冷却（上游 6004）只冷对应模型、不冷账号，也不喂熔断器；
+                  账号库 accounts.json 保持唯一真源，网关只读，冷却 / 熔断落在网关自有状态文件。
+                </p>
+              </div>
+            ) : null}
+
+            {/* 接入信息：Base URL / 访问密钥（与页面既有接入信息同款 InfoRow） */}
+            <InfoRow label="接口地址（Base URL）" hint="OpenAI 兼容端点；chat/completions 与 models 均在此路由组下">
+              <div className="flex items-center gap-1.5">
+                <code className="max-w-[260px] truncate rounded bg-muted/70 px-2 py-1 text-xs">
+                  {WB_POOL_BASE_URL}
+                </code>
+                <CopyButton text={WB_POOL_BASE_URL} label="接口地址" />
+              </div>
+            </InfoRow>
+            <InfoRow
+              label="访问密钥"
+              hint="请求头 Authorization: Bearer <密钥>；池网关与 grok / kimi / qoder 池网关共用同一套网关 Key，无独立密钥字段"
+            >
+              <span className="text-xs text-muted-foreground">
+                网关 Key（<code className="mx-1 rounded bg-muted px-1">gw_live_…</code>开头）统一在「网关管理」页创建 /
+                复制；本页不持有、不展示完整密钥
+              </span>
+            </InfoRow>
           </CardContent>
         </Card>
       </section>

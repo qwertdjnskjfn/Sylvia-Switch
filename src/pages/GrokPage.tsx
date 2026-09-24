@@ -961,6 +961,22 @@ export default function GrokPage() {
             </div>
           </div>
 
+          {/* 容量守卫告警：可用账号低于策略下限时提醒（暂停调度时给出明确原因） */}
+          {pool?.capacity && pool.capacity.available < pool.capacity.minPoolSize && (
+            <Alert className={cn("py-2.5", pool.capacity.belowMin ? "border-amber-500/30 bg-amber-500/[0.06]" : "border-border")}>
+              <CircleAlert className={cn("size-4", pool.capacity.belowMin ? "text-amber-600" : "text-muted-foreground")} />
+              <AlertTitle className="text-xs font-medium">
+                {pool.capacity.belowMin ? "账号池低于容量下限，调度已暂停" : "账号池低于容量下限（仅提醒）"}
+              </AlertTitle>
+              <AlertDescription className="text-xs">
+                当前可用账号 <strong>{pool.capacity.available}</strong> 个，低于容量下限 <strong>{pool.capacity.minPoolSize}</strong> 个。
+                {pool.capacity.belowMin
+                  ? "新的 chat / 测试请求会直接失败并提示补充账号；请添加账号或在「策略」中调整下限。"
+                  : "「低于下限暂停调度」已关闭，请求仍会继续调度；建议尽快补充账号。"}
+              </AlertDescription>
+            </Alert>
+          )}
+
           {/* 账号健康明细 */}
           {pool && pool.accounts.length > 0 && (
             <div className="overflow-hidden rounded-xl border">
@@ -1104,9 +1120,29 @@ export default function GrokPage() {
                   />
                   高风险账号自动熔断（暂停）
                 </label>
+                <div>
+                  <label className="text-xs text-muted-foreground">容量下限（可用账号数）</label>
+                  <Input
+                    type="number"
+                    min={1}
+                    defaultValue={poolPolicy.minPoolSize}
+                    onBlur={(e) => void handleSavePolicy({ minPoolSize: Number(e.target.value) })}
+                    className="mt-1 h-8 text-xs"
+                  />
+                </div>
+                <label className="flex items-center gap-2 text-xs">
+                  <input
+                    type="checkbox"
+                    checked={poolPolicy.pauseWhenBelowMin}
+                    onChange={(e) => void handleSavePolicy({ pauseWhenBelowMin: e.target.checked })}
+                    className="rounded border-input text-primary focus:ring-primary"
+                  />
+                  低于容量下限时暂停调度
+                </label>
               </div>
               <p className="text-[11px] text-muted-foreground">
                 体检为低频轮转（默认每 2 小时 1 个账号），行为接近真人使用；熔断宁可少用也不硬刚，降低风控风险。
+                容量守卫：可用账号低于下限时桌面告警，开启「暂停调度」后新的 chat / 测试请求直接失败并提示补充账号（体检循环不受影响——池越浅越需要体检）。
               </p>
             </div>
           )}
