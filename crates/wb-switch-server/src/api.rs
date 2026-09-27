@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use wb_switch_core::modules::{
     account, account_protection, auth_file, channel_health, checkin, config, credit_usage, credits, export_import,
     autoclaw_accounts, glm_proxy, loomy, loomy_proxy, model_probe, model_usage, oauth, platform_checkin, platform_switch, process, refresh,
-    gateway_admin, gateway_overview, glm_web, grok, grok_pool, grok_register, kimi, qoder, qwen, qwen_mcp, qwen_web, grok_sso, miaoshou, session, switch, token_stats, toolcall_monitor, travel, update, trae_acp, trae_accounts, trae_proxy, trae_proxy_config, workbuddy_proxy, workbuddy_errors, workbuddy_gateway, workbuddy_protocols, workbuddy_upstream, opencode,
+    gateway_admin, gateway_overview, glm_web, grok, grok_pool, grok_register, kimi, qoder, qwen, qwen_mcp, qwen_web, grok_sso, miaoshou, model_sync, session, switch, token_stats, toolcall_monitor, travel, update, trae_acp, trae_accounts, trae_proxy, trae_proxy_config, workbuddy_proxy, workbuddy_errors, workbuddy_gateway, workbuddy_protocols, workbuddy_upstream, opencode,
 };
 
 /// 服务实际绑定端口（main.rs serve 启动时写入），供端点展示使用。
@@ -181,6 +181,9 @@ pub fn router() -> Router {
         .route("/api/kimi/test", post(api_kimi_test))
         .route("/grok/v1/chat/completions", post(api_grok_chat_completions))
         .route("/grok/v1/models", get(api_grok_models))
+        // Grok 网关 Anthropic Messages 端点（2026-09-27）：ZCode 等 Anthropic 协议
+        // 客户端的入口——桥接透传 grok2api /v1/messages（原生 Messages 协议+工具调用）。
+        .route("/grok/v1/messages", post(api_grok_messages))
         .route("/api/grok/accounts", get(api_grok_accounts_list))
         .route("/api/grok/accounts/add", post(api_grok_add_account))
         .route("/api/grok/accounts/remove", post(api_grok_remove_account))
@@ -258,6 +261,12 @@ pub fn router() -> Router {
             "/workbuddy-native/v1/chat/completions",
             post(api_workbuddy_native_chat_completions),
         )
+        // 契约 §2.4：目录强制刷新（绕过 300s TTL 重探 ACP + 合并产品配置补充源）。
+        // 管理端点免 key（本机回环惯例，同 /api/workbuddy-proxy/config）。
+        .route(
+            "/api/workbuddy-native/catalog/refresh",
+            post(api_workbuddy_native_catalog_refresh),
+        )
         .route("/api/workbuddy-proxy/status", get(api_workbuddy_proxy_status))
         .route("/api/workbuddy-proxy/models", get(api_workbuddy_proxy_models))
         .route(
@@ -288,6 +297,11 @@ pub fn router() -> Router {
             post(api_workbuddy_pool_chat_completions),
         )
         .route("/workbuddy-pool/v1/models", get(api_workbuddy_pool_models))
+        // 区域专用接入密钥（国内版/国际版各一把）：GET 取/复用，?create=1 按需新建。
+        .route(
+            "/api/workbuddy-pool/region-key",
+            get(api_workbuddy_pool_region_key),
+        )
         .route("/workbuddy-pool/v1/status", get(api_workbuddy_pool_status))
         .route(
             "/workbuddy-pool/v1/config",
@@ -322,6 +336,24 @@ pub fn router() -> Router {
             get(api_travel_config).post(api_save_travel_config),
         )
         .route("/api/refresh-token", post(api_refresh_token))
+        // 模型目录自动同步（契约 model-sync-contract.md §四）：管理端点一律免 key
+        // （本机回环惯例，同 /api/workbuddy-proxy/config）。
+        .route("/api/model-sync/status", get(api_model_sync_status))
+        .route("/api/model-sync/run", post(api_model_sync_run))
+        .route("/api/model-sync/log", get(api_model_sync_log))
+        .route(
+            "/api/model-sync/config",
+            get(api_model_sync_config_get).post(api_model_sync_config_save),
+        )
+        .route(
+            "/api/model-sync/registry",
+            post(api_model_sync_registry_add),
+        )
+        // G6 手动补录的删除配套（补录错了要能撤回恢复原样）。
+        .route(
+            "/api/model-sync/registry/remove",
+            post(api_model_sync_registry_remove),
+        )
         .route("/api/update/check", get(api_update_check))
         .route(
             "/api/update/config",
@@ -1680,6 +1712,89 @@ async fn api_grok_models(headers: HeaderMap) -> Response {
     json_ok(grok::models_payload())
 }
 
+/// Grok 网关 Anthropic Messages 端点（2026-09-27）：ZCode 等 Anthropic 协议客户端
+/// 的入口——桥接透传 grok2api `/v1/messages`（cli-chat-proxy 原生支持 Messages
+/// 协议与工具调用，Build 池自动续期）。流式（text/event-stream）与非流式（JSON）
+/// 均按上游 Content-Type 透传；鉴权与 /grok/v1/chat/completions 同口径。
+async fn api_grok_messages(headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    let (auth_ok, key_id) = gateway_key_status(&headers);
+    if !auth_ok {
+        log_gateway_request("grok", key_id.as_deref(), "messages", false, 0, "无效的 API Key");
+        return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+    }
+    let Some(cfg) = grok::g2a_proxy_config() else {
+        return glm_proxy_error(
+            "grok2api 桥接未启用：请配置 ~/.wb-switch/grok_g2a_proxy.json".to_string(),
+            StatusCode::SERVICE_UNAVAILABLE,
+        );
+    };
+    // 透传客户端的 anthropic-version（上游要求该头；未带时由桥接补默认值）
+    let anthropic_version = headers
+        .get("anthropic-version")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    // 1.0.5：Anthropic 路径默认补 thinking（客户端显式传入优先，见 grok::prepare_messages_body）；
+    // 逃生开关 `x-grok-thinking: off` 可关闭该注入。
+    let thinking_disabled = grok::thinking_disabled_from_header(
+        headers.get("x-grok-thinking").and_then(|v| v.to_str().ok()),
+    );
+    match grok::g2a_messages_forward(
+        &cfg,
+        body.as_ref(),
+        anthropic_version.as_deref(),
+        thinking_disabled,
+    )
+    .await
+    {
+        Ok(resp) => {
+            let status = resp.status();
+            let content_type = resp
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("application/json")
+                .to_string();
+            let log_model = "messages";
+            if content_type.contains("event-stream") {
+                log_gateway_request("grok", key_id.as_deref(), log_model, true, 0, "流式桥接");
+                let stream = futures_util::stream::unfold(resp, |mut resp| async move {
+                    match resp.chunk().await {
+                        Ok(Some(chunk)) => Some((Ok::<_, String>(chunk), resp)),
+                        Ok(None) => None,
+                        Err(e) => Some((Err(format!("grok2api Messages 流中断: {e}")), resp)),
+                    }
+                });
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, content_type)],
+                    axum::body::Body::from_stream(stream),
+                )
+                    .into_response()
+            } else {
+                let body_text = resp.text().await.unwrap_or_default();
+                log_gateway_request(
+                    "grok",
+                    key_id.as_deref(),
+                    log_model,
+                    status.is_success(),
+                    0,
+                    &format!("status={status}"),
+                );
+                (
+                    status,
+                    [(header::CONTENT_TYPE, content_type)],
+                    body_text,
+                )
+                    .into_response()
+            }
+        }
+        Err(e) => {
+            log_gateway_request("grok", key_id.as_deref(), "messages", false, 0, &e);
+            glm_proxy_error(format!("grok2api 桥接失败: {e}"), StatusCode::BAD_GATEWAY)
+        }
+    }
+}
+
 async fn api_grok_accounts_list() -> Response {
     json_ok(json!({ "accounts": grok::list_for_display() }))
 }
@@ -1748,6 +1863,7 @@ async fn api_grok_pool_policy_get() -> Response {
         "fatalPenalty": p.fatal_penalty,
         "minPoolSize": p.min_pool_size,
         "pauseWhenBelowMin": p.pause_when_below_min,
+        "resident_ttl_min": p.resident_ttl_min,
     }))
 }
 
@@ -1765,6 +1881,7 @@ async fn api_grok_pool_policy_set(Json(body): Json<Value>) -> Response {
     if let Some(v) = body.get("fatalPenalty").and_then(Value::as_i64) { p.fatal_penalty = v.clamp(0, 100); }
     if let Some(v) = body.get("minPoolSize").and_then(Value::as_u64) { p.min_pool_size = (v as usize).clamp(1, 100); }
     if let Some(v) = body.get("pauseWhenBelowMin").and_then(Value::as_bool) { p.pause_when_below_min = v; }
+    if let Some(v) = body.get("resident_ttl_min").and_then(Value::as_u64) { p.resident_ttl_min = grok_pool::clamp_resident_ttl_min(v); }
     match grok_pool::save_policy(&p) {
         Ok(_) => json_ok(json!({"ok": true})),
         Err(e) => json_err(e, StatusCode::INTERNAL_SERVER_ERROR),
@@ -1942,7 +2059,12 @@ async fn api_gateway_keys_list() -> Response {
 
 async fn api_gateway_key_create(Json(body): Json<Value>) -> Response {
     let name = body.get("name").and_then(Value::as_str).unwrap_or("");
-    match gateway_admin::create_key(name) {
+    // region：可选 cn/intl（WorkBuddy 池区域专用密钥）；缺省/其它值 = 通用密钥。
+    let region = body.get("region").and_then(Value::as_str).filter(|r| {
+        let r = r.trim();
+        r == "cn" || r == "intl"
+    });
+    match gateway_admin::create_key_scoped(name, region) {
         Ok(key) => json_ok(json!({ "ok": true, "key": key })),
         Err(e) => json_err(e, StatusCode::INTERNAL_SERVER_ERROR),
     }
@@ -4171,9 +4293,8 @@ async fn api_trae_v1_models(headers: HeaderMap) -> Response {
 ///
 /// 刻意**不带 Json extractor**：畸形 body 也进门禁/参数逻辑（503/400 JSON），
 /// 不被 axum 的 422 抢答。方法不匹配（如 GET）由 axum MethodRouter 自动返回 405。
-/// TRAE/WorkBuddy 会话 ACP 转发的统一响应构造（/trae/v1 与
-/// /workbuddy-native/v1 两个路由共用：本质都是本机 WorkBuddy 内嵌
-/// codebuddy 会话，模型为该会话自带模型）。
+/// TRAE 会话 ACP 转发的统一响应构造（/trae/v1 专用；/workbuddy-native/v1 的
+/// 对话已改走 native-first + OpenCode 兜底编排，见 api_workbuddy_native_chat_completions）。
 async fn trae_acp_chat_response(body: axum::body::Bytes) -> Response {
     let value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     match trae_acp::chat_completions(value).await {
@@ -4200,40 +4321,258 @@ async fn api_trae_v1_chat_completions(body: axum::body::Bytes) -> Response {
     trae_acp_chat_response(body).await
 }
 
-/// WorkBuddy 桌面端自带模型通道（/workbuddy-native/v1）：与 /trae/v1 同一
-/// ACP 实现，路由名明确指向「WorkBuddy 内置模型」而非 OpenCode 借道模型。
+/// native-first 对话响应（/workbuddy-native/v1/chat/completions，契约 §3.2）：
+/// native 优先 + OpenCode 兜底，`wbServedBy` 流式放响应头 `x-wb-served-by`、
+/// 非流式放 JSON 字段。log_gateway_request 仍打 `workbuddy` tag（note 标
+/// servedBy）；record_channel_call：native 路径 channel=workbuddy-native，
+/// 兜底路径 channel=workbuddy（T6 口径）。
 async fn api_workbuddy_native_chat_completions(body: axum::body::Bytes) -> Response {
-    trae_acp_chat_response(body).await
+    let started = std::time::Instant::now();
+    let started_ms = config::now_ms();
+    let value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let log_model = value
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("—")
+        .to_string();
+    match workbuddy_proxy::chat_completions_native_first(value).await {
+        Ok(workbuddy_proxy::NativeFirstChat::Json { served_by, mut value }) => {
+            let latency = started.elapsed().as_millis() as u64;
+            // 非流式：JSON 增字段 wbServedBy（契约 §3.2）。
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("wbServedBy".to_string(), json!(served_by));
+            }
+            let actual_model = value
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or(&log_model)
+                .to_string();
+            log_gateway_request(
+                "workbuddy",
+                None,
+                &actual_model,
+                true,
+                latency,
+                &format!("servedBy={served_by}"),
+            );
+            record_workbuddy_call(
+                served_by_channel(served_by),
+                started_ms,
+                &actual_model,
+                true,
+                latency,
+                "",
+                value.get("usage"),
+                &format!("servedBy={served_by}"),
+            );
+            json_ok(value)
+        }
+        Ok(workbuddy_proxy::NativeFirstChat::Stream { served_by, rx }) => {
+            let latency = started.elapsed().as_millis() as u64;
+            log_gateway_request(
+                "workbuddy",
+                None,
+                &log_model,
+                true,
+                latency,
+                &format!("servedBy={served_by}（流式）"),
+            );
+            // 流式 cost 由 SSE 末尾 usage 帧携带，handler 返回时尚未产出，记 0 并注明。
+            record_workbuddy_call(
+                served_by_channel(served_by),
+                started_ms,
+                &log_model,
+                true,
+                latency,
+                "",
+                None,
+                &format!("servedBy={served_by}；流式：cost 见 SSE 末尾 usage 帧"),
+            );
+            let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|chunk| (chunk, rx))
+            });
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, "text/event-stream".to_string()),
+                    (
+                        header::HeaderName::from_static("x-wb-served-by"),
+                        served_by.to_string(),
+                    ),
+                ],
+                axum::body::Body::from_stream(stream),
+            )
+                .into_response()
+        }
+        Err((code, msg)) => {
+            let latency = started.elapsed().as_millis() as u64;
+            log_gateway_request("workbuddy", None, &log_model, false, latency, &msg);
+            record_workbuddy_call(
+                "workbuddy",
+                started_ms,
+                &log_model,
+                false,
+                latency,
+                &msg,
+                None,
+                "",
+            );
+            let status = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY);
+            glm_proxy_error(msg, status)
+        }
+    }
 }
 
-/// WorkBuddy 自带模型目录：实时探测内嵌 codebuddy 会话的 --model。
-/// 与 /workbuddy/v1/models（OpenCode 借道，594 个）是两套模型体系。
-async fn api_workbuddy_native_models() -> Response {
-    // 与 /workbuddy/v1/models 共用同一数据源（builtin_models_payload），
-    // 避免「目录里列的」与「ACP 通道实际能跑的」漂移。
-    json_ok(workbuddy_proxy::builtin_models_payload())
+/// wbServedBy → 记账 channel（T6）：native 链路新增 channel=workbuddy-native 行；
+/// OpenCode 兜底链路沿用 channel=workbuddy（note 已标 servedBy）。
+fn served_by_channel(served_by: &str) -> &'static str {
+    if served_by == workbuddy_proxy::SERVED_BY_NATIVE {
+        "workbuddy-native"
+    } else {
+        "workbuddy"
+    }
+}
+
+/// `?include=custom` 解析（契约 §3.1）：query 形如 `include=custom`（多参数容忍）。
+fn native_models_include_custom(query: &str) -> bool {
+    query.split('&').any(|kv| {
+        let mut parts = kv.splitn(2, '=');
+        parts.next() == Some("include") && parts.next() == Some("custom")
+    })
+}
+
+/// `?refresh=1` 解析（契约 §2.4）：强制重探目录（等价 refresh 端点），多参数容忍。
+fn native_models_force_refresh(query: &str) -> bool {
+    query.split('&').any(|kv| {
+        let mut parts = kv.splitn(2, '=');
+        parts.next() == Some("refresh") && parts.next() == Some("1")
+    })
+}
+
+/// WorkBuddy 内置模型目录（/workbuddy-native/v1/models，契约 §3.1）：
+/// ACP session/new 实时探测（TTL 缓存 300s，带 name/multiplier/kind/exposed 与来源标记），
+/// ACP 不可达 → builtin 静态回落（source=static-fallback），目录永不为空。
+/// 契约 §2.4 增补：`?refresh=1` 绕过 TTL 强制重探（与 refresh 端点同语义——
+/// 探测失败同样 502 + 错误串，不做 static 回落：显式刷新要如实报错）。
+async fn api_workbuddy_native_models(RawQuery(query): RawQuery) -> Response {
+    let query = query.as_deref().unwrap_or("");
+    let include_custom = native_models_include_custom(query);
+    let payload = if native_models_force_refresh(query) {
+        match workbuddy_proxy::refresh_native_catalog().await {
+            Ok(catalog) => workbuddy_proxy::catalog_to_payload(&catalog, include_custom),
+            Err(e) => return glm_proxy_error(e, StatusCode::BAD_GATEWAY),
+        }
+    } else {
+        workbuddy_proxy::native_models_payload(include_custom).await
+    };
+    // 目录查询轻量记账（对齐 /trae/v1/models 口径：不计费，注明）。
+    let source = payload
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let count = payload
+        .get("data")
+        .and_then(Value::as_array)
+        .map(|a| a.len())
+        .unwrap_or(0);
+    model_usage::record_channel_call(
+        "workbuddy-native",
+        json!({
+            "id": format!("wb-native-models-{}", config::now_ms()),
+            "ts": config::now_ms(),
+            "channel": "workbuddy-native",
+            "model": "models",
+            "requestedModel": "models",
+            "ok": true,
+            "latencyMs": 0,
+            "credits": 0,
+            "cost": 0,
+            "accountId": "workbuddy",
+            "modelCount": count,
+            "note": format!("目录查询不计费（source={source}）"),
+        }),
+    );
+    json_ok(payload)
+}
+
+/// POST /api/workbuddy-native/catalog/refresh（契约 §2.4）：绕过 TTL 强制重探
+/// 目录（ACP + 产品配置补充源合并），返回 `catalog_to_payload(&catalog, true)`
+/// （含 custom 条目，前端按 kind 分组展示）。探测失败 → 502 + 错误串。
+async fn api_workbuddy_native_catalog_refresh() -> Response {
+    match workbuddy_proxy::refresh_native_catalog().await {
+        Ok(catalog) => json_ok(workbuddy_proxy::catalog_to_payload(&catalog, true)),
+        Err(e) => glm_proxy_error(e, StatusCode::BAD_GATEWAY),
+    }
 }
 
 // ---------------------------------------------------------------------------
 // WorkBuddy 模型反代（借道本机 OpenCode server）
 // ---------------------------------------------------------------------------
 
+/// 401 自诊文案（契约 §2.3）：告诉用户本网关接受哪几类密钥，可自行定位错因。
+const WORKBUDDY_AUTH_INVALID_KEY_MSG: &str =
+    "无效的 API Key（本网关接受：TRAE / WorkBuddy 页展示的接入密钥，或网关密钥 gw_live_*）";
+
+/// WorkBuddy `/workbuddy/v1/*` 鉴权（契约 §2.3 扩展，三选一命中即过）：
+/// ① `cfg.api_key` 精确匹配（Bearer 或 x-api-key；空 key 放行，向后兼容现状）；
+/// ② ①未命中时走网关 key 体系 `gateway_admin::verify_request_key`——网关专用
+///    Key（gw_live_*，命中会计数+1 并落盘）或 GLM 主密钥（命中无副作用），主密钥
+///    来源与 `gateway_key_status` 同口径（`glm_proxy::load_config().api_key`）；
+/// ③ 主密钥已由 ② 覆盖，不重复实现。
+///
+/// ⚠️ 副作用说明：② 仅在 ① 未命中时调用（gw_live_* 命中会 requestCount+1），
+/// ① 命中的常规路径零副作用。仅作用于 `/workbuddy/v1/*`；`/workbuddy-native/v1/*`
+/// 维持免鉴权现状（契约 §2.3 明示不涉 native 端点）。
 fn workbuddy_proxy_auth_ok(headers: &HeaderMap, cfg: &workbuddy_proxy::WorkbuddyProxyConfig) -> bool {
     if cfg.api_key.is_empty() {
         return true;
     }
-    let bearer_ok = headers
+    // 双头提取对齐既有 wrapper `gateway_key_status`（Bearer 优先，其次 x-api-key）。
+    let presented = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|k| k == cfg.api_key)
-        .unwrap_or(false);
-    let x_api_key_ok = headers
+        .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()));
+    if presented.map(|k| k == cfg.api_key).unwrap_or(false) {
+        return true;
+    }
+    let glm_master = glm_proxy::load_config().api_key;
+    gateway_admin::verify_request_key(presented, &glm_master).0
+}
+
+/// 鉴权失败时的「收到的鉴权头长什么样」诊断串（模式同 `opencode_auth_diag`，
+/// 该 helper 绑定 opencode 配置无法直接复用）：只输出鉴权头前 6 字符与长度、
+/// UA 截断、头名列表与期望 key 的掩码，**绝不落全量密钥**。
+fn workbuddy_auth_diag(headers: &HeaderMap, cfg: &workbuddy_proxy::WorkbuddyProxyConfig) -> String {
+    let mask = |s: &str| -> String {
+        let n = s.chars().count();
+        let p: String = s.chars().take(6).collect();
+        format!("{p}…(len={n})")
+    };
+    let auth = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| mask(v.trim_start_matches("Bearer ")))
+        .unwrap_or_else(|| "<无>".to_string());
+    let xkey = headers
         .get("x-api-key")
         .and_then(|v| v.to_str().ok())
-        .map(|k| k == cfg.api_key)
-        .unwrap_or(false);
-    bearer_ok || x_api_key_ok
+        .map(mask)
+        .unwrap_or_else(|| "<无>".to_string());
+    let ua = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.chars().take(40).collect::<String>())
+        .unwrap_or_else(|| "<无>".to_string());
+    let mut names: Vec<String> = headers.keys().map(|k| k.as_str().to_string()).collect();
+    names.sort();
+    format!(
+        "无效的 API Key ｜ 期望={} 实收 Authorization={auth} x-api-key={xkey} UA={ua} 头列表=[{}]",
+        mask(&cfg.api_key),
+        names.join(",")
+    )
 }
 
 async fn api_workbuddy_proxy_status() -> Response {
@@ -4256,6 +4595,172 @@ async fn api_workbuddy_proxy_models() -> Response {
                 json_err(e, StatusCode::BAD_GATEWAY)
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 模型目录自动同步（/api/model-sync/*，契约 model-sync-contract.md §四）
+// 管理端点一律免 key（本机回环惯例，同 /api/workbuddy-proxy/config）。
+// ---------------------------------------------------------------------------
+
+/// GET /api/model-sync/status：总览（读 state，秒开不触发拉取）。
+async fn api_model_sync_status() -> Response {
+    json_ok(model_sync::status_payload())
+}
+
+/// POST /api/model-sync/run：立即跑一轮。body 可选 `{gateways:["kimi",…]}` 过滤；
+/// busy 时 409；返回本轮完整结果（形状同 log 单轮）。
+async fn api_model_sync_run(body: Option<Json<Value>>) -> Response {
+    let gateways = body
+        .as_ref()
+        .and_then(|Json(v)| v.get("gateways"))
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect::<Vec<_>>()
+        });
+    let round = model_sync::run_sync("manual", gateways.as_deref()).await;
+    if round.get("busy").and_then(Value::as_bool) == Some(true) {
+        return json_err(
+            round
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("同步已在进行中")
+                .to_string(),
+            StatusCode::CONFLICT,
+        );
+    }
+    json_ok(round)
+}
+
+/// GET /api/model-sync/log?limit=N：环形日志倒序（最新在前），limit 默认 20 上限 50。
+async fn api_model_sync_log(RawQuery(query): RawQuery) -> Response {
+    let limit = query
+        .unwrap_or_default()
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("limit=").and_then(|v| v.parse::<usize>().ok()))
+        .unwrap_or(20)
+        .min(model_sync::LOG_MAX_ROUNDS);
+    let mut log = model_sync::load_log();
+    log.reverse();
+    log.truncate(limit);
+    json_ok(json!({ "rounds": log }))
+}
+
+/// GET /api/model-sync/config：`{enabled, intervalMinutes}`。
+async fn api_model_sync_config_get() -> Response {
+    let cfg = model_sync::load_config();
+    json_ok(json!({
+        "enabled": cfg.enabled,
+        "intervalMinutes": cfg.interval_minutes,
+    }))
+}
+
+/// POST /api/model-sync/config：热更新（即写盘，定时轮下一轮现读生效）。
+async fn api_model_sync_config_save(Json(body): Json<Value>) -> Response {
+    let mut cfg = model_sync::load_config();
+    if let Some(enabled) = body.get("enabled").and_then(Value::as_bool) {
+        cfg.enabled = enabled;
+    }
+    if let Some(mins) = body.get("intervalMinutes").and_then(Value::as_i64) {
+        cfg.interval_minutes = mins.clamp(0, 60 * 24 * 30);
+    }
+    if let Err(e) = model_sync::save_config(&cfg) {
+        return json_err(e, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    json_ok(json!({
+        "enabled": cfg.enabled,
+        "intervalMinutes": cfg.interval_minutes,
+    }))
+}
+
+/// model-sync registry 补录端点只收 Manual 网关（glmweb/qoder）：Auto 网关的清单
+/// 已动态，手动塞进去既不可调也会被下轮 diff 语义搞乱（契约 §四）。
+fn model_sync_registry_manual_only(gateway: &str) -> Result<(), String> {
+    let is_manual = model_sync::SYNC_SOURCES.iter().any(|src| {
+        src.gateway == gateway && src.mode == model_sync::SourceMode::Manual
+    });
+    if is_manual {
+        Ok(())
+    } else {
+        Err(format!(
+            "网关「{gateway}」不是手动补录型（仅 glmweb / qoder 支持）；auto 型网关的模型清单来自其上游，会自动同步"
+        ))
+    }
+}
+
+/// POST /api/model-sync/registry：`{gateway, modelId, displayName?, note?}` 手动补录。
+/// 写入后该网关 models_payload 立即含该条目（合并尾步每次实时读注册表）。
+async fn api_model_sync_registry_add(Json(body): Json<Value>) -> Response {
+    let Some(gateway) = body.get("gateway").and_then(Value::as_str).map(str::trim) else {
+        return json_err("缺少 gateway".to_string(), StatusCode::BAD_REQUEST);
+    };
+    if gateway.is_empty() {
+        return json_err("gateway 不能为空".to_string(), StatusCode::BAD_REQUEST);
+    }
+    if let Err(e) = model_sync_registry_manual_only(gateway) {
+        return json_err(e, StatusCode::BAD_REQUEST);
+    }
+    let Some(model_id) = body
+        .get("modelId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return json_err("缺少 modelId".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let display_name = body
+        .get("displayName")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let note = body
+        .get("note")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    if let Err(e) =
+        model_sync::add_registry_entry(gateway, model_id, display_name, "manual", note)
+    {
+        return json_err(e, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    let entries = model_sync::registry_entries_for(gateway);
+    json_ok(json!({
+        "ok": true,
+        "gateway": gateway,
+        "modelId": model_id,
+        "registry": entries.iter().map(|e| json!({
+            "id": e.id,
+            "name": e.name,
+            "addedTs": e.added_ts,
+            "origin": e.origin,
+            "note": e.note,
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+/// POST /api/model-sync/registry/remove：`{gateway, modelId}` 撤销补录（G6 恢复原样）。
+async fn api_model_sync_registry_remove(Json(body): Json<Value>) -> Response {
+    let Some(gateway) = body.get("gateway").and_then(Value::as_str).map(str::trim) else {
+        return json_err("缺少 gateway".to_string(), StatusCode::BAD_REQUEST);
+    };
+    if let Err(e) = model_sync_registry_manual_only(gateway) {
+        return json_err(e, StatusCode::BAD_REQUEST);
+    }
+    let Some(model_id) = body.get("modelId").and_then(Value::as_str).map(str::trim) else {
+        return json_err("缺少 modelId".to_string(), StatusCode::BAD_REQUEST);
+    };
+    if model_sync::remove_registry_entry(gateway, model_id) {
+        json_ok(json!({"ok": true, "gateway": gateway, "removed": model_id}))
+    } else {
+        json_err(
+            format!("网关「{gateway}」的注册表中不存在模型「{model_id}」"),
+            StatusCode::NOT_FOUND,
+        )
     }
 }
 
@@ -4323,32 +4828,40 @@ async fn api_trae_proxy_config_get() -> Response {
     }))
 }
 
-/// `/workbuddy/v1/models` —— **只列 WorkBuddy 内置模型**。
+/// `/workbuddy/v1/models` —— **WorkBuddy 内置模型目录优先**（契约 T4）。
 ///
 /// 2026-09-23（用户要求「只保留 WorkBuddy 原本内置的模型」）：原先这里借道 OpenCode server
 /// 展开上游 provider 全量清单（实测 591 条 / 14 渠道），与设计边界冲突 ——
 /// `docs/gateway-split-20260922.md` 明确 WorkBuddy「**不拥有 provider 清单**（归 OpenCode 页呈现）」。
-/// 现改为与 `/workbuddy-native/v1/models` 同源（`builtin_models_payload`），目录数 591 → 内置模型数。
+/// 现改为与 `/workbuddy-native/v1/models` 同源（native ACP 实时目录，name/multiplier/kind），
+/// 目录数 591 → 内置模型数。
 ///
-/// ⚠️ 对话端点 `/workbuddy/v1/chat/completions` **保持宽松**（仍可走文档写明的 OpenCode 兜底链路），
-/// 以免打断在用调用；此处只是不再「主动宣传」那 591 个模型。
+/// 契约 T4 新增回落语义：native 目录**不可用**时（WorkBuddy 未运行 / ACP 失败），
+/// 回落 `channel_pick_models_payload()`（fresh 发现 OpenCode server + 展开上游目录，
+/// 此即「不可用时重新再去获取模型内容」），保证目录永不为空。
+///
+/// ⚠️ 对话端点 `/workbuddy/v1/chat/completions` 走 native 优先 + OpenCode 兜底（契约 §3.2）。
 /// ⚠️ 别顺手把 `workbuddy_proxy::models_payload()/models_catalog()` 改成只返回内置模型 ——
 /// **`opencode.rs` 正在复用它们**，改了会一起打断 OpenCode 网关与 OpenCode 页。
 async fn api_workbuddy_v1_models(headers: HeaderMap) -> Response {
     let cfg = workbuddy_proxy::load_config();
     if !workbuddy_proxy_auth_ok(&headers, &cfg) {
-        return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+        return glm_proxy_error(
+            WORKBUDDY_AUTH_INVALID_KEY_MSG.to_string(),
+            StatusCode::UNAUTHORIZED,
+        );
     }
-    // 每渠道各取 1 个代表（约 14 条）；
-    // 严格内置模型走 `/workbuddy-native/v1/models`（builtin_models_payload）。
-    json_ok(workbuddy_proxy::channel_pick_models_payload().await)
+    // 内置目录优先；目录不可用 → channel_pick 重新拉取（v1_models_payload 内部编排）。
+    json_ok(workbuddy_proxy::v1_models_payload().await)
 }
 
 /// T5：workbuddy 渠道请求级用量记录（chat 流式/非流式、成功/失败两条路径共用）。
 ///
-/// 写同一份 `glm_usage_records.json`（channel=workbuddy）；积分口径（F9）取
-/// 上游响应的 `usage.cost` 实耗（免费模型为 0，如实记录）。
+/// 写同一份 `glm_usage_records.json`；积分口径（F9）取上游响应的 `usage.cost`
+/// 实耗（免费模型为 0，如实记录）。`channel`：`workbuddy`（OpenCode 借道链路，
+/// 含兜底）或 `workbuddy-native`（native ACP 链路，T6 新增行，不改既有口径）。
 fn record_workbuddy_call(
+    channel: &str,
     started_ms: i64,
     model: &str,
     ok: bool,
@@ -4366,7 +4879,7 @@ fn record_workbuddy_call(
     let mut record = json!({
         "id": format!("wb-{}", started_ms),
         "ts": started_ms,
-        "channel": "workbuddy",
+        "channel": channel,
         "model": model,
         "requestedModel": model,
         "ok": ok,
@@ -4384,10 +4897,15 @@ fn record_workbuddy_call(
             obj.insert("note".to_string(), json!(note));
         }
     }
-    model_usage::record_channel_call("workbuddy", record);
+    model_usage::record_channel_call(channel, record);
 }
 
-/// WorkBuddy 对话补全（OpenAI 兼容；借道本机 OpenCode server）。
+/// WorkBuddy 对话补全（OpenAI 兼容；native 优先 + OpenCode 兜底，契约 §3.2）。
+///
+/// T4：keyed 路由改 native-first 编排——请求模型在内置目录（或缺省）时走
+/// native ACP（session/set_model 真切换），模型不在目录或 native 失败时落
+/// OpenCode 借道兜底（重新拉取模型内容）。`/workbuddy/v1` 记账保持
+/// channel=workbuddy（T6），note 标 servedBy。
 ///
 /// T5：流式 + 非流式、成功 + 失败全路径插桩——`log_gateway_request`（gateway_admin
 /// 请求日志，供渠道健康度 `traffic_source=logs` 消费）+ `record_channel_call`
@@ -4409,78 +4927,106 @@ async fn api_workbuddy_chat_completions(
         // （接 POST /api/workbuddy-proxy/config {enabled}），不存在旧的「设置」入口。
         let msg = "WorkBuddy 代理未启用（可在「TRAE / WorkBuddy」页开启）";
         log_gateway_request("workbuddy", None, &model, false, 0, msg);
-        record_workbuddy_call(started_ms, &model, false, 0, msg, None, "");
+        record_workbuddy_call("workbuddy", started_ms, &model, false, 0, msg, None, "");
         return glm_proxy_error(msg.to_string(), StatusCode::SERVICE_UNAVAILABLE);
     }
     if !workbuddy_proxy_auth_ok(&headers, &cfg) {
-        log_gateway_request("workbuddy", None, &model, false, 0, "无效的 API Key");
-        record_workbuddy_call(started_ms, &model, false, 0, "无效的 API Key", None, "");
-        return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+        // 契约 §2.3：401 可自诊——请求日志 error 字段记鉴权头诊断串（只前缀+长度，
+        // 不落全量密钥），响应 message 换可自诊文案。
+        let diag = workbuddy_auth_diag(&headers, &cfg);
+        log_gateway_request("workbuddy", None, &model, false, 0, &diag);
+        record_workbuddy_call(
+            "workbuddy",
+            started_ms,
+            &model,
+            false,
+            0,
+            WORKBUDDY_AUTH_INVALID_KEY_MSG,
+            None,
+            "",
+        );
+        return glm_proxy_error(
+            WORKBUDDY_AUTH_INVALID_KEY_MSG.to_string(),
+            StatusCode::UNAUTHORIZED,
+        );
     }
-    let stream = body
-        .get("stream")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if stream {
-        match workbuddy_proxy::chat_completions_stream(body).await {
-            Ok(upstream) => {
-                let latency = started.elapsed().as_millis() as u64;
-                log_gateway_request("workbuddy", None, &model, true, latency, "");
-                // 流式 cost 由 SSE 末尾 usage 帧携带，handler 返回时尚未产出，
-                // 本记录记 0 并注明（非流式路径照实记录 cost）。
-                record_workbuddy_call(
-                    started_ms,
-                    &model,
-                    true,
-                    latency,
-                    "",
-                    None,
-                    "流式：cost 见 SSE 末尾 usage 帧",
-                );
-                let stream = futures_util::stream::unfold(upstream.rx, |mut rx| async move {
-                    rx.recv().await.map(|chunk| (chunk, rx))
-                });
-                (
-                    StatusCode::OK,
-                    [(header::CONTENT_TYPE, "text/event-stream".to_string())],
-                    axum::body::Body::from_stream(stream),
-                )
-                    .into_response()
+    match workbuddy_proxy::chat_completions_native_first(body).await {
+        Ok(workbuddy_proxy::NativeFirstChat::Json { served_by, mut value }) => {
+            let latency = started.elapsed().as_millis() as u64;
+            // 非流式：JSON 增字段 wbServedBy（契约 §3.2）。
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("wbServedBy".to_string(), json!(served_by));
             }
-            Err(e) => {
-                let latency = started.elapsed().as_millis() as u64;
-                log_gateway_request("workbuddy", None, &model, false, latency, &e);
-                record_workbuddy_call(started_ms, &model, false, latency, &e, None, "");
-                glm_proxy_error(e, StatusCode::BAD_GATEWAY)
-            }
+            let actual_model = value
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or(&model)
+                .to_string();
+            log_gateway_request(
+                "workbuddy",
+                None,
+                &actual_model,
+                true,
+                latency,
+                &format!("servedBy={served_by}"),
+            );
+            // T6：/workbuddy/v1 记账保持 channel=workbuddy，note 标 servedBy。
+            record_workbuddy_call(
+                "workbuddy",
+                started_ms,
+                &actual_model,
+                true,
+                latency,
+                "",
+                value.get("usage"),
+                &format!("servedBy={served_by}"),
+            );
+            json_ok(value)
         }
-    } else {
-        match workbuddy_proxy::chat_completions_json(body).await {
-            Ok(value) => {
-                let latency = started.elapsed().as_millis() as u64;
-                let actual_model = value
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .unwrap_or(&model)
-                    .to_string();
-                log_gateway_request("workbuddy", None, &actual_model, true, latency, "");
-                record_workbuddy_call(
-                    started_ms,
-                    &actual_model,
-                    true,
-                    latency,
-                    "",
-                    value.get("usage"),
-                    "",
-                );
-                json_ok(value)
-            }
-            Err(e) => {
-                let latency = started.elapsed().as_millis() as u64;
-                log_gateway_request("workbuddy", None, &model, false, latency, &e);
-                record_workbuddy_call(started_ms, &model, false, latency, &e, None, "");
-                glm_proxy_error(e, StatusCode::BAD_GATEWAY)
-            }
+        Ok(workbuddy_proxy::NativeFirstChat::Stream { served_by, rx }) => {
+            let latency = started.elapsed().as_millis() as u64;
+            log_gateway_request(
+                "workbuddy",
+                None,
+                &model,
+                true,
+                latency,
+                &format!("servedBy={served_by}（流式）"),
+            );
+            // 流式 cost 由 SSE 末尾 usage 帧携带，handler 返回时尚未产出，
+            // 本记录记 0 并注明（非流式路径照实记录 cost）。
+            record_workbuddy_call(
+                "workbuddy",
+                started_ms,
+                &model,
+                true,
+                latency,
+                "",
+                None,
+                &format!("servedBy={served_by}；流式：cost 见 SSE 末尾 usage 帧"),
+            );
+            let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|chunk| (chunk, rx))
+            });
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, "text/event-stream".to_string()),
+                    (
+                        header::HeaderName::from_static("x-wb-served-by"),
+                        served_by.to_string(),
+                    ),
+                ],
+                axum::body::Body::from_stream(stream),
+            )
+                .into_response()
+        }
+        Err((code, msg)) => {
+            let latency = started.elapsed().as_millis() as u64;
+            log_gateway_request("workbuddy", None, &model, false, latency, &msg);
+            record_workbuddy_call("workbuddy", started_ms, &model, false, latency, &msg, None, "");
+            let status = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY);
+            glm_proxy_error(msg, status)
         }
     }
 }
@@ -4530,6 +5076,20 @@ const WB_POOL_MODES: [&str; 3] = ["balance", "rotate", "pinned"];
 /// models/status/config 是管理三端点、免 key（见路由注册处的鉴权策略注释）。
 fn workbuddy_pool_auth_ok(headers: &HeaderMap) -> (bool, Option<String>) {
     gateway_key_status(headers)
+}
+
+/// 区域版池鉴权：请求体 region 参与 key 校验（WorkBuddy 池两区密钥隔离）。
+fn workbuddy_pool_auth_ok_region(
+    headers: &HeaderMap,
+    wanted_region: Option<&str>,
+) -> (bool, Option<String>) {
+    let presented = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()));
+    let cfg = glm_proxy::load_config();
+    gateway_admin::verify_request_key_region(presented, &cfg.api_key, wanted_region)
 }
 
 /// system 字段拍平为纯文本：兼容字符串与 block 数组两种客户端形态
@@ -4719,8 +5279,14 @@ struct WorkbuddyPoolReply {
 /// `Err` 一侧的 `(StatusCode, String)` 已是面向客户端的最终状态码与文案，三个
 /// handler 拿到后只需 `glm_proxy_error`，不必再判错误类型。
 /// `key_id` 只用于观测日志归属（`log_gateway_request`，增补 §2.2）。
+///
+/// 区域化（workbuddy-pool-region 契约 §3.3）：入参 payload 为 `&mut`——请求体可选
+/// `region` 字段读出后**立即剥掉**（内部 chat 形态会原样交给 `prepare_body` 转发上游，
+/// 非协议字段不外发）。循环前解析区域（显式 region > 区域目录唯一命中 > 无约束），
+/// 循环内所有选号走 `pick_account_for_region`；上游错误含 `11102`（model service
+/// info not found）→ 翻转区域提示继续在本轮 picks 内重试（T3 自愈）。
 async fn workbuddy_pool_dispatch(
-    payload: &Value,
+    payload: &mut Value,
     key_id: Option<&str>,
 ) -> Result<WorkbuddyPoolReply, (StatusCode, String)> {
     let started = std::time::Instant::now();
@@ -4729,6 +5295,15 @@ async fn workbuddy_pool_dispatch(
         .and_then(Value::as_str)
         .unwrap_or("workbuddy")
         .to_string();
+    // 显式 region 字段（§3.3①）：读出后剥掉，不外发上游。
+    let region_hint = payload
+        .get("region")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .map(str::to_string);
+    if let Some(obj) = payload.as_object_mut() {
+        obj.remove("region");
+    }
     let cfg = workbuddy_gateway::load_config();
     let sticky_key = workbuddy_pool_sticky_key(payload);
     let mut sticky_uid = if sticky_key.is_empty() {
@@ -4737,33 +5312,80 @@ async fn workbuddy_pool_dispatch(
         workbuddy_gateway::sticky_get(&sticky_key)
     };
 
+    // 区域解析（循环前一次，§3.3）：显式 region 不需要目录；无显式时先确保目录缓存
+    // 温暖（TTL 10min 内零上游调用，§3.2 T2；过期/失败降级为无约束，可用性优先——§3.1）。
+    let mut region_filter = match workbuddy_gateway::RegionFilter::from_hint(region_hint.as_deref()) {
+        Some(f) => f,
+        None => {
+            if let Err(e) = workbuddy_gateway::region_catalog().await {
+                eprintln!(
+                    "[workbuddy-pool] region catalog refresh failed: {e}（区域解析降级为无约束）"
+                );
+            }
+            workbuddy_gateway::resolve_model_region(&model, None)
+        }
+    };
+    // 日志 region=xx 标注（§3.3：不加新 tag，沿用既有 model 字段备注；随 11102 翻转更新）。
+    let log_model = |wanted: workbuddy_gateway::RegionFilter| -> String {
+        match wanted.wanted_region() {
+            Some(r) => format!("{model} region={r}"),
+            None => model.clone(),
+        }
+    };
+
     let mut tried: Vec<String> = Vec::new();
     let mut last_err: Option<String> = None;
 
     for _ in 0..WB_POOL_MAX_PICKS {
-        // 选号：粘性号优先。契约 §13 只钉了 `pick_account(model, tried)`，没有
-        // 「按 uid 选号」入口 —— 把**其余全部账号**当 tried 传进去，等价于只放行
-        // 粘性号，且池内的冷却/熔断/在途判定仍然生效（`pick_account` 对 tried 一律
-        // 跳过，含全冷却兜底路径）。选不中即解绑，回到常规选号。
+        // 选号：粘性号优先，全部走区域约束版 pick_account_for_region（§3.2/§3.3）。
+        // 粘性的「按 model 过滤」仍由把其余全部账号放进 tried 实现（契约 §13 口径不变，
+        // 冷却/熔断/在途判定对粘性号一视同仁）。
         let picked = match sticky_uid.as_deref() {
             Some(uid) if !tried.iter().any(|t| t == uid) => {
-                let others: Vec<String> = workbuddy_gateway::load_pool_accounts()
-                    .into_iter()
-                    .map(|a| a.uid)
-                    .filter(|u| u != uid)
-                    .collect();
-                match workbuddy_gateway::pick_account(&model, &others) {
-                    Some(acc) => Some(acc),
-                    None => {
-                        workbuddy_gateway::sticky_clear(&sticky_key);
-                        sticky_uid = None;
-                        workbuddy_gateway::pick_account(&model, &tried)
+                let accounts = workbuddy_gateway::load_pool_accounts();
+                let sticky_region = accounts
+                    .iter()
+                    .find(|a| a.uid == uid)
+                    .map(|a| a.region.clone());
+                if workbuddy_gateway::sticky_region_mismatch(sticky_region.as_deref(), region_filter)
+                {
+                    // T4 粘性区域一致性：粘性号区域与本轮 wanted 不符 → 直接解绑，
+                    // 走常规区域选号（不硬塞跨区请求）。
+                    workbuddy_gateway::sticky_clear(&sticky_key);
+                    sticky_uid = None;
+                    workbuddy_gateway::pick_account_for_region(&model, &tried, region_filter)
+                } else {
+                    // 其余全部账号当 tried：等价只放行粘性号（旧口径）。
+                    let others: Vec<String> = accounts
+                        .into_iter()
+                        .map(|a| a.uid)
+                        .filter(|u| u != uid)
+                        .collect();
+                    match workbuddy_gateway::pick_account_for_region(&model, &others, region_filter)
+                    {
+                        Some(acc) => Some(acc),
+                        None => {
+                            workbuddy_gateway::sticky_clear(&sticky_key);
+                            sticky_uid = None;
+                            workbuddy_gateway::pick_account_for_region(&model, &tried, region_filter)
+                        }
                     }
                 }
             }
-            _ => workbuddy_gateway::pick_account(&model, &tried),
+            _ => workbuddy_gateway::pick_account_for_region(&model, &tried, region_filter),
         };
         let Some(mut acc) = picked else {
+            // 区域约束下选不到号：给出「区域内无可用账号」的清晰文案（契约 G4），
+            // 而不是把请求丢给对侧账号打上游。此前已有失败原因（11102 翻转后仍不可用
+            // 等）时保留原文并前置区域标注。
+            if let Some(want) = region_filter.wanted_region() {
+                let region_note =
+                    format!("region={want} 区内无可用账号（该区账号全部冷却/在途或不存在）");
+                last_err = Some(match last_err.take() {
+                    Some(prev) => format!("{region_note}；{prev}"),
+                    None => region_note,
+                });
+            }
             break;
         };
         let uid = acc.uid.clone();
@@ -4813,12 +5435,23 @@ async fn workbuddy_pool_dispatch(
                 let kind = workbuddy_errors::classify(status, &body);
                 let friendly = workbuddy_errors::friendly_message(kind, status, &body);
                 workbuddy_gateway::note_error(&uid, &model, kind, &body);
+                // 11102 跨区不匹配自愈（workbuddy-pool-region 契约 §3.3 T3）：翻转区域
+                // 继续在本轮 picks 内重试（tried 机制照旧）。判据取本轮实际使用的
+                // acc.region：filter 已有约束则取对侧，无约束（Unknown）则从账号区域反推。
+                if body.contains("11102") {
+                    let flipped = workbuddy_gateway::region_flip(region_filter, &acc.region);
+                    eprintln!(
+                        "[workbuddy-pool] 11102 region mismatch: uid={uid} acc_region={} filter→{:?}，翻转区域重试",
+                        acc.region, flipped
+                    );
+                    region_filter = flipped;
+                }
                 if let Some(fatal) = workbuddy_pool_fatal_status(kind) {
                     let latency = started.elapsed().as_millis() as u64;
                     log_gateway_request(
                         "workbuddy-pool",
                         key_id,
-                        &model,
+                        &log_model(region_filter),
                         false,
                         latency,
                         &friendly,
@@ -4854,7 +5487,7 @@ async fn workbuddy_pool_dispatch(
                 log_gateway_request(
                     "workbuddy-pool",
                     key_id,
-                    &model,
+                    &log_model(region_filter),
                     true,
                     latency,
                     "",
@@ -4877,7 +5510,7 @@ async fn workbuddy_pool_dispatch(
                         log_gateway_request(
                             "workbuddy-pool",
                             key_id,
-                            &model,
+                            &log_model(region_filter),
                             false,
                             started.elapsed().as_millis() as u64,
                             &e,
@@ -4900,7 +5533,7 @@ async fn workbuddy_pool_dispatch(
     log_gateway_request(
         "workbuddy-pool",
         key_id,
-        &model,
+        &log_model(region_filter),
         false,
         started.elapsed().as_millis() as u64,
         &msg,
@@ -4921,25 +5554,13 @@ async fn api_workbuddy_pool_chat_completions(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    let (auth_ok, key_id) = workbuddy_pool_auth_ok(&headers);
-    if !auth_ok {
-        log_gateway_request(
-            "workbuddy-pool",
-            key_id.as_deref(),
-            "—",
-            false,
-            0,
-            "无效的 API Key",
-        );
-        return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
-    }
     // 刻意用 Bytes 而非 `Json` extractor：畸形 body 也要能走到鉴权/参数逻辑并回
     // 400 JSON，不被 axum 的 422 抢答（与 trae_acp_chat_response 同口径，
     // 本文件 4130 行起的注释）。
-    let Ok(payload) = serde_json::from_slice::<Value>(&body) else {
+    let Ok(mut payload) = serde_json::from_slice::<Value>(&body) else {
         log_gateway_request(
             "workbuddy-pool",
-            key_id.as_deref(),
+            None,
             "—",
             false,
             0,
@@ -4947,11 +5568,31 @@ async fn api_workbuddy_pool_chat_completions(
         );
         return glm_proxy_error("请求体不是合法 JSON".to_string(), StatusCode::BAD_REQUEST);
     };
+    // 区域密钥隔离：请求体 region（cn/intl）参与鉴权——区域专用 key 跨区即拒，
+    // 只用区域提示约束选号不约束钥匙会导致「用国内版 key 打到国际账号」的混淆
+    // （与池模型区域切换同口径）。注意 body 先解析才能拿到 region（鉴权前置依赖）。
+    let want_region = payload
+        .get("region")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .map(str::to_string)
+        .filter(|r| !r.is_empty());
+    let (auth_ok, key_id) = workbuddy_pool_auth_ok_region(&headers, want_region.as_deref());
+    if !auth_ok {
+        let detail = match want_region.as_deref() {
+            Some(r) => format!("无效的 API Key（该密钥不属于当前区域：{r}）"),
+            None => "无效的 API Key".to_string(),
+        };
+        log_gateway_request("workbuddy-pool", key_id.as_deref(), "—", false, 0, &detail);
+        return glm_proxy_error(detail, StatusCode::UNAUTHORIZED);
+    }
     let want_stream = payload
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    match workbuddy_pool_dispatch(&payload, key_id.as_deref()).await {
+    // dispatch 以 &mut 收体：可选 region 字段在内部读出后剥掉，不外发上游
+    // （workbuddy-pool-region 契约 §3.3①）。
+    match workbuddy_pool_dispatch(&mut payload, key_id.as_deref()).await {
         Ok(reply) if want_stream => workbuddy_pool_sse(&workbuddy_pool_chat_frames(&reply)),
         Ok(reply) => json_ok(workbuddy_pool_chat_value(&reply)),
         Err((status, msg)) => glm_proxy_error(msg, status),
@@ -5008,7 +5649,14 @@ async fn api_workbuddy_pool_responses(headers: HeaderMap, body: axum::body::Byte
         .unwrap_or("workbuddy")
         .to_string();
     workbuddy_pool_set_model(&mut chat, &model);
-    match workbuddy_pool_dispatch(&chat, key_id.as_deref()).await {
+    // 请求体可选 region 字段透传（workbuddy-pool-region 契约 §3.3①）：转换层不保留
+    // 未知字段，显式带过——dispatch 读出后会剥掉，不外发上游。
+    if let Some(r) = payload.get("region") {
+        if let Some(obj) = chat.as_object_mut() {
+            obj.insert("region".to_string(), r.clone());
+        }
+    }
+    match workbuddy_pool_dispatch(&mut chat, key_id.as_deref()).await {
         Ok(reply) if want_stream => {
             let usage = reply.usage.clone().unwrap_or(Value::Null);
             workbuddy_pool_sse(&workbuddy_protocols::responses_stream_frames(
@@ -5090,6 +5738,13 @@ async fn api_workbuddy_pool_messages(headers: HeaderMap, body: axum::body::Bytes
     };
     let mut chat = workbuddy_protocols::anthropic_req_to_chat(&payload);
     workbuddy_pool_set_model(&mut chat, &mapped);
+    // 请求体可选 region 字段透传（workbuddy-pool-region 契约 §3.3①）：同 responses 入口，
+    // dispatch 读出后剥掉，不外发上游。
+    if let Some(r) = payload.get("region") {
+        if let Some(obj) = chat.as_object_mut() {
+            obj.insert("region".to_string(), r.clone());
+        }
+    }
     // 请求带 tools 时，上游可能把 tool_calls 当纯文本吐出（与 grok.rs:552 同款场景）：
     // 经 anthropic_sniff_tool_calls 补齐为 tool_use 块，Claude 客户端才不会只收到
     // 一段含 JSON 的正文。结构化 tool_calls 已由 dispatch 聚合。
@@ -5098,7 +5753,7 @@ async fn api_workbuddy_pool_messages(headers: HeaderMap, body: axum::body::Bytes
         .and_then(Value::as_array)
         .map(|a| !a.is_empty())
         .unwrap_or(false);
-    match workbuddy_pool_dispatch(&chat, key_id.as_deref()).await {
+    match workbuddy_pool_dispatch(&mut chat, key_id.as_deref()).await {
         Ok(mut reply) if want_stream => {
             let mut tool_calls = reply.tool_calls.clone();
             if has_tools && tool_calls.is_empty() {
@@ -5526,30 +6181,168 @@ async fn workbuddy_pool_aggregate_reply(
     agg.into_reply(uid)
 }
 
-/// GET /workbuddy-pool/v1/models：池内首个可用账号的 `fetch_models`，
-/// 全部失败（含池为空）回落 WorkBuddy 内置模型表，保证客户端始终拿得到目录。
+/// GET /workbuddy-pool/v1/models[?region=cn|intl]：**按区聚合**（workbuddy-pool-region
+/// 契约 §3.4）。cn 区取首个成功 cn 账号动态目录（全失败回落 builtin 内置表，
+/// source=fallback）；intl 区取首个成功 intl 账号动态目录（无 intl 账号/全失败回落
+/// `intl_static_models()`，source=static——本机当前无国际版账号时这正是正常态，
+/// 契约 §五-6）。每条目加 `region:"cn"|"intl"` 字段；跨区同名（glm-5.3）保留两条；
+/// 两区独立成败互不阻塞（并发拉取）。保持 OpenAI list 扁平形状（region/regions 均
+/// 为附加字段，不带 region 参数的响应 = 两区全量，回归红线 1）。
+///
+/// `?region=cn|intl` 过滤：data 只含单区条目，regions 元数据只含单区；缺席/非法值 =
+/// 两区全量。
+///
+/// 旧版「首个成功账号目录 + merge_intl_static_models 混入同一扁平列表」的混入语义
+/// 退役（区域混杂、无隔离，契约 §一缺口 1）——聚合纯函数在 core
+/// `workbuddy_gateway::{region_models_part, assemble_region_models}`（fetch 注入，G1 单测覆盖）。
 ///
 /// 免网关 key（与 status/config 同属管理三端点，理由见路由注册处的鉴权策略注释）：
 /// 契约 §13 路由表只对 chat/completions 标注「鉴权(网关 key)」，且本文件 WorkBuddy
 /// 家族另外两个模型目录端点（`/workbuddy-native/v1/models` 本文件 256 行、
 /// `/api/workbuddy-proxy/models` 本文件 262 行）同样免 key。
-async fn api_workbuddy_pool_models() -> Response {
-    let mut last_err = String::new();
-    for acc in workbuddy_gateway::load_pool_accounts() {
-        match workbuddy_upstream::fetch_models(&acc).await {
-            Ok(payload) => {
-                log_gateway_request("workbuddy-pool", None, "models", true, 0, "");
-                return json_ok(payload);
+async fn api_workbuddy_pool_models(RawQuery(query): RawQuery) -> Response {
+    let only = workbuddy_pool_models_region_query(query.as_deref().unwrap_or(""));
+    let accounts = workbuddy_gateway::load_pool_accounts();
+    let want_cn = only != workbuddy_gateway::RegionFilter::Intl;
+    let want_intl = only != workbuddy_gateway::RegionFilter::Cn;
+
+    // 两区独立成败，互不阻塞（§3.1/§3.4）：并发拉取；被过滤的区直接跳过（None）。
+    let (cn_fetch, intl_fetch) = tokio::join!(
+        async {
+            if want_cn {
+                workbuddy_pool_fetch_region_models(&accounts, "cn").await
+            } else {
+                None
             }
-            Err(e) => last_err = e,
+        },
+        async {
+            if want_intl {
+                workbuddy_pool_fetch_region_models(&accounts, "intl").await
+            } else {
+                None
+            }
+        },
+    );
+
+    // cn 回落 = builtin 内置表（§3.4）；intl 回落 = 静态表。聚合与 region 标注全在
+    // core 纯函数里（region_models_part 负责条目加 region 字段与区内去重）。
+    // 观测（不加新 tag，走 error 备注）：各区末次失败原因 + 目录来源与条目数。
+    let mut note = String::new();
+    for (fetch, region) in [(&cn_fetch, "cn"), (&intl_fetch, "intl")] {
+        if let Some((uid, Err(e))) = fetch {
+            note.push_str(&format!("{region} 区动态目录失败 uid={uid}: {e} | "));
         }
     }
-    log_gateway_request("workbuddy-pool", None, "models", false, 0, &last_err);
-    json_ok(workbuddy_proxy::builtin_models_payload())
+    let builtin = workbuddy_proxy::builtin_models_payload();
+    let builtin_items = builtin
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let cn_part = workbuddy_gateway::region_models_part(
+        workbuddy_gateway::RegionFilter::Cn,
+        cn_fetch,
+        builtin_items,
+    );
+    let intl_static = workbuddy_upstream::intl_static_models();
+    let intl_part = workbuddy_gateway::region_models_part(
+        workbuddy_gateway::RegionFilter::Intl,
+        intl_fetch,
+        intl_static,
+    );
+    note.push_str(&format!(
+        "cn={}:{} intl={}:{}",
+        cn_part.source,
+        cn_part.items.len(),
+        intl_part.source,
+        intl_part.items.len()
+    ));
+    log_gateway_request("workbuddy-pool", None, "models", true, 0, &note);
+
+    let payload = workbuddy_gateway::assemble_region_models(cn_part, intl_part, only);
+    json_ok(payload)
+}
+
+/// `?region=cn|intl` 解析：合法值 → 单区过滤；缺席/非法 → Unknown（两区全量，
+/// 客户端容错优先）。
+fn workbuddy_pool_models_region_query(query: &str) -> workbuddy_gateway::RegionFilter {
+    for pair in query.split('&') {
+        let Some((k, v)) = pair.split_once('=') else {
+            continue;
+        };
+        if k == "region" {
+            if let Some(f) = workbuddy_gateway::RegionFilter::from_hint(Some(v)) {
+                return f;
+            }
+        }
+    }
+    workbuddy_gateway::RegionFilter::Unknown
+}
+
+/// `GET/POST /api/workbuddy-pool/region-key?region=cn|intl`：取（或按需创建）该区
+/// 专用接入密钥。GET 找不到该区启用中的 key 时返回 `{key:null, created:false}`；
+/// POST（或 `?create=1`）时找不到即按该区新建并返回 `{key, created:true}`。
+/// 设计动机：用户要「国内版一个密钥、国际版一个密钥」的明确区分，不能共用一把。
+async fn api_workbuddy_pool_region_key(RawQuery(query): RawQuery) -> Response {
+    let create = query
+        .as_deref()
+        .unwrap_or_default()
+        .split('&')
+        .any(|pair| pair == "create=1" || pair == "create=true");
+    let region = query
+        .as_deref()
+        .unwrap_or_default()
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("region="))
+        .map(str::trim)
+        .map(str::to_ascii_lowercase);
+    let Some(region) = region.filter(|r| r == "cn" || r == "intl") else {
+        return json_err("缺少合法 region 参数（cn|intl）".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let region_name = if region == "cn" { "国内版" } else { "国际版" };
+    // 已有该区启用中的 key → 直接复用（多张卡不会互相顶号）。
+    if let Some(existing) = gateway_admin::load_keys().into_iter().find(|k| {
+        k.get("enabled").and_then(Value::as_bool).unwrap_or(true)
+            && k.get("region").and_then(Value::as_str) == Some(region.as_str())
+    }) {
+        let mut out = existing.clone();
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert("created".to_string(), json!(false));
+        }
+        return json_ok(json!({ "ok": true, "key": out }));
+    }
+    if !create {
+        return json_ok(json!({ "ok": true, "key": Value::Null, "created": false }));
+    }
+    match gateway_admin::create_key_scoped(&format!("WorkBuddy {region_name}专用"), Some(&region)) {
+        Ok(key) => json_ok(json!({ "ok": true, "key": key, "created": true })),
+        Err(e) => json_err(e, StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// 单区动态目录拉取（§3.4）：该区**首个成功**账号的 `fetch_models`（打对应区域端点，
+/// 账号 region 由登录域派生）；全部失败 → `(末次账号 uid, Err)`；该区无账号 → None
+/// （两区独立成败，调用方按区各自回落）。
+async fn workbuddy_pool_fetch_region_models(
+    accounts: &[workbuddy_gateway::PoolAccount],
+    region: &str,
+) -> Option<(String, Result<Value, String>)> {
+    let mut last: Option<(String, Result<Value, String>)> = None;
+    for acc in accounts.iter().filter(|a| a.region == region) {
+        match workbuddy_upstream::fetch_models(acc).await {
+            Ok(v) => return Some((acc.uid.clone(), Ok(v))),
+            Err(e) => last = Some((acc.uid.clone(), Err(e))),
+        }
+    }
+    last
 }
 
 /// GET /workbuddy-pool/v1/status：池状态 + 当前配置（grok 式 `pool_status()` +
 /// `load_config()` 合并成一份 JSON，前端一个请求拿全）。
+///
+/// 增 regions 聚合（workbuddy-pool-region 契约 §3.5）：`regions.cn/intl` 的
+/// `accounts/healthy/models`——在 core `pool_status()`（status_value）内完成，本端点
+/// 原样透传。
 ///
 /// ⚠️ 必须**扁平**返回（契约 §13「pool_status() + config」= 同层合并），不要在池数据
 /// 外面套 `{"pool": ...}` 信封：前端 `WorkbuddyPage.tsx:163` 拿到响应体直接
@@ -5558,7 +6351,8 @@ async fn api_workbuddy_pool_models() -> Response {
 /// `api.ts:1175 WorkbuddyPoolStatusResponse extends WorkbuddyPoolStatus`，这些字段
 /// 声明在**响应体顶层**）。套信封会让五个计数器恒显「—」、账号表恒显「暂无账号」。
 /// 同 Grok 池的既有约定：`api_grok_pool_overview`（本文件 1700 行）也是
-/// `json_ok(grok_pool::pool_overview())` 扁平返回。
+/// `json_ok(grok_pool::pool_overview())` 扁平返回。regions 是**新增附加字段**，
+/// 不改任何既有字段的层级（红线：前端直接 setPoolStatus）。
 async fn api_workbuddy_pool_status() -> Response {
     let cfg = workbuddy_gateway::load_config();
     let mut out = workbuddy_gateway::pool_status();

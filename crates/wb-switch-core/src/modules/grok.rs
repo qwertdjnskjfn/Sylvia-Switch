@@ -39,6 +39,235 @@ fn http_client() -> &'static reqwest::Client {
 }
 
 // ---------------------------------------------------------------------------
+// grok2api 桥接（Build 通道新旗舰：凭据与 OAuth 续期由 grok2api 管理，本网关纯转发）
+// ---------------------------------------------------------------------------
+
+/// grok2api 桥接配置文件（~/.wb-switch/grok_g2a_proxy.json）。
+fn g2a_proxy_config_path() -> PathBuf {
+    store_dir().join("grok_g2a_proxy.json")
+}
+
+/// grok2api 桥接配置。
+#[derive(Debug, Clone)]
+pub struct G2aProxyConfig {
+    /// grok2api 基址（如 http://127.0.0.1:8002，无尾斜杠）
+    pub base_url: String,
+    /// 客户端密钥（g2a_…）
+    pub api_key: String,
+    /// 由 grok2api 桥接承接的模型清单
+    pub models: Vec<String>,
+    /// Anthropic `/v1/messages` 缺省思考预算（tokens）。**0 = 不注入**。
+    ///
+    /// 为什么需要它：Anthropic 规范把 thinking 定义为**显式 opt-in** —— 请求不带
+    /// `thinking:{type:"enabled",budget_tokens:N}` 时上游**合法地**不产出思考块，
+    /// 而 OpenAI 路径默认就带 `reasoning_content`。实测（2026-09-28）同一问题：
+    /// OpenAI 80 字思考 vs Anthropic 0 字，带上该参数后 Anthropic 立得 73/246 字。
+    /// 故此处为 Anthropic 协议客户端补一个默认值，客户端零改动；客户端显式传入
+    /// 的 `thinking` 永远优先（不覆盖）。
+    pub default_thinking_budget_tokens: u64,
+}
+
+/// 缺省思考预算（tokens）。Anthropic 要求 `budget_tokens >= 1024` 且 `< max_tokens`，
+/// 故仅当 max_tokens 放得下时才注入（见 `default_thinking_budget`）。
+pub const DEFAULT_THINKING_BUDGET_TOKENS: u64 = 4000;
+
+/// 从 JSON 解析桥接配置（纯函数，便于单测）：enabled + 非空 base_url/api_key/models
+/// 缺一不可，否则返回 None（桥接关闭，完全走原账号池路径）。
+fn g2a_proxy_config_from_value(v: &Value) -> Option<G2aProxyConfig> {
+    let enabled = v.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+    let base_url = v
+        .get("base_url")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .unwrap_or_default();
+    let api_key = v
+        .get("api_key")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let models = v
+        .get("models")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|m| m.as_str().map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if base_url.is_empty() || api_key.is_empty() || models.is_empty() {
+        return None;
+    }
+    // 缺省思考预算：未配置时用默认值（4000）；显式 0 表示关闭注入（逃生用）。
+    let default_thinking_budget_tokens = v
+        .get("default_thinking_budget_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_THINKING_BUDGET_TOKENS);
+    Some(G2aProxyConfig {
+        base_url,
+        api_key,
+        models,
+        default_thinking_budget_tokens,
+    })
+}
+
+/// 读桥接配置（供 api 层 Anthropic Messages 桥接复用）。
+pub fn g2a_proxy_config() -> Option<G2aProxyConfig> {
+    let text = std::fs::read_to_string(g2a_proxy_config_path()).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    g2a_proxy_config_from_value(&v)
+}
+
+/// Anthropic Messages 桥接（/grok/v1/messages → grok2api /v1/messages）：
+/// cli-chat-proxy 原生支持 Messages 协议与工具调用（tool_use），且 Build 池
+/// 自动续期。原样转发请求体（ZCode 等 Anthropic 协议客户端的 tools/system
+/// 均由上游原生处理），返回上游 Response 供 api 层按 Content-Type 透传。
+/// `anthropic_version`：上游要求该头（客户端未带时补官方默认 2023-06-01）。
+/// 请求体里的 model 会做归一化（Grok4.7 → grok-4.7）——客户端钉住的写法
+/// 不一，不归一化会被上游判「模型不存在」404。
+pub async fn g2a_messages_forward(
+    cfg: &G2aProxyConfig,
+    body: &[u8],
+    anthropic_version: Option<&str>,
+    thinking_disabled: bool,
+) -> Result<reqwest::Response, String> {
+    let url = format!("{}/v1/messages", cfg.base_url);
+    let forwarded = prepare_messages_body(cfg, body, thinking_disabled);
+    http_client()
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", cfg.api_key))
+        .header("Content-Type", "application/json")
+        .header(
+            "anthropic-version",
+            anthropic_version.unwrap_or("2023-06-01"),
+        )
+        .body(forwarded)
+        .send()
+        .await
+        .map_err(|e| format!("grok2api Messages 桥接连接失败: {e}"))
+}
+
+/// Messages 请求体的 model 归一化：JSON 解析成功且带 model 字段时，用
+/// `canonical_g2a_model` 映射为上游规范 ID 后重序列化；非 JSON/无 model 原样返回。
+/// 请求头 `x-grok-thinking` 是否要求**关闭**缺省思考注入（逃生开关）。
+/// 接受 off / disable / disabled / none / 0（大小写与空白不敏感）。
+pub fn thinking_disabled_from_header(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("off") | Some("disable") | Some("disabled") | Some("none") | Some("0")
+    )
+}
+
+/// 缺省思考预算：`None` = 不注入。
+/// 约束来自 Anthropic 规范：`budget_tokens >= 1024` 且**严格小于** `max_tokens`
+/// （否则上游 400），故按 max_tokens 自适应收缩，并给正文留 512 tokens 余量。
+fn default_thinking_budget(max_tokens: u64, configured: u64) -> Option<u64> {
+    if configured == 0 || max_tokens <= 1024 {
+        return None;
+    }
+    let with_room_for_text = max_tokens.saturating_sub(512).max(1024);
+    let budget = configured.min(with_room_for_text).max(1024);
+    (budget < max_tokens).then_some(budget)
+}
+
+/// Messages 请求体预处理：① model 归一化（既有行为，不能丢）；
+/// ② 缺省注入 `thinking`（1.0.5）。非 JSON / 无 model 时原样返回，不做猜测性改造。
+///
+/// thinking 仅在三个条件同时成立时注入：客户端**未显式传入**（显式永远优先）、
+/// 未触发逃生开关、且预算算得出（见 `default_thinking_budget`）。
+fn prepare_messages_body(cfg: &G2aProxyConfig, body: &[u8], thinking_disabled: bool) -> Vec<u8> {
+    let Ok(mut v) = serde_json::from_slice::<Value>(body) else {
+        return body.to_vec();
+    };
+    let Some(model) = v.get("model").and_then(Value::as_str).map(String::from) else {
+        return body.to_vec();
+    };
+    v["model"] = json!(canonical_g2a_model(cfg, &model));
+    if !thinking_disabled && v.get("thinking").is_none() {
+        let max_tokens = v.get("max_tokens").and_then(Value::as_u64).unwrap_or(0);
+        if let Some(budget) =
+            default_thinking_budget(max_tokens, cfg.default_thinking_budget_tokens)
+        {
+            v["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+        }
+    }
+    serde_json::to_vec(&v).unwrap_or_else(|_| body.to_vec())
+}
+
+/// 该模型是否由 grok2api 桥接承接。纯函数。
+/// 模型 ID 归一化匹配（大小写/连字符不敏感）：Grok4.7 / grok 4.7 / GROK-4.7
+/// 都映射到 grok-4.7——客户端（ZCode 会话钉住的旧 ID 等）写法不一时也能路由。
+fn g2a_handles(cfg: &G2aProxyConfig, model: &str) -> bool {
+    let key = normalize_model_key(model);
+    cfg.models.iter().any(|m| normalize_model_key(m) == key)
+}
+
+/// 模型 ID 归一化：小写 + 仅保留字母数字（大小写/连字符/空格不敏感）。
+fn normalize_model_key(model: &str) -> String {
+    model
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// 把客户端请求的模型 ID 解析为 grok2api 上游的规范 ID（如 Grok4.7 → grok-4.7）。
+/// 无精确/归一化命中时原样返回（交给上游报未知模型）。
+fn canonical_g2a_model(cfg: &G2aProxyConfig, model: &str) -> String {
+    let key = normalize_model_key(model);
+    cfg.models
+        .iter()
+        .find(|m| normalize_model_key(m) == key)
+        .cloned()
+        .unwrap_or_else(|| model.to_string())
+}
+
+/// Build 专属模型经 grok2api 桥接转发：OpenAI 兼容端点，强制流式（统一解析器按
+/// delta.content 提取）。凭据由 grok2api 管理（含 OAuth 自动续期），本网关零凭据负担；
+/// 不经账号池，不做账号级标记。
+async fn send_g2a_request(
+    cfg: &G2aProxyConfig,
+    model: &str,
+    payload: &Value,
+) -> Result<WebReply, crate::modules::grok_sso::ChatError> {
+    use crate::modules::grok_sso::{ChatError, ChatErrorKind};
+    let url = format!("{}/v1/chat/completions", cfg.base_url);
+    // 归一化命中后用上游规范 ID 发送（Grok4.7 → grok-4.7）
+    let canonical = canonical_g2a_model(cfg, model);
+    let mut upstream_payload = payload.clone();
+    upstream_payload["model"] = json!(canonical);
+    upstream_payload["stream"] = json!(true);
+
+    let resp = http_client()
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", cfg.api_key))
+        .header("Content-Type", "application/json")
+        .json(&upstream_payload)
+        .send()
+        .await
+        .map_err(|e| {
+            ChatError::new(ChatErrorKind::Infra, format!("grok2api 桥接连接失败: {e}"))
+        })?;
+
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    if !(200..300).contains(&status) {
+        return Err(ChatError::new(
+            ChatErrorKind::Infra,
+            format!(
+                "grok2api 上游错误 ({}): {}",
+                status,
+                body.chars().take(200).collect::<String>()
+            ),
+        ));
+    }
+    Ok(WebReply { status, body })
+}
+
+// ---------------------------------------------------------------------------
 // 账号池存储（~/.wb-switch/grok_accounts.json）
 // ---------------------------------------------------------------------------
 
@@ -345,13 +574,27 @@ fn mark_account_success(id: &str) {
 // ---------------------------------------------------------------------------
 
 pub fn models_payload() -> Value {
-    let models = vec![
+    let mut models = vec![
+        json!({
+            "id": "grok-4.7",
+            "object": "model",
+            "created": 1790400000,
+            "owned_by": "xai",
+            "description": "Grok 4.7 最新旗舰（Build 通道 · 支持原生工具调用；免费档无内置联网，实时信息请用 grok-4）"
+        }),
+        json!({
+            "id": "grok-composer-2.5-fast",
+            "object": "model",
+            "created": 1790300000,
+            "owned_by": "xai",
+            "description": "Grok Composer 2.5 Fast（Build 通道 · 极速生成）"
+        }),
         json!({
             "id": "grok-4.6",
             "object": "model",
             "created": 1780000000,
             "owned_by": "xai",
-            "description": "Grok 4.6 最新旗舰（需 Build 通道账号）"
+            "description": "Grok 4.6（已被上游模型目录下线，请求将回落 web 通道 Grok 4）"
         }),
         json!({
             "id": "grok-4",
@@ -445,6 +688,25 @@ pub fn models_payload() -> Value {
             "description": "Grok 网页端专家深度推理通道（Expert Mode）"
         }),
     ];
+
+    // model-sync 注册表合并尾步（契约 model-sync-contract.md §3.3）：同步引擎检出的
+    // 新模型 / 页面手动补录追加在静态表之后。去重：已存在 id 跳过。
+    // 注册表为空时本循环零迭代，输出与既有实现逐字节一致。
+    for entry in crate::modules::model_sync::registry_entries_for("grok") {
+        if models
+            .iter()
+            .any(|m| m.get("id").and_then(Value::as_str) == Some(entry.id.as_str()))
+        {
+            continue;
+        }
+        models.push(json!({
+            "id": entry.id,
+            "object": "model",
+            "created": entry.added_ts / 1000,
+            "owned_by": "xai",
+            "description": entry.name.clone().unwrap_or_else(|| "（模型同步注册）".to_string()),
+        }));
+    }
 
     json!({
         "object": "list",
@@ -736,6 +998,45 @@ fn extract_prompt_from_messages(messages: &[Value], tools: Option<&[Value]>) -> 
     (system_prompt, conversation_text)
 }
 
+/// 合并一条 OpenAI 流式 tool_calls 分片进累加器（v1.7：grok2api/Build 通道原生
+/// 工具调用透传）。delta.tool_calls[] = {index, id?, type?, function?: {name?,
+/// arguments?}}——arguments 跨多 chunk 分片到达需按 index 拼接，id/name 只在
+/// 首片出现。纯函数，便于单测。
+fn merge_tool_call_fragment(acc: &mut Vec<Value>, frag: &Value) {
+    let idx = frag
+        .get("index")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    while acc.len() <= idx {
+        acc.push(json!({
+            "id": Value::Null,
+            "type": "function",
+            "function": {"name": String::new(), "arguments": String::new()},
+        }));
+    }
+    let slot = &mut acc[idx];
+    if let Some(id) = frag.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+        slot["id"] = json!(id);
+    }
+    if let Some(t) = frag.get("type").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+        slot["type"] = json!(t);
+    }
+    if let Some(name) = frag
+        .pointer("/function/name")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        slot["function"]["name"] = json!(name);
+    }
+    if let Some(args) = frag
+        .pointer("/function/arguments")
+        .and_then(Value::as_str)
+    {
+        let current = slot["function"]["arguments"].as_str().unwrap_or_default();
+        slot["function"]["arguments"] = json!(format!("{current}{args}"));
+    }
+}
+
 /// 执行统一的 chat_completions 请求
 pub async fn chat_completions_unified(payload: Value) -> Result<GrokChatOutput, String> {
     // v1.1.0：流式请求也走 WebReply 统一路径，最后按 payload.stream 合成输出。
@@ -752,6 +1053,20 @@ pub async fn chat_completions_unified(payload: Value) -> Result<GrokChatOutput, 
         .cloned()
         .unwrap_or_default();
 
+    // v1.7：Build 通道新旗舰（grok-4.7 等）经本地 grok2api 桥接——上游模型目录轮换后
+    // （grok-4.6 下线、grok-4.7 上线），web 页面与 api.x.ai 直连都跑不了这些模型；
+    // grok2api 的 Build 池（OAuth 自动续期）是唯一稳定入口。桥接关闭/配置缺失时
+    // 完全走原有账号池路径，行为不变。
+    let g2a = g2a_proxy_config();
+    // 回落守卫：g2a 空内容回落 web 的递归请求带 _g2a_fallback 标记，二跳不再走桥接。
+    let g2a_skip = payload
+        .get("_g2a_fallback")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let g2a_serve =
+        !g2a_skip && g2a.as_ref().map(|c| g2a_handles(c, &model)).unwrap_or(false);
+    let mut g2a_empty_fallback = false;
+
     // v1.6.0：tools 参数在此进入 —— web 通道没有原生入口，只能注入 prompt。
     let tools = payload.get("tools").and_then(Value::as_array).cloned();
     let (system_prompt, prompt) = extract_prompt_from_messages(&messages, tools.as_deref());
@@ -761,30 +1076,45 @@ pub async fn chat_completions_unified(payload: Value) -> Result<GrokChatOutput, 
     // 现在与 web 通道统一走 ChatError 分类。
     let mut last_err = String::new();
     for attempt in 0..2u32 {
-        let account = match pick_available_account() {
-            Ok(acc) => acc,
-            Err(e) => return Err(e),
-        };
+        // grok2api 桥接优先：Build 专属模型不经账号池（凭据由 grok2api 管理）。
+        let (req_res, served_by_g2a, account_id, channel_label) = if g2a_serve {
+            let cfg = g2a.as_ref().expect("g2a_serve implies config present");
+            (
+                send_g2a_request(cfg, &model, &payload).await,
+                true,
+                String::new(),
+                "grok2api 桥".to_string(),
+            )
+        } else {
+            let account = match pick_available_account() {
+                Ok(acc) => acc,
+                Err(e) => return Err(e),
+            };
 
-        let account_id = account.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
-        let provider = account.get("provider").and_then(Value::as_str).unwrap_or("web");
-        let token = account.get("token").and_then(Value::as_str).unwrap_or_default();
+            let account_id = account.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+            let provider = account.get("provider").and_then(Value::as_str).unwrap_or("web");
+            let token = account.get("token").and_then(Value::as_str).unwrap_or_default();
+            let channel_label = if provider == "build" { "Build" } else { "Web" }.to_string();
 
-        let req_res: Result<WebReply, crate::modules::grok_sso::ChatError> = match provider {
-            "build" => match send_build_request(&account_id, token, &model, &payload).await {
-                Ok(resp) => {
-                    let status = resp.status().as_u16();
-                    let body = resp.text().await.unwrap_or_default();
-                    Ok(crate::modules::grok::WebReply { status, body })
-                }
-                Err(e) => Err(e),
-            },
-            _ => send_web_request(&account_id, token, &model, &system_prompt, &prompt).await,
+            let req_res: Result<WebReply, crate::modules::grok_sso::ChatError> = match provider {
+                "build" => match send_build_request(&account_id, token, &model, &payload).await {
+                    Ok(resp) => {
+                        let status = resp.status().as_u16();
+                        let body = resp.text().await.unwrap_or_default();
+                        Ok(crate::modules::grok::WebReply { status, body })
+                    }
+                    Err(e) => Err(e),
+                },
+                _ => send_web_request(&account_id, token, &model, &system_prompt, &prompt).await,
+            };
+            (req_res, false, account_id, channel_label)
         };
 
         match req_res {
             Ok(reply) => {
-                mark_account_success(&account_id);
+                if !served_by_g2a {
+                    mark_account_success(&account_id);
+                }
                 let mut req_res_body = Some(reply.body);
                 let upstream_status = reply.status;
 
@@ -795,6 +1125,10 @@ pub async fn chat_completions_unified(payload: Value) -> Result<GrokChatOutput, 
                 // 非流式：聚合上游流/数据为完整 chat.completion JSON
                 let mut content = String::new();
                 let mut reasoning = String::new();
+                // v1.7：原生 tool_calls 累加（grok2api/Build 通道按 OpenAI 流式规范
+                // 分片下发；此前被解析器丢弃——网页反代模型无法调用工具的根因）。
+                let mut native_tool_calls: Vec<Value> = Vec::new();
+                let mut upstream_finish_reason: Option<String> = None;
                 let completion_id = format!("chatcmpl-{}", &uuid::Uuid::new_v4().to_string()[..12]);
 
                 // v1.1.0：WebReply.body（CDP fetch 为完整 JSON / 直连为 SSE 文本）统一按行解析。
@@ -829,11 +1163,65 @@ pub async fn chat_completions_unified(payload: Value) -> Result<GrokChatOutput, 
                             } else if let Some(r_str) = v.pointer("/result/response/reasoningToken").and_then(Value::as_str) {
                                 reasoning.push_str(r_str);
                             }
+                            // v1.7：原生 tool_calls 分片累积（OpenAI 流式规范）
+                            if let Some(fragments) = v.pointer("/choices/0/delta/tool_calls").and_then(Value::as_array) {
+                                for frag in fragments {
+                                    merge_tool_call_fragment(&mut native_tool_calls, frag);
+                                }
+                            }
+                            // finish_reason 透传（tool_calls 判定的上游权威来源）
+                            if let Some(fr) = v.pointer("/choices/0/finish_reason").and_then(Value::as_str) {
+                                if !fr.is_empty() {
+                                    upstream_finish_reason = Some(fr.to_string());
+                                }
+                            }
                         }
                     }
                 }
 
-                let final_message_content = if !reasoning.is_empty() {
+                // v1.7：原生 tool_calls 优先——有则组装标准 message.tool_calls 且
+                // content 保持纯净（推理只进 reasoning_content，不裹 <think>，
+                // 落实「工具调用不混思考」的用户要求）；无则走既有伪嗅探路径。
+                let native_tools: Option<Vec<Value>> = if native_tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(
+                        native_tool_calls
+                            .iter()
+                            .map(|tc| {
+                                json!({
+                                    "id": tc["id"].clone(),
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc["function"]["name"].clone(),
+                                        "arguments": tc["function"]["arguments"].clone(),
+                                    },
+                                })
+                            })
+                            .collect(),
+                    )
+                };
+
+                // v1.7 空内容回落：g2a（grok-4.7 等 Build 免费档模型）模型内部联网
+                // 尝试未获执行时正文为空——自动回落 web 通道（页面自带搜索），让
+                // 实时问题拿到真实答案而不是「无文本返回内容」。
+                if served_by_g2a && content.trim().is_empty() && native_tools.is_none() {
+                    g2a_empty_fallback = true;
+                    last_err = "grok-4.7 返回空正文（模型内部联网尝试未获执行），回落 web 通道".to_string();
+                    break;
+                }
+
+                let final_message_content = if native_tools.is_some() {
+                    // 原生工具调用：正文保持纯净（推理只进 reasoning_content 字段）
+                    content
+                } else if served_by_g2a {
+                    // g2a 纯文本路径：推理进独立字段，不裹 <think>（输出干净）
+                    if content.is_empty() {
+                        "Grok 服务已响应（无文本返回内容）".to_string()
+                    } else {
+                        content
+                    }
+                } else if !reasoning.is_empty() {
                     format!("<think>\n{}\n</think>\n\n{}", reasoning, content)
                 } else if content.is_empty() {
                     "Grok 服务已响应（无文本返回内容）".to_string()
@@ -841,15 +1229,26 @@ pub async fn chat_completions_unified(payload: Value) -> Result<GrokChatOutput, 
                     content
                 };
 
-                // v1.6.0：伪工具调用嗅探 —— **仅在请求带 tools 时**启用。
-                // 不带 tools 时绝不嗅探，否则正文里恰好出现的 JSON 会被误判成
-                // 工具调用并让客户端去执行（glm_web.rs:531 同款解析器）。
-                let (tool_calls, span) = if tools.is_some() {
+                // v1.6.0：伪工具调用嗅探 —— **仅在请求带 tools 且无原生 tool_calls 时**
+                // 兜底启用（web 通道 prompt 注入路径）；原生优先，避免双重工具调用。
+                let (tool_calls, span) = if native_tools.is_some() {
+                    (native_tools.clone(), None)
+                } else if tools.is_some() {
                     sniff_tool_calls(&final_message_content)
                 } else {
                     (None, None)
                 };
-                let finish_reason = if tool_calls.is_some() { "tool_calls" } else { "stop" };
+                let finish_reason = if native_tools.is_some() {
+                    upstream_finish_reason
+                        .as_deref()
+                        .filter(|f| *f != "stop")
+                        .map(String::from)
+                        .unwrap_or_else(|| "tool_calls".to_string())
+                } else if tool_calls.is_some() {
+                    "tool_calls".to_string()
+                } else {
+                    "stop".to_string()
+                };
                 // 已被解析成 tool_calls 的 JSON 块从正文里摘掉，避免客户端重复处理；
                 // 顺带剥掉代码块头部 UI 文案（如 "JSON复制已复制"）。
                 let content_out = match span {
@@ -898,8 +1297,12 @@ pub async fn chat_completions_unified(payload: Value) -> Result<GrokChatOutput, 
                     "[grok] 请求失败 ({:?}, attempt={}/1): {}",
                     chat_err.kind, attempt, chat_err.message
                 );
-                let channel = if provider == "build" { "Build" } else { "Web" };
+                let channel = channel_label.as_str();
                 last_err = format!("Grok {channel} 通道失败：{}", chat_err.message);
+                // grok2api 桥接失败与选号无关，重试也是同一结果——直接收尾。
+                if served_by_g2a {
+                    break;
+                }
                 match retry_backoff_ms(chat_err.kind, attempt) {
                     Some(ms) => {
                         tokio::time::sleep(Duration::from_millis(ms)).await;
@@ -910,6 +1313,27 @@ pub async fn chat_completions_unified(payload: Value) -> Result<GrokChatOutput, 
                 }
             }
         }
+    }
+
+    // g2a 空内容回落：grok-4.7（免费 Build 档无内置联网）正文为空时，自动改走
+    // web 账号池（页面侧自带搜索）——实时问题由此获得真实答案。递归带
+    // _g2a_fallback 标记确保二跳跳过桥接；结果注入 wbFallback 字段供观测。
+    if g2a_empty_fallback {
+        let mut fallback_payload = payload.clone();
+        fallback_payload["_g2a_fallback"] = json!(true);
+        return match Box::pin(chat_completions_unified(fallback_payload)).await {
+            Ok(GrokChatOutput::Json(mut v)) => {
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert(
+                        "wbFallback".to_string(),
+                        json!("grok-4.7 空正文 → web 通道回落（页面侧搜索）"),
+                    );
+                }
+                Ok(GrokChatOutput::Json(v))
+            }
+            Ok(other) => Ok(other),
+            Err(e) => Err(format!("grok-4.7 空正文回落 web 通道失败：{e}")),
+        };
     }
 
     Err(if last_err.is_empty() {
@@ -1049,6 +1473,95 @@ async fn send_web_request(
             Err(chat_err)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// x.ai 官方模型清单拉取（model-sync 专用，契约 model-sync-contract.md §3.1）
+// ---------------------------------------------------------------------------
+
+/// 从 grok 账号池选一个含 build token 的账号（provider=build、启用、token 非空）。
+/// 不走 pick_available_account（那是 chat 调度语义：容量守卫/驻留/round-robin），
+/// 同步引擎只读清单，不该触碰账号调度状态。
+fn pick_build_token() -> Option<String> {
+    let now = now_ms();
+    load_accounts().into_iter().find_map(|acc| {
+        let provider = acc.get("provider").and_then(Value::as_str).unwrap_or("");
+        let enabled = acc.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+        let token = acc
+            .get("token")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
+        if provider == "build" && enabled && is_account_available(&acc, now) && !token.is_empty()
+        {
+            Some(token)
+        } else {
+            None
+        }
+    })
+}
+
+/// 解析 x.ai /v1/models 响应 → (id, name) 列表（纯函数，便于单测）。
+/// 形状：`{"data": [{"id": "grok-4", "object": "model", ...}]}`；缺 data / id 缺失 /
+/// 空 id 一律跳过；重复 id 只保留首个。
+pub fn parse_xai_models_response(value: &Value) -> Vec<(String, Option<String>)> {
+    let Some(arr) = value.get("data").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, Option<String>)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for item in arr {
+        let Some(id) = item.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let id = id.trim();
+        if id.is_empty() || !seen.insert(id.to_string()) {
+            continue;
+        }
+        let name = item
+            .get("name")
+            .or_else(|| item.get("display_name"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        out.push((id.to_string(), name));
+    }
+    out
+}
+
+/// 拉取 x.ai 官方模型清单：`GET https://api.x.ai/v1/models`，Bearer 取 grok 账号池
+/// 任一含 build token 的账号（token 形态与 send_build_request 一致：自动补 Bearer 前缀）。
+/// 无可用 build token / 请求失败 / 解析失败 → Err（该网关本轮记 error，不阻塞他网关）。
+/// 🔴 本函数只读清单，不触碰账号调度/冷却状态，grok chat 路径零改动。
+pub async fn fetch_xai_models() -> Result<Vec<(String, Option<String>)>, String> {
+    let token = pick_build_token().ok_or_else(|| {
+        "无可用 build token（Grok 账号池中无启用的 Build 通道账号）".to_string()
+    })?;
+    let auth_header = if token.starts_with("Bearer ") {
+        token
+    } else {
+        format!("Bearer {token}")
+    };
+    let url = format!("{}/v1/models", GROK_BUILD_BASE);
+    let resp = http_client()
+        .get(&url)
+        .header("Authorization", auth_header)
+        .send()
+        .await
+        .map_err(|e| format!("x.ai /v1/models 请求失败: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!(
+            "x.ai /v1/models 失败（{status}）：{}",
+            text.chars().take(150).collect::<String>()
+        ));
+    }
+    let value: Value =
+        serde_json::from_str(&text).map_err(|e| format!("x.ai /v1/models 解析失败: {e}"))?;
+    Ok(parse_xai_models_response(&value))
 }
 
 // ---------------------------------------------------------------------------
@@ -1363,5 +1876,262 @@ mod tests {
         // 正文里有花括号但不是工具调用时，绝不能误判
         let (calls, _) = sniff_tool_calls("集合 {1, 2} 的元素个数是 2。");
         assert!(calls.is_none());
+    }
+
+    #[test]
+    fn parse_xai_models_response_extracts_ids() {
+        let resp = json!({
+            "object": "list",
+            "data": [
+                {"id": "grok-4", "object": "model", "created": 1745000000},
+                {"id": "grok-3", "object": "model", "created": 1735000000},
+                {"id": "", "object": "model"},
+                {"object": "model"},
+                {"id": "grok-4-fast", "name": "Grok 4 Fast"}
+            ]
+        });
+        let parsed = parse_xai_models_response(&resp);
+        let ids: Vec<&str> = parsed.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["grok-4", "grok-3", "grok-4-fast"], "空 id / 缺 id 跳过");
+        assert_eq!(parsed[2].1.as_deref(), Some("Grok 4 Fast"), "name 尽力透传");
+        assert_eq!(parsed[0].1, None, "上游无 name 字段 → None");
+    }
+
+    #[test]
+    fn parse_xai_models_response_dedupes_and_tolerates_garbage() {
+        let resp = json!({"data": [
+            {"id": "grok-4"},
+            {"id": "  grok-4  "},
+            {"id": "grok-9"}
+        ]});
+        assert_eq!(parse_xai_models_response(&resp).len(), 2, "重复 id 去重");
+        assert!(parse_xai_models_response(&json!({})).is_empty(), "缺 data → 空");
+        assert!(parse_xai_models_response(&json!({"data": "oops"})).is_empty(), "data 非数组 → 空");
+    }
+
+    #[test]
+    fn models_payload_with_empty_registry_matches_legacy_byte_for_byte() {
+        // 🔴 契约红线 §六 1：注册表为空时 models_payload 输出必须与改造前逐字节一致。
+        // 用临时隔离目录保证注册表文件缺失（空表）。
+        let dir = std::env::temp_dir()
+            .join(format!("wb-grok-payload-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let payload = crate::modules::model_sync::with_test_store(&dir, || models_payload());
+        // 2026-09-27：静态表新增 grok-4.7（置顶）与 grok-composer-2.5-fast，
+        // grok-4.6 描述标注「已被上游模型目录下线」——红线改为「空注册表输出 == 当前静态表」。
+        let expect = json!({
+            "object": "list",
+            "data": [
+                {"id": "grok-4.7", "object": "model", "created": 1790400000, "owned_by": "xai", "description": "Grok 4.7 最新旗舰（Build 通道 · 支持原生工具调用；免费档无内置联网，实时信息请用 grok-4）"},
+                {"id": "grok-composer-2.5-fast", "object": "model", "created": 1790300000, "owned_by": "xai", "description": "Grok Composer 2.5 Fast（Build 通道 · 极速生成）"},
+                {"id": "grok-4.6", "object": "model", "created": 1780000000, "owned_by": "xai", "description": "Grok 4.6（已被上游模型目录下线，请求将回落 web 通道 Grok 4）"},
+                {"id": "grok-4", "object": "model", "created": 1745000000, "owned_by": "xai", "description": "Grok 4 旗舰基座模型，推理能力全面升级"},
+                {"id": "grok-4-fast", "object": "model", "created": 1745000000, "owned_by": "xai", "description": "Grok 4 高速版，速度与智能平衡"},
+                {"id": "grok-4-thinking", "object": "model", "created": 1745000000, "owned_by": "xai", "description": "Grok 4 深度思考模式，完整思维链推演"},
+                {"id": "grok-beta", "object": "model", "created": 1710000000, "owned_by": "xai", "description": "Grok 官方通用主力模型"},
+                {"id": "grok-2", "object": "model", "created": 1720000000, "owned_by": "xai", "description": "Grok 2 标准大模型，具备高智能推理与编程表现"},
+                {"id": "grok-2-mini", "object": "model", "created": 1720000000, "owned_by": "xai", "description": "Grok 2 轻量版，兼具极速首字延迟与轻快响应"},
+                {"id": "grok-2-vision", "object": "model", "created": 1720000000, "owned_by": "xai", "description": "Grok 2 多模态视觉模型，支持图文理解"},
+                {"id": "grok-3", "object": "model", "created": 1735000000, "owned_by": "xai", "description": "Grok 3 新一代旗舰基座模型"},
+                {"id": "grok-3-mini", "object": "model", "created": 1735000000, "owned_by": "xai", "description": "Grok 3 轻量极速推理模型"},
+                {"id": "grok-3-thinking", "object": "model", "created": 1735000000, "owned_by": "xai", "description": "Grok 3 深度思考模式（输出完整思维链与详细推演）"},
+                {"id": "grok-chat-fast", "object": "model", "created": 1715000000, "owned_by": "xai", "description": "Grok 网页端极速通道（Fast Mode）"},
+                {"id": "grok-chat-auto", "object": "model", "created": 1715000000, "owned_by": "xai", "description": "Grok 网页端自适应通道（Auto Mode）"},
+                {"id": "grok-chat-expert", "object": "model", "created": 1715000000, "owned_by": "xai", "description": "Grok 网页端专家深度推理通道（Expert Mode）"}
+            ]
+        });
+        assert_eq!(
+            serde_json::to_string(&payload).unwrap(),
+            serde_json::to_string(&expect).unwrap(),
+            "空注册表输出必须逐字节等于改造前静态表"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn models_payload_appends_registry_entries_deduped() {
+        // 注册表条目追加到尾部；已存在 id 不重复。
+        let dir = std::env::temp_dir()
+            .join(format!("wb-grok-payload-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::modules::model_sync::with_test_store(&dir, || {
+            let _ = crate::modules::model_sync::add_registry_entry(
+                "grok", "grok-9", Some("Grok 9".into()), "sync", None,
+            );
+            let _ = crate::modules::model_sync::add_registry_entry(
+                "grok", "grok-4", Some("重复应被跳过".into()), "sync", None,
+            );
+            let payload = models_payload();
+            let data = payload.get("data").and_then(Value::as_array).unwrap();
+            assert_eq!(data.len(), 17, "16 静态（含 grok-4.7/composer）+ 1 注册（grok-4 已存在不重复）");
+            assert_eq!(data[16]["id"], "grok-9");
+            assert_eq!(data[16]["owned_by"], "xai");
+            assert_eq!(data[16]["description"], "Grok 9");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2026-09-27 grok2api 桥接：配置解析与模型匹配（Build 通道新旗舰 grok-4.7）。
+    #[test]
+    fn g2a_proxy_config_parsing_and_model_match() {
+        // 完整配置：enabled + 三要素齐全
+        let full = g2a_proxy_config_from_value(&json!({
+            "enabled": true,
+            "base_url": "http://127.0.0.1:8002/",
+            "api_key": " g2a_abc ",
+            "models": ["grok-4.7", "grok-composer-2.5-fast"]
+        }));
+        let cfg = full.expect("完整配置应解析成功");
+        assert_eq!(cfg.base_url, "http://127.0.0.1:8002"); // 尾斜杠被剪
+        assert_eq!(cfg.api_key, "g2a_abc"); // 空白被剪
+        assert!(g2a_handles(&cfg, "grok-4.7"));
+        assert!(!g2a_handles(&cfg, "grok-4"));
+        // 归一化匹配：大小写/连字符/空格写法不一也能路由
+        assert!(g2a_handles(&cfg, "Grok4.7"));
+        assert!(g2a_handles(&cfg, "GROK-4.7"));
+        assert!(g2a_handles(&cfg, "grok 4.7"));
+        // 规范 ID 解析：归一化命中 → 上游规范 ID
+        assert_eq!(canonical_g2a_model(&cfg, "Grok4.7"), "grok-4.7");
+        assert_eq!(canonical_g2a_model(&cfg, "grok-4.7"), "grok-4.7");
+        assert_eq!(canonical_g2a_model(&cfg, "totally-fake"), "totally-fake");
+        // disabled / 缺字段 / 空 models → 桥接关闭
+        assert!(g2a_proxy_config_from_value(&json!({"enabled": false, "base_url": "http://x", "api_key": "k", "models": ["m"]})).is_none());
+        assert!(g2a_proxy_config_from_value(&json!({"enabled": true, "api_key": "k", "models": ["m"]})).is_none());
+        assert!(g2a_proxy_config_from_value(&json!({"enabled": true, "base_url": "http://x", "models": ["m"]})).is_none());
+        assert!(g2a_proxy_config_from_value(&json!({"enabled": true, "base_url": "http://x", "api_key": "k"})).is_none());
+        // 1.0.5：缺省思考预算未配置时取默认值；显式 0 表示关闭注入
+        assert_eq!(cfg.default_thinking_budget_tokens, DEFAULT_THINKING_BUDGET_TOKENS);
+        let off = g2a_proxy_config_from_value(&json!({
+            "enabled": true, "base_url": "http://x", "api_key": "k", "models": ["m"],
+            "default_thinking_budget_tokens": 0
+        }))
+        .expect("显式 0 仍是有效配置");
+        assert_eq!(off.default_thinking_budget_tokens, 0);
+    }
+
+    /// 1.0.5：缺省思考预算的边界（Anthropic 要求 1024 <= budget < max_tokens）。
+    #[test]
+    fn default_thinking_budget_respects_anthropic_constraints() {
+        assert_eq!(default_thinking_budget(8000, 4000), Some(4000)); // 正常：取配置值
+        assert_eq!(default_thinking_budget(2000, 4000), Some(1488)); // 自适应收缩（留 512 给正文）
+        assert_eq!(default_thinking_budget(1600, 4000), Some(1088)); //
+        assert_eq!(default_thinking_budget(1536, 4000), Some(1024)); // 下限 1024
+        assert_eq!(default_thinking_budget(1024, 4000), None); // 放不下 → 不注入
+        assert_eq!(default_thinking_budget(0, 4000), None); // 无 max_tokens → 不注入
+        assert_eq!(default_thinking_budget(8000, 0), None); // 配置为 0 = 关闭
+        // 不变量：任何 Some 都必须满足 1024 <= budget < max_tokens
+        for mt in [1100u64, 1536, 2000, 4096, 8192, 20000] {
+            if let Some(b) = default_thinking_budget(mt, 4000) {
+                assert!((1024..mt).contains(&b), "mt={mt} budget={b}");
+            }
+        }
+    }
+
+    /// 1.0.5：请求体预处理 —— 缺 thinking 时注入；客户端显式传入不被覆盖；
+    /// 逃生开关与 model 归一化同时生效。
+    #[test]
+    fn prepare_messages_body_injects_thinking_without_overriding_client() {
+        let cfg = g2a_proxy_config_from_value(&json!({
+            "enabled": true, "base_url": "http://x", "api_key": "k",
+            "models": ["grok-4.7"], "default_thinking_budget_tokens": 4000
+        }))
+        .unwrap();
+
+        // ① 未带 thinking + max_tokens 足够 → 注入，且 model 已归一化
+        let out = prepare_messages_body(
+            &cfg,
+            br#"{"model":"Grok4.7","max_tokens":8000,"messages":[]}"#,
+            false,
+        );
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["model"], "grok-4.7");
+        assert_eq!(v["thinking"]["type"], "enabled");
+        assert_eq!(v["thinking"]["budget_tokens"], 4000);
+
+        // ② 客户端显式传 thinking → 原样保留（客户端优先）
+        let out = prepare_messages_body(
+            &cfg,
+            br#"{"model":"grok-4.7","max_tokens":8000,"thinking":{"type":"enabled","budget_tokens":1234},"messages":[]}"#,
+            false,
+        );
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["thinking"]["budget_tokens"], 1234);
+
+        // ③ 逃生开关 → 不注入
+        let out = prepare_messages_body(
+            &cfg,
+            br#"{"model":"grok-4.7","max_tokens":8000,"messages":[]}"#,
+            true,
+        );
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert!(v.get("thinking").is_none(), "逃生开关应关闭注入");
+
+        // ④ max_tokens 太小 → 不注入（避免上游 400）
+        let out = prepare_messages_body(
+            &cfg,
+            br#"{"model":"grok-4.7","max_tokens":512,"messages":[]}"#,
+            false,
+        );
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert!(v.get("thinking").is_none());
+
+        // ⑤ 非 JSON / 无 model → 原样返回（不猜测性改造）
+        let raw = b"not-json-at-all";
+        assert_eq!(prepare_messages_body(&cfg, raw, false), raw.to_vec());
+    }
+
+    /// 1.0.5：逃生开关取值（大小写/空白不敏感）。
+    #[test]
+    fn thinking_disabled_header_variants() {
+        for yes in [Some("off"), Some("OFF"), Some(" off "), Some("disable"), Some("disabled"), Some("none"), Some("0")] {
+            assert!(thinking_disabled_from_header(yes), "{yes:?} 应关闭注入");
+        }
+        for no in [None, Some("on"), Some("auto"), Some("enabled"), Some("")] {
+            assert!(!thinking_disabled_from_header(no), "{no:?} 应保持注入");
+        }
+    }
+
+    /// grok-4.7 / grok-composer-2.5-fast 必须在对外模型清单置顶（用户要求上线最新模型）。
+    #[test]
+    fn models_payload_lists_grok47_first() {
+        let payload = models_payload();
+        let ids: Vec<&str> = payload["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["id"].as_str())
+            .collect();
+        assert_eq!(ids[0], "grok-4.7", "grok-4.7 应置顶: {ids:?}");
+        assert!(ids.contains(&"grok-composer-2.5-fast"));
+        assert!(ids.contains(&"grok-4.6")); // 历史模型保留（描述标注已下线）
+    }
+
+    /// 2026-09-27 原生工具调用透传：OpenAI 流式 tool_calls 分片按 index 累积、
+    /// arguments 跨 chunk 拼接（网页反代模型工具适配的核心解析逻辑）。
+    #[test]
+    fn merge_tool_call_fragments_accumulates_openai_stream() {
+        let mut acc: Vec<Value> = Vec::new();
+        let frags = json!([
+            {"index": 0, "id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": ""}},
+            {"index": 0, "function": {"arguments": "{\"city\":"}},
+            {"index": 0, "function": {"arguments": "\"Tokyo\"}"}},
+            {"index": 1, "id": "call_2", "type": "function", "function": {"name": "get_time", "arguments": "{}"}}
+        ]);
+        if let Some(list) = frags.as_array() {
+            for frag in list {
+                merge_tool_call_fragment(&mut acc, frag);
+            }
+        }
+        assert_eq!(acc.len(), 2);
+        assert_eq!(acc[0]["id"], json!("call_1"));
+        assert_eq!(acc[0]["type"], json!("function"));
+        assert_eq!(acc[0]["function"]["name"], json!("get_weather"));
+        assert_eq!(
+            acc[0]["function"]["arguments"],
+            json!(r#"{"city":"Tokyo"}"#)
+        );
+        assert_eq!(acc[1]["id"], json!("call_2"));
+        assert_eq!(acc[1]["function"]["name"], json!("get_time"));
+        assert_eq!(acc[1]["function"]["arguments"], json!("{}"));
     }
 }

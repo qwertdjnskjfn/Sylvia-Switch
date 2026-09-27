@@ -7,6 +7,42 @@
 
 ---
 
+## 1.0.5 — 2026-09-28
+
+### 新增：grok Anthropic 路径**缺省注入 thinking** —— 修「能回复但不思考 / 不思考如何调用工具」
+
+**症状**（用户报，ZCode 走 Anthropic 协议）：`grok-4.7` 能回复但"不会主动思考问题、也不会思考如何调用工具"。
+
+**根因**（2026-09-28 实测 9 组，走真实网关）：**不是缺陷，是协议差异**。
+
+| 路径 | 不带 thinking 参数 | 带 `thinking:{type:enabled,budget_tokens:N}` |
+| --- | --- | --- |
+| `/grok/v1/chat/completions`（OpenAI） | ✅ `reasoning_content` **80 字**（默认就带） | — |
+| `/grok/v1/messages`（Anthropic） | ❌ 思考 **0 字**（无 thinking 块 / 无 thinking_delta） | ✅ **73 字**（budget 2000）/ **246 字**（budget 6000） |
+
+Anthropic 规范把 thinking 定义为**显式 opt-in**：不传该字段，上游**合法地**不产出思考块。
+而客户端（ZCode）不会主动传 → 主观上就是"模型不思考"。多轮 agent 场景更被放大：
+Anthropic 要求**多轮回传 thinking 块**以维持推理连续性，客户端既然没开也不会回传 →
+第二轮起推理上下文断裂 → 表现为"**不会思考如何调用工具**"。
+
+**改动**
+
+| 文件 | 改动 |
+| --- | --- |
+| `grok.rs` | ① `G2aProxyConfig` 新增 `default_thinking_budget_tokens`（**默认 4000**，显式 `0` = 关闭）；② 新增纯函数 `default_thinking_budget()` —— 按 Anthropic 约束（`1024 ≤ budget < max_tokens`）**自适应收缩并留 512 正文余量**，放不下就不注入；③ `canonicalize_messages_model()` → **`prepare_messages_body()`**：在既有 model 归一化之上追加 thinking 注入（**客户端显式传入永远优先，不覆盖**）；④ 新增 `thinking_disabled_from_header()` |
+| `api.rs` | `/grok/v1/messages` 读取逃生开关 `x-grok-thinking: off|disable|none|0` 并透传给转发层 |
+
+**行为**：客户端零改动即获得思考；想关掉可用请求头 `x-grok-thinking: off`，或把配置里
+`default_thinking_budget_tokens` 设为 `0`。
+
+**验证**（见下方部署记录）：单测 596 passed（新增 3 项：预算边界不变量、注入不覆盖客户端、
+开关取值矩阵）；部署后 e2e：不带 thinking → 出现 thinking 块；带开关 → 思考为 0（回退成功）。
+
+**已知约束（非缺陷）**：Free 档 `reasoning_effort` 不区分档位（high 与默认同为 80 字）、
+思考只给 ~80 字摘要；当前 grok 账号池 12/12 为 `tier=free`，需要更深推理需 Basic/Plus 档账号。
+
+---
+
 ## 1.0.4 — 2026-09-27
 
 ### 修复：`/v1/messages`（Anthropic 协议）补齐 ChatGLM 网页引擎兜底 —— 与 `/v1/chat/completions` 对齐
