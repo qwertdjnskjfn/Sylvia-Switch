@@ -7,6 +7,59 @@
 
 ---
 
+## 1.0.4 — 2026-09-27
+
+### 修复：`/v1/messages`（Anthropic 协议）补齐 ChatGLM 网页引擎兜底 —— 与 `/v1/chat/completions` 对齐
+
+**现象**（用户报，ZCode：Invalid API Key 后暴露的第二个问题）：
+`kind=anthropic` 的 provider 走 `/v1/messages` 恒 502 ——
+`全部 2 个账号均不可用：上游返回 403 Forbidden: The account has been banned`，
+**而同一模型走 `/v1/chat/completions` 却 200 正常**（实测 3/3 对 3/3）。
+
+**根因**（读码确认，两条协议路径兜底策略不对称）：
+
+| 路径 | 入口 | 账号池失败时 |
+| --- | --- | --- |
+| `/v1/chat/completions` | `glm_proxy::chat_completions()` | ✅ 兜底到 `glm_web`（抓取的 ChatGLM 网页 token） |
+| `/v1/messages` | `glm_proxy::anthropic_messages()` | ❌ 直接 `chat_completions_json()` → 原样 502 |
+
+⇒ 一旦账号池里有账号被上游封（403 banned）/ 限流，**OpenAI 路径靠网页 token 继续服务，
+Anthropic 路径必挂** —— 用 `kind=anthropic` 的编码 agent（ZCode / Claude Code 类）首当其冲。
+
+**改动**
+
+| 文件 | 改动 |
+| --- | --- |
+| `glm_anthropic.rs` | 新增 `pump_anthropic_from_web()`：把 `glm_web` 的 `Stream` / `Json` 两种输出**统一归一为 OpenAI 风格 SSE 文本**再喂同一个 `AnthropicSseTransformer` —— 事件序列与 autoclaw 链路逐帧一致，不另写一套事件生成；跨 chunk UTF-8 半字符仍走 `decode_stream_chunk`（红线） |
+| `glm_proxy.rs` | `anthropic_messages()`：流式在 `prepare_stream` 失败后兜底 `glm_web`；非流式改为**复用 `chat_completions()`**（其自带完整兜底策略），消除重复实现 |
+
+**验证**（2026-09-27 23:2x，部署到 1.0.4 后实测）
+- `cargo test -p wb-switch-core --lib`：**593 passed, 0 failed**（含新增 2 项：
+  `pump_from_web_json_synthesizes_anthropic_events`（Json→Anthropic SSE 全序）、
+  `pump_from_web_stream_keeps_split_utf8_intact`（**多字节中文被切在 chunk 中间不丢字**））；
+- `cargo build --release -p wb-switch-server`：通过；`deploy.py --expect-version 1.0.4`：停机 **1.1s**；
+- e2e（`tools/e2e_anthropic_messages.py`，全部实调）：
+
+| # | 场景 | 结果 |
+| --- | --- | --- |
+| 1 | `/v1/messages` 非流式 `glm-5.3` | ✅ 200 `type=message` `content="收到"`（修复前恒 502） |
+| 2 | `/v1/messages` 流式 `glm-5.3` | ✅ 200，事件全序 `message_start→content_block_start→delta→content_block_stop→message_delta→message_stop` |
+| 3 | **强制触发兜底**（非法模型 → 主路必失败）非流式 | ✅ 200 —— 证明兜底链路真的接上了 |
+| 4 | **强制触发兜底** 流式 | ✅ 200，事件全序完整 |
+| 5 | 回归：`/v1/chat/completions`、`/v1/models` | ✅ 200（无回归） |
+| 6 | 回归：`/opencode/v1`、`/workbuddy/v1`、`/grok/v1`、`/kimi/v1`、`/qwen-flash/v1` | ✅ 全部 200 |
+| 7 | 旧 key 打 `/v1/models` | ✅ 401（轮换仍有效） |
+| 8 | `tools/monitor.py` | ✅ **ALL GREEN** |
+
+**⚠️ 附带发现（非本次改动引入，需用户处理）**：autoclaw 账号池中有账号曾返回
+`403 Forbidden: The account has been banned`，`/v1/*` 一度实际靠 ChatGLM 网页 token
+兜底在撑（本次修复后两条协议路径都能兜底）。另：排查中两次遇到上游
+`autoglm-acceleration-api.zhipuai.cn` 瞬时故障（错误体为
+`upstream connect failed: 由于目标计算机积极拒绝 (os error 10061)`，**该文案来自上游自身、
+不在本仓库代码中**），数分钟后自愈 —— 属上游抖动，非网关问题。
+
+---
+
 ## 1.0.3 — 2026-09-24
 
 ### 新增：WorkBuddy 网关重构 P2+P3（Responses/Messages 双协议 + 余额巡检 + 观测）

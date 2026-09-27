@@ -1073,6 +1073,103 @@ pub(crate) async fn pump_anthropic_stream(
     }
 }
 
+/// 让 **ChatGLM 网页引擎兜底**的输出也能走 Anthropic SSE：复用同一个
+/// `AnthropicSseTransformer`，保证事件序列与 autoclaw 链路逐帧一致。
+///
+/// 背景（1.0.4）：`glm_proxy::chat_completions()` 在 autoclaw 账号池失败时会兜底到
+/// `glm_web`，而 `/v1/messages`（`anthropic_messages()`）原先没有这层兜底 ——
+/// 同一个上游、两条协议路径命运不同：kind=anthropic 的客户端（ZCode 等）在账号池
+/// 被限流/封号时必然 502，而 OpenAI 路径却正常。本函数补齐该不对称。
+///
+/// 两种入参都归一成 OpenAI 风格 SSE 文本再喂转换器：
+/// - `Stream`：逐块透传（跨 chunk 的 UTF-8 半字符交给 `decode_stream_chunk`，见其注释）
+/// - `Json`：把内容/思维链合成为 SSE 帧，避免为「非流式兜底结果」单写一套事件生成
+pub(crate) fn pump_anthropic_from_web(
+    out: super::glm_web::GlmChatOutput,
+) -> GlmUpstreamStream {
+    use bytes::Bytes;
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, String>>(16);
+    tokio::spawn(async move {
+        let mut t = AnthropicSseTransformer::new();
+
+        async fn emit(
+            tx: &tokio::sync::mpsc::Sender<Result<Bytes, String>>,
+            events: Vec<String>,
+        ) -> bool {
+            for event in events {
+                if tx.send(Ok(Bytes::from(event))).await.is_err() {
+                    return false; // 客户端已断开
+                }
+            }
+            true
+        }
+
+        match out {
+            super::glm_web::GlmChatOutput::Stream(mut web) => {
+                let mut carry: Vec<u8> = Vec::new();
+                while let Some(item) = web.rx.recv().await {
+                    match item {
+                        Ok(chunk) => {
+                            let text = decode_stream_chunk(&mut carry, &chunk);
+                            if !emit(&tx, t.push(&text)).await {
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            t.mark_error(e);
+                            break;
+                        }
+                    }
+                }
+            }
+            super::glm_web::GlmChatOutput::Json(value) => {
+                let content = value
+                    .pointer("/choices/0/message/content")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let reasoning = value
+                    .pointer("/choices/0/message/reasoning_content")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let mut text = String::new();
+                if !reasoning.is_empty() {
+                    text.push_str(&format!(
+                        "data: {}\n\n",
+                        json!({"choices": [{"index": 0, "delta": {"reasoning_content": reasoning}}]})
+                    ));
+                }
+                if !content.is_empty() {
+                    text.push_str(&format!(
+                        "data: {}\n\n",
+                        json!({"choices": [{"index": 0, "delta": {"content": content}}]})
+                    ));
+                }
+                text.push_str("data: [DONE]\n\n");
+                if !emit(&tx, t.push(&text)).await {
+                    return;
+                }
+            }
+        }
+
+        // 与 autoclaw 链路同样：错误流先下发 error 事件，再补齐收尾（幂等）。
+        if !t.ok() {
+            let _ = tx
+                .send(Ok(Bytes::from(sse_event(
+                    "error",
+                    &json!({"type": "error", "error": {"type": "overloaded_error", "message": t.error()}}),
+                ))))
+                .await;
+        }
+        let _ = emit(&tx, t.finish()).await;
+    });
+
+    GlmUpstreamStream {
+        content_type: "text/event-stream".to_string(),
+        rx,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1711,5 +1808,53 @@ mod tests {
         assert!(events.contains("\"index\":1"));
         assert_eq!(events.matches("event: content_block_stop").count(), 2);
         assert!(t.ok());
+    }
+
+    /// 1.0.4：glm_web 非流式兜底结果 → 必须合成出完整 Anthropic SSE 事件序列。
+    #[tokio::test]
+    async fn pump_from_web_json_synthesizes_anthropic_events() {
+        let out = crate::modules::glm_web::GlmChatOutput::Json(json!({
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "你好", "reasoning_content": "想一下"}
+            }]
+        }));
+        let mut stream = pump_anthropic_from_web(out);
+        let mut all = String::new();
+        while let Some(item) = stream.rx.recv().await {
+            if let Ok(bytes) = item {
+                all.push_str(&String::from_utf8_lossy(&bytes));
+            }
+        }
+        assert!(all.contains("event: message_start"), "缺 message_start");
+        assert!(all.contains("event: content_block_delta"), "缺 delta");
+        assert!(all.contains("你好"), "正文未透传");
+        assert!(all.contains("message_stop"), "缺收尾事件");
+        assert_eq!(stream.content_type, "text/event-stream");
+    }
+
+    /// 1.0.4：glm_web 流式兜底 → 逐块喂转换器；且**多字节码点被切在 chunk 中间**
+    /// 时不得丢字节（沿用 decode_stream_chunk 的跨 chunk 拼接）。
+    #[tokio::test]
+    async fn pump_from_web_stream_keeps_split_utf8_intact() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, String>>(8);
+        let frame = "data: {\"choices\":[{\"delta\":{\"content\":\"中文\"}}]}\n\n";
+        let bytes = frame.as_bytes().to_vec();
+        let cut = frame.find('中').unwrap() + 1; // 切在「中」的第 2 字节前
+        let (a, b) = (bytes[..cut].to_vec(), bytes[cut..].to_vec());
+        tokio::spawn(async move {
+            let _ = tx.send(Ok(bytes::Bytes::from(a))).await;
+            let _ = tx.send(Ok(bytes::Bytes::from(b))).await;
+        });
+        let out = crate::modules::glm_web::GlmChatOutput::Stream(crate::modules::glm_web::GlmWebStream { rx });
+        let mut stream = pump_anthropic_from_web(out);
+        let mut all = String::new();
+        while let Some(item) = stream.rx.recv().await {
+            if let Ok(chunk) = item {
+                all.push_str(&String::from_utf8_lossy(&chunk));
+            }
+        }
+        assert!(all.contains("中文"), "跨 chunk 的中文被丢字节: {all}");
+        assert!(all.contains("event: message_start"));
     }
 }

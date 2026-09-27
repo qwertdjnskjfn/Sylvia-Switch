@@ -1144,20 +1144,48 @@ pub async fn chat_completions(body: Value) -> Result<GlmChatCompletion, String> 
 // ---------------------------------------------------------------------------
 
 /// Anthropic Messages API 入口：转换请求 → 复用上游链路 → 转换响应。
+///
+/// 1.0.4：补上与 `/v1/chat/completions` **对齐的 ChatGLM 网页引擎兜底**。
+/// 原先 autoclaw 账号池失败（403 banned / 限流 / 冷却）时，OpenAI 路径会
+/// 自动切到 `glm_web` 继续服务，而本路径直接 502 —— 同一上游、两条协议路径
+/// 命运不同：用 `kind=anthropic` 的客户端（ZCode / Claude Code 类）在账号池
+/// 出问题时必然失败。现在两条路径的兜底策略完全一致。
 pub async fn anthropic_messages(body: Value) -> Result<GlmChatCompletion, String> {
     let (payload, requested_model, stream) =
         super::glm_anthropic::to_openai_payload(&body)?;
     if stream {
-        let (prepared, resp) = prepare_stream(&payload, &requested_model).await?;
-        Ok(GlmChatCompletion::Stream(
-            super::glm_anthropic::pump_anthropic_stream(prepared, resp).await,
-        ))
+        match prepare_stream(&payload, &requested_model).await {
+            Ok((prepared, resp)) => Ok(GlmChatCompletion::Stream(
+                super::glm_anthropic::pump_anthropic_stream(prepared, resp).await,
+            )),
+            Err(autoclaw_err) => {
+                // 兜底：ChatGLM 网页引擎（与 chat_completions() 同策略）
+                if crate::modules::glm_web::has_usable_token() {
+                    match crate::modules::glm_web::chat_completions(payload).await {
+                        Ok(out) => Ok(GlmChatCompletion::Stream(
+                            super::glm_anthropic::pump_anthropic_from_web(out),
+                        )),
+                        Err(web_err) => Err(format!(
+                            "{autoclaw_err}；且尝试调用抓取的 ChatGLM Token 失败: {web_err}"
+                        )),
+                    }
+                } else {
+                    Err(autoclaw_err)
+                }
+            }
+        }
     } else {
-        let openai = chat_completions_json(payload).await?;
-        Ok(GlmChatCompletion::Json(super::glm_anthropic::from_openai_response(
-            &openai,
-            &requested_model,
-        )))
+        // 复用 chat_completions()：它自带「autoclaw 失败 → glm_web 兜底」的完整策略，
+        // 避免在此重复实现（也保证两条协议路径行为一致）。
+        match chat_completions(payload).await {
+            Ok(GlmChatCompletion::Json(openai)) => Ok(GlmChatCompletion::Json(
+                super::glm_anthropic::from_openai_response(&openai, &requested_model),
+            )),
+            Ok(GlmChatCompletion::Stream(_)) => {
+                Err("上游返回了非预期的流式响应".to_string())
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
