@@ -42,6 +42,41 @@
 
 ---
 
+## 1.0.9 — 2026-09-29
+
+### 修复：AutoClaw 自动续期接上「账号池明文 refresh_token」—— 补上 1.0.6~1.0.8 留下的最后缺口
+
+**背景**：1.0.6~1.0.8 解决了「读不到 / 读到的旧」两个问题，但 `autoclaw_refresh_access_token()`
+仍只读旧 `%APPDATA%\autoclaw\auth.json` 的 `refreshToken`（5.5.6+ 已变空壳）→
+**401 后无法自愈**，只能等下次人工处理。
+
+**改动**（`platform_checkin.rs`）—— 续期改为**双来源**，任一路成功即返回：
+
+| 通路 | 来源 | 成功后写回 |
+| --- | --- | --- |
+| ① | 旧 `auth.json` 的加密 `refreshToken`（还能用时优先，行为与以前完全一致） | 按客户端同款 `enc:` 格式写回 `auth.json` |
+| ② **新增** | **账号池 `~/.wb-switch/accounts.json` 里本机 uid 的明文 `refresh_token`** + `device_id`（缺失时回退旧 auth.json 的 deviceId 字段） | 新 access token + `expiresAt` **写回池**，并**清空 token 缓存** → `read_autoclaw_token()` 的「池优先」次序立即拿到新鲜 token |
+
+- 新增 `refresh_from_pool()` / `pool_refresh_material()` / `write_back_pool_token()`（原子写）/
+  `clear_imported_token_cache()`；过期时间优先取 **JWT `exp`**（最可靠），退化为响应里的
+  `expires_at` / `expires_in`；
+- 两路都失败时错误信息**同时列出两条通路的原因**，便于定位；
+- 触发入口无需新增：既有 `POST /api/protection/keepalive-now` / 签到流程在 401 时会走
+  `PoolAccount::refresh()` → 本机账号分支即本函数。
+
+**验证**（2026-09-29 23:2x 实测）
+- `cargo test -p wb-switch-core --lib`：**607 passed**；`deploy.py --expect-version 1.0.9` 停机 0.9s；
+- `POST /api/protection/keepalive-now` → `{total:5, healthy:3, failed:2, refreshed:0}`：
+  `refreshed: 0` 属**设计如此** —— keepalive 只在「**临近过期**」时前瞻续期，
+  而本机 token 的 `exp` 还有 30 天（属"未过期但被吊销"的**僵尸态**，不触发续期）；
+- 用源码签名规则（`X-Auth-Sign = md5(appId&ts&appKey)`）手工复刻池内本机 `refresh_token` 的续期请求：
+  服务端返回 **`code=400000 用户未登录，请重新登录`**（而非签名错 `400002`）⇒
+  **请求格式与鉴权头均正确，通路可用**；但**该账号的 refresh token 已被服务端注销**
+  （access 与 refresh 双失效）→ **该账号无法靠代码自愈，需在 WorkBuddy 桌面端重新登录一次**。
+  注意：这不影响网关可用性 —— 探活已由健康池账号兜底（1.0.8），真实请求也走池账号。
+
+---
+
 ## 1.0.8 — 2026-09-29
 
 ### 修复（承接 1.0.7）：AutoClaw 探活不再误报「网关异常」—— 本机 token 被作废时回落池内健康账号

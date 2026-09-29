@@ -919,11 +919,33 @@ fn autoclaw_auth_failure(resp: &Value) -> Option<String> {
     None
 }
 
-/// 用 auth.json 里的 refresh token 换新 access token（/userapi/v1/refresh）。
+/// 用 refresh token 换新 access token（/userapi/v1/refresh）。
 ///
-/// 实测 refresh token 不轮换，续期不会破坏客户端登录态；新 access token
-/// 按客户端同款 `enc:` 格式写回 auth.json，客户端下次启动直接可用。
+/// **1.0.9 起双来源**（WorkBuddy 5.5.6+ 把 `%APPDATA%\autoclaw\auth.json` 变成
+/// 只剩 deviceId/updatedAt 的空壳后，旧来源必然失败）：
+/// ① 旧 `auth.json` 的加密 `refreshToken`（还能用时优先，且能按客户端同款 `enc:` 写回）；
+/// ② **账号池 `accounts.json` 里本机 uid 的明文 `refresh_token`** —— 续期成功后把新 token
+///    写回池，`read_autoclaw_token()` 的「池优先」次序即可拿到新鲜 token。
+/// 实测 refresh token 不轮换，续期不会破坏客户端登录态。
 pub(crate) async fn autoclaw_refresh_access_token() -> Result<String, String> {
+    let region = crate::modules::autoclaw_accounts::local_autoclaw_region();
+    let mut errors: Vec<String> = Vec::new();
+
+    match refresh_from_auth_json(region).await {
+        Ok(token) => return Ok(token),
+        Err(e) => errors.push(format!("auth.json: {e}")),
+    }
+    match refresh_from_pool(region).await {
+        Ok(token) => return Ok(token),
+        Err(e) => errors.push(format!("账号池: {e}")),
+    }
+    Err(format!("AutoClaw 续期失败（{}）", errors.join("；")))
+}
+
+/// 续期通路①：旧 `auth.json` 的加密 refreshToken（成功则按客户端同款格式写回）。
+async fn refresh_from_auth_json(
+    region: crate::modules::autoclaw_accounts::AccountRegion,
+) -> Result<String, String> {
     let dir = autoclaw_data_dir().ok_or_else(|| "无法定位 AutoClaw 数据目录".to_string())?;
     let path = dir.join("auth.json");
     let text = std::fs::read_to_string(&path).map_err(|e| format!("读取 auth.json 失败: {e}"))?;
@@ -934,14 +956,13 @@ pub(crate) async fn autoclaw_refresh_access_token() -> Result<String, String> {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "auth.json 缺少 refreshToken".to_string())?;
+
     let refresh_token = autoclaw_decrypt_token(refresh_enc)?;
     let device_id = auth
         .get("deviceId")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    // 本机续期：按当前登录账号所属区域选网关（国际账号的 refresh token
-    // 在国内网关会被拒绝）。
-    let region = crate::modules::autoclaw_accounts::local_autoclaw_region();
+    // 区域由调用方解析后传入（国际账号的 refresh token 在国内网关会被拒绝）。
     let resp = http_request(
         &format!("{}/userapi/v1/refresh", region.api_host()),
         "POST",
@@ -977,6 +998,140 @@ pub(crate) async fn autoclaw_refresh_access_token() -> Result<String, String> {
         }
     }
     Ok(new_token)
+}
+
+/// 续期通路②：账号池 `~/.wb-switch/accounts.json` 里**本机 uid** 的明文
+/// `refresh_token`（WorkBuddy 5.5.6+ 旧 auth.json 成空壳后只剩这条路）。
+/// 成功后把新 access token 写回池 —— `read_autoclaw_token()` 的「池优先」次序
+/// 随即拿到新鲜 token，网关无需人工干预即自愈。
+async fn refresh_from_pool(
+    region: crate::modules::autoclaw_accounts::AccountRegion,
+) -> Result<String, String> {
+    let uid = crate::modules::auth_file::read_auth_file()
+        .and_then(|root| {
+            root.pointer("/account/uid")
+                .and_then(Value::as_str)
+                .map(String::from)
+        })
+        .unwrap_or_default();
+    let (device_id, refresh_token) = pool_refresh_material(&uid)?;
+    let resp = http_request(
+        &format!("{}/userapi/v1/refresh", region.api_host()),
+        "POST",
+        Some(json!({
+            "source_id": "autoclaw",
+            "device_id": device_id,
+            "refresh_token": refresh_token,
+        })),
+        Some(&autoclaw_headers(None)),
+    )
+    .await;
+    if resp.get("code").and_then(Value::as_i64) != Some(0) {
+        return Err(resp_error(&resp, "刷新请求被拒绝"));
+    }
+    let new_token = resp
+        .pointer("/data/access_token")
+        .or_else(|| resp.pointer("/data/token"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "刷新响应缺少 access_token".to_string())?
+        .to_string();
+    // 写回池：过期时间优先用 JWT exp（最可靠），退化为响应里的 expires_in/expires_at。
+    let exp_ms = crate::modules::wb_memtoken::jwt_payload_for_display(&new_token)
+        .and_then(|p| p.get("exp").and_then(Value::as_i64))
+        .map(|s| s * 1000)
+        .or_else(|| {
+            resp.pointer("/data/expires_at").and_then(Value::as_i64)
+        })
+        .or_else(|| {
+            resp.pointer("/data/expires_in")
+                .and_then(Value::as_i64)
+                .map(|sec| now_ms() + sec * 1000)
+        })
+        .unwrap_or(0);
+    if let Err(e) = write_back_pool_token(&uid, &new_token, exp_ms) {
+        // 写回失败不掩盖「已拿到新 token」这个事实，但要在错误里说清楚。
+        import_missing_note(&e);
+    }
+    clear_imported_token_cache();
+    Ok(new_token)
+}
+
+/// 池内本机 uid 的续期材料：`(device_id, refresh_token)`。
+/// device_id 优先取池记录，缺失时回退旧 auth.json 的空壳字段。
+fn pool_refresh_material(uid: &str) -> Result<(String, String), String> {
+    if uid.is_empty() {
+        return Err("auth 文件缺少 account.uid".to_string());
+    }
+    let path = crate::modules::config::store_dir().join("accounts.json");
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("读取账号池失败: {e}"))?;
+    let rows: Vec<Value> =
+        serde_json::from_str(&text).map_err(|e| format!("解析账号池失败: {e}"))?;
+    let row = rows
+        .iter()
+        .find(|a| a.get("uid").and_then(Value::as_str) == Some(uid))
+        .ok_or_else(|| "账号池中无本机 uid 记录（请先导入本机账号）".to_string())?;
+    let refresh_token = row
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "池记录缺少 refresh_token".to_string())?
+        .trim_start_matches("Bearer ")
+        .to_string();
+    let device_id = row
+        .get("device_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .or_else(|| {
+            autoclaw_data_dir()
+                .and_then(|d| std::fs::read_to_string(d.join("auth.json")).ok())
+                .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+                .and_then(|v| {
+                    v.get("deviceId")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                })
+        })
+        .unwrap_or_default();
+    Ok((device_id, refresh_token))
+}
+
+/// 把续期得到的新 access token 写回账号池同 uid 记录（原子写）。
+fn write_back_pool_token(uid: &str, new_token: &str, expires_at_ms: i64) -> Result<(), String> {
+    let path = crate::modules::config::store_dir().join("accounts.json");
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("读取账号池失败: {e}"))?;
+    let mut rows: Vec<Value> =
+        serde_json::from_str(&text).map_err(|e| format!("解析账号池失败: {e}"))?;
+    let mut hit = false;
+    for row in rows.iter_mut() {
+        if row.get("uid").and_then(Value::as_str) != Some(uid) {
+            continue;
+        }
+        row["access_token"] = json!(new_token);
+        if expires_at_ms > 0 {
+            row["expiresAt"] = json!(expires_at_ms);
+        }
+        hit = true;
+    }
+    if !hit {
+        return Err("池内未找到同 uid 记录".to_string());
+    }
+    let out = serde_json::to_string_pretty(&rows).map_err(|e| e.to_string())?;
+    atomic_write(&path, &out).map_err(|e| format!("写回账号池失败: {e}"))
+}
+
+/// 让缓存里的旧 token 立即失效（续期成功后必须调用）。
+fn clear_imported_token_cache() {
+    if let Ok(mut guard) = IMPORTED_TOKEN_CACHE.lock() {
+        *guard = None;
+    }
+}
+
+/// 写回失败只留痕，不改变"已拿到新 token"的结论（日志可见）。
+fn import_missing_note(msg: &str) {
+    eprintln!("[autoclaw] 续期后写回账号池失败：{msg}");
 }
 
 /// AutoClaw 网关请求封装（按 token，账号池与本机账号共用）。
