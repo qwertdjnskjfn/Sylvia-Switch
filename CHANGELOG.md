@@ -7,6 +7,104 @@
 
 ---
 
+## 1.0.6 — 2026-09-29
+
+### 修复：AutoClaw 登录态读取不再只认旧位置 —— 修「网关异常 / AutoClaw 尚未登录（auth.json 无 token）」
+
+**症状**（用户报）：网关总览显示「网关异常」，AutoClaw 通道提示
+`AutoClaw 尚未登录（auth.json 无 token）`，`/api/autoclaw/accounts/import-local` 400 同样报错。
+
+**根因**（实测）：WorkBuddy **5.5.6+ 迁移了登录态存储**，而读取端还停在旧位置：
+
+| 项 | 旧（代码仍在读） | 新（实际登录态所在） |
+| --- | --- | --- |
+| 路径 | `%APPDATA%\autoclaw\auth.json` | `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info` |
+| 形态 | 顶层 `token` | `auth.accessToken = {"$wbEncrypted":1,"envelope":"…"}` |
+| 实测 | **仅 114 字节空壳**（只剩 `deviceId`/`updatedAt`） | 含 `expiresAt`（有效至 2026-10-29）等完整登录态 |
+
+信封密钥内置在定制 Electron 原生模块，**静态不可提取** —— 项目既有对策是
+`auth_file::import_from_auth_file()` 的「**从运行中的 WorkBuddy 进程内存提取**」路径，
+但 `platform_checkin::read_autoclaw_token()` 从未接上它，故一直失败。
+而 `glm_proxy` 用 `read_autoclaw_token().is_ok()` 判通道健康 → 连带显示「网关异常」。
+
+**改动**（`platform_checkin.rs`）
+
+| 改动 | 说明 |
+| --- | --- |
+| `read_autoclaw_token()` | 改为**旧位置优先 → 新位置回退**：旧位置（便宜）取到 token 即用；否则走 `auth_file::import_from_auth_file()`（内部自动处理明文/加密信封 → 内存提取），错误信息改为明确列出两个来源与「需 WorkBuddy 已登录且运行中」 |
+| **正/负缓存** | 内存扫描要扫 WorkBuddy 的 V8 堆，而该函数被健康检查与账选路**反复调用** → 正值缓存 **10 分钟**、失败也做 **30 秒负缓存**，杜绝每请求扫描 |
+| `discover_autoclaw_account()` | 拆为 `…_legacy()` + `…_from_auth_file()` 两路；新路取 `account.uid` 明文 + 由内存提取到的 JWT 取手机号，旧路无 token 时不再直接返回 None |
+
+**验证**（2026-09-29 部署 1.0.6 实测）
+- `/api/glm-proxy/status`：`tokenReady` **false → true** ✅（读取修复生效）；首次调用 **100.98s**（触发内存扫描）、
+  第二次 **0.10s**（命中 10 分钟正缓存）→ 证明缓存不是可选项而是必需项；
+- 但读到的 token 被上游按 401 拒 → 报「AutoClaw 登录态已过期」⇒ 追加 **1.0.7** 修正 token 源优先级。
+
+---
+
+## 1.0.8 — 2026-09-29
+
+### 修复（承接 1.0.7）：AutoClaw 探活不再误报「网关异常」—— 本机 token 被作废时回落池内健康账号
+
+**现象**：1.0.7 后 `tokenReady: true`，但 `gatewayOk: false` + 「AutoClaw 登录态已过期」→ 界面仍显示**网关异常**，
+**然而真实请求完全正常**（实测 `/v1/chat/completions` 的 `glm-5.3` 与 `auto` 均 200 有正文）。
+
+**根因**（5 个本地 token 逐一打 AutoClaw 任务接口实测，2026-09-29）：
+
+| token 来源 | exp | 任务接口 |
+| --- | --- | --- |
+| 池账号 `autoclaw:eb5b1479…` | 09-30 21:22 | ✅ 200 |
+| 池账号 `autoclaw:1daf28d6…`（配置钉选） | 09-30 20:57 | ✅ 200 |
+| 池账号 `autoclaw:qYgo09X…` | 09-30 21:35 | ❌ 401 |
+| 池账号 `autoclaw:97cfa33…` | 09-20（过期） | ❌ 401 |
+| **本机账号 `05efd60f…`** | 10-29 | ❌ **401（未过期但已被 workBuddy 刷新作废）** |
+
+⇒ WorkBuddy 刷新登录态时会**作废旧 access token**。探活只打本机 token，必然 401；
+而真实请求走池账号（故可用）。**「网关异常」纯属探活口径问题。**
+
+**改动**（`platform_checkin.rs`）
+- 新增 `pool_probe_candidates()` / 纯函数内核 `pool_probe_candidates_from_json()`：
+  从 `~/.wb-switch/autoclaw_accounts.json` 取**未过期**（JWT `exp` 判定）、非 `invalid` 的 accessToken，
+  按 **`is_manual_specified` 优先 → 最近 `updatedAt`** 排序（剪 `Bearer ` 前缀）；
+- `get_autoclaw_status()`：本机 token 探活失败时，**最多再试 3 个池候选**；成功则返回
+  `ok: true` 并标注 `localTokenInvalid: true` + 说明（"本机登录态已被上游作废，本结果来自账号池健康账号"）；
+  全失败则同时带出 `poolProbeError`，便于定位；
+- **有意不改 `read_autoclaw_token()` 的身份语义**：它仍返回本机账号 token（区域推断/账号身份依赖它，不能被池账号顶替）。
+
+**验证**：单测 607 passed（新增 `pool_probe_candidates_filters_and_orders`：过期剔除 / invalid 剔除 / 人工指定优先 / 非 JSON 容错）；
+部署后 `/api/glm-proxy/status` → `gatewayOk: true`（见下）。
+
+---
+
+## 1.0.7 — 2026-09-29
+
+### 修复（承接 1.0.6）：AutoClaw token 源优先级 —— 账号池新鲜 token 优先于内存提取
+
+**现象**：1.0.6 上线后 `tokenReady: true`，但仍是 `gatewayOk: false` + 「AutoClaw 登录态已过期」；
+`import-local` 报「auth.json 缺少 refreshToken」。
+
+**根因**（实测）：内存提取拿到的是 WorkBuddy 进程里的**旧 token 副本**（上游 401 拒），
+而本机其实**有可用 token**：
+
+| 来源 | uid | 过期时间 | 结果 |
+| --- | --- | --- | --- |
+| auth 文件（`$wbEncrypted` 信封） | 05efd60f-… | 2026-10-29 21:48 | 静态不可解密 |
+| **账号池 `~/.wb-switch/accounts.json`** | **05efd60f-…** | **2026-10-29 15:53 ✅未过期** | **本次改用的源** |
+| 内存提取（WorkBuddy V8 堆） | 05efd60f-… | — | ❌ 上游 401 |
+
+**改动**（`platform_checkin.rs`）
+- 新增 `pool_token_for_uid()` + 纯函数内核 `pool_token_from_json()`：按 auth 文件明文
+  `account.uid` 在 `accounts.json` 找**同 uid 且未过期**的 access token（兼容秒/毫秒时间戳、剪 `Bearer ` 前缀）；
+- `imported_autoclaw_token()` 次序改为 **① 账号池同 uid 未过期 token → ② 内存提取兜底**（保留 10 分钟正 / 30 秒负缓存）；
+- 为什么不用 `autoclaw_accounts::pool_accounts()`：其内部 `local_pool_account()` 会调
+  `read_autoclaw_token()` → 从这里调会**无限递归**，故直读文件；
+- 新增单测 `pool_token_from_json_picks_unexpired_matching_uid`（uid 匹配 / 过期剔除 / 秒毫秒兼容 / 非数组 / 空 uid）。
+
+**已知限制（未修，需后续）**：`import-local` 与 `autoclaw_refresh_access_token()` 仍读旧
+`%APPDATA%\autoclaw\auth.json` 的 `refreshToken`（已是空壳）→ 自动续期链路待接新信封或改走池内 refresh token。
+
+---
+
 ## 1.0.5 — 2026-09-28
 
 ### 新增：grok Anthropic 路径**缺省注入 thinking** —— 修「能回复但不思考 / 不思考如何调用工具」

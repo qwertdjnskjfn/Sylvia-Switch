@@ -131,6 +131,17 @@ pub fn account_platform(account: &Value) -> &'static str {
     }
 }
 
+/// 国际版 WorkBuddy 账号（domain 以 .ai 结尾）——没有签到功能，一律排除出签到流程。
+/// region 口径与 workbuddy_gateway 一致：由 domain 后缀派生（.ai → intl）。
+pub fn is_intl_workbuddy(account: &Value) -> bool {
+    account_platform(account) == PLATFORM_WORKBUDDY
+        && account
+            .get("domain")
+            .and_then(Value::as_str)
+            .map(|d| d.to_ascii_lowercase().ends_with(".ai"))
+            .unwrap_or(false)
+}
+
 pub fn platform_display_name(platform: &str) -> &'static str {
     match platform {
         PLATFORM_AUTOCLAW => "AutoClaw",
@@ -164,7 +175,12 @@ pub fn is_local_login_account(account: &Value) -> bool {
 }
 
 pub fn all_checkin_accounts() -> Vec<Value> {
-    let mut accounts = crate::modules::account::load_accounts();
+    // 国际版 WorkBuddy（domain .ai）无签到功能，不进签到循环——避免拿国际版
+    // token 打国服 codebuddy.cn 必败、刷失败通知。
+    let mut accounts: Vec<Value> = crate::modules::account::load_accounts()
+        .into_iter()
+        .filter(|acc| !is_intl_workbuddy(acc))
+        .collect();
     let mut seen: std::collections::HashSet<String> = accounts
         .iter()
         .filter_map(|acc| acc.get("id").and_then(Value::as_str).map(String::from))
@@ -594,7 +610,8 @@ fn autoclaw_data_dir() -> Option<PathBuf> {
     None
 }
 
-pub fn discover_autoclaw_account() -> Option<Value> {
+/// 旧位置（`%APPDATA%\autoclaw\auth.json`）的登录账号发现。
+fn discover_autoclaw_account_legacy() -> Option<Value> {
     let dir = autoclaw_data_dir()?;
     let text = std::fs::read_to_string(dir.join("auth.json")).ok()?;
     let auth: Value = serde_json::from_str(&text).ok()?;
@@ -628,6 +645,51 @@ pub fn discover_autoclaw_account() -> Option<Value> {
         // 本机实时登录账号的区域按身份动态推断（邮箱=国际、手机号=国内）。
         "region": crate::modules::autoclaw_accounts::local_autoclaw_region().as_str(),
     }))
+}
+
+/// 5.5.6+ 新位置（WorkBuddy 桌面端 auth 文件）的登录账号发现：
+/// uid 取自明文 `account.uid`，手机号从内存提取到的 access token 的 JWT payload 取。
+fn discover_autoclaw_account_from_auth_file() -> Option<Value> {
+    let root = crate::modules::auth_file::read_auth_file()?;
+    let uid = root
+        .pointer("/account/uid")
+        .and_then(Value::as_str)
+        .or_else(|| root.get("uid").and_then(Value::as_str))
+        .unwrap_or("")
+        .to_string();
+    // 必须真能拿到 token 才算「已登录」，否则会误报本机账号存在。
+    let token = read_autoclaw_token().ok()?;
+    let phone = crate::modules::wb_memtoken::jwt_payload_for_display(&token)
+        .and_then(|payload| {
+            payload
+                .get("preferred_username")
+                .or_else(|| payload.get("phone_number"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+        })
+        .unwrap_or_default();
+    let display = if phone.is_empty() { uid.clone() } else { phone };
+    if display.is_empty() {
+        return None;
+    }
+    let id = if uid.is_empty() {
+        "autoclaw:local".to_string()
+    } else {
+        format!("autoclaw:{uid}")
+    };
+    Some(json!({
+        "id": id,
+        "email": format!("AutoClaw · {display}"),
+        "nickname": format!("AutoClaw · {display}"),
+        "platform": PLATFORM_AUTOCLAW,
+        "region": crate::modules::autoclaw_accounts::local_autoclaw_region().as_str(),
+    }))
+}
+
+/// 本机 AutoClaw 登录账号：旧位置优先（便宜），其次 5.5.6+ 新位置。
+pub fn discover_autoclaw_account() -> Option<Value> {
+    discover_autoclaw_account_legacy().or_else(discover_autoclaw_account_from_auth_file)
 }
 
 /// AutoClaw 的 Local State `os_crypt.encrypted_key` → DPAPI → AES 密钥。
@@ -677,18 +739,124 @@ pub fn autoclaw_decrypt_token(enc_token: &str) -> Result<String, String> {
     }
 }
 
-pub(crate) fn read_autoclaw_token() -> Result<String, String> {
-    let dir = autoclaw_data_dir().ok_or_else(|| "无法定位 AutoClaw 数据目录".to_string())?;
-    let text = std::fs::read_to_string(dir.join("auth.json"))
-        .map_err(|_| "未找到 AutoClaw 登录信息（请安装并登录 AutoClaw）".to_string())?;
-    let auth: Value = serde_json::from_str(&text)
-        .map_err(|e| format!("解析 AutoClaw auth.json 失败: {e}"))?;
-    let token = auth
-        .get("token")
-        .and_then(Value::as_str)
+/// 从新位置导入 token 的缓存：内存扫描开销大（要扫 WorkBuddy 的 V8 堆），
+/// 而 `read_autoclaw_token()` 会被健康检查与账选路**反复调用**，故必须缓存。
+/// 正值缓存 10 分钟；失败也做 30 秒负缓存，避免登出状态下连环扫描。
+const IMPORT_TOKEN_TTL_MS: i64 = 10 * 60 * 1000;
+const IMPORT_TOKEN_NEGATIVE_TTL_MS: i64 = 30 * 1000;
+
+static IMPORTED_TOKEN_CACHE: std::sync::Mutex<Option<(String, i64)>> =
+    std::sync::Mutex::new(None);
+
+/// 账号池里「同一 uid 且未过期」的 access token（取自 `~/.wb-switch/accounts.json`）。
+///
+/// 为什么不走 `autoclaw_accounts::pool_accounts()`：它内部会调 `read_autoclaw_token()`
+/// （见 `local_pool_account()`），从这里调会**无限递归**，故直接读文件。
+/// 为什么池要优先于内存提取：WorkBuddy 运行时内存里可能残留**旧副本**，实测会被上游
+/// 按 401 拒掉（表现为「AutoClaw 登录态已过期」）；池内是此前导入保存的新鲜明文 token。
+fn pool_token_for_uid(uid: &str) -> Option<String> {
+    if uid.is_empty() {
+        return None;
+    }
+    let path = crate::modules::config::store_dir().join("accounts.json");
+    let text = std::fs::read_to_string(path).ok()?;
+    pool_token_from_json(&text, uid, crate::modules::config::now_ms())
+}
+
+/// `pool_token_for_uid` 的纯函数内核（便于单测）。
+fn pool_token_from_json(text: &str, uid: &str, now_ms: i64) -> Option<String> {
+    if uid.is_empty() {
+        return None;
+    }
+    let parsed: Value = serde_json::from_str(text).ok()?;
+    parsed.as_array()?.iter().find_map(|acc| {
+        if acc.get("uid").and_then(Value::as_str) != Some(uid) {
+            return None;
+        }
+        let raw_exp = acc.get("expiresAt").and_then(Value::as_i64).unwrap_or(0);
+        // 兼容秒 / 毫秒两种时间戳
+        let exp = if raw_exp > 0 && raw_exp < 10_000_000_000 {
+            raw_exp * 1000
+        } else {
+            raw_exp
+        };
+        if exp <= now_ms {
+            return None;
+        }
+        acc.get("access_token")
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty())
+            .map(|t| t.trim_start_matches("Bearer ").to_string())
+    })
+}
+
+/// 走 `auth_file::import_from_auth_file()` 取本机登录 token（5.5.6+ 加密信封时
+/// 该函数回退到从运行中的 WorkBuddy 进程内存提取），带正/负缓存。
+fn imported_autoclaw_token(now: i64) -> Option<String> {
+    if let Ok(guard) = IMPORTED_TOKEN_CACHE.lock() {
+        if let Some((token, until)) = guard.as_ref() {
+            if *until > now {
+                return (!token.is_empty()).then(|| token.clone());
+            }
+        }
+    }
+    // ① 账号池同 uid 且未过期的 token（明文、便宜、实测可用）优先
+    let uid = crate::modules::auth_file::read_auth_file()
+        .and_then(|root| {
+            root.pointer("/account/uid")
+                .and_then(Value::as_str)
+                .map(String::from)
+        })
+        .unwrap_or_default();
+    // ② 兜底：内存提取（需 WorkBuddy 桌面端正在运行）
+    let token = pool_token_for_uid(&uid)
+        .or_else(|| {
+            crate::modules::auth_file::import_from_auth_file().and_then(|acc| {
+                acc.get("access_token")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+            })
+        })
         .filter(|t| !t.is_empty())
-        .ok_or_else(|| "AutoClaw 尚未登录（auth.json 无 token）".to_string())?;
-    autoclaw_decrypt_token(token)
+        .unwrap_or_default();
+    let ttl = if token.is_empty() {
+        IMPORT_TOKEN_NEGATIVE_TTL_MS
+    } else {
+        IMPORT_TOKEN_TTL_MS
+    };
+    if let Ok(mut guard) = IMPORTED_TOKEN_CACHE.lock() {
+        *guard = Some((token.clone(), now + ttl));
+    }
+    (!token.is_empty()).then_some(token)
+}
+
+pub(crate) fn read_autoclaw_token() -> Result<String, String> {
+    // ① 旧位置优先（便宜）：`%APPDATA%\autoclaw\auth.json` 顶层的加密 token。
+    if let Some(dir) = autoclaw_data_dir() {
+        if let Ok(text) = std::fs::read_to_string(dir.join("auth.json")) {
+            if let Ok(auth) = serde_json::from_str::<Value>(&text) {
+                if let Some(token) = auth
+                    .get("token")
+                    .and_then(Value::as_str)
+                    .filter(|t| !t.is_empty())
+                {
+                    if let Ok(plain) = autoclaw_decrypt_token(token) {
+                        return Ok(plain);
+                    }
+                }
+            }
+        }
+    }
+    // ② 新位置：WorkBuddy 5.5.6+ 把登录态改成 `$wbEncrypted` 信封（密钥内置在
+    //    定制 Electron 原生模块里，静态不可提取），旧位置只剩 deviceId/updatedAt
+    //    空壳 → 复用 `auth_file` 的导入路径（内存提取），带缓存。
+    if let Some(token) = imported_autoclaw_token(crate::modules::config::now_ms()) {
+        return Ok(token);
+    }
+    Err("AutoClaw 登录态不可用：旧位置 %APPDATA%\\autoclaw\\auth.json 无 token\
+         （WorkBuddy 5.5.6+ 已改加密信封存储），从桌面端提取亦失败 —— \
+         请确认 WorkBuddy 已登录且正在运行"
+        .to_string())
 }
 
 fn md5_hex(input: &str) -> String {
@@ -943,7 +1111,87 @@ pub async fn get_autoclaw_status() -> Value {
         Ok(token) => token,
         Err(error) => return json!({"ok": false, "error": error}),
     };
-    get_autoclaw_status_with(&token).await
+    let probe = get_autoclaw_status_with(&token).await;
+    if probe.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        return probe;
+    }
+    // 本机 token 被判失效时（WorkBuddy 刷新会**作废旧 access token** —— 2026-09-29 实测：
+    // 本机 token 未过期却 401，而池账号 200），改用账号池内的健康账号再探。
+    // 真实请求走的正是池账号，不这样回退会把「能用」误报成「网关异常」。
+    // 注意：只影响探活结果，不改 `read_autoclaw_token()` 的「本机身份」语义
+    //（区域推断依赖本机账号，不能拿池账号顶替）。
+    let mut last_pool_error: Option<Value> = None;
+    for candidate in pool_probe_candidates().into_iter().take(3) {
+        let retry = get_autoclaw_status_with(&candidate).await;
+        if retry.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+            return json!({
+                "ok": true,
+                "todayCheckedIn": retry.get("todayCheckedIn").cloned().unwrap_or(Value::Bool(false)),
+                "raw": retry.get("raw").cloned().unwrap_or(Value::Null),
+                "localTokenInvalid": true,
+                "note": "本机登录态已被上游作废，本结果来自账号池健康账号（网关服务正常）",
+            });
+        }
+        last_pool_error = retry.get("error").cloned();
+    }
+    json!({
+        "ok": false,
+        "error": probe.get("error").cloned().unwrap_or_else(|| json!("AutoClaw 探活失败")),
+        "poolProbeError": last_pool_error.unwrap_or(Value::Null),
+    })
+}
+
+/// 探活候选：账号池里**未过期**的 accessToken（`is_manual_specified` 优先 → 最近更新优先）。
+/// 仅"未过期"不等于"未被吊销"，故调用方需逐个试（上限见调用处）。
+fn pool_probe_candidates() -> Vec<String> {
+    let path = crate::modules::config::store_dir().join("autoclaw_accounts.json");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    pool_probe_candidates_from_json(&text, crate::modules::config::now_ms())
+}
+
+/// `pool_probe_candidates` 的纯函数内核（便于单测）。
+fn pool_probe_candidates_from_json(text: &str, now_ms: i64) -> Vec<String> {
+    let Ok(parsed) = serde_json::from_str::<Value>(text) else {
+        return Vec::new();
+    };
+    let arr = parsed
+        .get("accounts")
+        .and_then(Value::as_array)
+        .or_else(|| parsed.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut rows: Vec<(bool, i64, String)> = arr
+        .iter()
+        .filter_map(|a| {
+            if a.get("status").and_then(Value::as_str) == Some("invalid") {
+                return None;
+            }
+            let token = a
+                .get("accessToken")
+                .and_then(Value::as_str)
+                .filter(|t| !t.is_empty())?
+                .trim_start_matches("Bearer ")
+                .to_string();
+            // 过期时间取自 JWT exp（池记录里的 expiresAt 不一定有）
+            let exp = crate::modules::wb_memtoken::jwt_payload_for_display(&token)
+                .and_then(|p| p.get("exp").and_then(Value::as_i64))
+                .unwrap_or(0);
+            if exp <= now_ms / 1000 {
+                return None; // 已过期（留 0 也视为不可用）
+            }
+            let manual = a
+                .get("is_manual_specified")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let updated = a.get("updatedAt").and_then(Value::as_i64).unwrap_or(0);
+            Some((manual, updated, token))
+        })
+        .collect();
+    // 人工指定优先，其次最近更新
+    rows.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    rows.into_iter().map(|(_, _, t)| t).collect()
 }
 
 /// AutoClaw 今日签到状态（按 token，供多账号池复用；无自动续期）。
@@ -2858,6 +3106,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn intl_workbuddy_detected_by_ai_domain_only() {
+        // .ai 域的 WorkBuddy 账号 = 国际版，无签到。
+        assert!(is_intl_workbuddy(&json!({
+            "id": "intl-1", "domain": "www.workbuddy.ai",
+        })));
+        // 大小写不敏感。
+        assert!(is_intl_workbuddy(&json!({
+            "id": "intl-2", "domain": "WorkBuddy.AI",
+        })));
+        // 国服域名不是国际版。
+        assert!(!is_intl_workbuddy(&json!({
+            "id": "cn-1", "domain": "www.workbuddy.cn",
+        })));
+        // 其他平台即使带 .ai 域也不算（区域隔离只针对 WorkBuddy）。
+        assert!(!is_intl_workbuddy(&json!({
+            "id": "ac-1", "platform": PLATFORM_AUTOCLAW, "domain": "autoglm-api.autoglm.ai",
+        })));
+        // 缺 domain 的 WorkBuddy 账号按国服处理（本机登录导入的缺省口径）。
+        assert!(!is_intl_workbuddy(&json!({ "id": "cn-2" })));
+    }
+
+    #[test]
     fn platform_defaults_to_workbuddy() {
         assert_eq!(account_platform(&json!({"id": "a"})), PLATFORM_WORKBUDDY);
         assert_eq!(
@@ -3050,5 +3320,81 @@ mod tests {
             .encrypt_padded_mut::<Pkcs7>(&mut out, plaintext.len())
             .expect("encrypt for test");
         encrypted.to_vec()
+    }
+}
+
+#[cfg(test)]
+mod autoclaw_pool_token_tests {
+    use super::*;
+
+    /// 池内 token 选择：uid 匹配 + 未过期；兼容秒/毫秒时间戳；过期或 uid 不符则不选。
+    #[test]
+    fn pool_token_from_json_picks_unexpired_matching_uid() {
+        let now_ms: i64 = 1_790_700_000_000; // 2026-09-29 附近
+        let future_ms = now_ms + 86_400_000;
+        let future_s = future_ms / 1000;
+        let past_ms = now_ms - 86_400_000;
+        let json_text = format!(
+            r#"[
+              {{"uid":"other","expiresAt":{future_ms},"access_token":"tok-other"}},
+              {{"uid":"u1","expiresAt":{past_ms},"access_token":"tok-expired"}},
+              {{"uid":"u1","expiresAt":{future_s},"access_token":"tok-seconds"}},
+              {{"uid":"u1","expiresAt":{future_ms},"access_token":"Bearer tok-ms"}}
+            ]"#
+        );
+        // 秒级时间戳那条先命中（列表顺序），且 Bearer 前缀被剪掉
+        assert_eq!(
+            pool_token_from_json(&json_text, "u1", now_ms).as_deref(),
+            Some("tok-seconds")
+        );
+        // 其它 uid 不命中
+        assert_eq!(
+            pool_token_from_json(&json_text, "other", now_ms).as_deref(),
+            Some("tok-other")
+        );
+        // 空 uid / 全部过期 / 非数组 → None
+        assert!(pool_token_from_json(&json_text, "", now_ms).is_none());
+        assert!(pool_token_from_json(r#"[{"uid":"u2","expiresAt":1,"access_token":"x"}]"#, "u2", now_ms).is_none());
+        assert!(pool_token_from_json(r#"{"uid":"u2"}"#, "u2", now_ms).is_none());
+    }
+}
+
+#[cfg(test)]
+mod autoclaw_probe_candidate_tests {
+    use super::*;
+
+    fn jwt_with_exp(exp: i64) -> String {
+        use base64::Engine as _;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!("{{\"exp\":{exp}}}").as_bytes());
+        format!("header.{payload}.sig")
+    }
+
+    /// 探活候选：剔除已过期 / invalid，人工指定优先，其次最近更新。
+    #[test]
+    fn pool_probe_candidates_filters_and_orders() {
+        let now_ms: i64 = 1_790_700_000_000;
+        let now_s = now_ms / 1000;
+        let text = format!(
+            r#"{{"accounts":[
+              {{"id":"a","accessToken":"{}","status":"ok","is_manual_specified":false,"updatedAt":30}},
+              {{"id":"b","accessToken":"{}","status":"ok","is_manual_specified":true,"updatedAt":10}},
+              {{"id":"c","accessToken":"{}","status":"ok","is_manual_specified":true,"updatedAt":50}},
+              {{"id":"d","accessToken":"{}","status":"ok","is_manual_specified":false,"updatedAt":99}},
+              {{"id":"e","accessToken":"{}","status":"invalid","is_manual_specified":false,"updatedAt":100}}
+            ]}}"#,
+            jwt_with_exp(now_s + 3600),
+            jwt_with_exp(now_s + 3600),
+            jwt_with_exp(now_s + 3600),
+            jwt_with_exp(now_s - 3600), // 已过期 → 剔除
+            jwt_with_exp(now_s + 3600),
+        );
+        let got = pool_probe_candidates_from_json(&text, now_ms);
+        assert_eq!(got.len(), 3, "过期的与 invalid 都应被剔除: {got:?}");
+        // 人工指定优先 → c(updatedAt 50) 在 b(updatedAt 10) 之前
+        assert_eq!(got[0], jwt_with_exp(now_s + 3600));
+        assert!(got.iter().all(|t| !t.starts_with("Bearer ")));
+        // 非 JSON / 空输入 → 空列表
+        assert!(pool_probe_candidates_from_json("not json", now_ms).is_empty());
     }
 }
