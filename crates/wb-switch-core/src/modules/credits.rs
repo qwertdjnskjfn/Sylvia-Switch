@@ -21,7 +21,10 @@ const RESOURCE_SUMMARY_PATH: &str = "/billing/meter/get-user-resource-summary";
 const RESOURCE_PAID_PACKAGES_PATH: &str = "/billing/meter/get-user-resource-paid-packages";
 const RESOURCE_FREE_PACKAGES_PATH: &str = "/billing/meter/get-user-resource-free-packages";
 const PRODUCT_CODE: &str = "p_tcaca";
-const EXPIRING_SOON_DAYS: i64 = 7;
+/// 「近期到期」窗口（天）。2026-10-01 由 7 放宽到 30：7 天过窄，
+/// 10/31 到期（29 天）这类包用户直觉算「近期」却不亮。与
+/// `unified_accounts::EXPIRING_SOON_DAYS` 保持同值。
+const EXPIRING_SOON_DAYS: i64 = 30;
 
 // WorkBuddy CN UserCenter 的商品码（来自其公开套餐配置）。解析器不会依赖
 // 这些常量，因此上游新增商品时仍可通过 summary/明细返回资源。

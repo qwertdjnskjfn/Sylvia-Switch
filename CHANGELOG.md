@@ -7,6 +7,82 @@
 
 ---
 
+## 1.0.18 — 2026-10-01
+
+### 修 1.0.17 的同源误判：不同 AutoClaw 账号被错标成同源
+
+1.0.17 上线后实测发现：`AutoClaw · 190****1173` 被标为与
+`AutoClaw · 180****2401` 同源 —— **这是误判**，两者是不同账号。
+
+**根因**：两个账号的积分包都是「奖励积分 / 剩余 1400 / **expireAt=null**」，
+指纹（`平台|可用积分|包明细`）完全一致。而无到期时间的额度包是**通用额度**，
+各账号雷同属正常，不足以证明同一账号。
+
+**修复**：同源指纹**只纳入有到期时间的积分包**；若某账号过滤后无这样的包，
+则指纹为 None、不参与分组（`mark_same_source`）。
+
+效果：
+- AutoClaw（奖励积分无到期）→ 不再误判 ✅
+- DuMate（订阅体验包 10/08 到期）→ 仍正确标注同源 ✅
+- WorkBuddy 两账号（包明细不同）→ 不误判 ✅
+
+新增回归断言 `identical_creditless_expiry_packages_are_not_same_source`。
+
+## 1.0.17 — 2026-10-01
+
+### 「近期到期」窗口 7 天 → 30 天
+
+**问题**：统一账号页几乎看不到「近期到期」。排查后确认展示逻辑本身没坏
+（徽标 `N 个积分包 · 最近 M/D 到期`，点击展开有名称/剩余/到期明细），
+**是 7 天窗口太窄**——实测数据：
+
+| 账号 | 最早到期 | 距今 | 7 天口径 |
+| --- | --- | --- | --- |
+| WorkBuddy 190\*\*\*\*1173 | 10/31 | 29 天 | ❌ 不亮 |
+| WorkBuddy 180\*\*\*\*2401 | 10/21 | 20 天 | ❌ 不亮 |
+| DuMate 订阅体验包 | 10/08 | 6.8 天 | ✅ 唯一命中 |
+
+用户直觉上 10/31 就算「近期」，全站却只有 1 个包亮 —— 窗口口径与实际预期不符。
+
+**改动**：三处统一为 30 天（此前散落硬编码 `7`）：
+- `unified_accounts.rs` 新增 `const EXPIRING_SOON_DAYS: i64 = 30`，
+  `packages_from_resources`（:311）与 `packages_from_dumate`（:349）均改用常量；
+- `credits.rs:24` `EXPIRING_SOON_DAYS` 7 → 30（与上面保持同值）。
+
+### DuMate 同源账号标注（不隐藏）
+
+实测 `dumate:local`（本机账号）与 `dumate:pool_1`（池主号）的**可用积分与全部积分包逐项相同**
+（都是 9105.49、同样 10 个包），是同一账号的两个入口。
+
+新增 `mark_same_source()`：按「平台 + 可用积分 + 积分包明细」做指纹，
+同指纹的第二个及以后打上 `sameSourceOf: <锚点 id>`。**只标注不隐藏**，两条都展示。
+
+🔴 指纹设计要点：
+- 只用积分视图，**无积分的账号（如 Grok）返回 None 不参与分组**，
+  否则十几个空积分账号会被误聚成一组（已加回归断言）；
+- 不同积分的同平台账号不会误判（已加断言）。
+
+前端：统一表账号名后加「同源」徽标（title 注明与哪个账号同源）。
+
+### 积分包信息更好找
+
+此前「近期到期」要点开才能看见。现在徽标**直接带上临期数量**：
+`10 个积分包 · 最近 10/08 到期 · 近期到期 3`，不点开也能判断。
+展开后仍是逐包的 `名称 / 剩余 / 10/31 到期 / 近期到期`。
+
+### 单测（新增 4 个，unified_accounts 共 13 个）
+`expiring_soon_window_is_thirty_days` / `marks_duplicate_entrances_of_the_same_account` /
+`different_accounts_are_not_marked_as_same_source` / `creditless_accounts_are_never_grouped_as_same_source`
+
+### 🔎 顺带查清（未改动，记录备查）
+- **全平台账号融合与自动签到其实已实现**：`/api/platform/accounts` 12 个账号
+  （AutoClaw 5 / Loomy 2 / DuMate 2 / TRAE Work CN / ChatGLM / 妙手）与统一列表一一对应，
+  `checkin::run_checkin_all()` 走 `all_checkin_accounts()` 已覆盖
+  workbuddy + autoclaw + trae_work_cn + loomy + dumate + chatglm + miaoshou。
+- **AutoClaw 国际/国内网关隔离已实现**：`AccountRegion`（国内 zhipuai.cn / 国际 autoglm.ai），
+  跨区返回 410000；国际版 WorkBuddy（.ai）已排除出签到循环。
+- Loomy 那两条 `loomy:26091…` 是**两个不同账号**（id 不同），不是重复。
+
 ## 1.0.16 — 2026-10-01
 
 ### 修复（关键）：dumate 通道注入「纯文本回答」约束 —— 根治「要它写代码就挂死」
