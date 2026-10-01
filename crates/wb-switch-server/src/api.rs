@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use wb_switch_core::modules::{
     account, account_protection, auth_file, channel_health, chatgpt_channel, checkin, config, credit_usage, credits, export_import,
     autoclaw_accounts, glm_proxy, glmplan, loomy, loomy_proxy, model_probe, model_usage, oauth, platform_checkin, platform_switch, process, refresh,
-    gateway_admin, gateway_overview, glm_web, grok, grok_pool, grok_register, kimi, qoder, qwen, qwen_mcp, qwen_web, grok2api_manager, grok_sso, miaoshou, model_sync, session, switch, token_stats, toolcall_monitor, travel, update, trae_acp, trae_accounts, trae_proxy, trae_proxy_config, workbuddy_proxy, workbuddy_errors, workbuddy_gateway, workbuddy_protocols, workbuddy_upstream, opencode, dumate,
+    gateway_admin, gateway_overview, glm_web, grok, grok_pool, grok_register, kimi, qoder, qwen, qwen_mcp, qwen_web, grok2api_manager, grok_sso, miaoshou, model_sync, session, switch, token_stats, toolcall_monitor, travel, update, trae_acp, trae_accounts, trae_proxy, trae_proxy_config, workbuddy_proxy, workbuddy_errors, workbuddy_gateway, workbuddy_protocols, workbuddy_upstream, opencode, dumate, dumate_accounts, unified_accounts,
 };
 
 /// 服务实际绑定端口（main.rs serve 启动时写入），供端点展示使用。
@@ -102,6 +102,8 @@ pub fn router() -> Router {
         )
         .route("/api/checkin/logs", get(api_checkin_logs))
         .route("/api/platform/accounts", get(api_platform_accounts))
+        // 统一账号管理（契约 unified-accounts-contract.md §2）：全平台聚合 schema。
+        .route("/api/accounts/unified", get(api_unified_accounts))
         .route("/v1/chat/completions", post(api_glm_chat_completions))
         .route("/v1/messages", post(api_glm_anthropic_messages))
         .route("/v1/models", get(api_glm_models))
@@ -281,11 +283,25 @@ pub fn router() -> Router {
         //    本机账号签到/积分/状态/配置管理面。 ──
         .route("/dumate/v1/models", get(api_dumate_v1_models))
         .route("/dumate/v1/chat/completions", post(api_dumate_chat_completions))
+        .route("/dumate/v1/messages", post(api_dumate_anthropic_messages))
         .route("/api/dumate/status", get(api_dumate_status))
         .route("/api/dumate/credits", get(api_dumate_credits))
         .route("/api/dumate/config", get(api_dumate_config_get).post(api_dumate_config_post))
         .route("/api/dumate/checkin", post(api_dumate_checkin))
         .route("/api/dumate/checkin-status", get(api_dumate_checkin_status))
+        // ── DuMate 多账号池（契约 unified-accounts-contract.md §1.5）：
+        //    签到/积分层多账号（模型调用仍走本机主账号）。
+        .route(
+            "/api/dumate/accounts",
+            get(api_dumate_accounts_list).post(api_dumate_accounts_add),
+        )
+        .route("/api/dumate/accounts/update", post(api_dumate_accounts_update))
+        .route("/api/dumate/accounts/remove", post(api_dumate_accounts_remove))
+        .route(
+            "/api/dumate/accounts/import-client",
+            post(api_dumate_accounts_import_client),
+        )
+        .route("/api/dumate/account/checkin", post(api_dumate_account_checkin))
         .route("/api/loomy-proxy/config", get(api_loomy_proxy_config_get).post(api_loomy_proxy_config_save))
         .route("/api/loomy-proxy/status", get(api_loomy_proxy_status))
         .route("/api/loomy/protection/status", get(api_loomy_protection_status))
@@ -7146,6 +7162,91 @@ fn dumate_error_status(msg: &str) -> StatusCode {
     }
 }
 
+/// POST /dumate/v1/messages：Anthropic Messages 协议兼容入口（1.0.13）。
+///
+/// 为什么需要：ZCode 等客户端的 provider **统一使用 `anthropic-messages` 协议**
+/// （实测其 11 个 provider 全为该类型），而 DuMate 通道原本只提供 OpenAI 风格接口。
+/// 本 handler 复用与 `/dumate/v1/chat/completions` 相同的鉴权，再走 `dumate::anthropic_messages`。
+async fn api_dumate_anthropic_messages(headers: HeaderMap, Json(body): Json<Value>) -> Response {
+    let started = std::time::Instant::now();
+    let cfg = dumate::load_config();
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    if !cfg.enabled {
+        let msg = "DuMate 网关未启用（可在「DuMate」页开启）";
+        log_gateway_request("dumate", None, &model, false, 0, msg);
+        return anthropic_error(msg.to_string(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+    match dumate_proxy_auth_result(&headers, &cfg) {
+        Some(true) => {}
+        Some(false) => log_gateway_request(
+            "dumate",
+            None,
+            &model,
+            true,
+            0,
+            "鉴权通过（兼容主网关密钥）",
+        ),
+        None => {
+            let diag = dumate_auth_diag(&headers, &cfg);
+            log_gateway_request("dumate", None, &model, false, 0, &diag);
+            return anthropic_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    match dumate::anthropic_messages(body).await {
+        Ok(dumate::DumateAnthropicReply::Json(value)) => {
+            log_gateway_request(
+                "dumate",
+                None,
+                &model,
+                true,
+                started.elapsed().as_millis() as u64,
+                "anthropic",
+            );
+            json_ok(value)
+        }
+        Ok(dumate::DumateAnthropicReply::Stream(upstream)) => {
+            log_gateway_request(
+                "dumate",
+                None,
+                &model,
+                true,
+                started.elapsed().as_millis() as u64,
+                "anthropic-stream",
+            );
+            let stream = futures_util::stream::unfold(upstream.rx, |mut rx| async move {
+                rx.recv().await.map(|chunk| (chunk, rx))
+            });
+            (
+                StatusCode::OK,
+                [(
+                    header::CONTENT_TYPE,
+                    "text/event-stream; charset=utf-8".to_string(),
+                )],
+                axum::body::Body::from_stream(stream),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            let status = anthropic_error_status(&e);
+            log_gateway_request(
+                "dumate",
+                None,
+                &model,
+                false,
+                started.elapsed().as_millis() as u64,
+                &e,
+            );
+            anthropic_error(e, status)
+        }
+    }
+}
+
 /// GET /dumate/v1/models：静态 4 模型目录（lite/turbo/ultra/points）。
 async fn api_dumate_v1_models(headers: HeaderMap) -> Response {
     let cfg = dumate::load_config();
@@ -7350,6 +7451,100 @@ async fn api_dumate_checkin_status() -> Response {
         }
     }
     json_ok(v)
+}
+
+// ---------------------------------------------------------------------------
+// DuMate 多账号池（契约 unified-accounts-contract.md §1.2/§1.5）
+// ---------------------------------------------------------------------------
+
+/// GET /api/dumate/accounts：池列表（含 dumate:local 本机行，isLocal 标记）。
+/// 不回传 cookie 明文，只回 cookieCount；credits 为最新缓存（可能为 null）。
+async fn api_dumate_accounts_list() -> Response {
+    json_ok(json!({ "accounts": dumate_accounts::list_entries() }))
+}
+
+/// POST /api/dumate/accounts：添加池账号。body `{name, cookies(数组或
+/// {cookies:[...]}), proxy?, note?}`。
+async fn api_dumate_accounts_add(Json(body): Json<Value>) -> Response {
+    let name = body.get("name").and_then(Value::as_str).unwrap_or("");
+    let proxy = body.get("proxy").and_then(Value::as_str).unwrap_or("");
+    let note = body.get("note").and_then(Value::as_str).unwrap_or("");
+    let Some(cookies_json) = body.get("cookies") else {
+        return json_err("缺少 cookies 字段（数组或 {cookies:[...]}）".to_string(), StatusCode::BAD_REQUEST);
+    };
+    match dumate_accounts::add_account(name, cookies_json, proxy, note) {
+        Ok(acc) => json_ok(json!({"ok": true, "account": dumate_accounts::summary_of(&acc)})),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/dumate/accounts/update：更新池账号。body `{id, name?, proxy?, note?}`。
+async fn api_dumate_accounts_update(Json(body): Json<Value>) -> Response {
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("");
+    if id.is_empty() {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    }
+    match dumate_accounts::update_account(
+        id,
+        body.get("name").and_then(Value::as_str),
+        body.get("proxy").and_then(Value::as_str),
+        body.get("note").and_then(Value::as_str),
+    ) {
+        Ok(()) => json_ok(json!({"ok": true})),
+        Err(e) => json_err(e, StatusCode::NOT_FOUND),
+    }
+}
+
+/// POST /api/dumate/accounts/remove：删除池账号。body `{id}`。
+async fn api_dumate_accounts_remove(Json(body): Json<Value>) -> Response {
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("");
+    if id.is_empty() {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    }
+    match dumate_accounts::remove_account(id) {
+        Ok(()) => json_ok(json!({"ok": true})),
+        Err(e) => json_err(e, StatusCode::NOT_FOUND),
+    }
+}
+
+/// POST /api/dumate/accounts/import-client：把本机桌面端当前登录态导入池
+/// （按 bce-user-info 值去重，重复报「已是同一登录态」）。
+async fn api_dumate_accounts_import_client() -> Response {
+    match dumate_accounts::import_from_client() {
+        Ok(acc) => json_ok(json!({"ok": true, "account": dumate_accounts::summary_of(&acc)})),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/dumate/account/checkin：单账号签到。body `{id}`（local/pool 都走它；
+/// `dumate:local` 路由到本机客户端凭据路径，`dumate:pool_*` 走池账号）。
+async fn api_dumate_account_checkin(Json(body): Json<Value>) -> Response {
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+    if id.is_empty() {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let local_id = format!("{}:local", platform_checkin::PLATFORM_DUMATE);
+    if id == local_id {
+        let account = platform_checkin::discover_dumate_account()
+            .unwrap_or_else(|| json!({"id": local_id, "email": "DuMate 本机账号"}));
+        let res = platform_checkin::perform_dumate_checkin(&account).await;
+        return json_ok(json!({
+            "id": id,
+            "result": res.get("result").cloned().unwrap_or(json!("error")),
+            "message": res.get("message").cloned().unwrap_or(Value::Null),
+            "error": res.get("error").cloned().unwrap_or(Value::Null),
+        }));
+    }
+    match dumate_accounts::find_account(&id) {
+        Some(_) => json_ok(dumate_accounts::account_checkin(&id).await),
+        None => json_err(format!("DuMate 账号不存在: {id}"), StatusCode::NOT_FOUND),
+    }
+}
+
+/// GET /api/accounts/unified：统一账号管理聚合（全平台统一 schema + summary，
+/// 契约 unified-accounts-contract.md §2；workbuddy 不跳过）。
+async fn api_unified_accounts() -> Response {
+    json_ok(unified_accounts::unified_accounts().await)
 }
 
 /// Loomy 对话补全（Anthropic Claude Messages 协议兼容）。

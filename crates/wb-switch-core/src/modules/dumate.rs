@@ -1295,6 +1295,16 @@ pub async fn chat_completions_stream(
 // OpenAI /v1/models 模型目录（静态 4 个）
 // ---------------------------------------------------------------------------
 
+/// Anthropic Messages 兼容入口（ZCode 等只讲 Anthropic 协议的客户端；见 dumate_anthropic）。
+pub async fn anthropic_messages(
+    body: Value,
+) -> Result<DumateAnthropicReply, String> {
+    super::dumate_anthropic::messages(body).await
+}
+
+/// Anthropic 兼容层返回类型（Json = Anthropic 形状；Stream = Anthropic SSE）。
+pub use super::dumate_anthropic::DumateAnthropicReply;
+
 pub fn models_payload() -> Value {
     let data: Vec<Value> = MODELS
         .iter()

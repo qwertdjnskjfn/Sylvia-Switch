@@ -7,6 +7,30 @@
 
 ---
 
+## 1.0.13 — 2026-10-01
+
+### 新增：`/dumate/v1/messages` —— DuMate 三档模型的 **Anthropic 协议兼容入口**（供 ZCode 接入）
+
+**背景**：ZCode 的 provider **统一使用 `anthropic-messages` 协议**（实测其 11 个 provider 全为该类型，
+含本机 `http://127.0.0.1:57890/v1`、`/loomy/v1`、`/grok/v1` 等），而 DuMate 通道此前只提供
+OpenAI 风格 `/dumate/v1/chat/completions` → ZCode 无法接入（实测 `/dumate/v1/messages` 与
+`/opencode/v1/messages` 均 404）。
+
+**改动**
+| 文件 | 内容 |
+| --- | --- |
+| `dumate_anthropic.rs`（新增） | Anthropic Messages → OpenAI 载荷 → 复用 dumate 上游；响应（含 SSE）转回 Anthropic 事件序列。转换逻辑复用 `glm_anthropic::{to_openai_payload, from_openai_response, AnthropicSseTransformer, decode_stream_chunk}`，与 loomy 兼容层同构 |
+| `mod.rs` | 注册 `pub mod dumate_anthropic;` |
+| `dumate.rs` | 新增 `anthropic_messages()` 入口 + 再导出 `DumateAnthropicReply` |
+| `api.rs` | 新增 `api_dumate_anthropic_messages` handler + 路由 `.route("/dumate/v1/messages", …)`；鉴权与 `/dumate/v1/chat/completions` 完全一致 |
+
+**要点**：流式中断用 `overloaded_error`（Anthropic 语义=瞬时故障、客户端应重试），而非 `api_error`。
+
+**验证**：`cargo check` 通过；部署 1.0.13 后以 Anthropic 形状请求（`x-api-key` + `anthropic-version`
++ `/v1/messages` 载荷）实测三档模型返回 Anthropic 响应（见下）。
+
+---
+
 ## 1.0.12 — 2026-10-01
 
 ### 新增：dumate 通道支持引擎**原生 `system` 字段**（工具调用桥的地基）
