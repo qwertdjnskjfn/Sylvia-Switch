@@ -76,3 +76,36 @@ curl http://<LAN IP>:57900/opencode/v1/models -H "Authorization: Bearer <lan key
   netsh advfirewall firewall add rule name="wb-switch LAN share 57900" dir=in action=allow protocol=TCP localport=57900 profile=private
   ```
 - 🟢 反代**不启动时**，本机原有 `127.0.0.1:57890` 用法完全不受影响。
+
+---
+
+## 2026-10-01 加固：对外分享的三道护栏（反代层，不动网关内核）
+
+**背景**：朋友用手机客户端调用时「一直超时」——服务端日志实锤：他选的是 `unorouter/*` 系模型，
+实测 **360–647 秒**（6–11 分钟），任何手机客户端都会先超时；更糟的是多条长请求并行时，
+**连 3.9 秒的 `dumate-lite` 都被挤到 120 秒并失败**（排队）。
+
+因此在**分享层**（`tools/lan_share_proxy.cjs`）加三道护栏 —— 好处：**你自己内部使用完全不受影响**、
+无需重编译部署：
+
+| # | 护栏 | 行为 | 实测 |
+| --- | --- | --- | --- |
+| ① | **快模型白名单** | 只放行 `dumate-*` 与 `opencode/*`；慢模型直接 **400** + 人话指引（附允许清单与替代建议）。`GET /models` 也会**过滤后**再返回 | `unorouter/glm-4.5-flash:free`：**361 秒 → 0.006 秒 400** ✅ |
+| ② | **超时护栏** | 上游超过 `LAN_SHARE_DEADLINE_MS`（默认 150s）仍未开始返回 → 本地 **504** + 人话；已在流式输出中的连接不打断 | 用 5s 护栏 + 89s 的 slow 模型：**5.03s 返回 504** ✅ |
+| ③ | **健康路径本地直答** | `/global/health`、`/health`、`/healthz`、`/v1/health` 本地回 200（不打上游、不校验 key） | 客户端健康探测不再 403，避免误判 provider 不可用 ✅ |
+
+**日志增强**：对话请求行现在带 `model=` 与 `models-filter N → M`，一眼能看出对方在用什么。
+
+**可调（环境变量，一般不用动）**
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `LAN_SHARE_MODEL_FILTER` | `on` | `off` = 关闭模型白名单 |
+| `LAN_SHARE_ALLOW_MODELS` | `dumate-,opencode/` | 允许的模型名前缀，逗号分隔 |
+| `LAN_SHARE_DEADLINE_MS` | `150000` | 上游首字节超时（毫秒） |
+| `LAN_SHARE_RPM` | `60` | 每 IP 每分钟请求上限 |
+
+**生效方式**：反代代码变更需重启进程 —— 双击 `funnel-share-on.bat`（或 `lan-share-on.vbs`）。
+（LAN key 变更**不需要**重启：key 走文件 mtime 热更新。）
+
+**给朋友的正确用法**：只选 `dumate-lite`（3 秒级）→ 其次 `dumate-turbo` / `dumate-ultra`；开流式；别连点/并发。
