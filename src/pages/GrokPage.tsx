@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   BrainCircuit,
   MonitorSmartphone,
@@ -42,11 +42,13 @@ import * as api from "@/lib/api";
 import { GatewayAdminSection } from "@/components/gateway/GatewayAdminSection";
 import { CartesianGrid, Line, LineChart, XAxis, YAxis } from "recharts";
 import { ChartContainer, ChartTooltip, ChartTooltipContent, type ChartConfig } from "@/components/ui/chart";
+import { Switch } from "@/components/ui/switch";
 import type { GrokAccountInfo, GrokTestResult, GrokPoolOverview, GrokPoolPolicy, GrokPoolSnapshot, GrokRegisterStatus } from "@/lib/types";
 
 const GROK_MODELS = [
-  { id: "grok-4.6", name: "Grok 4.6", desc: "最新旗舰（需 Build 通道账号；Web 通道自动回落 Grok 4）", badge: "最新" },
-  { id: "grok-4", name: "Grok 4", desc: "旗舰基座模型，推理能力全面升级（默认）", badge: "推荐" },
+  { id: "grok-4.7", name: "Grok 4.7", desc: "最新旗舰 · 支持原生工具调用；免费档无内置联网，实时信息请用 grok-4", badge: "最新" },
+  { id: "grok-4.6", name: "Grok 4.6", desc: "已被上游模型目录下线；请求自动回落 web 通道 Grok 4", badge: "已下线" },
+  { id: "grok-4", name: "Grok 4", desc: "web 通道自带联网搜索，实时信息问答首选", badge: "推荐" },
   { id: "grok-4-fast", name: "Grok 4 Fast", desc: "Grok 4 高速版，速度与智能平衡", badge: "高速" },
   { id: "grok-4-thinking", name: "Grok 4 Thinking", desc: "Grok 4 深度思考模式，完整思维链推演", badge: "推理" },
   { id: "grok-3", name: "Grok 3", desc: "上一代旗舰基座模型", badge: "经典" },
@@ -74,6 +76,19 @@ export default function GrokPage() {
   const [registerStatus, setRegisterStatus] = useState<GrokRegisterStatus | null>(null);
   const [registerBusy, setRegisterBusy] = useState<string | null>(null);
   const [showRegisterPrinciple, setShowRegisterPrinciple] = useState(false);
+  // 自动拉取（2026-09-26 用户要求）：开启后前端定时探测注册机实时登录态，
+  // 新登录自动入池（后端按 sso 去重）。仅前端定时驱动，后端零自动触发纪律不变。
+  // 开关持久化到 localStorage（2026-09-26 用户反馈：刷新后开关被重置导致"自动拉取没生效"）。
+  const [autoCapture, setAutoCapture] = useState(() => {
+    try {
+      return localStorage.getItem("grok_register_auto_capture") === "1";
+    } catch {
+      return false;
+    }
+  });
+  const autoSeenRef = useRef<Set<string>>(new Set());
+  const registerBusyRef = useRef<string | null>(null);
+  const autoWaitingMsgRef = useRef(false);
 
   // 添加账号弹窗状态
   const [showAdd, setShowAdd] = useState(false);
@@ -83,7 +98,7 @@ export default function GrokPage() {
   const [addTier, setAddTier] = useState("free");
 
   // 测试对话状态
-  const [testModel, setTestModel] = useState("grok-4");
+  const [testModel, setTestModel] = useState("grok-4.7");
   const [testPrompt, setTestPrompt] = useState("请用一句话介绍 Grok 的核心特色与优势");
   const [enableThinking, setEnableThinking] = useState(false);
   const [selectedAccountId, setSelectedAccountId] = useState<string>("");
@@ -364,21 +379,26 @@ export default function GrokPage() {
     }
   };
 
-  // 抓取注册成果：读取 sso/sso-rw cookie，以固定 ID grok_register 写入账号池
+  // 抓取注册成果：读取 sso/sso-rw cookie，按 sso 去重入池（同号原位刷新、新登录新建账号）
   const captureRegister = async () => {
     setRegisterBusy("capture");
     try {
       const res = await api.captureGrokRegister();
       if (res.ok) {
-        // 抓取成功即刷新账号池列表，让 grok_register 账号立即可见
+        // 抓取成功即刷新账号池列表，让新入池账号立即可见
         await loadAccounts();
         await refreshRegisterStatus();
         setMsg({
           type: "ok",
-          text: `注册成果已抓取：${res.cookieCount ?? "?"} 个 cookie，已写入 Grok 账号池（${res.accountId || "grok_register"} · ${res.accountName || "注册机注册账号"}）`,
+          text: `注册成果已抓取：${res.cookieCount ?? "?"} 个 cookie，入池账号 ${res.accountId || "grok_register"}（同 sso 重复抓取原位刷新；新登录将新建独立账号）`,
         });
       } else if (res.status === "not_registered") {
-        setMsg({ type: "err", text: "注册机里还没有可抓取的登录态：请先在注册机窗口里完成 grok.com 注册并登录。" });
+        setMsg({
+          type: "err",
+          text:
+            res.message ||
+            "注册机窗口的实时会话里没有登录态（未登录或已失效）：请在窗口内完成注册/重新登录后再抓取。",
+        });
       } else {
         setMsg({ type: "err", text: `抓取失败：${res.error || res.status}` });
       }
@@ -401,13 +421,72 @@ export default function GrokPage() {
         return;
       }
       setRegisterStatus(res);
-      setMsg({ type: "ok", text: "注册机已关闭：专用 Chrome 实例已结束，日常浏览器不受影响。" });
+      setMsg({
+        type: raw.ok ? "ok" : "err",
+        text: String(raw.message || (raw.ok ? "注册机已关闭：专用 Chrome 实例已结束，日常浏览器不受影响。" : "关闭注册机失败")),
+      });
     } catch (e) {
       setMsg({ type: "err", text: api.asError(e) });
     } finally {
       setRegisterBusy(null);
     }
   };
+
+  // busy 态镜像（自动拉取循环里读取，避免闭包读到过期值）
+  useEffect(() => {
+    registerBusyRef.current = registerBusy;
+  }, [registerBusy]);
+
+  // 自动拉取循环（2026-09-26 用户要求）：开关开启且面板展开时，每 8 秒探测一次
+  // 注册机实时登录态；新登录（后端按 sso 去重判新）自动入池并提示，同号静默刷新。
+  // 仅前端定时驱动：关开关 / 收起面板 / 离开页面即停；后端零自动触发纪律不变。
+  // 注册机未运行时给一次性待机提示（不刷屏），重新打开后自动恢复拉取。
+  useEffect(() => {
+    if (!autoCapture || !registerOpen) return;
+    let stopped = false;
+    const tick = async () => {
+      if (stopped || registerBusyRef.current !== null) return;
+      try {
+        const res = await api.captureGrokRegister();
+        if (res.ok && res.accountId) {
+          autoWaitingMsgRef.current = false;
+          if (!autoSeenRef.current.has(res.accountId)) {
+            autoSeenRef.current.add(res.accountId);
+            await loadAccounts();
+            setMsg({
+              type: "ok",
+              text: `自动拉取：新账号已入池 ${res.accountId}（${res.cookieCount ?? "?"} 个 cookie）。可继续在注册机窗口注册下一个账号。`,
+            });
+          }
+          await refreshRegisterStatus();
+        } else if (res.status === "error" && !autoWaitingMsgRef.current) {
+          // 注册机未启动/CDP 无响应：一次性待机提示，不刷屏
+          autoWaitingMsgRef.current = true;
+          setMsg({ type: "err", text: "自动拉取待机中：注册机未运行。点「打开注册机」后自动恢复拉取。" });
+        } else if (res.status === "not_registered") {
+          autoWaitingMsgRef.current = false; // 注册机在跑、只是还没登录态——正常注册中
+        }
+      } catch {
+        // 静默（网络抖动），下一轮重试
+      }
+    };
+    void tick();
+    const id = window.setInterval(() => void tick(), 8000);
+    return () => {
+      stopped = true;
+      window.clearInterval(id);
+    };
+  }, [autoCapture, registerOpen]);
+
+  /** 自动拉取开关（含 localStorage 持久化：刷新页面不丢状态）。 */
+  const toggleAutoCapture = useCallback((on: boolean) => {
+    setAutoCapture(on);
+    try {
+      localStorage.setItem("grok_register_auto_capture", on ? "1" : "0");
+    } catch {
+      // localStorage 不可用时仅内存态
+    }
+  }, []);
 
   return (
     <div className="mx-auto max-w-5xl space-y-6 pb-12">
@@ -599,6 +678,24 @@ export default function GrokPage() {
                   {registerBusy === "close" ? <Loader2 className="size-3.5 animate-spin" /> : <X className="size-3.5" />}
                   关闭注册机
                 </Button>
+                {/* 自动拉取开关（2026-09-26 用户要求）：开启后前端定时探测实时登录态，
+                    新登录自动入池——批量注册时无需逐个手动点「抓取注册成果」。 */}
+                <div className="ml-auto flex items-center gap-2 rounded-lg border bg-muted/20 px-2.5 py-1.5">
+                  <Switch
+                    checked={autoCapture}
+                    onCheckedChange={toggleAutoCapture}
+                    disabled={registerBusy !== null}
+                    aria-label="自动拉取开关"
+                  />
+                  <div className="text-xs leading-4">
+                    <span className="font-medium">自动拉取</span>
+                    <div className="text-[10px] text-muted-foreground">
+                      {autoCapture
+                        ? "开启中 · 每 8 秒探测实时登录态，新账号自动入池"
+                        : "注册完成自动入池，无需手动点抓取"}
+                    </div>
+                  </div>
+                </div>
               </div>
 
               {/* 状态网格（样式对齐 SSO 卡片） */}
@@ -653,11 +750,15 @@ export default function GrokPage() {
                 </div>
               </div>
 
-              {/* 自动触发说明行：后端原文 + 醒目的零自动标记 */}
+              {/* 自动触发说明行：后端原文 + 醒目的零自动标记 + 自动拉取边界说明 */}
               <div className="rounded-lg border bg-muted/20 p-2.5 text-xs text-muted-foreground">
                 <span className="font-medium text-emerald-600">✓ 无启动/后台自动触发</span>
                 <span className="mx-1.5">·</span>
                 {registerStatus?.autoTriggerNote || REGISTER_AUTO_TRIGGER_NOTE}
+                <div className="mt-1">
+                  「自动拉取」是前端可选开关（默认关，由你控制）：只自动读取注册机窗口里
+                  <strong>已完成</strong>的登录态入池，不代填、不自动提交任何注册动作；关闭页面或关掉开关即停止。
+                </div>
                 {registerStatus?.message && <div className="mt-1">{registerStatus.message}</div>}
               </div>
 
@@ -1081,6 +1182,18 @@ export default function GrokPage() {
                     type="number"
                     defaultValue={poolPolicy.checkIntervalMinutes}
                     onBlur={(e) => void handleSavePolicy({ checkIntervalMinutes: Number(e.target.value) })}
+                    className="mt-1 h-8 text-xs"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-muted-foreground">账号驻留时长（分钟）</label>
+                  <Input
+                    type="number"
+                    min={5}
+                    max={120}
+                    step={1}
+                    defaultValue={poolPolicy.resident_ttl_min ?? 30}
+                    onBlur={(e) => void handleSavePolicy({ resident_ttl_min: Number(e.target.value) })}
                     className="mt-1 h-8 text-xs"
                   />
                 </div>

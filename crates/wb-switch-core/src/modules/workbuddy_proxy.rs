@@ -708,6 +708,163 @@ fn pick_score(id: &str) -> u8 {
     2
 }
 
+// ---------------------------------------------------------------------------
+// 内置模型目录 payload（契约 §3.1：native ACP 实时探测 + static 回落）
+// ---------------------------------------------------------------------------
+
+/// session/new 实时目录 → §3.1 payload（纯函数，便于单测）。
+///
+/// - `source`：探测刚完成 → `acp-live`，命中 TTL 缓存 → `acp-cache`；
+/// - 默认只列 native（kind=tier|model，**含 exposed=false 的补充实模**——契约
+///   §2.1：默认列出 kind∈{tier,model}）；`include_custom` 追加 `custom-local:*`
+///   条目（kind="custom"，owned_by="workbuddy-custom"）；
+/// - 每条带 `exposed`（契约 §2.1：ACP 实时暴露=true，产品配置补充=false）；
+/// - 顺序保持服务端返回序（ACP 条目在前，补充条目追加在后）。
+pub fn catalog_to_payload(
+    catalog: &crate::modules::trae_acp::NativeCatalog,
+    include_custom: bool,
+) -> Value {
+    let source = if catalog.is_fresh() { "acp-live" } else { "acp-cache" };
+    let region = desktop_region();
+    let data: Vec<Value> = catalog
+        .models
+        .iter()
+        .filter(|m| include_custom || m.kind != "custom")
+        .map(|m| {
+            json!({
+                "id": m.id,
+                "object": "model",
+                "created": 0,
+                "owned_by": if m.kind == "custom" { "workbuddy-custom" } else { "workbuddy" },
+                "name": m.name,
+                "multiplier": m.multiplier,
+                "kind": m.kind,
+                "exposed": m.exposed,
+                "region": region,
+            })
+        })
+        .collect();
+    json!({
+        "object": "list",
+        "source": source,
+        "probedAt": catalog.probed_at,
+        "currentModelId": if catalog.current_model_id.is_empty() {
+            Value::Null
+        } else {
+            json!(catalog.current_model_id)
+        },
+        "region": region,
+        "data": data,
+    })
+}
+
+/// ACP 不可达时的静态回落形态（契约 §3.1）：`builtin_models_payload()` 原样数据
+/// （恒 1 条，语义不改）+ 来源标记三件套。目录永不为空。
+fn static_fallback_models_payload() -> Value {
+    let mut payload = builtin_models_payload();
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("source".to_string(), json!("static-fallback"));
+        obj.insert("probedAt".to_string(), Value::Null);
+        obj.insert("currentModelId".to_string(), Value::Null);
+    }
+    payload
+}
+
+/// GET /workbuddy-native/v1/models 的数据源（契约 §3.1）：
+/// ACP 实时探测目录优先（300s TTL 缓存同源），ACP 不可达 → static 回落。
+pub async fn native_models_payload(include_custom: bool) -> Value {
+    match crate::modules::trae_acp::native_models_catalog().await {
+        Ok(catalog) => catalog_to_payload(&catalog, include_custom),
+        Err(_) => static_fallback_models_payload(),
+    }
+}
+
+/// 桌面端登录区域（"cn" | "intl" | "unknown"）——账号页区域分类的数据源。
+///
+/// 判定链：`~/.workbuddy/settings.json` 的 `legacyOwnerUid`（桌面端登录账号）
+/// → 在 `~/.wb-switch/accounts.json` 按 uid 匹配（前缀/包含均可，状态表展示的
+/// 是截断 uid）→ 该账号 domain 后缀派生（含 ".ai" → intl，否则 cn）。
+/// 任一环节读不到 → "unknown"（前端显示「未知」徽标，不做猜测）。
+pub fn desktop_region() -> &'static str {
+    let settings_path = crate::modules::config::home_dir()
+        .join(".workbuddy")
+        .join("settings.json");
+    let settings = std::fs::read_to_string(settings_path).unwrap_or_default();
+    let accounts_path = crate::modules::config::home_dir()
+        .join(".wb-switch")
+        .join("accounts.json");
+    let accounts = std::fs::read_to_string(accounts_path).unwrap_or_default();
+    resolve_desktop_region(&settings, &accounts)
+}
+
+/// 桌面区域解析（纯函数，便于单测）。
+///
+/// ⚠️ `legacyOwnerUid` 实测嵌在 `settings.claw` 下（2026-09-25：根层读取恒
+/// unknown——第一版就栽在这里）；兼容根层与 `/claw` 两种位置。
+fn resolve_desktop_region(settings_text: &str, accounts_text: &str) -> &'static str {
+    let Ok(settings) = serde_json::from_str::<Value>(settings_text) else {
+        return "unknown";
+    };
+    let owner = settings
+        .get("legacyOwnerUid")
+        .or_else(|| settings.pointer("/claw/legacyOwnerUid"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if owner.is_empty() {
+        return "unknown";
+    }
+    let Ok(accounts) = serde_json::from_str::<Value>(accounts_text) else {
+        return "unknown";
+    };
+    let list: &[Value] = match accounts {
+        Value::Array(ref arr) => arr.as_slice(),
+        ref v => v
+            .get("accounts")
+            .and_then(Value::as_array)
+            .map(|a| a.as_slice())
+            .unwrap_or(&[]),
+    };
+    for acc in list {
+        let uid = acc.get("uid").and_then(Value::as_str).unwrap_or_default();
+        if uid.is_empty() || !(uid.starts_with(owner) || owner.starts_with(uid)) {
+            continue;
+        }
+        let domain = acc.get("domain").and_then(Value::as_str).unwrap_or_default();
+        return if domain.contains(".ai") { "intl" } else { "cn" };
+    }
+    "unknown"
+}
+
+/// 强制刷新目录（契约 §2.1：清缓存重探一次，绕过 300s TTL）→ §3.1 目录结构。
+/// 探测失败原样上抛 `Err`（api 层的 refresh 路由按 502 报错，不落 static 回落
+/// ——显式刷新要如实告诉用户「为什么刷不出」）。
+pub async fn refresh_native_catalog() -> Result<crate::modules::trae_acp::NativeCatalog, String> {
+    crate::modules::trae_acp::native_models_catalog_refresh().await
+}
+
+/// GET /workbuddy/v1/models 的数据源（契约 T4）：内置目录优先；
+/// 目录不可用时回落现有 `channel_pick_models_payload()`——其内部 fresh 发现
+/// OpenCode server 并展开上游目录，此即「不可用时重新再去获取模型内容」。
+pub async fn v1_models_payload() -> Value {
+    match crate::modules::trae_acp::native_models_catalog().await {
+        Ok(catalog) => catalog_to_payload(&catalog, false),
+        Err(_) => channel_pick_models_payload().await,
+    }
+}
+
+/// native-first 兜底判定（契约 §3.2①②，纯函数便于单测）：
+/// - model 缺省 → native（用会话默认模型）；
+/// - 目录不可用（ACP 探测失败）→ 仍先试 native，失败走 ③ 兜底；
+/// - 目录可用时 model ∈ 目录 ids（含 tier/custom）→ native；∉ → 直接兜底
+///   （②：set_model 对未知 ID 假成功，不能靠它报错）。
+fn should_try_native(catalog: Option<&crate::modules::trae_acp::NativeCatalog>, requested: Option<&str>) -> bool {
+    match (catalog, requested) {
+        (_, None) => true,
+        (None, Some(_)) => true,
+        (Some(catalog), Some(id)) => catalog.contains_id(id),
+    }
+}
+
 /// 状态探测。
 pub async fn proxy_status() -> Value {
     let cfg = load_config();
@@ -869,7 +1026,11 @@ async fn chat_completions_once(body: Value) -> Result<Value, String> {
     // 2a) 确认 session 已落库再提交，规避「message 外键指向的 session 行不存在」
     //     （表现为提交失败 + error sending request，见上方 CHAT_SERIAL 注释）。
     wait_session_ready(client, &base, &session_id).await;
-    // 2) 提交消息（fire-and-poll：POST 立即返回，回复异步产出）。
+    // 2) 提交消息。⚠️ 2026-09-25 实测 opencode 1.18.21 的 POST message 已改为
+    //    **阻塞到生成完成才返回**（直打实测 12.7s 后才回 200 + 完整 parts），
+    //    不再是注释里假设的 fire-and-poll——超时必须覆盖模型生成时长，
+    //    15s 会在上游稍慢时超时（reqwest 报 "error sending request"），
+    //    叠加外层重试 3 轮 ≈ 44s 后 502。放宽到 120s；成功后轮询立即取到回复。
     let payload = json!({
         "parts": [{"type": "text", "text": prompt}],
         "model": {"providerID": provider_id, "modelID": model_id},
@@ -878,7 +1039,7 @@ async fn chat_completions_once(body: Value) -> Result<Value, String> {
     let submit = client
         .post(format!("{base}/session/{session_id}/message"))
         .json(&payload)
-        .timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(120))
         .send()
         .await;
     match submit {
@@ -1072,6 +1233,183 @@ fn truncate(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
+// ---------------------------------------------------------------------------
+// native 优先 + OpenCode 兜底编排（契约 §3.2）
+// ---------------------------------------------------------------------------
+
+/// wbServedBy 来源标记：native ACP 内置模型链路。
+pub const SERVED_BY_NATIVE: &str = "workbuddy-native";
+/// wbServedBy 来源标记：OpenCode 借道兜底链路。
+pub const SERVED_BY_OPENCODE_FALLBACK: &str = "opencode-fallback";
+
+/// native-first 对话结果：来源标记 + 上游产物（流式/非流式统一 mpsc 字节流形态）。
+pub enum NativeFirstChat {
+    /// 非流式：聚合后的 OpenAI chat.completion（调用方可再补 wbServedBy 字段）。
+    Json {
+        served_by: &'static str,
+        value: Value,
+    },
+    /// 流式：OpenAI chunk SSE 字节流（调用方负责 `x-wb-served-by` 响应头）。
+    Stream {
+        served_by: &'static str,
+        rx: tokio::sync::mpsc::Receiver<Result<Bytes, String>>,
+    },
+}
+
+/// native 腿瞬态上游错误的有界重试参数。
+///
+/// 2026-09-25 17:17 实测案例：宿主 prompt 路径出现 ~32s 坏窗口，窗内 12 个
+/// 内置实模连吃 `ACP session/prompt 返回 500`（窗外 18/18 恢复）。提交期失败
+/// 时宿主未产出任何内容，fresh session 重发无重复投递；重试 4 次（退避
+/// 3/6/9/12s）+ 单次尝试耗时可覆盖 ~50s 窗口。流式请求 pump 失败在流中后置
+/// 显现，不经过本层（见函数文档「已知边界」）。
+const NATIVE_RETRY_MAX: usize = 4;
+const NATIVE_RETRY_BACKOFF_MS: [u64; NATIVE_RETRY_MAX] = [3_000, 6_000, 9_000, 12_000];
+
+/// 「宿主 prompt 提交期 500（UnknownError 族）」判定：只重试这一族瞬态错误。
+/// 门禁/无活跃会话（503）应尽快走兜底；400 请求自身错；其余错误原路返回。
+fn is_native_transient_error(msg: &str) -> bool {
+    (msg.contains("session/prompt")
+        && (msg.contains("Internal Server Error") || msg.contains("UnknownError")))
+        || msg.contains("提交消息失败 500 Internal Server Error")
+}
+
+/// native 失败后是否还落 OpenCode 兜底。
+///
+/// 请求 model ∈ 目录（tier/model/custom）→ **不兜底**：OpenCode 腿对裸
+/// WorkBuddy id 按 provider="opencode" 解析必失败（500 UnknownError），既
+/// 浪费一次调用又用兜底错误掩盖 native 真实错误（17:17 案例的观测障碍）。
+/// 缺省 model（None）→ 兜底 OpenCode 默认模型（WorkBuddy 未开时网关仍可用）；
+/// 目录不可用（探测失败）→ 兜底（保持「无活跃实例→兜底」的原有语义）。
+fn native_failure_should_fallback(
+    requested: Option<&str>,
+    catalog: Option<&crate::modules::trae_acp::NativeCatalog>,
+) -> bool {
+    match (requested, catalog) {
+        (None, _) => true,
+        (_, None) => true,
+        (Some(id), Some(catalog)) => !catalog.contains_id(id),
+    }
+}
+
+/// 对话补全（OpenAI 兼容）——native 优先 + OpenCode 兜底（契约 §3.2）：
+///
+/// ① model 为 None（缺省/空/"trae"/"workbuddy" 占位）或 ∈ 目录 ids（含
+///    tier/custom）→ native ACP（connect → initialize → session/new →
+///    set_mode → set_model → prompt）；提交期瞬态上游 500 在本层有界重试
+///    （NATIVE_RETRY_MAX，fresh session 重发）；
+/// ② model ∉ 目录 ids（目录可用时）→ **直接落 OpenCode 兜底**（不试 native：
+///    set_model 对未知 ID 假成功，不能靠它报错）；
+/// ③ native attempt 失败（503 门禁/无活跃会话 / 502 ACP 链路失败）→ 缺省
+///    model 或目录不可用时落 OpenCode 兜底；**model ∈ 目录时不兜底**（裸 id
+///    兜底必失败且掩盖 native 真实错误，见 `native_failure_should_fallback`）；
+///    400 请求自身错不兜底；
+/// ④ 兜底也失败 → `Err((502, 现有错误文案))`。
+///
+/// 已知边界：`stream:true` 时 native 的 pump 失败在流中后置显现（SSE 错误帧），
+/// 无法事后切兜底或重试；同步期失败（门禁/发现/400）仍按 ②③ 正常兜底。
+pub async fn chat_completions_native_first(body: Value) -> Result<NativeFirstChat, (u16, String)> {
+    let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let requested = crate::modules::trae_acp::native_request_model(&body);
+    // 目录判定：走 §3.1 同源 TTL 缓存，不额外打上游。
+    let catalog = crate::modules::trae_acp::native_models_catalog()
+        .await
+        .ok();
+    if !should_try_native(catalog.as_ref(), requested.as_deref()) {
+        // ② 请求模型不在内置目录 → 直接 OpenCode 兜底。
+        return opencode_fallback(body, stream).await;
+    }
+    // ① native ACP 尝试（瞬态上游 500 有界重试：提交期失败无内容产出，重发安全）。
+    let mut retries = 0usize;
+    let native = loop {
+        match crate::modules::trae_acp::chat_completions(body.clone()).await {
+            Ok(trae_acp_chat) => break Ok(trae_acp_chat),
+            // 400 = 请求自身错（如 messages 为空），兜底也一样失败，直接透传。
+            Err((400, message)) => break Err((400, message)),
+            Err((code, message)) => {
+                if retries < NATIVE_RETRY_MAX
+                    && code >= 500
+                    && is_native_transient_error(&message)
+                {
+                    retries += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        NATIVE_RETRY_BACKOFF_MS[retries - 1],
+                    ))
+                    .await;
+                    continue;
+                }
+                let message = if retries > 0 {
+                    format!("{message}（瞬态上游错误已重试 {retries} 次仍未恢复）")
+                } else {
+                    message
+                };
+                break Err((code, message));
+            }
+        }
+    };
+    match native {
+        Ok(crate::modules::trae_acp::TraeAcpChat::Json(mut value)) => {
+            // 重试恢复的成功请求带上次数，便于在响应侧观测坏窗口。
+            if retries > 0 {
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("wbNativeRetries".to_string(), json!(retries));
+                }
+            }
+            Ok(NativeFirstChat::Json {
+                served_by: SERVED_BY_NATIVE,
+                value,
+            })
+        }
+        Ok(crate::modules::trae_acp::TraeAcpChat::Stream(upstream)) => Ok(NativeFirstChat::Stream {
+            served_by: SERVED_BY_NATIVE,
+            rx: upstream.rx,
+        }),
+        // ③ native 失败 → 缺省 model / 目录不可用时兜底；目录内显式 model 不兜底。
+        Err(err) => {
+            if native_failure_should_fallback(requested.as_deref(), catalog.as_ref()) {
+                opencode_fallback(body, stream).await
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
+/// OpenCode 兜底（契约 §3.2③）：请求 model 原样透传（含 `provider/model` 形式）；
+/// model 缺省（含占位值视同 None）时沿用 OpenCode 链路现有默认模型。
+/// 失败 → `Err((502, ...))`（沿用现有错误文案）。
+async fn opencode_fallback(body: Value, stream: bool) -> Result<NativeFirstChat, (u16, String)> {
+    let mut body = body;
+    if crate::modules::trae_acp::native_request_model(&body).is_none() {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("model".to_string(), Value::Null);
+        }
+    }
+    if stream {
+        let rx = chat_completions_stream(body)
+            .await
+            .map(|upstream| upstream.rx)
+            .map_err(|e| (status_502(), e))?;
+        Ok(NativeFirstChat::Stream {
+            served_by: SERVED_BY_OPENCODE_FALLBACK,
+            rx,
+        })
+    } else {
+        let value = chat_completions_json(body)
+            .await
+            .map_err(|e| (status_502(), e))?;
+        Ok(NativeFirstChat::Json {
+            served_by: SERVED_BY_OPENCODE_FALLBACK,
+            value,
+        })
+    }
+}
+
+/// 502（core 不依赖 axum，用数值；与 trae_acp::status_code::BAD_GATEWAY 同值）。
+fn status_502() -> u16 {
+    502
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1111,5 +1449,205 @@ mod tests {
         assert_eq!(data.len(), 1);
         assert_eq!(data[0].get("owned_by").and_then(Value::as_str), Some("workbuddy"));
         assert!(!data[0].get("id").and_then(Value::as_str).unwrap_or_default().is_empty());
+    }
+
+    #[test]
+    fn resolve_desktop_region_matches_settings_and_accounts() {
+        // settings.json 的 legacyOwnerUid 实测嵌在 claw 下（根层读取恒 unknown）。
+        let settings = r#"{"claw":{"legacyOwnerUid":"05efd60f-3079-41a8-ab31-745eb9c09a40"}}"#;
+        let accounts = r#"[
+            {"uid":"05efd60f-3079-41a8-ab31-745eb9c09a40","domain":"www.workbuddy.cn"},
+            {"uid":"cbea9317-a9df-4e81-809b-1162a4e6be40","domain":"www.workbuddy.ai"}
+        ]"#;
+        assert_eq!(resolve_desktop_region(settings, accounts), "cn");
+
+        // 桌面端登录国际账号 → intl。
+        let settings_intl =
+            r#"{"claw":{"legacyOwnerUid":"cbea9317-a9df-4e81-809b-1162a4e6be40"}}"#;
+        assert_eq!(resolve_desktop_region(settings_intl, accounts), "intl");
+
+        // owner 缺失 / 账号不匹配 / 坏 JSON → unknown。
+        assert_eq!(resolve_desktop_region("{}", accounts), "unknown");
+        assert_eq!(
+            resolve_desktop_region(
+                r#"{"claw":{"legacyOwnerUid":"nobody"}}"#,
+                accounts
+            ),
+            "unknown"
+        );
+        assert_eq!(resolve_desktop_region("not-json", accounts), "unknown");
+    }
+
+    #[test]
+    fn static_fallback_models_payload_shape() {
+        // 契约 §3.1：ACP 不可达 → builtin 目录 + static-fallback 三件套，目录永不为空。
+        let v = static_fallback_models_payload();
+        assert_eq!(v.get("object").and_then(Value::as_str), Some("list"));
+        assert_eq!(v.get("source").and_then(Value::as_str), Some("static-fallback"));
+        assert!(v.get("probedAt").map(Value::is_null).unwrap_or(false));
+        assert!(v.get("currentModelId").map(Value::is_null).unwrap_or(false));
+        let data = v.get("data").and_then(Value::as_array).unwrap();
+        assert_eq!(data.len(), 1, "static 回落沿用 builtin_models_payload（恒 1 条）");
+        assert_eq!(data[0].get("owned_by").and_then(Value::as_str), Some("workbuddy"));
+    }
+
+    #[test]
+    fn catalog_to_payload_live_and_cache_shapes() {
+        let catalog = crate::modules::trae_acp::NativeCatalog {
+            models: vec![
+                crate::modules::trae_acp::NativeModel {
+                    id: "fast-model".into(),
+                    name: "快速".into(),
+                    multiplier: Some(0.21),
+                    kind: "tier",
+                    exposed: true,
+                },
+                crate::modules::trae_acp::NativeModel {
+                    id: "glm-5.3-flash".into(),
+                    name: "GLM-5.3-Flash".into(),
+                    multiplier: Some(0.06),
+                    kind: "model",
+                    exposed: true,
+                },
+                // 契约 §2.1：产品配置补充实模（ACP 未暴露）默认也要列出。
+                crate::modules::trae_acp::NativeModel {
+                    id: "kimi-k3-1".into(),
+                    name: "kimi-k3-1".into(),
+                    multiplier: None,
+                    kind: "model",
+                    exposed: false,
+                },
+                crate::modules::trae_acp::NativeModel {
+                    id: "custom-local:qwen3.8-flash".into(),
+                    name: "自定义".into(),
+                    multiplier: None,
+                    kind: "custom",
+                    exposed: true,
+                },
+            ],
+            current_model_id: "fast-model".into(),
+            probed_at: now_ms(),
+            port: 56599,
+        };
+        // 刚探测完 → acp-live；默认列出 tier|model（含 exposed=false 补充实模），不含 custom。
+        let v = catalog_to_payload(&catalog, false);
+        assert_eq!(v.get("object").and_then(Value::as_str), Some("list"));
+        assert_eq!(v.get("source").and_then(Value::as_str), Some("acp-live"));
+        assert_eq!(v.get("currentModelId").and_then(Value::as_str), Some("fast-model"));
+        let data = v.get("data").and_then(Value::as_array).unwrap();
+        assert_eq!(data.len(), 3);
+        assert_eq!(data[0].get("id").and_then(Value::as_str), Some("fast-model"));
+        assert_eq!(data[0].get("kind").and_then(Value::as_str), Some("tier"));
+        assert_eq!(data[0].get("multiplier").and_then(Value::as_f64), Some(0.21));
+        assert_eq!(data[0].get("owned_by").and_then(Value::as_str), Some("workbuddy"));
+        assert_eq!(data[0].get("exposed").and_then(Value::as_bool), Some(true));
+        assert_eq!(data[1].get("multiplier").and_then(Value::as_f64), Some(0.06));
+        // 补充实模（exposed=false）在默认列表中，带 exposed 标记。
+        assert_eq!(data[2].get("id").and_then(Value::as_str), Some("kimi-k3-1"));
+        assert_eq!(data[2].get("exposed").and_then(Value::as_bool), Some(false));
+        assert_eq!(data[2].get("kind").and_then(Value::as_str), Some("model"));
+        assert!(data[2].get("multiplier").map(Value::is_null).unwrap_or(false));
+        assert!(
+            !data.iter().any(|m| m.get("kind").and_then(Value::as_str) == Some("custom")),
+            "默认列表不得含 custom 条目"
+        );
+        // include=custom：追加 custom 条目（owned_by=workbuddy-custom，multiplier null）。
+        let v = catalog_to_payload(&catalog, true);
+        let data = v.get("data").and_then(Value::as_array).unwrap();
+        assert_eq!(data.len(), 4);
+        assert_eq!(data[3].get("id").and_then(Value::as_str), Some("custom-local:qwen3.8-flash"));
+        assert_eq!(data[3].get("owned_by").and_then(Value::as_str), Some("workbuddy-custom"));
+        assert_eq!(data[3].get("kind").and_then(Value::as_str), Some("custom"));
+        assert!(data[3].get("multiplier").map(Value::is_null).unwrap_or(false));
+        assert_eq!(data[3].get("exposed").and_then(Value::as_bool), Some(true));
+        // 缓存命中（probed_at 超过「刚探测完」窗口）→ acp-cache。
+        let mut stale = catalog.clone();
+        stale.probed_at = now_ms() - 10_000;
+        let v = catalog_to_payload(&stale, false);
+        assert_eq!(v.get("source").and_then(Value::as_str), Some("acp-cache"));
+        // currentModelId 缺失（空串）→ null。
+        let mut no_current = catalog.clone();
+        no_current.current_model_id = String::new();
+        let v = catalog_to_payload(&no_current, false);
+        assert!(v.get("currentModelId").map(Value::is_null).unwrap_or(false));
+    }
+
+    #[test]
+    fn should_try_native_matrix() {
+        let catalog = crate::modules::trae_acp::NativeCatalog {
+            models: vec![crate::modules::trae_acp::NativeModel {
+                id: "glm-5.3-flash".into(),
+                name: "GLM-5.3-Flash".into(),
+                multiplier: Some(0.06),
+                kind: "model",
+                exposed: true,
+            }],
+            current_model_id: "fast-model".into(),
+            probed_at: now_ms(),
+            port: 1,
+        };
+        // ① 缺省 → native。
+        assert!(should_try_native(Some(&catalog), None));
+        assert!(should_try_native(None, None));
+        // ① 目录可用且模型在目录 → native（tier/model/custom 均按目录判断）。
+        assert!(should_try_native(Some(&catalog), Some("glm-5.3-flash")));
+        // ② 目录可用且模型不在目录 → 直接兜底。
+        assert!(!should_try_native(Some(&catalog), Some("opencode/mimo-v2.6-flash-free")));
+        assert!(!should_try_native(Some(&catalog), Some("totally-fake-model")));
+        // 目录不可用 → 仍先试 native（失败走 ③）。
+        assert!(should_try_native(None, Some("opencode/mimo-v2.6-flash-free")));
+    }
+
+    #[test]
+    fn native_transient_error_predicate() {
+        // 2026-09-25 17:17 案例的 native 腿真实文案（prompt 提交期 500）。
+        assert!(is_native_transient_error(
+            "ACP session/prompt 返回 500 Internal Server Error: {\"name\":\"UnknownError\",\"data\":{\"message\":\"Unexpected server error.\"}}"
+        ));
+        assert!(is_native_transient_error(
+            "ACP session/prompt 返回 502 Bad Gateway: {\"name\":\"UnknownError\"}"
+        ));
+        // 非瞬态：门禁/无会话/请求错/流中失败，均不重试。
+        assert!(!is_native_transient_error(
+            "未发现运行中的 TRAE 会话（~/.workbuddy/sessions 注册表 5 分钟心跳内无活跃条目）"
+        ));
+        assert!(!is_native_transient_error(
+            "TRAE ACP 对话转发未开放（acp_enabled 未开启）"
+        ));
+        assert!(!is_native_transient_error("messages 不能为空"));
+        assert!(!is_native_transient_error(
+            "提交消息失败: error sending request"
+        ));
+    }
+
+    #[test]
+    fn native_failure_fallback_policy() {
+        let catalog = crate::modules::trae_acp::NativeCatalog {
+            models: vec![crate::modules::trae_acp::NativeModel {
+                id: "glm-5.3-flash".into(),
+                name: "GLM-5.3-Flash".into(),
+                multiplier: Some(0.06),
+                kind: "model",
+                exposed: true,
+            }],
+            current_model_id: "fast-model".into(),
+            probed_at: now_ms(),
+            port: 1,
+        };
+        // 目录内显式 model → 不兜底（裸 id 兜底必失败且掩盖 native 真实错误）。
+        assert!(!native_failure_should_fallback(
+            Some("glm-5.3-flash"),
+            Some(&catalog)
+        ));
+        // 缺省 model → 兜底 OpenCode 默认（WorkBuddy 未开时网关仍可用）。
+        assert!(native_failure_should_fallback(None, Some(&catalog)));
+        // 目录不可用 → 兜底（保持「无活跃实例→兜底」语义）。
+        assert!(native_failure_should_fallback(Some("glm-5.3-flash"), None));
+        assert!(native_failure_should_fallback(None, None));
+        // 目录可用但 id ∉ 目录 → 兜底（该路径本就 ② 直落兜底，防御性覆盖）。
+        assert!(native_failure_should_fallback(
+            Some("opencode/mimo-v2.6-flash-free"),
+            Some(&catalog)
+        ));
     }
 }

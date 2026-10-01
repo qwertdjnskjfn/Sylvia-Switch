@@ -1,6 +1,10 @@
 import { Component, Suspense, lazy, useEffect, useState, type ErrorInfo, type ReactNode } from "react";
 import { BrowserRouter, HashRouter, Navigate, NavLink, Outlet, Route, Routes } from "react-router-dom";
-import { AlertTriangle, ArrowUp, Cat, FlaskConical, Loader2, RefreshCw, RotateCcw, Settings, User, BarChart3, Activity } from "lucide-react";
+import { AlertTriangle, ArrowUp, FlaskConical, Loader2, RefreshCw, RotateCcw, Settings, User, BarChart3, Activity } from "lucide-react";
+// 模型同步页图标（独立 import 行：纯新增，不动既有 import 条目）
+import { ArrowLeftRight } from "lucide-react";
+// ChatGPT 通道页图标（独立 import 行：纯新增，不动既有 import 条目）
+import { Bot } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import { emitRefreshAll } from "@/lib/refresh-all";
@@ -8,13 +12,16 @@ import * as api from "@/lib/api";
 import type { UpdateInfo } from "@/lib/types";
 import AccountsPage from "@/pages/AccountsPage";
 import GlmProxyPage from "@/pages/GlmProxyPage";
+import GlmPlanPage from "@/pages/GlmPlanPage";
 import QoderPage from "@/pages/QoderPage";
 import QwenPage from "@/pages/QwenPage";
 import KimiPage from "@/pages/KimiPage";
 import GlmwebPage from "@/pages/GlmwebPage";
 import GrokPage from "@/pages/GrokPage";
+import ChatGptPage from "@/pages/ChatGptPage";
 import LoomyPage from "@/pages/LoomyPage";
 import MiaoshouPage from "@/pages/MiaoshouPage";
+import DuMatePage from "@/pages/DuMatePage";
 import OpencodePage from "@/pages/OpencodePage";
 import TraeWorkCnPage from "@/pages/TraeWorkCnPage";
 import WorkbuddyPage from "@/pages/WorkbuddyPage";
@@ -24,6 +31,7 @@ const SettingsPage = lazy(() => import("@/pages/SettingsPage"));
 const ChannelHealthPage = lazy(() => import("@/pages/ChannelHealthPage"));
 const ChannelHealthDetailPage = lazy(() => import("@/pages/ChannelHealthDetailPage"));
 const ModelTestPage = lazy(() => import("@/pages/ModelTestPage"));
+const ModelSyncPage = lazy(() => import("@/pages/ModelSyncPage"));
 import { StatusDot, AppIconMark } from "@/components/product-marks";
 import { SidebarThemeSwitcher } from "@/components/theme-switcher";
 import { GatewaySwitcher } from "@/components/gateway/gateway-switcher";
@@ -347,9 +355,8 @@ function Layout() {
             <FlaskConical className="size-4" />
             模型测试
           </NavLink>
-          <GatewayNavGroup />
           <NavLink
-            to="/miaoshou"
+            to="/model-sync"
             className={({ isActive }) =>
               cn(
                 "flex items-center gap-2.5 rounded-xl px-3 py-2.5 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sidebar-ring/50",
@@ -359,9 +366,24 @@ function Layout() {
               )
             }
           >
-            <Cat className="size-4" />
-            妙手
+            <ArrowLeftRight className="size-4" />
+            模型同步
           </NavLink>
+          <NavLink
+            to="/chatgpt"
+            className={({ isActive }) =>
+              cn(
+                "flex items-center gap-2.5 rounded-xl px-3 py-2.5 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sidebar-ring/50",
+                isActive
+                  ? "bg-primary/[0.13] font-medium text-foreground"
+                  : "text-muted-foreground hover:bg-foreground/[0.045] hover:text-foreground",
+              )
+            }
+          >
+            <Bot className="size-4" />
+            ChatGPT 通道
+          </NavLink>
+          <GatewayNavGroup />
           <NavLink
             to="/settings"
             className={({ isActive }) =>
@@ -420,6 +442,7 @@ export default function App() {
             <Route path="/token-stats" element={<Navigate to="/stats?tab=token" replace />} />
             <Route path="/settings" element={<SettingsPage />} />
             <Route path="/glm-proxy" element={<GlmProxyPage />} />
+            <Route path="/glm-plan" element={<GlmPlanPage />} />
             <Route path="/qwen" element={<QwenPage />} />
             <Route path="/qoder" element={<QoderPage />} />
             <Route path="/kimi" element={<KimiPage />} />
@@ -433,9 +456,12 @@ export default function App() {
           {/* 旧路径重定向，避免书签/外链 404 */}
           <Route path="/trae-workbuddy" element={<Navigate to="/trae-work-cn" replace />} />
             <Route path="/miaoshou" element={<MiaoshouPage />} />
+            <Route path="/dumate" element={<DuMatePage />} />
             <Route path="/channel-health" element={<ChannelHealthPage />} />
             <Route path="/channel-health/:gatewayId" element={<ChannelHealthDetailPage />} />
             <Route path="/model-test" element={<ModelTestPage />} />
+            <Route path="/model-sync" element={<ModelSyncPage />} />
+            <Route path="/chatgpt" element={<ChatGptPage />} />
             <Route path="/model-usage" element={<Navigate to="/stats?tab=model" replace />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>

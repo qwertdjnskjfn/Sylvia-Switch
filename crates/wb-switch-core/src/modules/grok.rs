@@ -65,6 +65,25 @@ pub struct G2aProxyConfig {
     /// 故此处为 Anthropic 协议客户端补一个默认值，客户端零改动；客户端显式传入
     /// 的 `thinking` 永远优先（不覆盖）。
     pub default_thinking_budget_tokens: u64,
+    /// 工具调用可见思考链（1.1.0 一期）：tools 非空时向 system 追加「强制工具
+    /// 规划协议」+「已完成调用链」摘要。**false = 关闭**（请求体原样转发）。
+    ///
+    /// 为什么需要它：grok-4.7 的内部思考是服务端加密的（客户端永远看不到），
+    /// ZCode 侧只能看到 tool_use 而看不到"为什么调它"。该开关把规划外置为
+    /// 可见文本（每步调用前输出【规划】、最终答复前输出【收尾】），并让模型
+    /// 每轮都"看得见"完整调用链。`x-grok-tool-protocol: off` 头可按请求逃生。
+    pub tool_protocol: bool,
+    /// 1.2.0 二期：工具交换最终回答的**收尾复盘尾块**（响应侧）——历史含工具
+    /// 调用且响应不再发起 tool_use 时，在流式 message_stop 前 / 非流式 content
+    /// 数组末尾追加【工具链路复盘】。**false = 关闭**。
+    pub wrap_up: bool,
+    /// 1.2.0 二期：复盘内容升级——回答过薄或存在断链时，追加一次预算封顶
+    /// （max_tokens=1000、无思考注入、30s 超时）的模型复盘调用，失败静默
+    /// 回退到确定性复盘。**false = 只用确定性复盘**。
+    pub wrap_up_model_review: bool,
+    /// 1.2.1：调用链摘要注入 system 的独立开关（默认开）。它只进请求输入侧、
+    /// 不进会话历史；想彻底省掉这部分输入 token 时置 false。
+    pub chain_summary: bool,
 }
 
 /// 缺省思考预算（tokens）。Anthropic 要求 `budget_tokens >= 1024` 且 `< max_tokens`，
@@ -106,11 +125,24 @@ fn g2a_proxy_config_from_value(v: &Value) -> Option<G2aProxyConfig> {
         .get("default_thinking_budget_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(DEFAULT_THINKING_BUDGET_TOKENS);
+    // 工具协议：未配置时默认开启；显式 false 关闭（逃生用）。
+    let tool_protocol = v.get("tool_protocol").and_then(Value::as_bool).unwrap_or(true);
+    // 二期收尾复盘：均默认开启；显式 false 关闭。
+    let wrap_up = v.get("wrapUp").and_then(Value::as_bool).unwrap_or(true);
+    let wrap_up_model_review = v
+        .get("wrapUpModelReview")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let chain_summary = v.get("chainSummary").and_then(Value::as_bool).unwrap_or(true);
     Some(G2aProxyConfig {
         base_url,
         api_key,
         models,
         default_thinking_budget_tokens,
+        tool_protocol,
+        wrap_up,
+        wrap_up_model_review,
+        chain_summary,
     })
 }
 
@@ -133,9 +165,11 @@ pub async fn g2a_messages_forward(
     body: &[u8],
     anthropic_version: Option<&str>,
     thinking_disabled: bool,
+    tool_protocol_disabled: bool,
 ) -> Result<reqwest::Response, String> {
     let url = format!("{}/v1/messages", cfg.base_url);
     let forwarded = prepare_messages_body(cfg, body, thinking_disabled);
+    let forwarded = augment_messages_tools(cfg, &forwarded, tool_protocol_disabled);
     http_client()
         .post(&url)
         .header("Authorization", format!("Bearer {}", cfg.api_key))
@@ -195,6 +229,509 @@ fn prepare_messages_body(cfg: &G2aProxyConfig, body: &[u8], thinking_disabled: b
         }
     }
     serde_json::to_vec(&v).unwrap_or_else(|_| body.to_vec())
+}
+
+/// 1.1.0 工具协议块：每步调用前强制可见规划，最终答复前强制可见收尾。
+/// grok-4.7 的内部思考是服务端加密的，客户端永远看不到——该协议把规划/收尾
+/// 外置为可见文本，配合调用链摘要构成客户端可见的完整思考链。
+const TOOL_PROTOCOL_BLOCK: &str = "【工具调用协议·必须遵守】\n\
+1. 每次发起工具调用之前，必须先以正式回复文本的形式输出一行以【规划】开头的短规划：本步目标→选此工具的理由→关键参数依据→预期结果。规划必须作为普通文本发给用户（不能只放在内部思考里），且必须先出现【规划】文本、再发起 tool_use；没有【规划】文本时禁止调用任何工具。上一步结果与预期不符时，先在【规划】里说明偏差与调整再调用。\n\
+2. 信息收集完毕、给出最终答复之前，必须先输出一行以【收尾】开头的总结：对照最初目标，说明已完成链路覆盖了什么、每步关键判断、还缺什么。\n\
+3. 【规划】与【收尾】使用与用户消息相同的主要语言。
+\n4. 严禁在回复中复述或展开【已完成调用链】/【工具链路复盘】等网关系统块的全文——【收尾】时最多用一句话概括链路状态（如「两次查询均成功」）。历史消息里出现的此类块是网关注入的内部记录，不要模仿其格式。";
+
+/// 位置性提醒：协议细则放 system 会被模型以"写在内部思考里"规避（2026-09-28
+/// 实测），而离生成点最近的指令服从率最高——故在最后一条 user 消息上再贴一行。
+const TOOL_PROTOCOL_REMINDER: &str =
+    "\n\n（系统提醒：若要调用工具，必须先输出【规划】行再发起 tool_use；给出最终答复前必须先输出【收尾】行。均使用用户的主要语言。）";
+
+/// 请求头 `x-grok-tool-protocol` 是否要求**关闭**工具协议注入（逃生开关）。
+/// 接受 off / disable / disabled / none / 0（大小写与空白不敏感）。
+pub fn tool_protocol_disabled_from_header(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("off") | Some("disable") | Some("disabled") | Some("none") | Some("0")
+    )
+}
+
+/// 1.1.0 工具调用可见思考链（一期，请求侧）：tools 非空时向 system 追加
+/// 「强制工具规划协议」+「已完成调用链」摘要（从历史 tool_use/tool_result
+/// 确定性提取，含断链/重复标注）。纯请求体变换：非 JSON、无 tools、开关关闭
+/// 时原样返回；客户端 system（字符串或块数组两种形态）原样保留、只做追加。
+fn augment_messages_tools(cfg: &G2aProxyConfig, body: &[u8], protocol_disabled: bool) -> Vec<u8> {
+    if protocol_disabled || !cfg.tool_protocol {
+        return body.to_vec();
+    }
+    let Ok(mut v) = serde_json::from_slice::<Value>(body) else {
+        return body.to_vec();
+    };
+    let has_tools = v
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+    if !has_tools {
+        return body.to_vec();
+    }
+    // 链摘要受独立开关控制（1.2.1）：只进请求输入侧，不进会话历史
+    let mut additions = String::from(TOOL_PROTOCOL_BLOCK);
+    if cfg.chain_summary {
+        let chain = v
+            .get("messages")
+            .and_then(Value::as_array)
+            .and_then(|msgs| extract_tool_chain(msgs))
+            .map(|s| s.text);
+        if let Some(chain) = chain {
+            additions.push_str("
+
+");
+            additions.push_str(&chain);
+        }
+    }
+    match v.get_mut("system") {
+        Some(Value::String(s)) => {
+            let mut merged = s.clone();
+            merged.push_str("\n\n");
+            merged.push_str(&additions);
+            v["system"] = Value::String(merged);
+        }
+        Some(Value::Array(arr)) => {
+            arr.push(json!({ "type": "text", "text": additions }));
+        }
+        _ => {
+            v["system"] = Value::String(additions);
+        }
+    }
+    // 位置性提醒：贴在最后一条 user 消息上（内容为字符串则拼接，为块数组则追加文本块）。
+    if let Some(last) = v
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+        .and_then(|a| a.last_mut())
+    {
+        if last.get("role").and_then(Value::as_str) == Some("user") {
+            match last.get_mut("content") {
+                Some(Value::String(s)) => s.push_str(TOOL_PROTOCOL_REMINDER),
+                Some(Value::Array(arr)) => arr.push(json!({
+                    "type": "text",
+                    "text": TOOL_PROTOCOL_REMINDER.trim_start_matches('\n')
+                })),
+                _ => {}
+            }
+        }
+    }
+    serde_json::to_vec(&v).unwrap_or_else(|_| body.to_vec())
+}
+
+/// 从 messages 历史确定性提取工具调用链：assistant.tool_use 与 user.tool_result
+/// 按 id 配对，产出带状态与 ⚠ 标注的摘要；历史无 tool_use 时返回 None。
+fn extract_tool_chain(messages: &[Value]) -> Option<ToolChainSummary> {
+    struct Call {
+        id: String,
+        name: String,
+        input: String,
+        /// None=尚未收到结果；Some((摘要, 是否错误))
+        result: Option<(String, bool)>,
+    }
+    let mut calls: Vec<Call> = Vec::new();
+    for msg in messages {
+        let role = msg.get("role").and_then(Value::as_str).unwrap_or("");
+        let Some(blocks) = msg.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for block in blocks {
+            let btype = block.get("type").and_then(Value::as_str).unwrap_or("");
+            if role == "assistant" && btype == "tool_use" {
+                calls.push(Call {
+                    id: block
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    name: block
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("?")
+                        .to_string(),
+                    input: summarize_compact(block.get("input").unwrap_or(&Value::Null), 40),
+                    result: None,
+                });
+            } else if role == "user" && btype == "tool_result" {
+                let tid = block
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let is_error = block
+                    .get("is_error")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let summary = summarize_compact(block.get("content").unwrap_or(&Value::Null), 30);
+                if let Some(call) = calls.iter_mut().rev().find(|c| c.id == tid && c.result.is_none())
+                {
+                    call.result = Some((summary, is_error));
+                }
+            }
+        }
+    }
+    if calls.is_empty() {
+        return None;
+    }
+    let mut lines = vec!["【已完成调用链】(网关自动生成，规划下一步前先对照)".to_string()];
+    // 只显示最近 6 步：链摘要每轮都会进 system，步数上限必须克制（上下文成本）
+    let skip = calls.len().saturating_sub(6);
+    if skip > 0 {
+        lines.push(format!("(前 {skip} 步省略)"));
+    }
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (idx, call) in calls.iter().enumerate().skip(skip) {
+        let status = match &call.result {
+            Some((s, false)) => format!("→ ok({s})"),
+            Some((s, true)) => format!("→ 错误({s})"),
+            None => "→ ⚠无结果".to_string(),
+        };
+        let dup_flag = if !seen.insert(format!("{}|{}", call.name, call.input)) {
+            " ⚠重复调用"
+        } else {
+            ""
+        };
+        lines.push(format!("{}. {}({}){}{}", idx + 1, call.name, call.input, status, dup_flag));
+    }
+    let dangling = calls.iter().filter(|c| c.result.is_none()).count();
+    if dangling > 0 {
+        lines.push(format!("⚠ {dangling} 个调用未收到结果：规划时先补齐再继续，勿重复发起。"));
+    }
+    Some(ToolChainSummary {
+        text: lines.join("\n"),
+        calls: calls.len(),
+        dangling,
+    })
+}
+
+/// 调用链摘要与统计（一期注入 + 二期复盘共用）。
+#[derive(Clone)]
+pub struct ToolChainSummary {
+    /// 注入 system / 复盘块用的多行文本
+    pub text: String,
+    /// 工具调用总步数
+    pub calls: usize,
+    /// 未收到结果的调用数（断链）
+    pub dangling: usize,
+}
+
+/// 压缩为单行摘要并按字符截断（避免多字节截半）。
+fn summarize_compact(value: &Value, max_chars: usize) -> String {
+    let raw = match value {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let mut flat: String = raw
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect();
+    let count = flat.chars().count();
+    if count > max_chars {
+        flat = flat.chars().take(max_chars).collect::<String>() + "…";
+    }
+    flat
+}
+
+/// 1.2.0 二期：收尾复盘上下文（请求侧一次性提取）。
+#[derive(Clone)]
+pub struct WrapUpContext {
+    pub chain: ToolChainSummary,
+    /// 首条 user 消息文本（前 120 字）——复盘"对照最初目标"的基准
+    pub goal: String,
+}
+
+/// 从请求体提取收尾复盘上下文：tools 非空且历史含工具调用时返回 Some，
+/// 否则 None（首轮请求 / 纯对话请求都不需要收尾复盘）。
+pub fn wrap_up_context(cfg: &G2aProxyConfig, body: &[u8]) -> Option<WrapUpContext> {
+    if !cfg.wrap_up {
+        return None;
+    }
+    let v: Value = serde_json::from_slice(body).ok()?;
+    let has_tools = v
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+    if !has_tools {
+        return None;
+    }
+    let messages = v.get("messages")?.as_array()?;
+    let chain = extract_tool_chain(messages)?;
+    let goal = messages
+        .iter()
+        .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+        .and_then(|m| first_text(m.get("content")))
+        .map(|s| summarize_compact(&Value::String(s), 120))
+        .unwrap_or_default();
+    Some(WrapUpContext { chain, goal })
+}
+
+/// 取 content（字符串或块数组）里的首段文本。
+fn first_text(content: Option<&Value>) -> Option<String> {
+    match content? {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(arr) => arr.iter().find_map(|b| {
+            if b.get("type").and_then(Value::as_str) == Some("text") {
+                b.get("text").and_then(Value::as_str).map(String::from)
+            } else {
+                None
+            }
+        }),
+        _ => None,
+    }
+}
+
+/// 3A 确定性复盘尾块：链路回放 + 悬空检查，零模型调用。
+pub fn wrap_up_tail(ctx: &WrapUpContext) -> String {
+    let check = if ctx.chain.dangling > 0 {
+        format!("共 {} 次工具调用，其中 {} 个未收到结果", ctx.chain.calls, ctx.chain.dangling)
+    } else {
+        format!("共 {} 次工具调用，全部有结果", ctx.chain.calls)
+    };
+    format!(
+        "【工具链路复盘·网关生成】\n目标：{}\n{}\n检查：{}。\n（本块由网关在工具链路收尾时自动生成，用于补全可见思考链。）",
+        ctx.goal, ctx.chain.text, check
+    )
+}
+
+/// 3B 触发条件：存在断链调用，或最终回答过薄（<200 字）。
+pub fn wrap_up_review_needed(ctx: &WrapUpContext, draft_text: &str) -> bool {
+    ctx.chain.dangling > 0 || draft_text.trim().chars().count() < 200
+}
+
+/// 3B 条件性模型复盘：预算封顶（max_tokens=1000、无思考注入、30s 超时），
+/// 失败返回 None（调用方回退到 3A 确定性复盘）。
+pub async fn g2a_wrap_up_review(
+    cfg: &G2aProxyConfig,
+    ctx: &WrapUpContext,
+    draft_text: &str,
+) -> Option<String> {
+    let model = cfg.models.first()?.clone();
+    let prompt = format!(
+        "以下是本次任务的目标、工具调用链与助手最终回答。请以第三方视角输出不超过 200 字的复盘：目标→实际链路→每步关键判断→遗漏与下一步建议。直接输出正文，不要客套。\n目标：{}\n调用链：\n{}\n最终回答：{}",
+        ctx.goal,
+        ctx.chain.text,
+        summarize_compact(&Value::String(draft_text.to_string()), 500)
+    );
+    let body = json!({
+        "model": model,
+        "max_tokens": 1000,
+        "messages": [{ "role": "user", "content": prompt }]
+    });
+    let resp = http_client()
+        .post(format!("{}/v1/messages", cfg.base_url))
+        .header("Authorization", format!("Bearer {}", cfg.api_key))
+        .header("Content-Type", "application/json")
+        .header("anthropic-version", "2023-06-01")
+        .timeout(std::time::Duration::from_secs(30))
+        .json(&body)
+        .send()
+        .await
+        .ok()?;
+    let v: Value = resp.json().await.ok()?;
+    let text: String = v
+        .get("content")?
+        .as_array()?
+        .iter()
+        .filter_map(|b| b.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("");
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// 解析 anthropic JSON 响应：返回 (正文文本, 是否发起 tool_use)。非 JSON 返回 None。
+pub fn parse_response_content(body_text: &str) -> Option<(String, bool)> {
+    let v: Value = serde_json::from_str(body_text).ok()?;
+    let content = v.get("content")?.as_array()?;
+    let mut text = String::new();
+    let mut has_tool_use = false;
+    for b in content {
+        match b.get("type").and_then(Value::as_str).unwrap_or("") {
+            "text" => {
+                if let Some(t) = b.get("text").and_then(Value::as_str) {
+                    text.push_str(t);
+                }
+            }
+            "tool_use" => has_tool_use = true,
+            _ => {}
+        }
+    }
+    Some((text, has_tool_use))
+}
+
+/// 非流式收尾：向 content 数组末尾追加复盘文本块；非 JSON 原样返回。
+pub fn wrap_up_append_to_json(body_text: &str, tail: &str) -> String {
+    let Ok(mut v) = serde_json::from_str::<Value>(body_text) else {
+        return body_text.to_string();
+    };
+    let Some(content) = v.get_mut("content").and_then(Value::as_array_mut) else {
+        return body_text.to_string();
+    };
+    content.push(json!({ "type": "text", "text": tail }));
+    serde_json::to_string(&v).unwrap_or_else(|_| body_text.to_string())
+}
+
+/// 1.2.0 二期：SSE 流式复盘尾块注入器（字节保真版）。
+/// 上游原始字节原样透传（UTF-8 多字节字符跨 chunk 也不会被截坏——解码分析只
+/// 发生在完整事件的副本上）；收到 `message_stop` 事件时扣住原始字节，由调用方
+/// 经 `complete_with_tail` 注入尾块事件（index = 已见最大 index + 1）后再放行。
+/// 响应里出现过 tool_use 时调用方应传 tail=None（调用链未结束）。
+pub struct WrapUpStreamInjector {
+    buf: Vec<u8>,
+    tail_enabled: bool,
+    seen_tool_use: bool,
+    max_index: i64,
+    draft: String,
+    holding_stop: bool,
+    injected: bool,
+    held_event: Vec<u8>,
+}
+
+impl WrapUpStreamInjector {
+    pub fn new(tail_enabled: bool) -> Self {
+        Self {
+            buf: Vec::new(),
+            tail_enabled,
+            seen_tool_use: false,
+            max_index: -1,
+            draft: String::new(),
+            holding_stop: false,
+            injected: false,
+            held_event: Vec::new(),
+        }
+    }
+
+    /// 模型已输出的可见正文（供"回答是否过薄"的复盘判定）。
+    pub fn draft(&self) -> &str {
+        &self.draft
+    }
+
+    /// 本轮响应是否发起过 tool_use（发起过 = 调用链未结束，不注入复盘）。
+    pub fn seen_tool_use(&self) -> bool {
+        self.seen_tool_use
+    }
+
+    /// 是否扣住了 message_stop（等待 complete_with_tail）。
+    pub fn is_holding_stop(&self) -> bool {
+        self.holding_stop
+    }
+
+    /// 喂入上游字节，返回应下发给客户端的字节（字节保真）。
+    /// 完成态（已注入/已放行）后原样透传。
+    pub fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
+        if self.holding_stop || self.injected {
+            return chunk.to_vec();
+        }
+        self.buf.extend_from_slice(chunk);
+        let mut out = Vec::new();
+        while let Some(pos) = find_event_end(&self.buf) {
+            let event: Vec<u8> = self.buf.drain(..pos).collect();
+            out.extend_from_slice(&self.process_event(&event));
+        }
+        out
+    }
+
+    /// 放行收尾：tail=Some 时先注入尾块事件（content_block_start/delta/stop，
+    /// index = max_index + 1）再放行扣住的 message_stop 原始字节；None 时直接
+    /// 放行。调用后进入完成态。
+    pub fn complete_with_tail(&mut self, tail: Option<String>) -> Vec<u8> {
+        let mut out = Vec::new();
+        if let (Some(tail), false) = (&tail, self.injected) {
+            let idx = self.max_index + 1;
+            let start = json!({"type":"content_block_start","index":idx,"content_block":{"type":"text","text":""}});
+            let delta = json!({"type":"content_block_delta","index":idx,"delta":{"type":"text_delta","text":tail}});
+            let stop = json!({"type":"content_block_stop","index":idx});
+            for (name, payload) in [
+                ("content_block_start", start),
+                ("content_block_delta", delta),
+                ("content_block_stop", stop),
+            ] {
+                out.extend_from_slice(format!("event: {name}\ndata: {payload}\n\n").as_bytes());
+            }
+        }
+        if !self.held_event.is_empty() {
+            out.extend_from_slice(&self.held_event);
+            self.held_event = Vec::new();
+        }
+        // 复位扣留态：否则每次 poll 都会重入补尾分支、发出 0 字节死循环
+        // （实测 2026-09-28：24 万+ 次空 poll，流永不结束，客户端超时）。
+        self.holding_stop = false;
+        self.injected = true;
+        out
+    }
+
+    /// 上游流结束时调用：冲刷残留缓冲（不足一个完整事件的部分原样放行）。
+    pub fn finish(&mut self) -> Vec<u8> {
+        if self.buf.is_empty() {
+            return Vec::new();
+        }
+        std::mem::take(&mut self.buf)
+    }
+
+    fn process_event(&mut self, event: &[u8]) -> Vec<u8> {
+        let analysis = String::from_utf8_lossy(event);
+        let mut is_message_stop = false;
+        for line in analysis.lines() {
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<Value>(data.trim()) else {
+                continue;
+            };
+            match v.get("type").and_then(Value::as_str).unwrap_or("") {
+                "content_block_start" => {
+                    if let Some(idx) = v.get("index").and_then(Value::as_i64) {
+                        if idx > self.max_index {
+                            self.max_index = idx;
+                        }
+                    }
+                    if v.pointer("/content_block/type").and_then(Value::as_str) == Some("tool_use") {
+                        self.seen_tool_use = true;
+                    }
+                }
+                "content_block_delta" => {
+                    if let Some(t) = v.pointer("/delta/text").and_then(Value::as_str) {
+                        self.draft.push_str(t);
+                    }
+                }
+                "message_stop" => is_message_stop = true,
+                _ => {}
+            }
+        }
+        if is_message_stop && self.tail_enabled && !self.injected {
+            self.holding_stop = true;
+            self.held_event = event.to_vec();
+            return Vec::new();
+        }
+        event.to_vec()
+    }
+}
+
+/// 找 SSE 事件边界（\n\n 或 \r\n\r\n），返回"边界之后"的字节偏移；未找到返回 None。
+fn find_event_end(buf: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while i + 1 < buf.len() {
+        if buf[i] == b'\n' && buf[i + 1] == b'\n' {
+            return Some(i + 2);
+        }
+        if i + 3 < buf.len()
+            && buf[i] == b'\r'
+            && buf[i + 1] == b'\n'
+            && buf[i + 2] == b'\r'
+            && buf[i + 3] == b'\n'
+        {
+            return Some(i + 4);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// 该模型是否由 grok2api 桥接承接。纯函数。
@@ -1298,11 +1835,14 @@ pub async fn chat_completions_unified(payload: Value) -> Result<GrokChatOutput, 
                     chat_err.kind, attempt, chat_err.message
                 );
                 let channel = channel_label.as_str();
-                last_err = format!("Grok {channel} 通道失败：{}", chat_err.message);
-                // grok2api 桥接失败与选号无关，重试也是同一结果——直接收尾。
-                if served_by_g2a {
-                    break;
+                // g2a 桥接失败：grok2api 进程可能掉线——托管自愈（探活/拉起）后
+                // 重试一次（attempt 0 → 1）；仍失败才按错误收尾。
+                if served_by_g2a && attempt == 0 {
+                    let _ = crate::modules::grok2api_manager::ensure_alive().await;
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    continue;
                 }
+                last_err = format!("Grok {channel} 通道失败：{}", chat_err.message);
                 match retry_backoff_ms(chat_err.kind, attempt) {
                     Some(ms) => {
                         tokio::time::sleep(Duration::from_millis(ms)).await;
@@ -2089,6 +2629,281 @@ mod tests {
         for no in [None, Some("on"), Some("auto"), Some("enabled"), Some("")] {
             assert!(!thinking_disabled_from_header(no), "{no:?} 应保持注入");
         }
+    }
+
+    /// 1.1.0 工具协议开关取值（与 thinking 逃生头同口径）。
+    #[test]
+    fn tool_protocol_disabled_header_variants() {
+        for yes in [Some("off"), Some("OFF"), Some(" off "), Some("0")] {
+            assert!(tool_protocol_disabled_from_header(yes), "{yes:?} 应关闭协议");
+        }
+        for no in [None, Some("on"), Some("enabled"), Some("")] {
+            assert!(!tool_protocol_disabled_from_header(no), "{no:?} 应保持协议");
+        }
+    }
+
+    /// 1.1.0 工具协议配置：未配置默认开启；显式 false 关闭。
+    #[test]
+    fn tool_protocol_config_defaults() {
+        let on = g2a_proxy_config_from_value(
+            &json!({"enabled": true, "base_url": "http://x", "api_key": "k", "models": ["m"]}),
+        )
+        .unwrap();
+        assert!(on.tool_protocol, "未配置应默认开启");
+        let off = g2a_proxy_config_from_value(&json!(
+            {"enabled": true, "base_url": "http://x", "api_key": "k", "models": ["m"], "tool_protocol": false}
+        ))
+        .unwrap();
+        assert!(!off.tool_protocol, "显式 false 应关闭");
+    }
+
+    /// 1.1.0：tools 非空 → system 追加协议块 + 调用链摘要（字符串 system 追加，
+    /// 原文保留）；无 tools / 开关关闭 → 原样返回。
+    #[test]
+    fn augment_messages_tools_injects_protocol_and_chain() {
+        let cfg = g2a_proxy_config_from_value(
+            &json!({"enabled": true, "base_url": "http://x", "api_key": "k", "models": ["grok-4.7"]}),
+        )
+        .unwrap();
+        let body = r#"{
+            "model":"grok-4.7","max_tokens":8000,
+            "system":"你是助手。",
+            "tools":[{"name":"Bash","description":"run","input_schema":{}}],
+            "messages":[
+                {"role":"user","content":"改代码"},
+                {"role":"assistant","content":[
+                    {"type":"text","text":"【规划】读文件"},
+                    {"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"a.rs"}}
+                ]},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"t1","content":"fn main(){}"}
+                ]},
+                {"role":"assistant","content":[
+                    {"type":"tool_use","id":"t2","name":"Edit","input":{"file_path":"a.rs"}}
+                ]},
+                {"role":"user","content":"继续"}
+            ]
+        }"#
+        .as_bytes();
+        let out = augment_messages_tools(&cfg, body, false);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let sys = v["system"].as_str().unwrap();
+        assert!(sys.starts_with("你是助手。"), "客户端 system 原文必须保留在最前");
+        assert!(sys.contains("【工具调用协议"), "应注入协议块");
+        assert!(sys.contains("【已完成调用链】"), "应注入链摘要");
+        assert!(sys.contains("1. Read(\"a.rs\"") || sys.contains("1. Read({"), "链里应有第 1 步 Read");
+        assert!(sys.contains("2. Edit("), "链里应有第 2 步 Edit");
+        assert!(sys.contains("→ ok("), "t1 已有结果应标 ok");
+        assert!(sys.contains("⚠无结果"), "t2 悬空应标 ⚠");
+        // 客户端 messages 不被改动
+        assert_eq!(v["messages"].as_array().unwrap().len(), 5);
+        // 位置性提醒贴在最后一条 user 消息上
+        let last = v["messages"].as_array().unwrap().last().unwrap();
+        assert!(
+            last["content"].as_str().unwrap().contains("系统提醒"),
+            "最后一条 user 消息应携带位置性提醒: {last}"
+        );
+
+        // 无 tools → 原样返回
+        let no_tools = br#"{"model":"grok-4.7","max_tokens":8000,"system":"s","messages":[]}"#;
+        assert_eq!(augment_messages_tools(&cfg, no_tools, false), no_tools.to_vec());
+
+        // 逃生开关 → 原样返回
+        assert_eq!(augment_messages_tools(&cfg, body, true), body.to_vec());
+
+        // tool_protocol=false → 原样返回
+        let cfg_off = g2a_proxy_config_from_value(&json!(
+            {"enabled": true, "base_url": "http://x", "api_key": "k", "models": ["m"], "tool_protocol": false}
+        ))
+        .unwrap();
+        assert_eq!(augment_messages_tools(&cfg_off, body, false), body.to_vec());
+    }
+
+    /// 1.1.0：system 为块数组形态时追加 text 块而非拼接字符串。
+    #[test]
+    fn augment_messages_tools_handles_block_system() {
+        let cfg = g2a_proxy_config_from_value(
+            &json!({"enabled": true, "base_url": "http://x", "api_key": "k", "models": ["m"]}),
+        )
+        .unwrap();
+        let body = br#"{
+            "model":"grok-4.7","max_tokens":8000,
+            "system":[{"type":"text","text":"base","cache_control":{"type":"ephemeral"}}],
+            "tools":[{"name":"Bash","input_schema":{}}],
+            "messages":[{"role":"user","content":"hi"}]
+        }"#;
+        let out = augment_messages_tools(&cfg, body, false);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let arr = v["system"].as_array().unwrap();
+        assert_eq!(arr[0]["text"], "base", "原块必须原样保留");
+        assert_eq!(arr.len(), 2, "只追加一个块");
+        assert!(arr[1]["text"].as_str().unwrap().contains("【工具调用协议"));
+        assert_eq!(arr[0]["cache_control"]["type"], "ephemeral", "原块字段不丢");
+    }
+
+    /// 1.1.0：重复调用与错误结果都会被标注。
+    #[test]
+    fn extract_tool_chain_marks_dup_and_error() {
+        let msgs = json!([
+            {"role":"assistant","content":[{"type":"tool_use","id":"a","name":"Bash","input":{"cmd":"ls"}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"a","content":"file1","is_error":false}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":"b","name":"Bash","input":{"cmd":"ls"}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"b","content":"boom","is_error":true}]}
+        ])
+        .as_array()
+        .unwrap()
+        .clone();
+        let summary = extract_tool_chain(&msgs).unwrap().text;
+        assert!(summary.contains("⚠重复调用"), "同参重复调用应标注: {summary}");
+        assert!(summary.contains("→ 错误("), "错误结果应标注: {summary}");
+    }
+
+    /// 1.2.0：收尾上下文——有工具历史才 Some；goal 取首条 user 文本。
+    #[test]
+    fn wrap_up_context_extracts_goal_and_chain() {
+        let cfg = g2a_proxy_config_from_value(
+            &json!({"enabled": true, "base_url": "http://x", "api_key": "k", "models": ["m"]}),
+        )
+        .unwrap();
+        let body = r#"{
+            "model":"grok-4.7","max_tokens":8000,
+            "tools":[{"name":"Bash","input_schema":{}}],
+            "messages":[
+                {"role":"user","content":"修复登录 bug 并验证"},
+                {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"cmd":"cargo test"}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok 601"}]}
+            ]
+        }"#
+        .as_bytes();
+        let ctx = wrap_up_context(&cfg, body).unwrap();
+        assert_eq!(ctx.chain.calls, 1);
+        assert_eq!(ctx.chain.dangling, 0);
+        assert!(ctx.goal.contains("修复登录"), "goal 应来自首条 user 消息: {}", ctx.goal);
+
+        // 首轮（tools 有、无历史调用）→ None
+        let first = r#"{"model":"grok-4.7","max_tokens":8000,"tools":[{"name":"Bash","input_schema":{}}],"messages":[{"role":"user","content":"hi"}]}"#.as_bytes();
+        assert!(wrap_up_context(&cfg, first).is_none(), "首轮无需收尾复盘");
+
+        // 无 tools → None
+        let plain = br#"{"model":"grok-4.7","max_tokens":8000,"messages":[{"role":"user","content":"hi"}]}"#;
+        assert!(wrap_up_context(&cfg, plain).is_none());
+    }
+
+    /// 1.2.0：确定性复盘尾块与 3B 触发条件。
+    #[test]
+    fn wrap_up_tail_and_review_trigger() {
+        let cfg = g2a_proxy_config_from_value(
+            &json!({"enabled": true, "base_url": "http://x", "api_key": "k", "models": ["m"]}),
+        )
+        .unwrap();
+        let body = r#"{
+            "model":"grok-4.7","max_tokens":8000,
+            "tools":[{"name":"Bash","input_schema":{}}],
+            "messages":[
+                {"role":"user","content":"测试目标"},
+                {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"cmd":"ls"}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}
+            ]
+        }"#
+        .as_bytes();
+        let ctx = wrap_up_context(&cfg, body).unwrap();
+        let tail = wrap_up_tail(&ctx);
+        assert!(tail.contains("【工具链路复盘·网关生成】"));
+        assert!(tail.contains("测试目标"));
+        assert!(tail.contains("全部有结果"));
+        assert!(!wrap_up_review_needed(&ctx, &"这是一段足够长的回答。".repeat(30)), "链完整+回答够长 → 不触发模型复盘");
+        assert!(wrap_up_review_needed(&ctx, "太短"), "回答过薄 → 触发模型复盘");
+    }
+
+    /// 1.2.0：非流式响应解析与尾块追加。
+    #[test]
+    fn parse_and_append_response_json() {
+        let resp = json!({
+            "content":[
+                {"type":"thinking","thinking":"内部"},
+                {"type":"text","text":"最终答案"},
+                {"type":"tool_use","id":"x","name":"Bash","input":{}}
+            ]
+        });
+        let (text, has_tool) = parse_response_content(&resp.to_string()).unwrap();
+        assert_eq!(text, "最终答案");
+        assert!(has_tool, "tool_use 应被识别");
+
+        let resp2 = json!({"content":[{"type":"text","text":"答案"}],"stop_reason":"end_turn"});
+        let (text2, has_tool2) = parse_response_content(&resp2.to_string()).unwrap();
+        assert_eq!(text2, "答案");
+        assert!(!has_tool2);
+        let appended = wrap_up_append_to_json(&resp2.to_string(), "【工具链路复盘】内容");
+        let v: Value = serde_json::from_str(&appended).unwrap();
+        let arr = v["content"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[1]["type"], "text");
+        assert!(arr[1]["text"].as_str().unwrap().starts_with("【工具链路复盘】"));
+        assert_eq!(v["stop_reason"], "end_turn", "其余字段不丢");
+        // 非 JSON 原样
+        assert_eq!(wrap_up_append_to_json("not-json", "t"), "not-json");
+    }
+
+    /// 1.2.0：SSE 注入器——完整事件流、跨 chunk 切分、tool_use 抑制、注入顺序。
+    #[test]
+    fn sse_injector_injects_tail_before_message_stop() {
+        let tail = "【工具链路复盘·网关生成】测试复盘";
+        let make = |text: &str| {
+            format!(
+                "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n\
+                 event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{text}\"}}}}\n\n\
+                 event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+                 event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":9}}}}\n\n\
+                 event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+            )
+        };
+        // ① 整段喂入：尾块在 message_stop 之前、index=1
+        let mut inj = WrapUpStreamInjector::new(true);
+        let _ = inj.feed(make("答案").as_bytes());
+        assert!(inj.is_holding_stop(), "message_stop 应被扣住");
+        assert!(!inj.seen_tool_use());
+        let out = inj.complete_with_tail(Some(tail.to_string()));
+        let s = String::from_utf8(out).unwrap();
+        let stop_pos = s.find("event: message_stop").unwrap();
+        let tail_pos = s.find("content_block_start").unwrap();
+        assert!(tail_pos < stop_pos, "尾块事件必须先于 message_stop: {s}");
+        assert!(s.contains("\"index\":1"), "尾块 index = 已见最大 index + 1");
+        assert!(s.contains("event: content_block_delta"));
+        assert!(s.contains(tail), "尾块文本应在 delta 事件里: {s}");
+        assert!(s.contains("\"type\":\"text_delta\""), "应为 text_delta 事件: {s}");
+        // 完成后再喂 → 原样透传
+        let later = inj.feed(b"event: ping\ndata: {}\n\n");
+        assert_eq!(later, b"event: ping\ndata: {}\n\n".to_vec());
+
+        // ② 跨 chunk 切分（事件被从中间劈开）仍能重组
+        let mut inj2 = WrapUpStreamInjector::new(true);
+        let full = make("跨chunk");
+        let (a, b) = full.split_at(full.len() / 2);
+        let _ = inj2.feed(a.as_bytes());
+        assert!(!inj2.is_holding_stop());
+        let _ = inj2.feed(b.as_bytes());
+        assert!(inj2.is_holding_stop(), "跨 chunk 的 message_stop 也应被扣住");
+        let out2 = inj2.complete_with_tail(Some("t".into()));
+        assert!(String::from_utf8(out2).unwrap().contains("content_block_start"));
+
+        // ③ 响应里出现过 tool_use → 不注入，message_stop 直接放行
+        let with_tool = format!(
+            "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"t\",\"name\":\"Bash\",\"input\":{{}}}}}}\n\n\
+             event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+        );
+        let mut inj3 = WrapUpStreamInjector::new(true);
+        let _ = inj3.feed(with_tool.as_bytes());
+        assert!(inj3.seen_tool_use());
+        let out3 = inj3.complete_with_tail(None);
+        let s3 = String::from_utf8(out3).unwrap();
+        assert!(s3.contains("event: message_stop"));
+        assert!(!s3.contains("content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1"), "tool_use 轮不得注入尾块: {s3}");
+
+        // ④ 尾块开关关闭 → new(false) 时 complete 直接放行
+        let mut inj4 = WrapUpStreamInjector::new(false);
+        let _ = inj4.feed(make("x").as_bytes());
+        let out4 = inj4.complete_with_tail(None);
+        assert!(!String::from_utf8(out4).unwrap().contains("content_block_delta"));
     }
 
     /// grok-4.7 / grok-composer-2.5-fast 必须在对外模型清单置顶（用户要求上线最新模型）。

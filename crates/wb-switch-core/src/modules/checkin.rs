@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use crate::modules::account::{account_display_name, build_auth_headers};
 use crate::modules::config::{
-    add_checkin_log, http_request, load_checkin_config, load_checkin_logs, now_ms, RunFlagGuard,
-    CHECKIN_API_PREFIX, WORKBUDDY_API_ENDPOINT,
+    add_checkin_log, apply_region_headers, http_request, load_checkin_config, load_checkin_logs,
+    now_ms, workbuddy_api_endpoint_for, RunFlagGuard, CHECKIN_API_PREFIX,
 };
 use crate::modules::platform_checkin::{
     account_platform, all_checkin_accounts, checkin_platform_account, get_platform_status,
@@ -92,9 +92,13 @@ fn is_unauthorized(resp: &Value) -> bool {
 }
 
 /// 发签到相关请求；遇到未授权且存在 refresh token 时刷新一次并重试。
+/// 端点按账号 domain 选区域（国际账号打 workbuddy.ai，此前硬打国服端点
+/// 会对国际账号返回 openresty 401，被当成签到/登录失败展示）。
 async fn checkin_request(path: &str, account: &Value) -> Value {
-    let url = format!("{WORKBUDDY_API_ENDPOINT}{path}");
-    let headers = build_auth_headers(account);
+    let base = workbuddy_api_endpoint_for(account);
+    let url = format!("{base}{path}");
+    let mut headers = build_auth_headers(account);
+    apply_region_headers(account, &mut headers);
     let mut resp = http_request(&url, "POST", Some(json!({})), Some(&headers)).await;
     if is_unauthorized(&resp)
         && !account
@@ -104,7 +108,8 @@ async fn checkin_request(path: &str, account: &Value) -> Value {
             .is_empty()
     {
         let refreshed = refresh_account_token(account.clone()).await;
-        let headers = build_auth_headers(&refreshed);
+        let mut headers = build_auth_headers(&refreshed);
+        apply_region_headers(&refreshed, &mut headers);
         resp = http_request(&url, "POST", Some(json!({})), Some(&headers)).await;
     }
     resp
@@ -204,6 +209,19 @@ pub async fn checkin_account(account: &Value) -> Value {
     let Some(_account_guard) = AccountRunGuard::try_acquire(account) else {
         return json!({"result": "error", "error": "该账号正在签到，请稍后再试"});
     };
+    // 国际版 WorkBuddy（domain .ai）无签到功能：直接返回 unsupported，
+    // 不拿国际版 token 去打国服 codebuddy.cn 签到端点（必败且污染失败通知）。
+    if crate::modules::platform_checkin::is_intl_workbuddy(account) {
+        let entry = json!({
+            "result": "unsupported",
+            "ts": now_ms(),
+            "accountId": account.get("id").cloned().unwrap_or(Value::Null),
+            "email": account_display_name(account),
+            "error": "国际版 WorkBuddy 账号没有签到功能",
+        });
+        add_checkin_log(&entry);
+        return entry;
+    }
     if let Some(store_id) = account.get("autoclawStoreId").and_then(Value::as_str) {
         // AutoClaw 账号池账号：用自身 token 签到（401 自动续期重试）。
         let res = crate::modules::autoclaw_accounts::checkin_stored(store_id).await;

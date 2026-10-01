@@ -13,8 +13,39 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // ---------------------------------------------------------------------------
 
 pub const WORKBUDDY_API_ENDPOINT: &str = "https://www.codebuddy.cn";
+/// WorkBuddy API 基址·国际版（契约 §10/§11：domain 含 workbuddy.ai 的账号走此域）。
+pub const WORKBUDDY_API_ENDPOINT_INTL: &str = "https://www.workbuddy.ai";
 pub const WORKBUDDY_API_PREFIX: &str = "/v2/plugin";
 pub const WORKBUDDY_PLATFORM: &str = "workbuddy";
+
+/// 按账号 domain 选 API 基址：含 workbuddy.ai → 国际版，其余 → 国服。
+/// 此前 refresh/checkin/travel 对所有账号硬打国服端点，国际账号刷新天然
+/// invalid_grant（keycloak realm 不同），被误标「需重新登录」
+/// （2026-09-25 用户实测发现并定位）。
+pub fn workbuddy_api_endpoint_for(account: &Value) -> &'static str {
+    let domain = account
+        .get("domain")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if domain.contains("workbuddy.ai") {
+        WORKBUDDY_API_ENDPOINT_INTL
+    } else {
+        WORKBUDDY_API_ENDPOINT
+    }
+}
+
+/// 国际版上游按 Origin/Referer 判定来源区域，跨区域发送会被拒（与池网关
+/// `apply_common` 同口径）；国服现状不带这些头也能通，保持不变。
+pub fn apply_region_headers(account: &Value, headers: &mut HashMap<String, String>) {
+    if workbuddy_api_endpoint_for(account) == WORKBUDDY_API_ENDPOINT_INTL {
+        headers.insert("Origin".to_string(), WORKBUDDY_API_ENDPOINT_INTL.to_string());
+        headers.insert(
+            "Referer".to_string(),
+            format!("{WORKBUDDY_API_ENDPOINT_INTL}/"),
+        );
+        headers.insert("X-Auth-Refresh-Source".to_string(), "workbuddy".to_string());
+    }
+}
 
 pub const OAUTH_TIMEOUT_SECONDS: i64 = 600;
 
@@ -43,6 +74,43 @@ pub const DEFAULT_HTTP_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS 
 
 pub fn home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// 1.4.1：各模型家族的最长上下文宣称值（全网关统一口径，供模型清单序列化
+/// 时覆盖/补齐上游目录缺失值）。匹配按小写包含；未识别的家族返回 None
+/// （保留上游原值，不虚构）。
+pub fn max_context_window(model: &str) -> Option<u64> {
+    let m = model.to_ascii_lowercase();
+    // 精确优先：GLM-4.6（Coding Plan）官方 200k，先于 glm 泛匹配
+    if m.contains("glm-4.6") {
+        return Some(200_000);
+    }
+    if m.contains("step-5") {
+        return Some(1_024_000);
+    }
+    if m.contains("step") {
+        return Some(262_144);
+    }
+    if m.contains("grok") {
+        return Some(500_000);
+    }
+    if m.contains("minimax") {
+        return Some(1_000_000);
+    }
+    if m.contains("deepseek") || m.contains("hy3") || m.contains("hunyuan") {
+        return Some(256_000);
+    }
+    if m.contains("kimi") || m.contains("moonshot") {
+        return Some(256_000);
+    }
+    // GLM 家族（glm-5.x / glm-4.x / auto / auto-fast / spark）目录实锤 1M
+    if m.contains("glm") || m.contains("auto") || m.contains("spark") {
+        return Some(1_048_576);
+    }
+    if m.contains("qwen") {
+        return Some(1_048_576);
+    }
+    None
 }
 
 pub fn store_dir() -> PathBuf {
@@ -545,15 +613,51 @@ pub async fn http_request_with_proxy(
             if status.is_success() {
                 serde_json::from_str(&text).unwrap_or(Value::Null)
             } else {
-                serde_json::from_str(&text).unwrap_or_else(|_| {
-                    json!({
-                        "code": status.as_u16(),
-                        "message": text.chars().take(500).collect::<String>(),
-                    })
-                })
+                serde_json::from_str(&text).unwrap_or_else(|_| sanitize_non_json_error(status.as_u16(), &text))
             }
         }
         Err(e) => json!({"code": -1, "message": e.to_string()}),
+    }
+}
+
+/// 非 JSON 错误响应的错误整形（纯函数，便于单测）。
+///
+/// 🔴 HTML 页面（如上游网关层 nginx 的 `401 Authorization Required`）绝不透传原文：
+/// 原文进 `message` 后会被前端当文案渲染，界面上直接糊一段 HTML 源码
+/// （2026-09-25 用户实测：国际版账号 token 失效时 www.workbuddy.ai 网关层回
+/// nginx 401 HTML，原文上屏账号页）。转为「状态码 + <title> 摘要」的干净文案，
+/// 并保留数字状态码与 401/unauthorized 等关键词，使既有的登录态失效分类
+/// （travel 的 is_unauthorized 等）照常命中。非 HTML 的纯文本错误保持原文截断。
+pub fn sanitize_non_json_error(status: u16, text: &str) -> Value {
+    let lowered = text.to_ascii_lowercase();
+    let looks_html = lowered.contains("<html") || lowered.contains("<!doctype html");
+    if !looks_html {
+        return json!({
+            "code": status,
+            "message": text.chars().take(500).collect::<String>(),
+        });
+    }
+    let title = extract_html_title(text)
+        .map(|t| format!("：{t}"))
+        .unwrap_or_default();
+    json!({
+        "code": status,
+        "message": format!(
+            "上游返回 HTTP {status}（HTML 页面{title}）——若为 401 多为登录态失效，请刷新凭证或重新登录"
+        ),
+    })
+}
+
+/// 提取 HTML <title> 文本（大小写不敏感；无/空 → None）。
+fn extract_html_title(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    let start = lower.find("<title>")? + "<title>".len();
+    let end = lower[start..].find("</title>")? + start;
+    let title = text[start..end].trim();
+    if title.is_empty() {
+        None
+    } else {
+        Some(title.to_string())
     }
 }
 
@@ -628,6 +732,67 @@ pub async fn http_request_raw(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_html_401_is_clean_and_classifiable() {
+        // 2026-09-25 用户实测形态：国际版上游 nginx 的 401 HTML 页面。
+        let raw = "<html>\r\n<head><title>401 Authorization Required</title></head>\r\n\
+                   <body>\r\n<center><h1>401 Authorization Required</h1></center>\r\n</body>\r\n</html>";
+        let v = sanitize_non_json_error(401, raw);
+        assert_eq!(v.get("code").and_then(Value::as_u64), Some(401));
+        let msg = v.get("message").and_then(Value::as_str).unwrap();
+        assert!(!msg.contains("<html"), "message 不得包含 HTML 标记: {msg}");
+        assert!(!msg.contains("<title>"), "message 不得包含 HTML 标记: {msg}");
+        assert!(msg.contains("HTTP 401"), "保留状态码供分类: {msg}");
+        assert!(
+            msg.contains("401 Authorization Required"),
+            "保留 <title> 摘要供诊断: {msg}"
+        );
+        // 既有登录态分类（关键词 401/unauthorized）仍能命中。
+        assert!(msg.to_lowercase().contains("401"));
+    }
+
+    #[test]
+    fn sanitize_plain_text_error_keeps_raw_truncated() {
+        let v = sanitize_non_json_error(502, "plain upstream error");
+        assert_eq!(v.get("code").and_then(Value::as_u64), Some(502));
+        assert_eq!(
+            v.get("message").and_then(Value::as_str),
+            Some("plain upstream error")
+        );
+    }
+
+    #[test]
+    fn sanitize_html_without_title_has_no_suffix() {
+        let v = sanitize_non_json_error(503, "<html><body>maintenance</body></html>");
+        let msg = v.get("message").and_then(Value::as_str).unwrap();
+        assert!(msg.contains("HTTP 503"));
+        assert!(!msg.contains("<"), "message 不得包含 HTML 标记: {msg}");
+    }
+
+    #[test]
+    fn workbuddy_api_endpoint_follows_account_domain() {
+        // 国际账号（domain .ai）→ workbuddy.ai；国服/缺省 → codebuddy.cn。
+        let intl = json!({"domain": "www.workbuddy.ai"});
+        let cn = json!({"domain": "www.workbuddy.cn"});
+        let none = json!({});
+        assert_eq!(
+            workbuddy_api_endpoint_for(&intl),
+            WORKBUDDY_API_ENDPOINT_INTL
+        );
+        assert_eq!(workbuddy_api_endpoint_for(&cn), WORKBUDDY_API_ENDPOINT);
+        assert_eq!(workbuddy_api_endpoint_for(&none), WORKBUDDY_API_ENDPOINT);
+        // 国际账号附带区域头（Origin/Referer/刷新来源），国服不带。
+        let mut headers = HashMap::new();
+        apply_region_headers(&cn, &mut headers);
+        assert!(headers.is_empty());
+        apply_region_headers(&intl, &mut headers);
+        assert_eq!(
+            headers.get("Origin").map(String::as_str),
+            Some(WORKBUDDY_API_ENDPOINT_INTL)
+        );
+        assert_eq!(headers.get("X-Auth-Refresh-Source").map(String::as_str), Some("workbuddy"));
+    }
 
     fn local_timestamp_ms(year: i32, month: u32, day: u32, hour: u32) -> i64 {
         Local

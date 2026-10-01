@@ -46,6 +46,7 @@ pub const PLATFORM_TRAE_WORK_CN: &str = "trae_work_cn";
 pub const PLATFORM_LOOMY: &str = "loomy";
 pub const PLATFORM_CHATGLM: &str = "chatglm";
 pub const PLATFORM_MIAOSHOU: &str = "miaoshou";
+pub const PLATFORM_DUMATE: &str = "dumate";
 
 // ---------------------------------------------------------------------------
 // AutoClaw（澳龙）客户端常量（自 resources/app.asar 逆向确认）
@@ -127,6 +128,7 @@ pub fn account_platform(account: &Value) -> &'static str {
         Some(PLATFORM_LOOMY) => PLATFORM_LOOMY,
         Some(PLATFORM_CHATGLM) => PLATFORM_CHATGLM,
         Some(PLATFORM_MIAOSHOU) => PLATFORM_MIAOSHOU,
+        Some(PLATFORM_DUMATE) => PLATFORM_DUMATE,
         _ => PLATFORM_WORKBUDDY,
     }
 }
@@ -149,11 +151,12 @@ pub fn platform_display_name(platform: &str) -> &'static str {
         PLATFORM_LOOMY => "Loomy",
         PLATFORM_CHATGLM => "ChatGLM",
         PLATFORM_MIAOSHOU => "妙手",
+        PLATFORM_DUMATE => "DuMate（百度搭子）",
         _ => "WorkBuddy",
     }
 }
 
-/// 全部可签到账号：WorkBuddy 账号库 + 本机发现的 AutoClaw / TRAE Work CN / Loomy / ChatGLM / 妙手。
+/// 全部可签到账号：WorkBuddy 账号库 + 本机发现的 AutoClaw / TRAE Work CN / Loomy / ChatGLM / 妙手 / DuMate。
 /// 该签到条目是否就是「本机客户端当前登录」的账号。
 pub fn is_local_login_account(account: &Value) -> bool {
     let Some(id) = account.get("id").and_then(Value::as_str) else {
@@ -170,6 +173,7 @@ pub fn is_local_login_account(account: &Value) -> bool {
         PLATFORM_LOOMY => crate::modules::loomy::is_local_login(account),
         PLATFORM_CHATGLM => id.starts_with("chatglm:"),
         PLATFORM_MIAOSHOU => id.starts_with("miaoshou:"),
+        PLATFORM_DUMATE => id.starts_with("dumate:"),
         _ => false,
     }
 }
@@ -263,6 +267,7 @@ pub fn all_checkin_accounts() -> Vec<Value> {
         discover_autoclaw_account(),
         discover_trae_work_cn_account(),
         crate::modules::loomy::discover_loomy_account(),
+        discover_dumate_account(),
     ]
         .into_iter()
         .flatten()
@@ -462,6 +467,8 @@ pub async fn get_platform_status(account: &Value) -> Value {
         }
         PLATFORM_CHATGLM => get_chatglm_status(account).await,
         PLATFORM_MIAOSHOU => get_miaoshou_status(account).await,
+        // DuMate：本机单账号（qianfan 登录态），状态走 console.bce.baidu.com。
+        PLATFORM_DUMATE => get_dumate_status().await,
         _ => json!({"ok": false, "error": "未知签到平台"}),
     }
 }
@@ -566,6 +573,7 @@ pub async fn checkin_platform_account(account: &Value) -> Value {
         }
         PLATFORM_CHATGLM => perform_chatglm_checkin(account).await,
         PLATFORM_MIAOSHOU => perform_miaoshou_checkin().await,
+        PLATFORM_DUMATE => perform_dumate_checkin(account).await,
         _ => json!({"ok": false, "error": "未知签到平台"}),
     };
     if let Some(result) = res.get("result").and_then(Value::as_str) {
@@ -3153,6 +3161,7 @@ pub async fn get_platform_credits(account: &Value) -> Value {
         }
         PLATFORM_CHATGLM => get_chatglm_credits(account).await,
         PLATFORM_MIAOSHOU => get_miaoshou_credits(account).await,
+        PLATFORM_DUMATE => get_dumate_credits().await,
         _ => json!({"ok": false, "error": "未知签到平台"}),
     };
     if result.get("ok").and_then(Value::as_bool) == Some(true) {
@@ -3253,6 +3262,276 @@ pub async fn get_miaoshou_credits(account: &Value) -> Value {
 }
 
 // ---------------------------------------------------------------------------
+// DuMate（百度搭子）—— console.bce.baidu.com 每日签到（契约
+// docs/dumate-channel-contract.md §0/§3.1）
+//
+// 登录态 = 本机 DuMate 客户端的 qianfan cookie（解密见 dumate_credentials）；
+// 单账号 `dumate:local`。上游协议（2026-10-01 实测）：
+// - GET  /api/dumate/points/loginBonusInfo → {code:0,result:{hasIssued,...}}；
+// - POST /api/dumate/points/loginBonus body {} → +500 积分；
+// - HTTP 302/401 或 code=401 → 登录态失效。
+// ---------------------------------------------------------------------------
+
+/// 上游签到状态端点。
+const DUMATE_LOGIN_BONUS_INFO: &str = "/api/dumate/points/loginBonusInfo";
+/// 上游签到领取端点。
+const DUMATE_LOGIN_BONUS: &str = "/api/dumate/points/loginBonus";
+
+/// 登录态失效的统一返回（reason 供前端判别，error 供签到调度直接展示）。
+fn dumate_login_expired() -> Value {
+    json!({
+        "ok": false,
+        "reason": "login_expired",
+        "error": "百度登录态已失效，请打开 DuMate 客户端重新登录",
+    })
+}
+
+/// JSON `code`/`errno` 类字段取值（数字或数字字符串兼容）。
+fn json_code_field(body: &Value, key: &str) -> Option<i64> {
+    match body.get(key) {
+        Some(Value::Number(n)) => n.as_i64(),
+        Some(Value::String(s)) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+/// 上游响应摘要（报错信息用，截断防刷屏）。
+fn json_brief(v: &Value, max: usize) -> String {
+    v.to_string().chars().take(max).collect()
+}
+
+/// loginBonus 成功判定（契约 §0 实测口径，纯函数便于单测）：
+/// `code==0 || errno==0 || (result 存在且无 error 字段) || points 为数字`。
+fn login_bonus_success(body: &Value) -> bool {
+    let code_zero = json_code_field(body, "code") == Some(0);
+    let errno_zero = json_code_field(body, "errno") == Some(0);
+    let result_clean = body
+        .get("result")
+        .is_some_and(|r| !r.is_null() && r.get("error").is_none());
+    let points_number = body.get("points").map(Value::is_number).unwrap_or(false)
+        || body
+            .pointer("/result/points")
+            .map(Value::is_number)
+            .unwrap_or(false);
+    code_zero || errno_zero || result_clean || points_number
+}
+
+/// 重复领取的文本兜底判定（上游「已领语义」文案，纯函数便于单测）。
+fn login_bonus_already_text(body: &Value) -> bool {
+    let text = body
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| body.get("msg").and_then(Value::as_str))
+        .unwrap_or("");
+    text.contains("已领") || text.contains("已经领取") || text.contains("重复")
+}
+
+/// 从 DuMate 桌面端进程环境读登录用户名（`DUMATE_LOGIN_USER_NAME`；
+/// 实测 main-server / opencode 都可能持有，两个进程都要试）。
+/// 60s TTL 缓存：读进程环境要先跑 tasklist，避免签到列表高频刷新时反复打命令行。
+fn dumate_login_user_name() -> Option<String> {
+    static CACHE: OnceLock<Mutex<Option<(i64, Option<String>)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    {
+        let guard = cache.lock().unwrap();
+        if let Some((at, name)) = guard.as_ref() {
+            if now_ms() - *at < 60_000 {
+                return name.clone();
+            }
+        }
+    }
+    let mut found = None;
+    for image in ["dumate-opencode.exe", "dumate-main-server.exe"] {
+        if let Ok(env) = crate::modules::dumate::process_env_by_image(image) {
+            if let Some((_, v)) = env
+                .iter()
+                .find(|(k, _)| k == "DUMATE_LOGIN_USER_NAME")
+            {
+                let v = v.trim();
+                if !v.is_empty() {
+                    found = Some(v.to_string());
+                    break;
+                }
+            }
+        }
+    }
+    *cache.lock().unwrap() = Some((now_ms(), found.clone()));
+    found
+}
+
+/// 发现本机 DuMate 登录账号：qianfan cookie 解密成功即产出 `dumate:local`
+/// 单账号；解密失败（未安装 / 未登录 / 凭据损坏）→ 不产出账号（契约 §3.1）。
+pub fn discover_dumate_account() -> Option<Value> {
+    if crate::modules::dumate_credentials::decrypt_cookies().is_err() {
+        return None;
+    }
+    // 显示名优先取进程环境 DUMATE_LOGIN_USER_NAME；取不到用缺省名。
+    let display = match dumate_login_user_name() {
+        Some(name) => format!("DuMate · {name}"),
+        None => "DuMate 本机账号".to_string(),
+    };
+    Some(json!({
+        "id": format!("{PLATFORM_DUMATE}:local"),
+        "email": display,
+        "nickname": display.clone(),
+        "platform": PLATFORM_DUMATE,
+    }))
+}
+
+/// DuMate 账号列表形态（单元素；gateway_overview 等需要 Vec 的调用方用）。
+pub fn discover_dumate_accounts() -> Vec<Value> {
+    discover_dumate_account().into_iter().collect()
+}
+
+/// loginBonusInfo 响应 → 签到状态（纯函数便于单测；契约 §3.1 形态
+/// `{ok, todayCheckedIn: result.hasIssued, raw: result}`）。
+fn assemble_dumate_status(http_status: u16, body: &Value) -> Value {
+    if http_status == 302 || http_status == 401 {
+        return dumate_login_expired();
+    }
+    match json_code_field(body, "code") {
+        Some(0) => {
+            let result = body.get("result").cloned().unwrap_or(Value::Null);
+            let today_checked_in = result
+                .get("hasIssued")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            json!({
+                "ok": true,
+                "todayCheckedIn": today_checked_in,
+                "raw": result,
+                "platform": PLATFORM_DUMATE,
+            })
+        }
+        Some(401) => dumate_login_expired(),
+        _ => json!({
+            "ok": false,
+            "error": format!(
+                "查询 DuMate 签到状态失败（HTTP {http_status}）: {}",
+                json_brief(body, 200)
+            ),
+        }),
+    }
+}
+
+/// DuMate 本机账号签到状态：GET loginBonusInfo。
+pub async fn get_dumate_status() -> Value {
+    match crate::modules::dumate::bce_api("GET", DUMATE_LOGIN_BONUS_INFO, None).await {
+        Err(e) => json!({"ok": false, "error": e}),
+        Ok((http_status, body)) => assemble_dumate_status(http_status, &body),
+    }
+}
+
+/// DuMate 本机账号每日签到：先查状态（hasIssued 短路 already）→ POST loginBonus
+/// （契约 §0 成功判定）→ success(+500)/already/error → 记签到日志。
+/// 返回 `{result, error/message}`，result ∈ success / already / error（与
+/// WorkBuddy 口径一致，checkin_platform_account 直接消费）。
+pub async fn perform_dumate_checkin(account: &Value) -> Value {
+    let account_id = account
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("dumate:local")
+        .to_string();
+    let email = account
+        .get("email")
+        .and_then(Value::as_str)
+        .unwrap_or("DuMate")
+        .to_string();
+
+    // 1) 先查状态：hasIssued=true 短路 already（服务端幂等口径）。
+    let status = get_dumate_status().await;
+    if status.get("ok").and_then(Value::as_bool) != Some(true) {
+        return json!({
+            "result": "error",
+            "error": status
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("查询签到状态失败"),
+        });
+    }
+    if status.get("todayCheckedIn").and_then(Value::as_bool) == Some(true) {
+        add_checkin_log(&json!({
+            "ts": now_secs() as i64,
+            "accountId": account_id,
+            "email": email,
+            "result": "already",
+        }));
+        return json!({"result": "already", "message": "今日已完成 DuMate 签到"});
+    }
+
+    // 2) 提交领取：POST loginBonus body {}。
+    let (http_status, body) =
+        match crate::modules::dumate::bce_api("POST", DUMATE_LOGIN_BONUS, Some(json!({}))).await {
+            Ok(v) => v,
+            Err(e) => return json!({"result": "error", "error": e}),
+        };
+    if http_status == 302 || http_status == 401 || json_code_field(&body, "code") == Some(401) {
+        return json!({
+            "result": "error",
+            "error": "百度登录态已失效，请打开 DuMate 客户端重新登录",
+        });
+    }
+
+    // 3) 成功判定（契约 §0）；重复领取的「已领语义」按文本兜底归 already。
+    if login_bonus_success(&body) {
+        add_checkin_log(&json!({
+            "ts": now_secs() as i64,
+            "accountId": account_id,
+            "email": email,
+            "result": "success",
+        }));
+        json!({
+            "result": "success",
+            "message": "DuMate 每日签到成功，+500 积分",
+            "raw": body,
+        })
+    } else if login_bonus_already_text(&body) {
+        add_checkin_log(&json!({
+            "ts": now_secs() as i64,
+            "accountId": account_id,
+            "email": email,
+            "result": "already",
+        }));
+        json!({
+            "result": "already",
+            "message": "今日已领取过 DuMate 签到积分",
+        })
+    } else {
+        json!({
+            "result": "error",
+            "error": format!(
+                "DuMate 签到失败（HTTP {http_status}）: {}",
+                json_brief(&body, 200)
+            ),
+        })
+    }
+}
+
+/// DuMate 积分概览（quota_overview）：数字上游是字符串，这里补
+/// totalRemaining/remainingTotal 数值镜像字段，让统一的 credit_usage 快照
+/// 有数可记（前端展示仍以 availablePoints 为准）。
+pub async fn get_dumate_credits() -> Value {
+    let credits = crate::modules::dumate::get_credits().await;
+    if credits.get("ok").and_then(Value::as_bool) != Some(true) {
+        return credits;
+    }
+    let parse = |key: &str| -> f64 {
+        credits
+            .get(key)
+            .and_then(Value::as_str)
+            .map(|s| s.replace(',', ""))
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    };
+    let total_remaining = parse("totalPoints");
+    let remaining_total = parse("availablePoints");
+    let mut out = credits;
+    out["totalRemaining"] = json!(total_remaining);
+    out["remainingTotal"] = json!(remaining_total);
+    out
+}
+
+// ---------------------------------------------------------------------------
 // 测试
 // ---------------------------------------------------------------------------
 
@@ -3301,6 +3580,80 @@ mod tests {
             account_platform(&json!({"id": "a", "platform": "miaoshou"})),
             PLATFORM_MIAOSHOU
         );
+        assert_eq!(
+            account_platform(&json!({"id": "a", "platform": "dumate"})),
+            PLATFORM_DUMATE
+        );
+        assert_eq!(platform_display_name(PLATFORM_DUMATE), "DuMate（百度搭子）");
+    }
+
+    #[test]
+    fn dumate_local_login_account_by_prefix() {
+        // dumate: 前缀 = 本机登录账号；其他 id 不算。
+        assert!(is_local_login_account(&json!({
+            "id": "dumate:local", "platform": PLATFORM_DUMATE,
+        })));
+        assert!(!is_local_login_account(&json!({
+            "id": "dumate-pool-1", "platform": PLATFORM_DUMATE,
+        })));
+        assert!(!is_local_login_account(&json!({"id": "dumate:local"})));
+    }
+
+    #[test]
+    fn dumate_login_bonus_success_matrix() {
+        // 契约 §0 成功判定四选一：code==0 / errno==0 / result 无 error / points 为数字。
+        assert!(login_bonus_success(&json!({"code": 0})));
+        assert!(login_bonus_success(&json!({"code": "0"})));
+        assert!(login_bonus_success(&json!({"errno": 0})));
+        assert!(login_bonus_success(&json!({"result": {"totalPoints": 500}})));
+        assert!(login_bonus_success(&json!({"points": 500})));
+        assert!(login_bonus_success(&json!({"result": {"points": "500"}})));
+        // result 带 error 字段 = 失败语义。
+        assert!(!login_bonus_success(&json!({"result": {"error": "boom"}})));
+        assert!(!login_bonus_success(&json!({"code": 1, "message": "x"})));
+        assert!(!login_bonus_success(&json!({})));
+    }
+
+    #[test]
+    fn dumate_login_bonus_already_by_text() {
+        assert!(login_bonus_already_text(&json!({"code": 1, "message": "今日已领取过"})));
+        assert!(login_bonus_already_text(&json!({"message": "已经领取过了"})));
+        assert!(login_bonus_already_text(&json!({"message": "请勿重复签到"})));
+        assert!(!login_bonus_already_text(&json!({"message": "internal error"})));
+        assert!(!login_bonus_already_text(&json!({})));
+    }
+
+    #[test]
+    fn dumate_status_assemble_contract_shape() {
+        // 契约 §0 实测形态：code=0 + result.hasIssued。
+        let v = assemble_dumate_status(
+            200,
+            &json!({"code": 0, "success": true, "result": {
+                "totalTimes": 3, "totalPoints": 1500, "hasIssued": true,
+                "signInDays": ["2026-10-01"],
+            }}),
+        );
+        assert_eq!(v.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(v.get("todayCheckedIn").and_then(Value::as_bool), Some(true));
+        assert_eq!(v.pointer("/raw/totalPoints").and_then(Value::as_i64), Some(1500));
+        // 未签到日：hasIssued=false。
+        let v = assemble_dumate_status(200, &json!({"code": 0, "result": {"hasIssued": false}}));
+        assert_eq!(v.get("todayCheckedIn").and_then(Value::as_bool), Some(false));
+        // 登录态失效：HTTP 302/401 与 code=401 同归 login_expired。
+        for (status, body) in [
+            (302u16, json!({})),
+            (401u16, json!({})),
+            (200u16, json!({"code": 401})),
+        ] {
+            let v = assemble_dumate_status(status, &body);
+            assert_eq!(v.get("ok").and_then(Value::as_bool), Some(false));
+            assert_eq!(v.get("reason").and_then(Value::as_str), Some("login_expired"));
+            assert!(v.get("error").and_then(Value::as_str).unwrap_or_default().contains("重新登录"));
+        }
+        // 其他非 0 code = 上游异常。
+        let v = assemble_dumate_status(200, &json!({"code": 500, "message": "oops"}));
+        assert_eq!(v.get("ok").and_then(Value::as_bool), Some(false));
+        assert!(v.get("error").is_some());
     }
 
     #[tokio::test]

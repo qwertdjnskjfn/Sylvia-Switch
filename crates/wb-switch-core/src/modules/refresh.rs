@@ -8,8 +8,8 @@ use std::sync::atomic::AtomicBool;
 
 use crate::modules::account::{build_auth_headers, upsert_account};
 use crate::modules::config::{
-    http_request, load_checkin_config, norm_ts, now_ms, RunFlagGuard, WORKBUDDY_API_ENDPOINT,
-    WORKBUDDY_API_PREFIX,
+    apply_region_headers, http_request, load_checkin_config, norm_ts, now_ms,
+    workbuddy_api_endpoint_for, RunFlagGuard, WORKBUDDY_API_PREFIX,
 };
 
 static KEEPALIVE_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -34,25 +34,40 @@ pub async fn refresh_account_token(mut account: Value) -> Value {
         return account;
     }
 
+    let base = workbuddy_api_endpoint_for(&account);
     let mut headers = build_auth_headers(&account);
     headers.insert("X-Refresh-Token".to_string(), rt.clone());
-    let url = format!("{WORKBUDDY_API_ENDPOINT}{WORKBUDDY_API_PREFIX}/auth/token/refresh");
-    let resp = http_request(&url, "POST", Some(json!({})), Some(&headers)).await;
-    let code = resp.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
-    if code != 0 && code != 200 {
-        account["needs_relogin"] = json!(true);
-        account["needs_relogin_reason"] = json!(format!(
-            "刷新失败(code={code}): {}",
-            resp.get("message")
-                .or_else(|| resp.get("msg"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("未知错误")
-        ));
-        let _ = upsert_account(&account);
-        return account;
+    // 国际版按 Origin/Referer 判定来源区域，且刷新请求不带 body（与池网关
+    // apply_refresh_headers 同口径）；国服维持原形态（空 body）不变。
+    apply_region_headers(&account, &mut headers);
+    let url = format!("{base}{WORKBUDDY_API_PREFIX}/auth/token/refresh");
+    let intl = base == crate::modules::config::WORKBUDDY_API_ENDPOINT_INTL;
+    let body = if intl { None } else { Some(json!({})) };
+    let resp = http_request(&url, "POST", body, Some(&headers)).await;
+    // 响应双形态：国服信封 {code,data:{accessToken}}；国际版扁平 {accessToken,expiresIn}
+    // （无 code 字段——见池网关 RefreshResp）。仅在 code 字段存在时按信封判失败。
+    let code = resp.get("code").and_then(|v| v.as_i64());
+    if let Some(code) = code {
+        if code != 0 && code != 200 {
+            account["needs_relogin"] = json!(true);
+            account["needs_relogin_reason"] = json!(format!(
+                "刷新失败(code={code}): {}",
+                resp.get("message")
+                    .or_else(|| resp.get("msg"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("未知错误")
+            ));
+            let _ = upsert_account(&account);
+            return account;
+        }
     }
 
     let data = resp.get("data").cloned().unwrap_or_else(|| json!({}));
+    let data = if data.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+        resp.clone()
+    } else {
+        data
+    };
     let new_at = data
         .get("accessToken")
         .and_then(|v| v.as_str())

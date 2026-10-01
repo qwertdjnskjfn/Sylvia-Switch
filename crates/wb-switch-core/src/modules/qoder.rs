@@ -1831,18 +1831,37 @@ pub fn models_payload() -> Value {
         ("qwen-plus", "Qwen-Plus 别名（自动路由至 Pro 档）"),
         ("qwen-turbo", "Qwen-Turbo 别名（自动路由至 Lite 档）"),
     ];
+    let mut data = models
+        .iter()
+        .map(|(id, desc)| json!({
+            "id": id,
+            "object": "model",
+            "created": 1756400000,
+            "owned_by": "qoder",
+            "description": desc,
+        }))
+        .collect::<Vec<_>>();
+    // model-sync 注册表合并尾步（契约 model-sync-contract.md §3.3）：qoder 无上游清单
+    // 概念，仅页面手动补录进注册表后在此合并展示。去重：已存在 id 跳过。
+    // 注册表为空时本循环零迭代，输出与既有实现逐字节一致。
+    for entry in crate::modules::model_sync::registry_entries_for("qoder") {
+        if data
+            .iter()
+            .any(|m| m.get("id").and_then(Value::as_str) == Some(entry.id.as_str()))
+        {
+            continue;
+        }
+        data.push(json!({
+            "id": entry.id,
+            "object": "model",
+            "created": 1756400000,
+            "owned_by": "qoder",
+            "description": entry.name.clone().unwrap_or_else(|| "（模型同步补录）".to_string()),
+        }));
+    }
     json!({
         "object": "list",
-        "data": models
-            .iter()
-            .map(|(id, desc)| json!({
-                "id": id,
-                "object": "model",
-                "created": 1756400000,
-                "owned_by": "qoder",
-                "description": desc,
-            }))
-            .collect::<Vec<_>>(),
+        "data": data,
     })
 }
 
@@ -2272,5 +2291,71 @@ mod retry_policy_tests {
         // 这里只验证退避本身不会超过 10s（不至于让客户端等天涯海角）。
         let total_backoff = (MAX_ROUNDS as u64 - 1) * ROUND_DELAY_MS;
         assert!(total_backoff <= 10_000, "总退避 {total_backoff}ms 过长");
+    }
+}
+
+/// model-sync 注册表合并尾步回归（契约 model-sync-contract.md §六 1 / G1）。
+#[cfg(test)]
+mod model_sync_registry_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 🔴 红线：注册表为空时输出与改造前逐字节一致。
+    #[test]
+    fn empty_registry_matches_legacy_byte_for_byte() {
+        let dir = std::env::temp_dir()
+            .join(format!("wb-qoder-payload-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let payload = crate::modules::model_sync::with_test_store(&dir, || models_payload());
+        let expect = json!({
+            "object": "list",
+            "data": [
+                {"id": "max", "object": "model", "created": 1756400000, "owned_by": "qoder",
+                 "description": "Max — 旗舰档（底层搭载阿里通义千问 Qwen3.8-Max · 2.4T 参数 · 1M 上下文）"},
+                {"id": "pro", "object": "model", "created": 1756400000, "owned_by": "qoder",
+                 "description": "Pro — 标准档（底层搭载 Qwen3.6-Plus）"},
+                {"id": "lite", "object": "model", "created": 1756400000, "owned_by": "qoder",
+                 "description": "Lite — 极速档（底层搭载 Qwen3.8-Flash 混合架构，高吞吐低延迟）"},
+                {"id": "qwen3.8-max", "object": "model", "created": 1756400000, "owned_by": "qoder",
+                 "description": "Qwen3.8-Max — 通义千问 2026 最新旗舰模型别名（自动路由至 Max 档）"},
+                {"id": "qwen3.8-flash", "object": "model", "created": 1756400000, "owned_by": "qoder",
+                 "description": "Qwen3.8-Flash — 通义千问超快模型别名（自动路由至 Lite 档）"},
+                {"id": "qwen-max", "object": "model", "created": 1756400000, "owned_by": "qoder",
+                 "description": "Qwen-Max 别名（自动路由至 Max 档）"},
+                {"id": "qwen-plus", "object": "model", "created": 1756400000, "owned_by": "qoder",
+                 "description": "Qwen-Plus 别名（自动路由至 Pro 档）"},
+                {"id": "qwen-turbo", "object": "model", "created": 1756400000, "owned_by": "qoder",
+                 "description": "Qwen-Turbo 别名（自动路由至 Lite 档）"}
+            ]
+        });
+        assert_eq!(
+            serde_json::to_string(&payload).unwrap(),
+            serde_json::to_string(&expect).unwrap(),
+            "空注册表输出必须逐字节等于改造前静态表"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 手动补录条目追加到尾部；与静态条目同 id 时去重。
+    #[test]
+    fn manual_registry_entry_is_appended() {
+        let dir = std::env::temp_dir()
+            .join(format!("wb-qoder-payload-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::modules::model_sync::with_test_store(&dir, || {
+            let _ = crate::modules::model_sync::add_registry_entry(
+                "qoder", "qwen3.9-coder", Some("Qwen3.9-Coder（手动补录）".into()), "manual", None,
+            );
+            let _ = crate::modules::model_sync::add_registry_entry(
+                "qoder", "max", Some("重复应被跳过".into()), "manual", None,
+            );
+            let payload = models_payload();
+            let data = payload.get("data").and_then(Value::as_array).unwrap();
+            assert_eq!(data.len(), 9, "8 静态 + 1 补录（max 已存在不重复）");
+            assert_eq!(data[8]["id"], "qwen3.9-coder");
+            assert_eq!(data[8]["owned_by"], "qoder");
+            assert_eq!(data[8]["description"], "Qwen3.9-Coder（手动补录）");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

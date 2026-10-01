@@ -9,7 +9,9 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 
 use crate::modules::account::{account_display_name, build_auth_headers};
-use crate::modules::config::{http_request, load_checkin_config, now_ms, WORKBUDDY_API_ENDPOINT};
+use crate::modules::config::{
+    http_request, load_checkin_config, now_ms, WORKBUDDY_API_ENDPOINT, WORKBUDDY_API_ENDPOINT_INTL,
+};
 use crate::modules::credit_usage;
 use crate::modules::refresh::{ensure_fresh_token, refresh_account_token};
 
@@ -354,7 +356,11 @@ async fn post_with_account(account: &Value, url: &str, body: Value) -> Value {
 }
 
 fn request_origin(url: &str) -> &'static str {
-    if url.starts_with(WORKBUDDY_WEB_ENDPOINT) {
+    // 国际版上游按 Origin/Referer 判定来源区域，跨区域发送会被拒——intl URL
+    // 必须带 intl Origin（2026-09-25 修复：此前 .ai URL 会错拿国服 Origin）。
+    if url.starts_with(WORKBUDDY_API_ENDPOINT_INTL) {
+        WORKBUDDY_API_ENDPOINT_INTL
+    } else if url.starts_with(WORKBUDDY_WEB_ENDPOINT) {
         WORKBUDDY_WEB_ENDPOINT
     } else {
         WORKBUDDY_API_ENDPOINT
@@ -412,7 +418,11 @@ fn new_resource_endpoint(account: &Value) -> &'static str {
     // 官网脚本使用相对路径，实际请求的是当前登录 origin。账号库中的 CN
     // OAuth token 默认签发给 www.codebuddy.cn；若把它固定发往
     // www.workbuddy.cn，令牌域和 X-Domain 会不一致并被网关拒绝。
-    // 这里只在两个已知官方 origin 间选择，不允许账号数据拼出任意主机。
+    // 这里只在已知官方 origin 间选择，不允许账号数据拼出任意主机。
+    // 🔴 2026-09-25 修复：国际账号（domain *.workbuddy.ai）此前落入 `_` 兜底
+    // 被派往国服 codebuddy.cn——国际 token 打国服网关 → nginx 401 HTML
+    // （用户账号页积分/用量 401 报错根因）。与 travel 的
+    // workbuddy_api_endpoint_for 同口径：.ai → 国际端点。
     match account
         .get("domain")
         .and_then(Value::as_str)
@@ -421,6 +431,7 @@ fn new_resource_endpoint(account: &Value) -> &'static str {
         .as_deref()
     {
         Some("workbuddy.cn") | Some("www.workbuddy.cn") => WORKBUDDY_WEB_ENDPOINT,
+        Some(d) if d.ends_with(".ai") => WORKBUDDY_API_ENDPOINT_INTL,
         _ => WORKBUDDY_API_ENDPOINT,
     }
 }
@@ -519,7 +530,8 @@ async fn fetch_legacy_user_resource(account: &Value) -> Value {
         "PackageEndTimeRangeBegin": begin,
         "PackageEndTimeRangeEnd": end,
     });
-    let url = format!("{WORKBUDDY_API_ENDPOINT}{USER_RESOURCE_PATH}");
+    // 旧接口回退同样按账号区域选端点（intl 账号此前被硬编码到国服端点 → 401）。
+    let url = format!("{}{USER_RESOURCE_PATH}", new_resource_endpoint(account));
     // 新接口编排已经统一执行过惰性刷新，并在任一路未授权时只刷新一次。
     // 旧接口回退必须直接复用该账号，不能重新进入 authenticated_post，
     // 否则可能重复刷新并用旧 refresh token 覆盖刚落盘的新 token。
@@ -985,6 +997,32 @@ mod tests {
         assert_eq!(
             workbuddy_headers.get("X-Domain").map(String::as_str),
             Some("www.workbuddy.cn")
+        );
+
+        // 国际账号（domain .ai）必须走国际端点 + intl Origin/Referer——
+        // 此前落入国服兜底 → 国际 token 打 codebuddy.cn → nginx 401 HTML。
+        let intl = json!({
+            "domain": "www.workbuddy.ai",
+            "access_token": "redacted",
+            "uid": "u3"
+        });
+        assert_eq!(
+            new_resource_url(&intl, RESOURCE_SUMMARY_PATH),
+            "https://www.workbuddy.ai/billing/meter/get-user-resource-summary"
+        );
+        let intl_headers = resource_auth_headers(&intl, request_origin(&new_resource_url(&intl, RESOURCE_SUMMARY_PATH)));
+        assert_eq!(
+            intl_headers.get("Origin").map(String::as_str),
+            Some("https://www.workbuddy.ai")
+        );
+        assert_eq!(
+            intl_headers.get("Referer").map(String::as_str),
+            Some("https://www.workbuddy.ai/profile/plans-usage")
+        );
+        // request_origin 对 intl URL 返回 intl origin（旧逻辑错拿国服 Origin）。
+        assert_eq!(
+            request_origin("https://www.workbuddy.ai/billing/meter/get-user-resource-summary"),
+            WORKBUDDY_API_ENDPOINT_INTL
         );
 
         let unknown_headers = resource_auth_headers(&unknown, new_resource_endpoint(&unknown));

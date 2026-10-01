@@ -17,9 +17,9 @@ use rust_embed::RustEmbed;
 use serde_json::{json, Value};
 
 use wb_switch_core::modules::{
-    account, account_protection, auth_file, channel_health, checkin, config, credit_usage, credits, export_import,
-    autoclaw_accounts, glm_proxy, loomy, loomy_proxy, model_probe, model_usage, oauth, platform_checkin, platform_switch, process, refresh,
-    gateway_admin, gateway_overview, glm_web, grok, grok_pool, grok_register, kimi, qoder, qwen, qwen_mcp, qwen_web, grok_sso, miaoshou, model_sync, session, switch, token_stats, toolcall_monitor, travel, update, trae_acp, trae_accounts, trae_proxy, trae_proxy_config, workbuddy_proxy, workbuddy_errors, workbuddy_gateway, workbuddy_protocols, workbuddy_upstream, opencode,
+    account, account_protection, auth_file, channel_health, chatgpt_channel, checkin, config, credit_usage, credits, export_import,
+    autoclaw_accounts, glm_proxy, glmplan, loomy, loomy_proxy, model_probe, model_usage, oauth, platform_checkin, platform_switch, process, refresh,
+    gateway_admin, gateway_overview, glm_web, grok, grok_pool, grok_register, kimi, qoder, qwen, qwen_mcp, qwen_web, grok2api_manager, grok_sso, miaoshou, model_sync, session, switch, token_stats, toolcall_monitor, travel, update, trae_acp, trae_accounts, trae_proxy, trae_proxy_config, workbuddy_proxy, workbuddy_errors, workbuddy_gateway, workbuddy_protocols, workbuddy_upstream, opencode, dumate,
 };
 
 /// 服务实际绑定端口（main.rs serve 启动时写入），供端点展示使用。
@@ -110,6 +110,16 @@ pub fn router() -> Router {
             get(api_glm_proxy_config_get).post(api_glm_proxy_config_save),
         )
         .route("/api/glm-proxy/status", get(api_glm_proxy_status))
+        // ── GLM Plan 网关（1.4.0 新通道：GLM Coding Plan 账号池）──
+        .route("/api/glmplan/status", get(api_glmplan_status))
+        .route("/api/glmplan/test", post(api_glmplan_test))
+        .route("/api/glmplan/config", post(api_glmplan_config_save))
+        .route("/api/glmplan/accounts/add", post(api_glmplan_accounts_add))
+        .route("/api/glmplan/accounts/remove", post(api_glmplan_accounts_remove))
+        .route("/api/glmplan/accounts/enable", post(api_glmplan_accounts_enable))
+        .route("/glmplan/v1/models", get(api_glmplan_models))
+        .route("/glmplan/v1/chat/completions", post(api_glmplan_chat))
+        .route("/glmplan/v1/messages", post(api_glmplan_messages))
         .route("/api/glm-proxy/test", post(api_glm_proxy_test))
         // Cuckoo Code 融合模块：本地聊天页 + 自定义 Provider 下载 + 免 Key 中转
         .route("/cuckoo/chat", get(api_cuckoo_chat_page))
@@ -201,6 +211,34 @@ pub fn router() -> Router {
         .route("/api/grok/register/open", post(api_grok_register_open))
         .route("/api/grok/register/capture", post(api_grok_register_capture))
         .route("/api/grok/register/close", post(api_grok_register_close))
+        // ── ChatGPT 通道（gpt-reg-review 工具链托管+控制，契约 chatgpt-channel-contract.md §4；
+        //    管理面免 key 与现状一致——服务仅绑 127.0.0.1；零自动触发：批量注册仅手动启动）──
+        .route("/api/chatgpt/channel/status", get(api_chatgpt_channel_status))
+        .route("/api/chatgpt/webui/start", post(api_chatgpt_webui_start))
+        .route("/api/chatgpt/webui/stop", post(api_chatgpt_webui_stop))
+        .route(
+            "/api/chatgpt/registrar/start",
+            post(api_chatgpt_registrar_start),
+        )
+        .route(
+            "/api/chatgpt/registrar/pause",
+            post(api_chatgpt_registrar_pause),
+        )
+        .route(
+            "/api/chatgpt/registrar/resume",
+            post(api_chatgpt_registrar_resume),
+        )
+        .route(
+            "/api/chatgpt/registrar/stop",
+            post(api_chatgpt_registrar_stop),
+        )
+        .route(
+            "/api/chatgpt/registrar/status",
+            get(api_chatgpt_registrar_status),
+        )
+        .route("/api/chatgpt/registered", get(api_chatgpt_registered))
+        .route("/api/chatgpt/accounts", get(api_chatgpt_accounts))
+        .route("/api/chatgpt/accounts/sync", post(api_chatgpt_accounts_sync))
         .route("/api/gateway/keys", get(api_gateway_keys_list).post(api_gateway_key_create))
         .route("/api/gateway/keys/delete", post(api_gateway_key_delete))
         .route("/api/gateway/logs", get(api_gateway_logs))
@@ -238,6 +276,16 @@ pub fn router() -> Router {
         .route("/api/miaoshou/chat", post(api_miaoshou_chat))
         .route("/miaoshou/v1/models", get(api_miaoshou_v1_models))
         .route("/miaoshou/v1/chat/completions", post(api_miaoshou_v1_chat_completions))
+        // ── DuMate（百度搭子）渠道（契约 dumate-channel-contract.md §3.2）：
+        //    /dumate/v1 OpenAI 兼容网关（独立密钥 + 主网关密钥双轨鉴权）+
+        //    本机账号签到/积分/状态/配置管理面。 ──
+        .route("/dumate/v1/models", get(api_dumate_v1_models))
+        .route("/dumate/v1/chat/completions", post(api_dumate_chat_completions))
+        .route("/api/dumate/status", get(api_dumate_status))
+        .route("/api/dumate/credits", get(api_dumate_credits))
+        .route("/api/dumate/config", get(api_dumate_config_get).post(api_dumate_config_post))
+        .route("/api/dumate/checkin", post(api_dumate_checkin))
+        .route("/api/dumate/checkin-status", get(api_dumate_checkin_status))
         .route("/api/loomy-proxy/config", get(api_loomy_proxy_config_get).post(api_loomy_proxy_config_save))
         .route("/api/loomy-proxy/status", get(api_loomy_proxy_status))
         .route("/api/loomy/protection/status", get(api_loomy_protection_status))
@@ -379,7 +427,7 @@ fn is_logged_path(path: &str) -> bool {
     let prefixes = [
         "/v1/", "/qwen/", "/qwen-flash/", "/qoder/", "/kimi/", "/glmweb/",
         "/grok/", "/loomy/", "/cuckoo/", "/trae/", "/api/", "/workbuddy/",
-        "/workbuddy-pool/",
+        "/workbuddy-pool/", "/dumate/",
     ];
     prefixes.iter().any(|p| path.starts_with(p))
 }
@@ -976,7 +1024,7 @@ fn anthropic_error_status(message: &str) -> StatusCode {
     }
 }
 
-async fn api_glm_models(headers: HeaderMap) -> Response {
+async fn api_glm_models(headers: HeaderMap, RawQuery(raw_query): RawQuery) -> Response {
     let cfg = glm_proxy::load_config();
     if !cfg.enabled {
         return glm_proxy_error("GLM 代理未启用".to_string(), StatusCode::SERVICE_UNAVAILABLE);
@@ -984,7 +1032,12 @@ async fn api_glm_models(headers: HeaderMap) -> Response {
     if !glm_proxy_auth_ok(&headers, &cfg) {
         return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
     }
-    json_ok(glm_proxy::models_payload())
+    // 1.3.0：?region= 按区过滤（domestic/international，兼容 cn/intl 别名，all/缺省=全量）
+    let region = raw_query.as_deref().and_then(|q| {
+        q.split('&')
+            .find_map(|kv| kv.strip_prefix("region=").map(|v| v.to_string()))
+    });
+    json_ok(glm_proxy::models_payload_filtered(region.as_deref()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1738,14 +1791,43 @@ async fn api_grok_messages(headers: HeaderMap, body: axum::body::Bytes) -> Respo
     let thinking_disabled = grok::thinking_disabled_from_header(
         headers.get("x-grok-thinking").and_then(|v| v.to_str().ok()),
     );
-    match grok::g2a_messages_forward(
+    // 1.1.0：工具调用可见思考链（规划协议+调用链摘要）；
+    // 逃生开关 `x-grok-tool-protocol: off` 可按请求关闭。
+    let tool_protocol_disabled = grok::tool_protocol_disabled_from_header(
+        headers
+            .get("x-grok-tool-protocol")
+            .and_then(|v| v.to_str().ok()),
+    );
+    // 1.2.0：工具交换最终回答的收尾复盘尾块；逃生开关 `x-grok-wrapup: off`。
+    let wrap_up_disabled = grok::tool_protocol_disabled_from_header(
+        headers.get("x-grok-wrapup").and_then(|v| v.to_str().ok()),
+    );
+    let wrap_up_ctx = if wrap_up_disabled {
+        None
+    } else {
+        grok::wrap_up_context(&cfg, body.as_ref())
+    };
+    // 托管自愈：桥接失败可能是 grok2api 进程掉线——探活/拉起后重试一次
+    let mut forward = grok::g2a_messages_forward(
         &cfg,
         body.as_ref(),
         anthropic_version.as_deref(),
         thinking_disabled,
+        tool_protocol_disabled,
     )
-    .await
-    {
+    .await;
+    if forward.is_err() {
+        let _ = grok2api_manager::ensure_alive().await;
+        forward = grok::g2a_messages_forward(
+            &cfg,
+            body.as_ref(),
+            anthropic_version.as_deref(),
+            thinking_disabled,
+            tool_protocol_disabled,
+        )
+        .await;
+    }
+    match forward {
         Ok(resp) => {
             let status = resp.status();
             let content_type = resp
@@ -1757,13 +1839,93 @@ async fn api_grok_messages(headers: HeaderMap, body: axum::body::Bytes) -> Respo
             let log_model = "messages";
             if content_type.contains("event-stream") {
                 log_gateway_request("grok", key_id.as_deref(), log_model, true, 0, "流式桥接");
-                let stream = futures_util::stream::unfold(resp, |mut resp| async move {
-                    match resp.chunk().await {
-                        Ok(Some(chunk)) => Some((Ok::<_, String>(chunk), resp)),
-                        Ok(None) => None,
-                        Err(e) => Some((Err(format!("grok2api Messages 流中断: {e}")), resp)),
-                    }
-                });
+                // 1.2.0：收尾复盘尾块（流式）。扣住 message_stop → 判定是否需要
+                // 模型复盘（30s 超时 fail-open）→ 注入尾块事件 → 放行 message_stop。
+                let injector = grok::WrapUpStreamInjector::new(wrap_up_ctx.is_some());
+                let cfg_s = cfg.clone();
+                let ctx_s = wrap_up_ctx.clone();
+                let mut drained = false;
+                let stream = futures_util::stream::unfold(
+                    (resp, injector, Some(cfg_s), ctx_s, drained),
+                    |(mut resp, mut inj, cfg, ctx, mut drained)| async move {
+                        // 扣住 message_stop：先补尾块再放行（同一次 poll 内完成）
+                        if inj.is_holding_stop() {
+                            let tail = match (&cfg, &ctx) {
+                                (Some(c), Some(wctx)) => {
+                                    let mut tail = None;
+                                    if c.wrap_up_model_review
+                                        && grok::wrap_up_review_needed(wctx, inj.draft())
+                                    {
+                                        tail = grok::g2a_wrap_up_review(c, wctx, inj.draft())
+                                            .await
+                                            .map(|r| {
+                                                format!(
+                                                    "【工具链路复盘·网关复核】\n{r}\n（本块由网关在工具链路收尾时自动生成）"
+                                                )
+                                            });
+                                    }
+                                    Some(tail.unwrap_or_else(|| grok::wrap_up_tail(wctx)))
+                                }
+                                _ => None,
+                            };
+                            let out = inj.complete_with_tail(tail);
+                            return Some((
+                                Ok::<_, String>(axum::body::Bytes::from(out)),
+                                (resp, inj, None, None, drained),
+                            ));
+                        }
+                        if drained {
+                            return None;
+                        }
+                        match resp.chunk().await {
+                            Ok(Some(chunk)) => {
+                                let mut out = inj.feed(&chunk);
+                                if inj.is_holding_stop() {
+                                    let tail = match (&cfg, &ctx) {
+                                        (Some(c), Some(wctx)) => {
+                                            let mut tail = None;
+                                            if c.wrap_up_model_review
+                                                && grok::wrap_up_review_needed(wctx, inj.draft())
+                                            {
+                                                tail = grok::g2a_wrap_up_review(c, wctx, inj.draft())
+                                                    .await
+                                                    .map(|r| {
+                                                        format!(
+                                                            "【工具链路复盘·网关复核】\n{r}\n（本块由网关在工具链路收尾时自动生成）"
+                                                        )
+                                                    });
+                                            }
+                                            Some(tail.unwrap_or_else(|| grok::wrap_up_tail(wctx)))
+                                        }
+                                        _ => None,
+                                    };
+                                    out.extend_from_slice(&inj.complete_with_tail(tail));
+                                    return Some((
+                                        Ok::<_, String>(axum::body::Bytes::from(out)),
+                                        (resp, inj, None, None, drained),
+                                    ));
+                                }
+                                Some((Ok(axum::body::Bytes::from(out)), (resp, inj, cfg, ctx, drained)))
+                            }
+                            Ok(None) => {
+                                // 上游结束：冲刷残留缓冲后关闭
+                                let out = inj.finish();
+                                if out.is_empty() {
+                                    None
+                                } else {
+                                    drained = true;
+                                    Some((Ok(axum::body::Bytes::from(out)), (resp, inj, None, None, drained)))
+                                }
+                            }
+                            Err(e) => {
+                                Some((
+                                    Err(format!("grok2api Messages 流中断: {e}")),
+                                    (resp, inj, None, None, true),
+                                ))
+                            }
+                        }
+                    },
+                );
                 (
                     StatusCode::OK,
                     [(header::CONTENT_TYPE, content_type)],
@@ -1772,6 +1934,30 @@ async fn api_grok_messages(headers: HeaderMap, body: axum::body::Bytes) -> Respo
                     .into_response()
             } else {
                 let body_text = resp.text().await.unwrap_or_default();
+                // 1.2.0：收尾复盘尾块（非流式）——本轮无 tool_use 且历史有工具调用
+                // 时，向 content 数组末尾追加复盘块。
+                let body_text = match &wrap_up_ctx {
+                    Some(ctx) => match grok::parse_response_content(&body_text) {
+                        Some((model_text, false)) => {
+                            let mut reviewed = None;
+                            if cfg.wrap_up_model_review
+                                && grok::wrap_up_review_needed(ctx, &model_text)
+                            {
+                                reviewed = grok::g2a_wrap_up_review(&cfg, ctx, &model_text)
+                                    .await
+                                    .map(|r| {
+                                        format!(
+                                            "【工具链路复盘·网关复核】\n{r}\n（本块由网关在工具链路收尾时自动生成）"
+                                        )
+                                    });
+                            }
+                            let tail = reviewed.unwrap_or_else(|| grok::wrap_up_tail(ctx));
+                            grok::wrap_up_append_to_json(&body_text, &tail)
+                        }
+                        _ => body_text,
+                    },
+                    None => body_text,
+                };
                 log_gateway_request(
                     "grok",
                     key_id.as_deref(),
@@ -4196,6 +4382,81 @@ async fn api_grok_register_close() -> Response {
 }
 
 // ---------------------------------------------------------------------------
+// ChatGPT 通道（gpt-reg-review 工具链托管+控制；handler 薄封装，逻辑在 core
+// chatgpt_channel 模块。管理面免 key——服务仅绑 127.0.0.1，契约 §4）
+// ---------------------------------------------------------------------------
+
+async fn api_chatgpt_channel_status() -> Response {
+    json_ok(chatgpt_channel::status_value().await)
+}
+
+async fn api_chatgpt_webui_start() -> Response {
+    let cfg = chatgpt_channel::load_config();
+    match chatgpt_channel::ensure_webui(&cfg).await {
+        Ok(port) => json_ok(json!({ "ok": true, "port": port })),
+        Err(e) => json_err(e, StatusCode::BAD_GATEWAY),
+    }
+}
+
+async fn api_chatgpt_webui_stop() -> Response {
+    let cfg = chatgpt_channel::load_config();
+    // 批量注册进行中停止 WebUI 会打断注册循环并释放 in_use 号——core 内已先
+    // auto_stop 尽力而为，前端应在停止前二次确认（契约 §3 ⚠️）。
+    let stopped = chatgpt_channel::stop_webui(&cfg).await;
+    json_ok(json!({ "ok": stopped, "stopped": stopped }))
+}
+
+/// 批量注册启动：body（AutoLoopStartReq）透传。target_count 必填 ≥1
+/// （0 = 不限量会无限跑），由前端保证；工具链已在跑时回 400 透传。
+async fn api_chatgpt_registrar_start(Json(body): Json<Value>) -> Response {
+    let cfg = chatgpt_channel::load_config();
+    match chatgpt_channel::auto_start(&cfg, body).await {
+        Ok(v) => json_ok(v),
+        Err(e) => json_err(e, StatusCode::BAD_GATEWAY),
+    }
+}
+
+async fn api_chatgpt_registrar_pause() -> Response {
+    let cfg = chatgpt_channel::load_config();
+    match chatgpt_channel::auto_pause(&cfg).await {
+        Ok(v) => json_ok(v),
+        Err(e) => json_err(e, StatusCode::BAD_GATEWAY),
+    }
+}
+
+async fn api_chatgpt_registrar_resume() -> Response {
+    let cfg = chatgpt_channel::load_config();
+    match chatgpt_channel::auto_resume(&cfg).await {
+        Ok(v) => json_ok(v),
+        Err(e) => json_err(e, StatusCode::BAD_GATEWAY),
+    }
+}
+
+async fn api_chatgpt_registrar_stop() -> Response {
+    let cfg = chatgpt_channel::load_config();
+    match chatgpt_channel::auto_stop(&cfg).await {
+        Ok(v) => json_ok(v),
+        Err(e) => json_err(e, StatusCode::BAD_GATEWAY),
+    }
+}
+
+async fn api_chatgpt_registrar_status() -> Response {
+    json_ok(chatgpt_channel::auto_status(&chatgpt_channel::load_config()).await)
+}
+
+async fn api_chatgpt_registered() -> Response {
+    json_ok(chatgpt_channel::registered(&chatgpt_channel::load_config()).await)
+}
+
+async fn api_chatgpt_accounts() -> Response {
+    json_ok(chatgpt_channel::accounts(&chatgpt_channel::load_config()).await)
+}
+
+async fn api_chatgpt_accounts_sync() -> Response {
+    json_ok(chatgpt_channel::sync_pool(&chatgpt_channel::load_config()).await)
+}
+
+// ---------------------------------------------------------------------------
 // TRAE Work CN 模型反代（V1：目录+权益；对话需客户端会话态暂未开放）
 // ---------------------------------------------------------------------------
 
@@ -6527,6 +6788,89 @@ fn opencode_error_status(msg: &str) -> StatusCode {
     }
 }
 
+/// /opencode/v1 上的 DuMate 档位模型转发（1.0.10）。
+///
+/// 复用 dumate 的核心实现（JSON / SSE 分流 + 错误状态映射），差异只有两点：
+/// ① 日志记在 `opencode` 渠道下；② **不重复鉴权**（外层 opencode handler 已完成）。
+async fn opencode_dumate_bridge(
+    model: &str,
+    body: &Value,
+    started: std::time::Instant,
+) -> Response {
+    if !dumate::load_config().enabled {
+        let msg = "DuMate 网关未启用（可在「DuMate」页开启）".to_string();
+        log_gateway_request("opencode", None, model, false, 0, &msg);
+        return glm_proxy_error(msg, StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    if stream {
+        match dumate::chat_completions_stream(model, body).await {
+            Ok((upstream, actual)) => {
+                log_gateway_request(
+                    "opencode",
+                    None,
+                    &actual,
+                    true,
+                    started.elapsed().as_millis() as u64,
+                    "dumate 档位转发",
+                );
+                let stream = futures_util::stream::unfold(upstream.rx, |mut rx| async move {
+                    rx.recv().await.map(|chunk| (chunk, rx))
+                });
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "text/event-stream".to_string())],
+                    axum::body::Body::from_stream(stream),
+                )
+                    .into_response()
+            }
+            Err(e) => {
+                let status = dumate_error_status(&e.message);
+                log_gateway_request(
+                    "opencode",
+                    None,
+                    model,
+                    false,
+                    started.elapsed().as_millis() as u64,
+                    &e.message,
+                );
+                glm_proxy_error(e.message, status)
+            }
+        }
+    } else {
+        match dumate::chat_completions_json(model, body).await {
+            Ok(value) => {
+                let actual = value
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or(model)
+                    .to_string();
+                log_gateway_request(
+                    "opencode",
+                    None,
+                    &actual,
+                    true,
+                    started.elapsed().as_millis() as u64,
+                    "dumate 档位转发",
+                );
+                json_ok(value)
+            }
+            Err(e) => {
+                let status = dumate_error_status(&e.message);
+                log_gateway_request(
+                    "opencode",
+                    None,
+                    model,
+                    false,
+                    started.elapsed().as_millis() as u64,
+                    &e.message,
+                );
+                glm_proxy_error(e.message, status)
+            }
+        }
+    }
+}
+
 /// GET /opencode/v1/models：只列免费模型。
 async fn api_opencode_v1_models(headers: HeaderMap) -> Response {
     let cfg = opencode::load_config();
@@ -6552,7 +6896,24 @@ async fn api_opencode_v1_models(headers: HeaderMap) -> Response {
         }
     }
     match opencode::models_payload().await {
-        Ok(value) => {
+        Ok(mut value) => {
+            // 1.0.10：并入 DuMate 的 4 个档位模型（dumate-lite/turbo/ultra/points），
+            // 让同一 base_url + 同一把 key 就能选用；取自 dumate 自己的静态目录，
+            // 前置展示便于客户端一眼看到。
+            if dumate::load_config().enabled {
+                let extra = dumate::models_payload()
+                    .get("data")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                if !extra.is_empty() {
+                    if let Some(list) = value.get_mut("data").and_then(Value::as_array_mut) {
+                        let mut merged = extra;
+                        merged.append(list);
+                        *list = merged;
+                    }
+                }
+            }
             let n = value.get("data").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
             log_gateway_request("opencode", None, "models", true, 0, "");
             let _ = n;
@@ -6595,6 +6956,12 @@ async fn api_opencode_chat_completions(headers: HeaderMap, Json(body): Json<Valu
             log_gateway_request("opencode", None, &model, false, 0, &diag);
             return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
         }
+    }
+
+    // 1.0.10：DuMate 的 4 个档位模型（dumate-lite/turbo/ultra/points）也走本入口，
+    // 以 `dumate-` 前缀分流到 dumate 核心（外层已鉴权，不再重复校验）。
+    if model.starts_with("dumate-") {
+        return opencode_dumate_bridge(&model, &body, started).await;
     }
 
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
@@ -6697,6 +7064,294 @@ async fn api_opencode_proxy_config_save(Json(body): Json<Value>) -> Response {
     json_ok(opencode::config_info(port))
 }
 
+// ---------------------------------------------------------------------------
+// DuMate（百度搭子）网关（/dumate/v1）+ 管理面（/api/dumate/*）
+//
+// 契约 docs/dumate-channel-contract.md §3.2：鉴权三态对齐 opencode（自有密钥
+// 或主网关密钥皆放行）；chat handler 对齐 api_opencode_chat_completions 的
+// enabled 检查 / JSON / SSE 分流；成功请求写 gateway_admin 日志（渠道健康
+// 看板的流量数据源，channel_health 的 dumate 行 traffic_source="logs"）。
+// ---------------------------------------------------------------------------
+
+/// 鉴权判定：`Some(true)` = 用了本网关自有密钥；`Some(false)` = 用了兼容密钥（主网关 /v1 的）；
+/// `None` = 不通过。空密钥视为放行（与传统各网关一致）。
+fn dumate_proxy_auth_result(headers: &HeaderMap, cfg: &dumate::DumateProxyConfig) -> Option<bool> {
+    if cfg.api_key.is_empty() {
+        return Some(true);
+    }
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::to_string);
+    let xkey = headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let got = bearer.or(xkey);
+    let Some(got) = got else {
+        return None;
+    };
+    if got == cfg.api_key {
+        return Some(true);
+    }
+    // 兼容：客户端历史上可能只配了主网关密钥。接受主网关密钥以免阻塞接入，
+    // 并在调用侧记一条日志（不是静默放行）。
+    if got == glm_proxy::load_config().api_key {
+        return Some(false);
+    }
+    None
+}
+
+/// 鉴权失败时的「收到的鉴权头长什么样」诊断串（模式同 `opencode_auth_diag`，
+/// 该 helper 绑定各自网关配置类型无法直接复用）：只输出鉴权头前 6 字符与长度、
+/// UA 截断、头名列表与期望 key 的掩码，**绝不落全量密钥**。
+fn dumate_auth_diag(headers: &HeaderMap, cfg: &dumate::DumateProxyConfig) -> String {
+    let mask = |s: &str| -> String {
+        let n = s.chars().count();
+        let p: String = s.chars().take(6).collect();
+        format!("{p}…(len={n})")
+    };
+    let auth = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| mask(v.trim_start_matches("Bearer ")))
+        .unwrap_or_else(|| "<无>".to_string());
+    let xkey = headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(mask)
+        .unwrap_or_else(|| "<无>".to_string());
+    let ua = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.chars().take(40).collect::<String>())
+        .unwrap_or_else(|| "<无>".to_string());
+    let mut names: Vec<String> = headers.keys().map(|k| k.as_str().to_string()).collect();
+    names.sort();
+    format!(
+        "无效的 API Key ｜ 期望={} 实收 Authorization={auth} x-api-key={xkey} UA={ua} 头列表=[{}]",
+        mask(&cfg.api_key),
+        names.join(",")
+    )
+}
+
+/// 「客户端请求体问题」用 400（便于调用方区分该改请求还是该重试），
+/// 「上游/引擎故障」用 502 —— 口径对齐 opencode_error_status。
+fn dumate_error_status(msg: &str) -> StatusCode {
+    if msg.contains("不能为空") {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::BAD_GATEWAY
+    }
+}
+
+/// GET /dumate/v1/models：静态 4 模型目录（lite/turbo/ultra/points）。
+async fn api_dumate_v1_models(headers: HeaderMap) -> Response {
+    let cfg = dumate::load_config();
+    if !cfg.enabled {
+        let msg = "DuMate 网关未启用（可在「DuMate」页开启）";
+        log_gateway_request("dumate", None, "models", false, 0, msg);
+        return glm_proxy_error(msg.to_string(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+    match dumate_proxy_auth_result(&headers, &cfg) {
+        Some(true) => {}
+        Some(false) => log_gateway_request(
+            "dumate",
+            None,
+            "models",
+            true,
+            0,
+            "鉴权通过（兼容主网关密钥；建议在「DuMate」页用本网关自有密钥）",
+        ),
+        None => {
+            let diag = dumate_auth_diag(&headers, &cfg);
+            log_gateway_request("dumate", None, "models", false, 0, &diag);
+            return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+        }
+    }
+    log_gateway_request("dumate", None, "models", true, 0, "");
+    json_ok(dumate::models_payload())
+}
+
+/// POST /dumate/v1/chat/completions：JSON / SSE 分流；引擎同步返回最终消息
+/// （SSE 为聚合后合成帧，见 dumate::chat_completions_stream）。
+async fn api_dumate_chat_completions(headers: HeaderMap, Json(body): Json<Value>) -> Response {
+    let started = std::time::Instant::now();
+    let cfg = dumate::load_config();
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    if !cfg.enabled {
+        let msg = "DuMate 网关未启用（可在「DuMate」页开启）";
+        log_gateway_request("dumate", None, &model, false, 0, msg);
+        return glm_proxy_error(msg.to_string(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+    match dumate_proxy_auth_result(&headers, &cfg) {
+        Some(true) => {}
+        Some(false) => log_gateway_request(
+            "dumate",
+            None,
+            &model,
+            true,
+            0,
+            "鉴权通过（兼容主网关密钥；建议在「DuMate」页用本网关自有密钥）",
+        ),
+        None => {
+            let diag = dumate_auth_diag(&headers, &cfg);
+            log_gateway_request("dumate", None, &model, false, 0, &diag);
+            return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    if stream {
+        match dumate::chat_completions_stream(&model, &body).await {
+            Ok((upstream, actual)) => {
+                log_gateway_request(
+                    "dumate",
+                    None,
+                    &actual,
+                    true,
+                    started.elapsed().as_millis() as u64,
+                    "",
+                );
+                let stream = futures_util::stream::unfold(upstream.rx, |mut rx| async move {
+                    rx.recv().await.map(|chunk| (chunk, rx))
+                });
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "text/event-stream".to_string())],
+                    axum::body::Body::from_stream(stream),
+                )
+                    .into_response()
+            }
+            Err(e) => {
+                let status = dumate_error_status(&e.message);
+                log_gateway_request(
+                    "dumate",
+                    None,
+                    &model,
+                    false,
+                    started.elapsed().as_millis() as u64,
+                    &e.message,
+                );
+                glm_proxy_error(e.message, status)
+            }
+        }
+    } else {
+        match dumate::chat_completions_json(&model, &body).await {
+            Ok(value) => {
+                let actual = value
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&model)
+                    .to_string();
+                log_gateway_request(
+                    "dumate",
+                    None,
+                    &actual,
+                    true,
+                    started.elapsed().as_millis() as u64,
+                    "",
+                );
+                json_ok(value)
+            }
+            Err(e) => {
+                let status = dumate_error_status(&e.message);
+                log_gateway_request(
+                    "dumate",
+                    None,
+                    &model,
+                    false,
+                    started.elapsed().as_millis() as u64,
+                    &e.message,
+                );
+                glm_proxy_error(e.message, status)
+            }
+        }
+    }
+}
+
+/// GET /api/dumate/status：渠道状态聚合（桌面端 / 引擎 / 凭据 / 网关配置 / 积分）。
+async fn api_dumate_status() -> Response {
+    json_ok(dumate::status().await)
+}
+
+/// GET /api/dumate/credits：积分概览（quota_overview 组装）。
+async fn api_dumate_credits() -> Response {
+    json_ok(dumate::get_credits().await)
+}
+
+/// GET /api/dumate/config：接入信息（Base URL / 密钥掩码 / 启用态），只读不触发发现。
+async fn api_dumate_config_get() -> Response {
+    json_ok(dumate::config_info())
+}
+
+/// POST /api/dumate/config：启用开关 / 重新生成或手填密钥 / 引擎静态地址与 inapp key。
+async fn api_dumate_config_post(Json(body): Json<Value>) -> Response {
+    let mut cfg = dumate::load_config();
+    if let Some(enabled) = body.get("enabled").and_then(Value::as_bool) {
+        cfg.enabled = enabled;
+    }
+    if body.get("regenerateKey").and_then(Value::as_bool) == Some(true) {
+        cfg.api_key = glm_proxy::generate_api_key();
+    } else if let Some(key) = body.get("apiKey").and_then(Value::as_str) {
+        let key = key.trim();
+        if !key.is_empty() {
+            cfg.api_key = key.to_string();
+        }
+    }
+    if let Some(url) = body.get("opencodeUrl").and_then(Value::as_str) {
+        cfg.opencode_url = url.trim().to_string();
+    }
+    if let Some(key) = body.get("inappKey").and_then(Value::as_str) {
+        cfg.inapp_key = key.trim().to_string();
+    }
+    if let Err(e) = dumate::save_config(&cfg) {
+        return json_err(e, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    json_ok(dumate::config_info())
+}
+
+/// POST /api/dumate/checkin：本机账号一键签到（status → claim，幂等）。
+/// 凭据缺失时也照常执行——上游链路会给出「请打开 DuMate 客户端重新登录」的人话报错。
+async fn api_dumate_checkin() -> Response {
+    let account = platform_checkin::discover_dumate_account().unwrap_or_else(|| {
+        json!({
+            "id": format!("{}:local", platform_checkin::PLATFORM_DUMATE),
+            "email": "DuMate 本机账号",
+        })
+    });
+    let res = platform_checkin::perform_dumate_checkin(&account).await;
+    json_ok(json!({
+        "id": account.get("id").cloned().unwrap_or(Value::Null),
+        "result": res.get("result").cloned().unwrap_or(json!("error")),
+        "message": res.get("message").cloned().unwrap_or(Value::Null),
+        "error": res.get("error").cloned().unwrap_or(Value::Null),
+    }))
+}
+
+/// GET /api/dumate/checkin-status：今日签到状态（loginBonusInfo 直查）。
+async fn api_dumate_checkin_status() -> Response {
+    let mut v = platform_checkin::get_dumate_status().await;
+    // 前端契约（§4.1）按顶层读 totalTimes/totalPoints/signInDays；上游字段在 raw 里，
+    // 这里拍平到顶层（raw 保留兜底），否则前端数字与 7 天打点全部落空。
+    if let (Some(raw), Some(obj)) = (v.get("raw").cloned(), v.as_object_mut()) {
+        if let Some(raw_obj) = raw.as_object() {
+            for key in ["totalTimes", "totalPoints", "signInDays", "hasIssued"] {
+                if let Some(val) = raw_obj.get(key) {
+                    obj.entry(key.to_string()).or_insert(val.clone());
+                }
+            }
+        }
+    }
+    json_ok(v)
+}
+
 /// Loomy 对话补全（Anthropic Claude Messages 协议兼容）。
 async fn api_loomy_anthropic_messages(
     headers: HeaderMap,
@@ -6754,6 +7409,271 @@ async fn api_loomy_protection_cooldown_clear(Json(body): Json<Value>) -> Respons
 }
 
 /// AutoClaw 网关状态（UI 用）。
+// ---------------------------------------------------------------------------
+// GLM Plan 网关（1.4.0 新通道：GLM Coding Plan 账号池 → OpenAI/Anthropic）
+// ---------------------------------------------------------------------------
+
+fn glmplan_mask_key(key: &str) -> String {
+    if key.len() <= 10 {
+        "*".repeat(key.len())
+    } else {
+        format!("{}...{}", &key[..6], &key[key.len() - 4..])
+    }
+}
+
+fn glmplan_key_ok(headers: &HeaderMap) -> bool {
+    let cfg = glmplan::load_config();
+    let got = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()));
+    matches!(got, Some(k) if k == cfg.api_key)
+}
+
+async fn api_glmplan_status() -> Response {
+    let cfg = glmplan::load_config();
+    let stats = glmplan::cache_stats();
+    let accounts: Vec<Value> = cfg
+        .accounts
+        .iter()
+        .map(|a| {
+            json!({
+                "id": a.id,
+                "label": a.label,
+                "provider": a.provider,
+                "providerLabel": glmplan::provider_label(&a.provider),
+                "apiKeyMasked": glmplan_mask_key(&a.api_key),
+                "enabled": a.enabled,
+                "lastError": a.last_error,
+                "cooling": a.cooldown_until_ms > glmplan::now_ms(),
+            })
+        })
+        .collect();
+    let port = BOUND_PORT.get().copied().unwrap_or(57890);
+    json_ok(json!({
+        "enabled": cfg.enabled,
+        "apiKey": cfg.api_key,
+        "apiKeyMasked": glmplan_mask_key(&cfg.api_key),
+        "defaultProvider": cfg.default_provider,
+        "defaultModel": cfg.default_model,
+        "models": cfg.models,
+        "accounts": accounts,
+        "cache": {
+            "enabled": cfg.cache_enabled,
+            "hits": stats.hits,
+            "misses": stats.misses,
+            "entries": stats.entries,
+        },
+        "endpoint": format!("http://127.0.0.1:{port}/glmplan/v1"),
+    }))
+}
+
+async fn api_glmplan_test(Json(body): Json<Value>) -> Response {
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("glm-4.6").to_string();
+    let prompt = body.get("prompt").and_then(Value::as_str).unwrap_or("只回复 OK").to_string();
+    let payload = json!({
+        "model": model,
+        "messages": [{ "role": "user", "content": prompt }],
+        "max_tokens": 512,
+    });
+    let started = std::time::Instant::now();
+    match glmplan::chat_completions(payload).await {
+        Ok(v) => {
+            let content = v
+                .pointer("/choices/0/message/content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let served = v
+                .pointer("/model")
+                .and_then(Value::as_str)
+                .unwrap_or(&model)
+                .to_string();
+            json_ok(json!({
+                "ok": true,
+                "content": content,
+                "model": served,
+                "latencyMs": started.elapsed().as_millis() as u64,
+            }))
+        }
+        Err((status, err)) => json_ok(json!({
+            "ok": false,
+            "error": err,
+            "status": status,
+        })),
+    }
+}
+
+async fn api_glmplan_config_save(Json(body): Json<Value>) -> Response {
+    let mut cfg = glmplan::load_config();
+    if let Some(b) = body.get("enabled").and_then(Value::as_bool) {
+        cfg.enabled = b;
+    }
+    if let Some(p) = body.get("defaultProvider").and_then(Value::as_str) {
+        if glmplan::provider_info(p).is_some() {
+            cfg.default_provider = p.to_string();
+        }
+    }
+    if let Some(m) = body.get("defaultModel").and_then(Value::as_str) {
+        if !m.is_empty() {
+            cfg.default_model = m.to_string();
+        }
+    }
+    if let Some(b) = body.get("cacheEnabled").and_then(Value::as_bool) {
+        cfg.cache_enabled = b;
+    }
+    if let Some(b) = body.get("spoof").and_then(Value::as_bool) {
+        cfg.spoof = b;
+    }
+    if body.get("regenerateKey").and_then(Value::as_bool).unwrap_or(false) {
+        cfg.api_key = glmplan::gen_api_key();
+    }
+    glmplan::save_config(&cfg);
+    json_ok(json!({ "ok": true }))
+}
+
+async fn api_glmplan_accounts_add(Json(body): Json<Value>) -> Response {
+    let provider = body
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if glmplan::provider_info(&provider).is_none() {
+        return json_err(
+            "provider 必须为 bigmodel（国内版）或 zai（国际版）".to_string(),
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    let api_key = body
+        .get("apiKey")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if api_key.is_empty() {
+        return json_err("缺少 apiKey".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let label = body
+        .get("label")
+        .and_then(Value::as_str)
+        .unwrap_or("未命名")
+        .trim()
+        .to_string();
+    let mut cfg = glmplan::load_config();
+    if cfg.accounts.iter().any(|a| a.api_key == api_key) {
+        return json_err("该 API Key 已在账号池中".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let id = glmplan::gen_id();
+    cfg.accounts.push(glmplan::PlanAccount {
+        id: id.clone(),
+        label,
+        provider,
+        api_key,
+        enabled: true,
+        added_at: glmplan::now_ms(),
+        last_error: None,
+        cooldown_until_ms: 0,
+    });
+    if !cfg.enabled {
+        cfg.enabled = true;
+    }
+    glmplan::save_config(&cfg);
+    json_ok(json!({ "ok": true, "id": id }))
+}
+
+async fn api_glmplan_accounts_remove(Json(body): Json<Value>) -> Response {
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("");
+    let mut cfg = glmplan::load_config();
+    let before = cfg.accounts.len();
+    cfg.accounts.retain(|a| a.id != id);
+    if cfg.accounts.len() == before {
+        return json_err("账号不存在".to_string(), StatusCode::NOT_FOUND);
+    }
+    glmplan::save_config(&cfg);
+    json_ok(json!({ "ok": true }))
+}
+
+async fn api_glmplan_accounts_enable(Json(body): Json<Value>) -> Response {
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("");
+    let enabled = body.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+    let mut cfg = glmplan::load_config();
+    match cfg.accounts.iter_mut().find(|a| a.id == id) {
+        Some(a) => {
+            a.enabled = enabled;
+            a.cooldown_until_ms = 0;
+            glmplan::save_config(&cfg);
+            json_ok(json!({ "ok": true }))
+        }
+        None => json_err("账号不存在".to_string(), StatusCode::NOT_FOUND),
+    }
+}
+
+async fn api_glmplan_models(headers: HeaderMap, RawQuery(raw_query): RawQuery) -> Response {
+    if !glmplan_key_ok(&headers) {
+        return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+    }
+    let cfg = glmplan::load_config();
+    let region = raw_query.as_deref().and_then(|q| {
+        q.split('&')
+            .find_map(|kv| kv.strip_prefix("region=").map(|v| v.to_string()))
+    });
+    json_ok(glmplan::models_payload_filtered(&cfg, region.as_deref()))
+}
+
+async fn api_glmplan_chat(headers: HeaderMap, Json(body): Json<Value>) -> Response {
+    if !glmplan_key_ok(&headers) {
+        return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+    }
+    let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    if streaming {
+        return match glmplan::chat_stream(body).await {
+            Ok(resp) => {
+                let ct = resp
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .cloned()
+                    .unwrap_or(header::HeaderValue::from_static("text/event-stream"));
+                let stream = futures_util::stream::unfold(resp, |mut r| async move {
+                    match r.chunk().await {
+                        Ok(Some(c)) => Some((Ok::<_, String>(c), r)),
+                        Ok(None) => None,
+                        Err(e) => Some((Err(format!("GLM Plan 流中断: {e}")), r)),
+                    }
+                });
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, ct)],
+                    axum::body::Body::from_stream(stream),
+                )
+                    .into_response()
+            }
+            Err((s, e)) => {
+                glm_proxy_error(e, StatusCode::from_u16(s).unwrap_or(StatusCode::BAD_GATEWAY))
+            }
+        };
+    }
+    match glmplan::chat_completions(body).await {
+        Ok(v) => json_ok(v),
+        Err((s, e)) => glm_proxy_error(e, StatusCode::from_u16(s).unwrap_or(StatusCode::BAD_GATEWAY)),
+    }
+}
+
+async fn api_glmplan_messages(headers: HeaderMap, Json(body): Json<Value>) -> Response {
+    if !glmplan_key_ok(&headers) {
+        return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+    }
+    match glmplan::anthropic_messages(body).await {
+        Ok((status, text)) => (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
+            [(header::CONTENT_TYPE, "application/json")],
+            text,
+        )
+            .into_response(),
+        Err((s, e)) => glm_proxy_error(e, StatusCode::from_u16(s).unwrap_or(StatusCode::BAD_GATEWAY)),
+    }
+}
+
 async fn api_glm_proxy_status() -> Response {
     json_ok(glm_proxy::gateway_status().await)
 }
@@ -6976,7 +7896,7 @@ fn is_api_namespace(path: &str) -> bool {
     // ⚠️ 新增网关路由时务必在此登记，否则未知子路径会落进 SPA 兜底返回 200 HTML，
     //    把「路由不存在」伪装成成功（排查时极具误导性）。
     //    注意：`qwen` 一条**覆盖不到** `qwen3.8-flash`（要求前缀后紧跟 `/`），必须单独登记。
-    const WITH_SUB: [&str; 15] = [
+    const WITH_SUB: [&str; 16] = [
         "api",
         "v1",
         "kimi",
@@ -7001,6 +7921,8 @@ fn is_api_namespace(path: &str) -> bool {
         // OpenCode 网关（/opencode/v1/*，2026-09-22 三拆新增）。
         // ⚠️ `opencode` 这一条只兜 `/opencode/<子路径>`；`/opencode`（前端页面）无尾斜杠，不受影响。
         "opencode",
+        // DuMate（百度搭子）网关（/dumate/v1/*，2026-10-01 接入；`/dumate` 单段是前端页面）。
+        "dumate",
     ];
 
     if EXACT.contains(&path) {

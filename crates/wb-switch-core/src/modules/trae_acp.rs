@@ -44,6 +44,7 @@
 use bytes::Bytes;
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::modules::config::{home_dir, now_ms};
@@ -79,6 +80,7 @@ const STEP_DEADLINE_SECS: u64 = 60;
 const ID_INITIALIZE: &str = "wb-acp-init";
 const ID_SESSION_NEW: &str = "wb-acp-new";
 const ID_SET_MODE: &str = "wb-acp-mode";
+const ID_SET_MODEL: &str = "wb-acp-model";
 const ID_PROMPT: &str = "wb-acp-prompt";
 
 /// initialize 的 clientInfo。
@@ -88,6 +90,356 @@ const CLIENT_NAME: &str = "wb-switch";
 /// （cwd 白名单才是真实控制面）；请求体可用 `acpMode` 覆盖。
 const DEFAULT_MODE: &str = "bypassPermissions";
 
+/// 内置模型目录 TTL 缓存（契约 §3.1：TTL 300s，`source:"acp-cache"` 供前端标注）。
+const NATIVE_CATALOG_TTL_MS: i64 = 300 * 1000;
+
+/// 目录探测专用 cwd 尾段（`%TEMP%\wb-native-catalog-probe`）：与 IDE 会话隔离，
+/// 不污染用户正在用的项目会话（session/new 对同 cwd 会复用既有会话）。
+const NATIVE_CATALOG_PROBE_DIR: &str = "wb-native-catalog-probe";
+
+/// 「刚探测完」判定窗口：`now - probed_at` 小于该值视为 acp-live，否则 acp-cache。
+/// probed_at 在探测完成后写入，新探测的 delta 通常 <1s。
+const NATIVE_CATALOG_FRESH_MS: i64 = 3_000;
+
+/// 档位别名（WorkBuddy UI 的三档快捷选择，非真实模型）。
+const TIER_MODEL_IDS: [&str; 3] = ["fast-model", "balanced-model", "deep-model"];
+
+/// 自定义接入条目前缀（用户自定义接入，随用户配置漂移）。
+const CUSTOM_MODEL_PREFIX: &str = "custom-local:";
+
+// ---------------------------------------------------------------------------
+// 内置模型目录（契约 §3.1 / §3.3：ACP session/new 实时探测）
+// ---------------------------------------------------------------------------
+
+/// 一条内置模型目录条目。`kind`：`tier`（档位别名）| `model`（实模）| `custom`（自定义接入）。
+///
+/// `exposed`（契约 §2.1）：该 id 是否被 ACP `session/new` 的 `models.availableModels`
+/// 实时暴露 —— ACP 命中=true；仅来自客户端产品配置补充源=false（2026-09-25 实测
+/// 上游不再暴露内置实模，补充源是内置清单的唯一可用来源，可调用性以实测为准）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeModel {
+    pub id: String,
+    pub name: String,
+    pub multiplier: Option<f64>,
+    pub kind: &'static str,
+    pub exposed: bool,
+}
+
+/// 一次目录探测的产物（契约 §3.3）。
+#[derive(Clone, Debug)]
+pub struct NativeCatalog {
+    pub models: Vec<NativeModel>,
+    /// 会话默认模型（session/new 的 `models.currentModelId`；缺失为空串）。
+    pub current_model_id: String,
+    /// 探测完成时刻（ms）。
+    pub probed_at: i64,
+    /// 探测命中的 WorkBuddy 实例端口。
+    pub port: u16,
+}
+
+impl NativeCatalog {
+    /// 请求模型是否在目录内（tier/model/custom 全部算「可走 native」；
+    /// 契约 §3.2①：set_model 对未知 ID 假成功，兜底判定必须在网关侧对照目录）。
+    pub fn contains_id(&self, id: &str) -> bool {
+        self.models.iter().any(|m| m.id == id)
+    }
+
+    /// 探测是否「刚完成」（未走 TTL 缓存）——payload 组装据此标
+    /// `source:"acp-live"`，否则 `source:"acp-cache"`（契约 §3.1）。
+    pub fn is_fresh(&self) -> bool {
+        now_ms() - self.probed_at < NATIVE_CATALOG_FRESH_MS
+    }
+}
+
+/// 目录 TTL 缓存：`(写入时刻, 目录)`。进程内共享；测试不触碰（探测要走网络）。
+static NATIVE_CATALOG_CACHE: Mutex<Option<(i64, NativeCatalog)>> = Mutex::new(None);
+
+/// 目录探测 cwd：`%TEMP%\wb-native-catalog-probe`。
+fn native_catalog_probe_cwd() -> String {
+    std::env::temp_dir()
+        .join(NATIVE_CATALOG_PROBE_DIR)
+        .to_string_lossy()
+        .to_string()
+}
+
+/// WorkBuddy 内置模型目录（契约 §3.3）：300s TTL 缓存，缓存内不重打上游。
+pub async fn native_models_catalog() -> Result<NativeCatalog, String> {
+    {
+        let guard = NATIVE_CATALOG_CACHE.lock().unwrap();
+        if let Some((at, catalog)) = guard.as_ref() {
+            if now_ms() - *at < NATIVE_CATALOG_TTL_MS {
+                return Ok(catalog.clone());
+            }
+        }
+    }
+    native_models_catalog_refresh().await
+}
+
+/// 强制刷新目录（绕过 TTL 缓存重探测一次）。
+pub async fn native_models_catalog_refresh() -> Result<NativeCatalog, String> {
+    let catalog = probe_native_catalog().await?;
+    {
+        let mut guard = NATIVE_CATALOG_CACHE.lock().unwrap();
+        *guard = Some((now_ms(), catalog.clone()));
+    }
+    Ok(catalog)
+}
+
+/// 目录探测（契约 §3.3）：注册表取心跳最新实例 → connect → initialize →
+/// session/new（探针 cwd，**不受 acp_allowed_dirs 门禁**——目录发现不涉内容
+/// 转发）→ 解析 `models.availableModels` + `configOptions` 的 model select。
+/// 连接随作用域关闭；探针会话由服务端生命周期管理，无需显式删除。
+async fn probe_native_catalog() -> Result<NativeCatalog, String> {
+    let entry = scan_registry().ok_or_else(|| {
+        "未发现运行中的 WorkBuddy 会话（~/.workbuddy/sessions 注册表 5 分钟心跳内无活跃条目）".to_string()
+    })?;
+    let conn = acp_connect(entry.port).await?;
+    acp_call(
+        &conn,
+        ID_INITIALIZE,
+        "initialize",
+        json!({
+            "protocolVersion": 1,
+            "capabilities": {},
+            "clientInfo": {"name": CLIENT_NAME, "version": env!("CARGO_PKG_VERSION")},
+        }),
+    )
+    .await?;
+    let new_result = acp_call(
+        &conn,
+        ID_SESSION_NEW,
+        "session/new",
+        json!({
+            "cwd": native_catalog_probe_cwd(),
+            "mcpServers": [],
+        }),
+    )
+    .await?;
+    let mut catalog = parse_native_catalog(&new_result, entry.port).ok_or_else(|| {
+        "ACP session/new 响应缺少 models.availableModels（无法构建内置模型目录）".to_string()
+    })?;
+    // 契约 §2.1：ACP 探测成功后合并「内置补充源」（客户端产品配置）。合并失败
+    // 静默跳过——绝不让目录探测因此失败（补充源是 Electron 缓存，随时可能变形）。
+    if let Ok(text) = std::fs::read_to_string(product_config_path()) {
+        if let Ok(value) = serde_json::from_str::<Value>(&text) {
+            catalog = merge_product_config_models(catalog, &value);
+        }
+    }
+    Ok(catalog)
+}
+
+// ---------------------------------------------------------------------------
+// 内置补充源（契约 §2.1：~/.workbuddy/cache/acc-product-config-v3.json）
+// ---------------------------------------------------------------------------
+
+/// 客户端产品配置缓存（Electron 写入的只读缓存，宽松解析、绝不写入）。
+const PRODUCT_CONFIG_REL_PATH: [&str; 3] = [".workbuddy", "cache", "acc-product-config-v3.json"];
+
+/// 产品配置缓存路径（`~/.workbuddy/cache/acc-product-config-v3.json`，home 拼接）。
+fn product_config_path() -> PathBuf {
+    let mut dir = home_dir();
+    for part in PRODUCT_CONFIG_REL_PATH {
+        dir = dir.join(part);
+    }
+    dir
+}
+
+/// 宽松解析产品配置里的内置模型 id 清单（纯函数，注入 JSON 便于单测）：
+/// 递归找 `name=="cli"` 且 `models` 为字符串数组的对象；找不到则回落「任何含
+/// `fast-model` 的 models 字符串数组」；两者皆无 → 空表（调用方静默跳过）。
+fn product_config_cli_model_ids(root: &Value) -> Vec<String> {
+    let mut cli_hit: Option<Vec<String>> = None;
+    let mut any_fast: Option<Vec<String>> = None;
+    walk_product_config(root, &mut cli_hit, &mut any_fast);
+    cli_hit.or(any_fast).unwrap_or_default()
+}
+
+/// 递归遍历：记录首个 `name=="cli"` 命中与首个含 `fast-model` 的 models 数组。
+fn walk_product_config(
+    value: &Value,
+    cli_hit: &mut Option<Vec<String>>,
+    any_fast: &mut Option<Vec<String>>,
+) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                walk_product_config(item, cli_hit, any_fast);
+            }
+        }
+        Value::Object(map) => {
+            if let Some(models) = map
+                .get("models")
+                .and_then(Value::as_array)
+                .map(|items| models_string_list(items))
+            {
+                if !models.is_empty() {
+                    if map.get("name").and_then(Value::as_str) == Some("cli") {
+                        if cli_hit.is_none() {
+                            *cli_hit = Some(models);
+                        }
+                    } else if any_fast.is_none()
+                        && models.iter().any(|m| m == "fast-model")
+                    {
+                        *any_fast = Some(models);
+                    }
+                }
+            }
+            for child in map.values() {
+                walk_product_config(child, cli_hit, any_fast);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// models 数组 → 字符串清单（只收字符串元素；变形/混合类型静默剔除）。
+fn models_string_list(items: &[Value]) -> Vec<String> {
+    items
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// 合并纯函数（契约 §2.1，注入产品配置 JSON 便于单测）：对不在 ACP
+/// availableModels 里的 id 追加 `NativeModel { name: id 原样, multiplier: None,
+/// kind: "model", exposed: false }`；ACP 命中的既有条目保持 `exposed: true`。
+fn merge_product_config_models(mut catalog: NativeCatalog, product_config: &Value) -> NativeCatalog {
+    for id in product_config_cli_model_ids(product_config) {
+        if catalog.models.iter().any(|m| m.id == id) {
+            continue;
+        }
+        catalog.models.push(NativeModel {
+            name: id.clone(),
+            multiplier: None,
+            kind: "model",
+            exposed: false,
+            id,
+        });
+    }
+    catalog
+}
+
+/// 解析 session/new result → 目录（纯函数，便于单测）。
+///
+/// - id 权威来源：`models.availableModels[].modelId`（顺序 = 服务端返回序）；
+/// - name / multiplier 优先取 `configOptions` 中 `id=="model"` 的 select
+///   （`options[].value/name/description`），缺失时回落 availableModels 条目；
+/// - multiplier 从 description 的 `x<float>` 解析（如 "x0.21" → 0.21），失败为 null；
+/// - kind：档位别名 → tier，`custom-local:*` → custom，其余 → model。
+fn parse_native_catalog(result: &Value, port: u16) -> Option<NativeCatalog> {
+    let available = result.pointer("/models/availableModels")?.as_array()?;
+    let current_model_id = result
+        .pointer("/models/currentModelId")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    // model select 的 (value → (name, description)) 映射（线性查表，条目量 ~50）。
+    let mut select: Vec<(&str, &str, Option<&str>)> = Vec::new();
+    if let Some(options) = result
+        .pointer("/configOptions")
+        .and_then(Value::as_array)
+        .and_then(|opts| {
+            opts.iter()
+                .find(|o| o.get("id").and_then(Value::as_str) == Some("model"))
+                .and_then(|o| o.get("options"))
+                .and_then(Value::as_array)
+        })
+    {
+        for option in options {
+            if let (Some(value), Some(name)) = (
+                option.get("value").and_then(Value::as_str),
+                option.get("name").and_then(Value::as_str),
+            ) {
+                select.push((value, name, option.get("description").and_then(Value::as_str)));
+            }
+        }
+    }
+    let models = available
+        .iter()
+        .filter_map(|entry| {
+            let id = entry.get("modelId").and_then(Value::as_str)?;
+            let hit = select.iter().find(|(value, _, _)| *value == id);
+            let name = hit
+                .map(|(_, name, _)| *name)
+                .or_else(|| entry.get("name").and_then(Value::as_str))
+                .unwrap_or(id);
+            let description = hit
+                .and_then(|(_, _, desc)| *desc)
+                .or_else(|| entry.get("description").and_then(Value::as_str));
+            Some(NativeModel {
+                id: id.to_string(),
+                name: name.to_string(),
+                multiplier: description.and_then(parse_multiplier),
+                kind: model_kind(id),
+                // ACP availableModels 条目 = 实时暴露（契约 §2.1）。
+                exposed: true,
+            })
+        })
+        .collect();
+    Some(NativeCatalog {
+        models,
+        current_model_id,
+        probed_at: now_ms(),
+        port,
+    })
+}
+
+/// multiplier 解析：取 description 中首个 `x<float>`（如 "x0.21"、"credits x0.29"、
+/// "x0.34 credits"）。解析失败 → None（契约：解析失败为 null）。纯函数，便于单测。
+/// pub(crate)：池网关模型目录（workbuddy_upstream 的 credits 字段）复用同一解析口径。
+pub(crate) fn parse_multiplier(description: &str) -> Option<f64> {
+    let lower = description.trim().to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    for (idx, byte) in bytes.iter().enumerate() {
+        if *byte != b'x' {
+            continue;
+        }
+        let rest = &lower[idx + 1..];
+        let number: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        // 仅有 `.`（如 "x."）不算数字。
+        if number.is_empty() || number == "." {
+            continue;
+        }
+        if let Ok(value) = number.parse::<f64>() {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// kind 判定（契约 §3.3）：档位别名 → tier，`custom-local:*` → custom，否则 model。
+fn model_kind(id: &str) -> &'static str {
+    if TIER_MODEL_IDS.contains(&id) {
+        "tier"
+    } else if id.starts_with(CUSTOM_MODEL_PREFIX) {
+        "custom"
+    } else {
+        "model"
+    }
+}
+
+/// 请求模型解析（契约 §3.3）：`model` 缺省/空 → None；"trae"/"workbuddy" 历史
+/// 占位值视同 None（保证 /trae/v1 行为不变——占位不触发 set_model）。
+/// /workbuddy-proxy 的 native-first 编排复用同一口径。
+pub fn native_request_model(body: &Value) -> Option<String> {
+    body.get("model")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .filter(|s| s != "trae" && s != "workbuddy")
+}
+
+/// `session/set_model` 参数（提取为纯函数供单测；2026-09-25 实测：
+/// `{sessionId, modelId}`，成功回 `result:{modelId}`，对非法 ID 也假成功）。
+fn build_set_model_params(session_id: &str, model_id: &str) -> Value {
+    json!({"sessionId": session_id, "modelId": model_id})
+}
+
 // ---------------------------------------------------------------------------
 // 公开 API
 // ---------------------------------------------------------------------------
@@ -96,6 +448,13 @@ const DEFAULT_MODE: &str = "bypassPermissions";
 /// 活跃条目的 `(端口, sessionId)`；无活跃条目（或目录不存在/全部损坏）返回 None。
 pub async fn discover_active_session() -> Option<(u16, String)> {
     scan_registry().map(|hit| (hit.port, hit.session_id))
+}
+
+/// 同步判定是否存在 5 分钟心跳内的活跃 WorkBuddy 会话（契约 §2.2：gateway_overview
+/// 的 `fetch_accounts` 是同步函数、不能 await 目录探测，用该信号近似「WorkBuddy
+/// 在线」）。只读注册表文件，无网络请求。
+pub fn has_active_session() -> bool {
+    scan_registry().is_some()
 }
 
 /// WorkBuddy 桌面端自带模型：从内嵌 `codebuddy --serve` 进程的命令行提取
@@ -174,17 +533,24 @@ pub async fn chat_completions(body: Value) -> Result<TraeAcpChat, (u16, String)>
         ));
     }
 
-    // ② 请求解析。
+    // ② 请求解析。model 三态（契约 §3.3）：
+    //    - `native_request_model()` → Some(id)：走 session/set_model 真切换；
+    //    - None（缺省/空/"trae"/"workbuddy" 占位）：不 set_model，用会话默认模型
+    //      （/trae/v1 历史占位语义由此保持不变——占位值不触发 set_model）；
+    //    - 响应 `model` 字段回显（契约 §3.2）：请求显式值（含占位原样）优先，
+    //      缺省时回显会话 currentModelId（session/new 后经 PromptEvent::Model 覆盖），
+    //      再兜底 "trae"（连接早错、尚未拿到会话信息的极端路径）。
     let stream = body
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let model = body
+    let model_switch = native_request_model(&body);
+    let raw_model = body
         .get("model")
         .and_then(Value::as_str)
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or("trae")
-        .to_string();
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let model_echo_fallback = raw_model.clone().unwrap_or_else(|| "trae".to_string());
     let messages = body
         .get("messages")
         .and_then(Value::as_array)
@@ -233,15 +599,26 @@ pub async fn chat_completions(body: Value) -> Result<TraeAcpChat, (u16, String)>
 
     // ⑤ ACP 转发（pump 任务独立跑，事件经 channel 汇出；断线重连一次在 pump 内）。
     let (tx, mut rx) = tokio::sync::mpsc::channel::<PromptEvent>(64);
-    let handle = tokio::spawn(pump_prompt(entry.port, cwd, mode, prompt, tx));
+    let handle = tokio::spawn(pump_prompt(
+        entry.port,
+        cwd,
+        mode,
+        model_switch,
+        raw_model,
+        prompt,
+        tx,
+    ));
 
     if !stream {
         // 非流式：聚合 agent_message_chunk 文本为单条 completion。
         let mut text = String::new();
         let mut stop = "end_turn".to_string();
         let mut failure: Option<String> = None;
+        // 响应 model 回显：请求显式值优先，缺省时取会话默认（PromptEvent::Model）。
+        let mut echo_model = model_echo_fallback.clone();
         while let Some(event) = rx.recv().await {
             match event {
+                PromptEvent::Model(model) => echo_model = model,
                 PromptEvent::Text(chunk) => text.push_str(&chunk),
                 PromptEvent::Finished(reason) => stop = reason,
                 PromptEvent::Failed(message) => failure = Some(message),
@@ -256,7 +633,7 @@ pub async fn chat_completions(body: Value) -> Result<TraeAcpChat, (u16, String)>
             "id": id,
             "object": "chat.completion",
             "created": now_ms() / 1000,
-            "model": model,
+            "model": echo_model,
             "choices": [{
                 "index": 0,
                 "message": {"role": "assistant", "content": text},
@@ -268,27 +645,44 @@ pub async fn chat_completions(body: Value) -> Result<TraeAcpChat, (u16, String)>
     }
 
     // 流式：事件 → OpenAI chunk 帧翻译。
+    // 首帧（role）从「立即发」改为「拿到回显 model 后发」——run_attempt 在
+    // session/new 后先汇 PromptEvent::Model（契约 §3.2 的 currentModelId 回显），
+    // 该事件必先于任何文本增量，帧序不变；仅「连接即失败」的早错路径不再先发
+    // role 帧（错误帧内容不变）。
     let (client_tx, client_rx) = tokio::sync::mpsc::channel::<Result<Bytes, String>>(16);
     tokio::spawn(async move {
         let id = format!("chatcmpl-trae-{}", uuid::Uuid::new_v4());
-        // 首帧：role（OpenAI 流式惯例）。
-        if client_tx
-            .send(Ok(Bytes::from(openai_chunk(
-                &id,
-                &model,
-                json!({"role": "assistant", "content": ""}),
-                None,
-            ))))
-            .await
-            .is_err()
-        {
-            return;
+        let mut model = model_echo_fallback;
+        let mut role_sent = false;
+        // 首帧：role（OpenAI 流式惯例）；model 回显就绪后立即发。
+        macro_rules! send_role {
+            () => {
+                if !role_sent
+                    && client_tx
+                        .send(Ok(Bytes::from(openai_chunk(
+                            &id,
+                            &model,
+                            json!({"role": "assistant", "content": ""}),
+                            None,
+                        ))))
+                        .await
+                        .is_err()
+                {
+                    return; // 下游已断开
+                }
+                role_sent = true;
+            };
         }
         let mut stop = "end_turn".to_string();
         let mut failure: Option<String> = None;
         while let Some(event) = rx.recv().await {
             match event {
+                PromptEvent::Model(echo) => {
+                    model = echo;
+                    send_role!();
+                }
                 PromptEvent::Text(chunk) => {
+                    send_role!();
                     if client_tx
                         .send(Ok(Bytes::from(openai_chunk(
                             &id,
@@ -302,7 +696,10 @@ pub async fn chat_completions(body: Value) -> Result<TraeAcpChat, (u16, String)>
                         return; // 下游已断开
                     }
                 }
-                PromptEvent::Finished(reason) => stop = reason,
+                PromptEvent::Finished(reason) => {
+                    stop = reason;
+                    send_role!();
+                }
                 PromptEvent::Failed(message) => failure = Some(message),
             }
         }
@@ -740,6 +1137,9 @@ impl SseLines {
 
 /// pump 向上层（流式翻译器 / 聚合器）汇出的事件。
 enum PromptEvent {
+    /// 响应 `model` 字段的回显值（session/new 后汇出：请求显式 model 优先，
+    /// 否则该会话的 currentModelId；契约 §3.2「缺省时回显 currentModelId」）。
+    Model(String),
     /// agent_message_chunk 增量文本。
     Text(String),
     /// 本轮正常结束（stopReason）。
@@ -764,13 +1164,25 @@ async fn pump_prompt(
     port: u16,
     cwd: String,
     mode: String,
+    model: Option<String>,
+    echo_hint: Option<String>,
     prompt: String,
     tx: tokio::sync::mpsc::Sender<PromptEvent>,
 ) {
     let mut first_error: Option<String> = None;
     let mut emitted = false;
     for attempt in 0..2u8 {
-        match run_attempt(port, &cwd, &mode, &prompt, &tx).await {
+        match run_attempt(
+            port,
+            &cwd,
+            &mode,
+            model.as_deref(),
+            echo_hint.as_deref(),
+            &prompt,
+            &tx,
+        )
+        .await
+        {
             Ok(outcome) => {
                 let _ = tx
                     .send(PromptEvent::Finished(outcome.stop_reason))
@@ -814,11 +1226,15 @@ async fn pump_prompt(
 }
 
 /// 单轮 attempt：connect → initialize → session/new →(best-effort set_mode)→
-/// session/prompt，增量块经 tx 汇出。
+/// (Some(model) 时 session/set_model)→ session/prompt，增量块经 tx 汇出。
+/// `echo_hint`：请求显式 model 原值（含 "trae"/"workbuddy" 占位），回显优先级
+/// 高于会话 currentModelId——显式占位请求的响应 model 字段保持历史行为。
 async fn run_attempt(
     port: u16,
     cwd: &str,
     mode: &str,
+    model: Option<&str>,
+    echo_hint: Option<&str>,
     prompt: &str,
     tx: &tokio::sync::mpsc::Sender<PromptEvent>,
 ) -> Result<AttemptOutcome, AttemptError> {
@@ -886,6 +1302,34 @@ async fn run_attempt(
         json!({"sessionId": session_id, "modeId": mode}),
     )
     .await;
+    // 4b) session/set_model（契约 §3.3）：请求显式指定内置模型时真切换。
+    //     失败走 AttemptError 重试链（重连一次后仍失败 → 上层 502/兜底）。
+    //     注意：set_model 对非法 ID 假成功，合法性由调用方（网关侧）对照目录校验。
+    //     响应 model 回显（契约 §3.2）：请求显式值（含占位原样）优先，缺省时
+    //     回显会话 currentModelId（session/new 的 models.currentModelId）。
+    let current_model_id = new_result
+        .pointer("/models/currentModelId")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let echo_model = echo_hint
+        .map(String::from)
+        .or_else(|| (!current_model_id.is_empty()).then_some(current_model_id));
+    if let Some(echo) = echo_model {
+        let _ = tx.send(PromptEvent::Model(echo)).await;
+    }
+    if let Some(model_id) = model {
+        if let Err(message) = acp_call(
+            &conn,
+            ID_SET_MODEL,
+            "session/set_model",
+            build_set_model_params(&session_id, model_id),
+        )
+        .await
+        {
+            return Err(AttemptError { message, emitted });
+        }
+    }
     // 5) session/prompt（SSE 实时流）。
     let resp = match acp_post(
         &conn,
@@ -1285,5 +1729,320 @@ mod tests {
             .expect("帧体应为合法 JSON");
         assert_eq!(value["object"], "chat.completion.chunk");
         assert_eq!(value["choices"][0]["delta"]["content"], "hi");
+    }
+
+    // -------------------------------------------------------------------------
+    // 内置模型目录（契约 §3.3 新增）
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn parse_multiplier_from_description() {
+        // 2026-09-25 实测 description 形态（"x0.21"）。
+        assert_eq!(parse_multiplier("x0.21"), Some(0.21));
+        assert_eq!(parse_multiplier("x1.20"), Some(1.2));
+        assert_eq!(parse_multiplier("x0.06"), Some(0.06));
+        assert_eq!(parse_multiplier("x0"), Some(0.0));
+        // 嵌在文案里也能取到。
+        assert_eq!(parse_multiplier("credits x0.29 per call"), Some(0.29));
+        // 无倍率 / 空串 / 非 x 前缀 → None（契约：解析失败为 null）。
+        assert_eq!(parse_multiplier(""), None);
+        assert_eq!(parse_multiplier("no multiplier here"), None);
+        assert_eq!(parse_multiplier("0.5x faster"), None);
+        assert_eq!(parse_multiplier("x."), None);
+    }
+
+    #[test]
+    fn model_kind_classification() {
+        // 档位别名 3 个（2026-09-25 实测）。
+        assert_eq!(model_kind("fast-model"), "tier");
+        assert_eq!(model_kind("balanced-model"), "tier");
+        assert_eq!(model_kind("deep-model"), "tier");
+        // 自定义接入条目。
+        assert_eq!(model_kind("custom-local:qwen3.8-flash"), "custom");
+        assert_eq!(model_kind("custom-local:opencode/mimo-v2.6-flash-free"), "custom");
+        // 实模。
+        assert_eq!(model_kind("glm-5.3-flash"), "model");
+        assert_eq!(model_kind("kimi-k3-1"), "model");
+        assert_eq!(model_kind("deepseek-v4.1-flash"), "model");
+    }
+
+    #[test]
+    fn build_set_model_params_shape() {
+        let params = build_set_model_params("sess-1", "glm-5.3-flash");
+        assert_eq!(
+            params,
+            json!({"sessionId": "sess-1", "modelId": "glm-5.3-flash"})
+        );
+    }
+
+    #[test]
+    fn native_request_model_placeholder_semantics() {
+        // 占位值视同 None（/trae/v1 行为不变）。
+        assert_eq!(native_request_model(&json!({"model": "trae"})), None);
+        assert_eq!(native_request_model(&json!({"model": "workbuddy"})), None);
+        assert_eq!(native_request_model(&json!({"model": " trae "})), None);
+        // 缺省 / 空 → None。
+        assert_eq!(native_request_model(&json!({})), None);
+        assert_eq!(native_request_model(&json!({"model": ""})), None);
+        assert_eq!(native_request_model(&json!({"model": "   "})), None);
+        // 显式模型 → Some。
+        assert_eq!(
+            native_request_model(&json!({"model": "glm-5.3-flash"})),
+            Some("glm-5.3-flash".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_native_catalog_from_session_new_result() {
+        // 仿 2026-09-25 实测 session/new result 形态（字段名逐一对齐）。
+        let result = json!({
+            "sessionId": "probe-session",
+            "models": {
+                "availableModels": [
+                    {"modelId": "fast-model", "name": "快速", "description": "x0.21"},
+                    {"modelId": "glm-5.3-flash", "name": "GLM-5.3-Flash", "description": "x0.06"},
+                    {"modelId": "kimi-k3-1", "name": "Kimi-K3-1", "description": "x1.62"},
+                    {"modelId": "custom-local:qwen3.8-flash", "name": "自定义", "description": null}
+                ],
+                "currentModelId": "fast-model"
+            },
+            "configOptions": [
+                {"id": "mode", "type": "select", "options": []},
+                {"id": "model", "type": "select", "options": [
+                    {"value": "fast-model", "name": "快速", "description": "x0.21"},
+                    {"value": "glm-5.3-flash", "name": "GLM-5.3-Flash", "description": "x0.06"},
+                    {"value": "kimi-k3-1", "name": "Kimi-K3-1", "description": "x1.62"},
+                    {"value": "custom-local:qwen3.8-flash", "name": "自定义", "description": null}
+                ]}
+            ]
+        });
+        let catalog = parse_native_catalog(&result, 56599).expect("应解析成功");
+        assert_eq!(catalog.port, 56599);
+        assert_eq!(catalog.current_model_id, "fast-model");
+        // 顺序保持服务端返回序（与 WorkBuddy UI 一致）。
+        let ids: Vec<&str> = catalog.models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["fast-model", "glm-5.3-flash", "kimi-k3-1", "custom-local:qwen3.8-flash"]);
+        // kind / multiplier。
+        assert_eq!(catalog.models[0].kind, "tier");
+        assert_eq!(catalog.models[0].multiplier, Some(0.21));
+        assert_eq!(catalog.models[1].kind, "model");
+        assert_eq!(catalog.models[1].multiplier, Some(0.06));
+        assert_eq!(catalog.models[2].kind, "model");
+        assert_eq!(catalog.models[2].multiplier, Some(1.62));
+        assert_eq!(catalog.models[3].kind, "custom");
+        assert_eq!(catalog.models[3].multiplier, None);
+        assert_eq!(catalog.models[0].name, "快速");
+        // contains_id：tier/model/custom 全部命中；目录外 id 不命中。
+        assert!(catalog.contains_id("fast-model"));
+        assert!(catalog.contains_id("custom-local:qwen3.8-flash"));
+        assert!(!catalog.contains_id("totally-fake-model"));
+    }
+
+    #[test]
+    fn parse_native_catalog_falls_back_to_available_models() {
+        // configOptions 缺 model select 时，name/description 回落 availableModels 条目。
+        let result = json!({
+            "models": {
+                "availableModels": [
+                    {"modelId": "glm-5.3", "name": "GLM-5.3", "description": "x0.79"}
+                ],
+                "currentModelId": "glm-5.3"
+            }
+        });
+        let catalog = parse_native_catalog(&result, 1).expect("应解析成功");
+        assert_eq!(catalog.models.len(), 1);
+        assert_eq!(catalog.models[0].name, "GLM-5.3");
+        assert_eq!(catalog.models[0].multiplier, Some(0.79));
+        assert_eq!(catalog.models[0].kind, "model");
+        // ACP availableModels 命中 = exposed:true（契约 §2.1）。
+        assert!(catalog.models[0].exposed);
+        // 缺 availableModels → None。
+        assert!(parse_native_catalog(&json!({"sessionId": "x"}), 1).is_none());
+        assert!(parse_native_catalog(&Value::Null, 1).is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // 内置补充源合并（契约 §2.1 新增）
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn product_config_cli_model_ids_prefers_cli_agent() {
+        // 仿实测形态：agents 数组里恰 1 个 name=="cli" 的对象，models 为字符串数组
+        // （2026-09-25 实测 18 个内置 id，此处取代表）；另有含 fast-model 的诱饵对象。
+        let config = json!({
+            "version": 3,
+            "agents": [
+                {"name": "ide", "models": ["not-a-real-model", "decoy"]},
+                {
+                    "name": "cli",
+                    "models": [
+                        "fast-model", "balanced-model", "deep-model",
+                        "glm-5.3-flash", "kimi-k3-1", "deepseek-v4.1-flash"
+                    ]
+                }
+            ],
+            "other": {"models": ["fast-model", "fake-from-decoy"]}
+        });
+        let ids = product_config_cli_model_ids(&config);
+        assert_eq!(
+            ids,
+            vec![
+                "fast-model",
+                "balanced-model",
+                "deep-model",
+                "glm-5.3-flash",
+                "kimi-k3-1",
+                "deepseek-v4.1-flash"
+            ]
+        );
+    }
+
+    #[test]
+    fn product_config_cli_model_ids_fallback_to_any_fast_model() {
+        // 无 name=="cli" 对象 → 回落「任何含 fast-model 的 models 字符串数组」。
+        let config = json!({
+            "nested": {"agents": [{"name": "ide", "models": ["a", "fast-model", "b"]}]}
+        });
+        assert_eq!(
+            product_config_cli_model_ids(&config),
+            vec!["a", "fast-model", "b"]
+        );
+        // 完全没有 models 字符串数组 → 空表（调用方静默跳过）。
+        assert!(product_config_cli_model_ids(&json!({"agents": [{"name": "cli"}]})).is_empty());
+        assert!(product_config_cli_model_ids(&Value::Null).is_empty());
+    }
+
+    #[test]
+    fn product_config_cli_model_ids_deformed_models_array_is_skipped() {
+        // models 混入非字符串/空串：只收字符串元素；全非字符串视为无该数组。
+        let config = json!({
+            "agents": [
+                {"name": "cli", "models": ["glm-5.3", 42, null, "", {"id": "x"}]}
+            ]
+        });
+        assert_eq!(product_config_cli_model_ids(&config), vec!["glm-5.3"]);
+        let config = json!({"agents": [{"name": "cli", "models": [1, 2]}]});
+        assert!(product_config_cli_model_ids(&config).is_empty());
+        // models 不是数组（如对象）→ 不命中。
+        let config = json!({"agents": [{"name": "cli", "models": {"0": "fast-model"}}]});
+        assert!(product_config_cli_model_ids(&config).is_empty());
+    }
+
+    #[test]
+    fn merge_product_config_models_appends_missing_and_marks_exposed() {
+        // ACP 只回了 3 档位 + 1 实模；产品配置含档位（已存在，跳过）+ 2 个补充实模。
+        let catalog = parse_native_catalog(
+            &json!({
+                "models": {
+                    "availableModels": [
+                        {"modelId": "fast-model", "name": "快速", "description": "x0.21"},
+                        {"modelId": "deep-model", "name": "深度", "description": "x1.20"},
+                        {"modelId": "glm-5.3-flash", "name": "GLM-5.3-Flash", "description": "x0.06"}
+                    ],
+                    "currentModelId": "fast-model"
+                }
+            }),
+            56599,
+        )
+        .expect("应解析成功");
+        let product_config = json!({
+            "agents": [{"name": "cli", "models": [
+                "fast-model", "deep-model", "glm-5.3-flash",
+                "kimi-k3-1", "deepseek-v4-pro", "custom-local:qwen3.8-flash"
+            ]}]
+        });
+        let merged = merge_product_config_models(catalog, &product_config);
+        let ids: Vec<&str> = merged.models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["fast-model", "deep-model", "glm-5.3-flash", "kimi-k3-1", "deepseek-v4-pro", "custom-local:qwen3.8-flash"]
+        );
+        // 既有 ACP 条目：exposed=true，其余字段不变。
+        let fast = merged.models.iter().find(|m| m.id == "fast-model").unwrap();
+        assert!(fast.exposed);
+        assert_eq!(fast.kind, "tier");
+        assert_eq!(fast.multiplier, Some(0.21));
+        assert_eq!(fast.name, "快速");
+        // 补充条目：kind="model"、multiplier=None、name=id 原样、exposed=false。
+        for id in ["kimi-k3-1", "deepseek-v4-pro"] {
+            let m = merged.models.iter().find(|x| x.id == id).unwrap();
+            assert!(!m.exposed, "{id} 仅来自产品配置，应 exposed=false");
+            assert_eq!(m.kind, "model");
+            assert_eq!(m.multiplier, None);
+            assert_eq!(m.name, id);
+        }
+        // custom-local:* 若 ACP 未暴露也按补充源原样追加（kind 仍为 model——
+        // 补充源无 custom 语义，前端按 exposed=false 展示；custom 判定仅对
+        // ACP availableModels 条目生效，见 model_kind）。
+        let custom = merged
+            .models
+            .iter()
+            .find(|m| m.id == "custom-local:qwen3.8-flash")
+            .unwrap();
+        assert!(!custom.exposed);
+        assert_eq!(custom.kind, "model");
+        // contains_id 对补充条目同样生效（native-first 兜底判定依赖目录全集）。
+        assert!(merged.contains_id("kimi-k3-1"));
+    }
+
+    #[test]
+    fn merge_product_config_models_tolerates_garbage_config() {
+        // 变形配置（空对象/Null/无 cli）→ 目录原样返回，绝不 panic。
+        let catalog = parse_native_catalog(
+            &json!({
+                "models": {"availableModels": [{"modelId": "fast-model", "name": "快速"}]}
+            }),
+            1,
+        )
+        .unwrap();
+        for garbage in [
+            Value::Null,
+            json!({}),
+            json!({"agents": [{"name": "cli", "models": "not-an-array"}]}),
+        ] {
+            let merged = merge_product_config_models(catalog.clone(), &garbage);
+            assert_eq!(merged.models.len(), 1);
+            assert!(merged.models[0].exposed);
+        }
+    }
+
+    /// 开发期自检（默认跳过，需本机 WorkBuddy 运行中）：
+    /// `cargo test -p wb-switch-core native_catalog_live_probe -- --ignored --nocapture`
+    /// 打真实 ACP session/new（探针 cwd）验证目录探测链路。
+    #[test]
+    #[ignore = "live probe：需本机 WorkBuddy 运行，默认套件跳过"]
+    fn native_catalog_live_probe() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let catalog = rt
+            .block_on(async { crate::modules::trae_acp::native_models_catalog().await })
+            .expect("live 探测应成功（WorkBuddy 未运行则本测试失败属预期）");
+        let native = catalog
+            .models
+            .iter()
+            .filter(|m| m.kind != "custom")
+            .count();
+        let tiers = catalog.models.iter().filter(|m| m.kind == "tier").count();
+        assert!(native >= 15, "native 条目应 ≥15，实得 {native}");
+        assert_eq!(tiers, 3, "档位别名应为 3 个");
+        assert!(catalog.contains_id("fast-model"), "档位 fast-model 应在目录");
+        assert!(catalog.contains_id("glm-5.3-flash"), "实模 glm-5.3-flash 应在目录");
+        assert!(catalog.contains_id("kimi-k3-1"), "实模 kimi-k3-1 应在目录");
+        assert!(catalog
+            .models
+            .iter()
+            .all(|m| m.id == "fast-model" || m.multiplier.is_some() || m.kind == "custom"),
+            "native 条目应有 multiplier（custom 可空）");
+        println!(
+            "live catalog: port={} current={} models={} (native={native}, tiers={tiers})",
+            catalog.port,
+            catalog.current_model_id,
+            catalog.models.len()
+        );
+        for m in catalog.models.iter().take(5) {
+            println!("  {:12} {:18} {:>6} {:?}", m.kind, m.id, format!("{:?}", m.multiplier), m.name);
+        }
     }
 }

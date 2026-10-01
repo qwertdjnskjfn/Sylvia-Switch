@@ -25,7 +25,9 @@ const DEFAULT_MAX_TOKENS: u64 = 64;
 const MAX_MAX_TOKENS: u64 = 8192;
 const MAX_PROMPT_CHARS: usize = 4000;
 const CONNECT_TIMEOUT_SECS: u64 = 10;
-const DEFAULT_TIMEOUT_SECS: u64 = 90;
+/// 默认 210s：妙手等工具型网关的 agent 要跑「搜索→汇总」多轮（实测天气类 153s），
+/// 90s 会在工具轮中途砍掉。超时只是上限，快网关几秒即回，Stop 按钮随时可中断。
+const DEFAULT_TIMEOUT_SECS: u64 = 210;
 const MIN_TIMEOUT_SECS: u64 = 5;
 const MAX_TIMEOUT_SECS: u64 = 600;
 const RAW_SNIPPET_CHARS: usize = 600;
@@ -136,12 +138,19 @@ pub async fn run(bound_port: u16, body: &Value) -> Value {
         }
     };
 
-    let payload = json!({
+    let mut payload = json!({
         "model": model,
         "messages": [{ "role": "user", "content": prompt }],
         "max_tokens": max_tokens,
         "stream": false,
     });
+    // region 透传（WorkBuddy 池按请求体 region 精确切区；其余网关忽略该字段）。
+    let region = str_field(body, "region");
+    if !region.is_empty() {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("region".to_string(), json!(region));
+        }
+    }
 
     // ④ 发送
     let resp = match client

@@ -7,6 +7,75 @@
 
 ---
 
+## 1.0.11 — 2026-10-01
+
+### 新增：DuMate 4 个档位模型并入 `/opencode/v1` 共享入口 —— 朋友用同一 base_url + 同一把 key 即可选用
+
+**背景**：1.0.10 交付了 DuMate 渠道（`/dumate/v1` + `dumate-lite/turbo/ultra/points` 四档），
+但对外分享走的是白名单反代只放行 `/opencode/v1`（见 `lan_share_proxy.cjs`），
+朋友因此看不到、也用不了这 4 个模型。
+
+**改动**（仅 `api.rs`，两处）
+
+| 位置 | 改动 |
+| --- | --- |
+| `GET /opencode/v1/models` | 在 opencode 免费模型清单**前置并入** dumate 的 4 个档位模型（仅当 `dumate.enabled`；取自 `dumate::models_payload()` 静态目录，含 `level` 与中文描述） |
+| `POST /opencode/v1/chat/completions` | 模型名以 **`dumate-` 前缀**分流到新增的 `opencode_dumate_bridge()`：复用 dumate 核心（JSON / SSE 分流 + `dumate_error_status` 映射），差异仅 ① 日志记 `opencode` 渠道 ② **不重复鉴权**（外层 opencode handler 已完成） |
+
+**设计取舍**：不新建路由、不改白名单（避免扩大暴露面）；前缀分流保证与 opencode/orcarouter 等 39 个模型互不冲突；
+`dumate-points` 走同一通道但语义是「积分概览」，与档位模型共用转发逻辑。
+
+**验证**：`cargo check` 通过；部署后公网实测 4 个模型均可列可对话（见下）。
+
+---
+
+## 1.0.10 — 2026-10-01
+
+### 新增：DuMate（百度搭子）渠道 —— 每日签到 / 积分查询 / OpenAI 兼容模型网关 / 独立页面
+
+契约：`docs/dumate-channel-contract.md`（唯一事实来源，§0 含上游协议实测记录）。
+上游协议全部经本机实测（2026-10-01，DuMate 桌面端运行中，引擎 `127.0.0.1:52002`）。
+
+**四件套**
+
+| # | 交付 | 说明 |
+| --- | --- | --- |
+| 1 | 每日签到 | console.bce.baidu.com `loginBonus`（**+500 积分**），进统一签到调度（`platform_checkin` 新增 `dumate` 平台），幂等（服务端 `hasIssued` 短路 + 文本兜底，重复领取返回已领语义） |
+| 2 | 积分查询 | `quota_overview`：总积分 / 已用 / 订阅包 / 加油包 / 限流状态（上游数字是字符串，网关侧归一为 `availablePoints` 等字段） |
+| 3 | `/dumate/v1` 模型网关 | OpenAI 兼容（`models` + `chat/completions`），静态 4 模型；`stream:true` 聚合后合成 SSE 帧（对齐 workbuddy 反代形态）；鉴权 = 本网关自有密钥**或**主网关密钥（三态放行，401 带自诊文案） |
+| 4 | `/dumate` 独立页面 | 通道状态 / 每日签到 / 积分余额 / 模型测试四卡 + 侧栏入口 |
+
+模型档位（档位在**消息体 headers 字段** `X-Dumate-AutoModel-Level`，不是 HTTP 头）：
+
+| 模型 | 档位 | 用途 |
+| --- | --- | --- |
+| `dumate-lite` | L0 | 极速，日常对话 |
+| `dumate-turbo` | L1 | 增强，内容/代码 |
+| `dumate-ultra` | L2 | 专业，深度推理 |
+| `dumate-points` | — | 积分查询（直接回积分概览组装的回复，不消耗模型积分） |
+
+客户端友好映射：`*haiku*`→lite、`*sonnet*`→turbo、`*opus*`→ultra（大小写/连字符变体归一化）。
+
+**引擎自动发现（免配置）**：DuMate 桌面端内嵌 `dumate-opencode.exe`（**动态端口**），网关按
+「读进程环境变量（`DUMATE_HOST_URL` / `OPENCODE_SERVER_PORT` / `DUMATE_INAPP_KEY`，
+main-server 与 opencode 两个进程都试）→ 本进程环境变量 → 配置文件静态值 → 默认端口 52795
+探活」覆盖；请求时惰性发现 + 60s 正 / 30s 负缓存。**零自动触发纪律**：不新增任何 spawn
+循环，DuMate 桌面端由用户自行启动，状态页只读报告。
+
+**接入统一模型网关（三处注册）**：`gateway_overview`（GATEWAYS + fetch_models / fetch_accounts）、
+`model_sync`（SYNC_SOURCES 12→13，测试断言同步更新）、`channel_health`（CHANNELS 11→12 +
+签到键 arm）。
+
+**验证**（2026-10-01 门禁全过）
+- `cargo check -p wb-switch-core -p wb-switch-server` 通过；
+- 单测：`dumate` **29/29**、`platform_checkin` **16/16**、`model_sync` **18/18**（含 13 网关断言）、
+  core 全量 **654/654**、server **6/6**；
+- `tsc --noEmit` **0 错误**；零自动触发审计（`tokio::spawn` / `fn spawn_`）**0 命中**；
+- 本机实测：引擎 `127.0.0.1:52002` 会话创建 + 消息 **3.9s** 返回最终 assistant 消息（同步阻塞，
+  勿做轮询）、签到状态 `hasIssued=true`、积分 **16020.00** / 已用 **55.73**。
+
+---
+
 ## 1.0.6 — 2026-09-29
 
 ### 修复：AutoClaw 登录态读取不再只认旧位置 —— 修「网关异常 / AutoClaw 尚未登录（auth.json 无 token）」

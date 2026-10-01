@@ -58,12 +58,23 @@ fn generate_key() -> String {
 }
 
 pub fn create_key(name: &str) -> Result<Value, String> {
+    self::create_key_scoped(name, None)
+}
+
+/// 创建密钥；`region` 为 Some("cn")/Some("intl") 时按区域归属（WorkBuddy 池
+/// 国内版/国际版专用密钥，跨区请求被拒），None 为通用密钥（无区域约束）。
+pub fn create_key_scoped(name: &str, region: Option<&str>) -> Result<Value, String> {
     let _guard = WRITE_LOCK.lock().unwrap();
     let mut keys = load_keys();
+    let region = region
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .filter(|r| !r.is_empty());
     let key = json!({
         "id": uuid::Uuid::new_v4().simple().to_string(),
         "name": if name.is_empty() { "默认密钥".to_string() } else { name.to_string() },
         "key": generate_key(),
+        "region": region,
         "createdAt": now_ms(),
         "lastUsedAt": Value::Null,
         "requestCount": 0,
@@ -98,6 +109,8 @@ pub fn list_keys_masked() -> Vec<Value> {
                 "lastUsedAt": k.get("lastUsedAt").cloned().unwrap_or(Value::Null),
                 "requestCount": k.get("requestCount").cloned().unwrap_or(json!(0)),
                 "enabled": k.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+                // 区域归属（null=通用；cn/intl=区域专用，WorkBuddy 池两区密钥隔离）
+                "region": k.get("region").cloned().unwrap_or(Value::Null),
             })
         })
         .collect()
@@ -106,30 +119,76 @@ pub fn list_keys_masked() -> Vec<Value> {
 /// 校验请求密钥：命中"网关专用 Key"或 GLM 代理主密钥。
 /// 返回 (是否有效, 命中的 key id 或主密钥标记)。
 pub fn verify_request_key(header_value: Option<&str>, glm_master: &str) -> (bool, Option<String>) {
+    self::verify_request_key_region(header_value, glm_master, None)
+}
+
+/// 密钥归属是否匹配请求区域（纯函数，脱离 IO 便于测试）：
+/// - 通用 key（region 空/识别不出）恒匹配——向后兼容；
+/// - cn/intl 专用 key 只在 wanted 相同或 wanted 为空（无约束）时匹配。
+fn key_region_matches(key_region: Option<&str>, wanted: Option<&str>) -> bool {
+    let norm = |v: Option<&str>| -> Option<String> {
+        v.map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .filter(|r| !r.is_empty())
+    };
+    let key = norm(key_region).filter(|r| r == "cn" || r == "intl");
+    match (key, norm(wanted)) {
+        (None, _) => true,          // 通用 key：无区域约束
+        (Some(_), None) => true,    // 无区域请求：不限制归属 key
+        (Some(k), Some(w)) => k == w,
+    }
+}
+
+/// 带区域约束的密钥校验（WorkBuddy 池两区密钥隔离）：
+/// - `wanted_region` 为 Some("cn"/"intl") 时，区域专用 key 只有归属相同才通过；
+///   通用 key（region 为空/非 cn/intl）与 GLM 主密钥**仍然通过**（兼容既有用户）；
+/// - 区域专用 key 跨区使用一律拒绝，返回 (false, None)。
+pub fn verify_request_key_region(
+    header_value: Option<&str>,
+    glm_master: &str,
+    wanted_region: Option<&str>,
+) -> (bool, Option<String>) {
     let Some(presented) = header_value else {
         return (false, None);
     };
-    // 主密钥仍然可用（向后兼容）
+    let wanted = wanted_region
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .filter(|r| !r.is_empty());
+    // 主密钥仍然可用（向后兼容，无区域约束）
     if !glm_master.is_empty() && presented == glm_master {
         return (true, Some("__master__".to_string()));
     }
+    let mut matched_id: Option<String> = None;
     for key in load_keys() {
         if key.get("enabled").and_then(Value::as_bool) == Some(false) {
             continue;
         }
-        if key.get("key").and_then(Value::as_str) == Some(presented) {
-            // 计数 + 上次使用
-            let _guard = WRITE_LOCK.lock().unwrap();
-            let mut keys = load_keys();
-            for k in keys.iter_mut() {
-                if k.get("key").and_then(Value::as_str) == Some(presented) {
-                    k["requestCount"] = json!(k.get("requestCount").and_then(Value::as_u64).unwrap_or(0) + 1);
-                    k["lastUsedAt"] = json!(now_ms());
-                }
-            }
-            let _ = save_keys(&keys);
-            return (true, key.get("id").and_then(Value::as_str).map(String::from));
+        if key.get("key").and_then(Value::as_str) != Some(presented) {
+            continue;
         }
+        // 区域约束：key 归属 cn/intl 且与请求区不同 → 直接拒绝（不做计数）。
+        let key_region = key
+            .get("region")
+            .and_then(Value::as_str);
+        if !key_region_matches(key_region, wanted.as_deref()) {
+            return (false, None);
+        }
+        matched_id = key.get("id").and_then(Value::as_str).map(String::from);
+        break;
+    }
+    if let Some(id) = matched_id {
+        // 计数 + 上次使用
+        let _guard = WRITE_LOCK.lock().unwrap();
+        let mut keys = load_keys();
+        for k in keys.iter_mut() {
+            if k.get("key").and_then(Value::as_str) == Some(presented) {
+                k["requestCount"] = json!(k.get("requestCount").and_then(Value::as_u64).unwrap_or(0) + 1);
+                k["lastUsedAt"] = json!(now_ms());
+            }
+        }
+        let _ = save_keys(&keys);
+        return (true, Some(id));
     }
     (false, None)
 }
@@ -213,3 +272,29 @@ pub fn overview() -> Value {
     })
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_region_matching_matrix() {
+        // 通用 key：不受任何区域请求约束（向后兼容存量通用密钥）
+        assert!(key_region_matches(None, Some("cn")));
+        assert!(key_region_matches(None, Some("intl")));
+        assert!(key_region_matches(None, None));
+        // 区域 key：同区放行、跨区拒绝；大小写与空白容错
+        assert!(key_region_matches(Some("cn"), Some("cn")));
+        assert!(key_region_matches(Some("intl"), Some("intl")));
+        assert!(!key_region_matches(Some("cn"), Some("intl")));
+        assert!(!key_region_matches(Some("intl"), Some("cn")));
+        assert!(key_region_matches(Some("CN"), Some("cn")));
+        assert!(key_region_matches(Some(" intl "), Some("INTL")));
+        // 无区域请求时连区域 key 也放行（models/status 等免 key 端点不经过此路径，
+        // 这里保证老客户端不带 region 也能用）
+        assert!(key_region_matches(Some("cn"), None));
+        // 未知归属按通用处理（防御）
+        assert!(key_region_matches(Some("legacy"), Some("cn")));
+        assert!(key_region_matches(Some(""), Some("intl")));
+    }
+}

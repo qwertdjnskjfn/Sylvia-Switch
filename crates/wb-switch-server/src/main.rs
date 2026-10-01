@@ -188,6 +188,8 @@ async fn serve(args: &[String]) {
     }
 
     spawn_background_loops();
+    // Build 通道托管看门狗：grok2api（8002）掉线自动拉起（60s 巡检）。
+    wb_switch_core::modules::grok2api_manager::spawn_watchdog();
     // Grok SSO 同步循环（30 分钟；专用 Chrome 实例未启动时该轮静默失败不刷屏）。
     wb_switch_core::modules::grok_sso::spawn_sync_loop();
     // v1.5.0：冷账号保活续签循环（每 6 小时；仅对长期未活跃的 web 账号）。
@@ -196,6 +198,12 @@ async fn serve(args: &[String]) {
     wb_switch_core::modules::grok_pool::spawn_health_check_loop();
     // WorkBuddy 多账号网关：余额巡检循环（启动后 60s 首轮，之后每 balance_refresh_minutes 分钟；0 = 关闭）。
     wb_switch_core::modules::workbuddy_gateway::spawn_balance_patrol_loop();
+    // 模型目录自动同步循环（契约 model-sync-contract.md §3.5：启动 5 分钟后首轮，
+    // 之后每 intervalMinutes 分钟；0 = 关闭但循环空转，配置热更新每轮现读）。
+    wb_switch_core::modules::model_sync::spawn_model_sync_loop();
+    // ChatGPT 通道托管循环（契约 chatgpt-channel-contract.md §3/§5：60s 轮询，
+    // enabled+auto_start 才拉起 WebUI 服务进程；🔴 只托管服务，绝不自动启动批量注册）。
+    wb_switch_core::modules::chatgpt_channel::spawn_watchdog();
 
     axum::serve(listener, app).await.unwrap();
 }

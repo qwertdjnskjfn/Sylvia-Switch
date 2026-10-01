@@ -14,7 +14,6 @@ use crate::modules::account::{account_display_name, build_auth_headers, load_acc
 use crate::modules::config::{
     http_request, load_checkin_config, load_travel_cache, load_travel_config, now_ms, now_secs,
     save_travel_cache, with_travel_cache_lock, RunFlagGuard, TRAVEL_API_PREFIX,
-    WORKBUDDY_API_ENDPOINT,
 };
 use crate::modules::refresh::{ensure_fresh_token, refresh_account_token};
 
@@ -58,12 +57,13 @@ fn account_key(account: &Value) -> String {
 }
 
 fn build_travel_headers(account: &Value) -> HashMap<String, String> {
+    let base = crate::modules::config::workbuddy_api_endpoint_for(account);
     let mut headers = build_auth_headers(account);
     headers.insert("x-client-platform".to_string(), "web".to_string());
-    headers.insert("origin".to_string(), WORKBUDDY_API_ENDPOINT.to_string());
+    headers.insert("origin".to_string(), base.to_string());
     headers.insert(
         "referer".to_string(),
-        format!("{WORKBUDDY_API_ENDPOINT}/profile/growth-center"),
+        format!("{base}/profile/growth-center"),
     );
     headers
 }
@@ -85,8 +85,10 @@ fn is_unauthorized(resp: &Value) -> bool {
 }
 
 /// 发旅行接口请求；遇到未授权且存在 refresh token 时刷新一次并重试。
+/// 端点按账号 domain 选区域（与 refresh/checkin 同口径）。
 async fn travel_request(path: &str, method: &str, body: Option<Value>, account: &Value) -> Value {
-    let url = format!("{WORKBUDDY_API_ENDPOINT}{path}");
+    let base = crate::modules::config::workbuddy_api_endpoint_for(account);
+    let url = format!("{base}{path}");
     let headers = build_travel_headers(account);
     let mut resp = http_request(&url, method, body.clone(), Some(&headers)).await;
     if is_unauthorized(&resp)

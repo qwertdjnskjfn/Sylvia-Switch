@@ -1,4 +1,4 @@
-//! 渠道健康度监控看板：11 个模型渠道的统一健康评分、预警与趋势。
+//! 渠道健康度监控看板：12 个模型渠道的统一健康评分、预警与趋势。
 //!
 //! ## 解决什么问题
 //! 每个渠道的健康信息散落在各自模块里：请求日志在 `gateway_admin`、
@@ -31,7 +31,7 @@ use crate::modules::{gateway_admin, grok, grok_pool, model_usage};
 // 渠道清单
 // ---------------------------------------------------------------------------
 
-/// 渠道清单（11 个，顺序即展示顺序）。与契约第 1 节逐字一致。
+/// 渠道清单（12 个，顺序即展示顺序）。与契约第 1 节逐字一致。
 struct ChannelEntry {
     id: &'static str,
     name: &'static str,
@@ -60,6 +60,9 @@ const CHANNELS: &[ChannelEntry] = &[
     // 记录，渠道健康度走请求日志口径（与 kimi/glmweb/miaoshou 一致）。
     ChannelEntry { id: "workbuddy", name: "WorkBuddy 反代", page: "/trae-workbuddy", base: "/workbuddy/v1", traffic_source: "logs" },
     ChannelEntry { id: "trae", name: "TRAE 反代", page: "/trae-workbuddy", base: "/trae/v1", traffic_source: "logs" },
+    // DuMate（百度搭子）渠道（2026-10-01 接入）：api.rs 的 /dumate/v1 chat handler
+    // 写 gateway_admin 请求日志，流量走 logs 口径。
+    ChannelEntry { id: "dumate", name: "DuMate（百度搭子）", page: "/dumate", base: "/dumate/v1", traffic_source: "logs" },
 ];
 
 // ---------------------------------------------------------------------------
@@ -772,6 +775,9 @@ fn checkin_keys(channel_id: &str) -> Vec<String> {
                 push_field(&a, &mut keys, "nickname");
             }
         }
+        // DuMate（百度搭子）：本机单账号（id=dumate:local，email/nickname 带
+        // DuMate 字样），键即渠道前缀，靠 accountId/email 包含匹配命中。
+        "dumate" => keys.push("dumate".to_string()),
         _ => {}
     }
     keys

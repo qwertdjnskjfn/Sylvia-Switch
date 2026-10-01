@@ -59,6 +59,16 @@ import type {
   GrokRegisterStatus,
   WorkbuddyPoolStatus,
   WorkbuddyGatewayConfig,
+  ChatGptChannelStatus,
+  ChatGptRegistrarStatus,
+  ChatGptRegistrarStartBody,
+  ChatGptRegisteredResponse,
+  ChatGptAccountsResponse,
+  DumateStatus,
+  DumateCredits,
+  DumateCheckinStatus,
+  DumateCheckinResult,
+  DumateConfigInfo,
 } from "./types";
 import type { ChannelDetail, ChannelHealthOverview } from "@/lib/channel-health-types";
 import type { ModelTestRequest, ModelTestResult } from "@/lib/model-test-types";
@@ -131,6 +141,11 @@ const ROUTES: Record<string, Route> = {
   platform_accounts: { method: "GET", path: "/api/platform/accounts" },
   get_glm_proxy_config: { method: "GET", path: "/api/glm-proxy/config" },
   get_glm_proxy_status: { method: "GET", path: "/api/glm-proxy/status" },
+  get_glmplan_status: { method: "GET", path: "/api/glmplan/status" },
+  save_glmplan_config: { method: "POST", path: "/api/glmplan/config" },
+  add_glmplan_account: { method: "POST", path: "/api/glmplan/accounts/add" },
+  remove_glmplan_account: { method: "POST", path: "/api/glmplan/accounts/remove" },
+  enable_glmplan_account: { method: "POST", path: "/api/glmplan/accounts/enable" },
   get_glm_usage_summary: { method: "GET", path: "/api/glm-usage/summary" },
   get_glm_usage_records: { method: "GET", path: "/api/glm-usage/records" },
   get_glm_usage_monitor: { method: "GET", path: "/api/glm-usage/monitor" },
@@ -188,6 +203,10 @@ const ROUTES: Record<string, Route> = {
   close_grok_register: { method: "POST", path: "/api/grok/register/close" },
   get_gateway_keys: { method: "GET", path: "/api/gateway/keys" },
   create_gateway_key: { method: "POST", path: "/api/gateway/keys" },
+  get_workbuddy_pool_region_key: {
+    method: "GET",
+    path: "/api/workbuddy-pool/region-key",
+  },
   delete_gateway_key: { method: "POST", path: "/api/gateway/keys/delete" },
   get_gateway_logs: { method: "GET", path: "/api/gateway/logs" },
   get_gateway_overview: { method: "GET", path: "/api/gateway/overview" },
@@ -223,6 +242,14 @@ const ROUTES: Record<string, Route> = {
   get_miaoshou_credits: { method: "GET", path: "/api/miaoshou/credits" },
   get_miaoshou_models: { method: "GET", path: "/api/miaoshou/models" },
   miaoshou_chat: { method: "POST", path: "/api/miaoshou/chat" },
+  // DuMate（百度搭子）渠道（契约 docs/dumate-channel-contract.md §3.2/§4.1）；
+  // /dumate/v1 网关调用不走 ROUTES（前端 fetch 直连 + Bearer 鉴权，见 dumateTestChat）
+  get_dumate_status: { method: "GET", path: "/api/dumate/status" },
+  get_dumate_credits: { method: "GET", path: "/api/dumate/credits" },
+  get_dumate_config: { method: "GET", path: "/api/dumate/config" },
+  save_dumate_config: { method: "POST", path: "/api/dumate/config" },
+  dumate_checkin: { method: "POST", path: "/api/dumate/checkin" },
+  get_dumate_checkin_status: { method: "GET", path: "/api/dumate/checkin-status" },
   get_trae_proxy_status: { method: "GET", path: "/api/trae-proxy/status" },
   get_trae_proxy_models: { method: "GET", path: "/api/trae-proxy/models" },
   get_trae_proxy_config: { method: "GET", path: "/api/trae-proxy/config" },
@@ -231,6 +258,7 @@ const ROUTES: Record<string, Route> = {
   get_workbuddy_proxy_config: { method: "GET", path: "/api/workbuddy-proxy/config" },
   save_workbuddy_proxy_config: { method: "POST", path: "/api/workbuddy-proxy/config" },
   get_workbuddy_native_models: { method: "GET", path: "/workbuddy-native/v1/models" },
+  refresh_workbuddy_catalog: { method: "POST", path: "/api/workbuddy-native/catalog/refresh" },
   // WorkBuddy 多账号网关（cloud 账号池 · 2026-09-24 重构新增，独立路由组；
   // 存量 /workbuddy/v1 与 /workbuddy-native/v1 原样不动）
   get_workbuddy_pool_status: { method: "GET", path: "/workbuddy-pool/v1/status" },
@@ -271,6 +299,25 @@ const ROUTES: Record<string, Route> = {
   get_channel_health: { method: "GET", path: "/api/channel-health" },
   get_channel_health_detail: { method: "GET", path: "/api/channel-health/detail" },
   model_test: { method: "POST", path: "/api/model-test" },
+  // 模型目录自动同步（model-sync · 仅 webui 后端支持；契约 docs/model-sync-contract.md §四）
+  get_model_sync_status: { method: "GET", path: "/api/model-sync/status" },
+  run_model_sync: { method: "POST", path: "/api/model-sync/run" },
+  get_model_sync_log: { method: "GET", path: "/api/model-sync/log" },
+  get_model_sync_config: { method: "GET", path: "/api/model-sync/config" },
+  save_model_sync_config: { method: "POST", path: "/api/model-sync/config" },
+  add_model_sync_registry: { method: "POST", path: "/api/model-sync/registry" },
+  // ChatGPT 通道（gpt-reg-review 托管+注册机控制+账号表；契约 docs/chatgpt-channel-contract.md §4）
+  get_chatgpt_channel_status: { method: "GET", path: "/api/chatgpt/channel/status" },
+  chatgpt_webui_start: { method: "POST", path: "/api/chatgpt/webui/start" },
+  chatgpt_webui_stop: { method: "POST", path: "/api/chatgpt/webui/stop" },
+  chatgpt_registrar_start: { method: "POST", path: "/api/chatgpt/registrar/start" },
+  chatgpt_registrar_pause: { method: "POST", path: "/api/chatgpt/registrar/pause" },
+  chatgpt_registrar_resume: { method: "POST", path: "/api/chatgpt/registrar/resume" },
+  chatgpt_registrar_stop: { method: "POST", path: "/api/chatgpt/registrar/stop" },
+  chatgpt_registrar_status: { method: "GET", path: "/api/chatgpt/registrar/status" },
+  chatgpt_registered: { method: "GET", path: "/api/chatgpt/registered" },
+  chatgpt_accounts: { method: "GET", path: "/api/chatgpt/accounts" },
+  chatgpt_accounts_sync: { method: "POST", path: "/api/chatgpt/accounts/sync" },
 };
 
 function queryString(args?: Record<string, unknown>): string {
@@ -526,6 +573,26 @@ export async function getPlatformCheckinItems(): Promise<PlatformCheckinItem[]> 
 export async function getGlmProxyConfig(): Promise<GlmProxyConfigInfo> {
   return call("get_glm_proxy_config");
 }
+/** GLM Plan 网关（1.4.0 新通道）状态 */
+export async function getGlmplanStatus() {
+  return call("get_glmplan_status");
+}
+/** 保存 GLM Plan 网关配置 */
+export async function saveGlmplanConfig(body: Record<string, unknown>) {
+  return call("save_glmplan_config", body);
+}
+/** 加入 GLM Plan 账号池 */
+export async function addGlmplanAccount(body: { label: string; provider: string; apiKey: string }) {
+  return call("add_glmplan_account", body);
+}
+/** 移出 GLM Plan 账号池 */
+export async function removeGlmplanAccount(body: { id: string }) {
+  return call("remove_glmplan_account", body);
+}
+/** 启用/停用 GLM Plan 账号（清冷却） */
+export async function enableGlmplanAccount(body: { id: string; enabled: boolean }) {
+  return call("enable_glmplan_account", body);
+}
 
 /** GLM 代理试调：服务端转发一条测试对话。 */
 export async function testGlmProxy(model: string, prompt: string): Promise<{
@@ -710,8 +777,19 @@ export async function getGatewayKeys(): Promise<{ keys: GatewayApiKey[] }> {
   return call("get_gateway_keys");
 }
 
-export async function createGatewayKey(name: string): Promise<{ ok: boolean; key: GatewayApiKey }> {
-  return call("create_gateway_key", { name });
+export async function createGatewayKey(
+  name: string,
+  region?: string,
+): Promise<{ ok: boolean; key: GatewayApiKey }> {
+  return call("create_gateway_key", region ? { name, region } : { name });
+}
+
+/** 取（或按需创建）WorkBuddy 池区域专用接入密钥；create=false 时找不到仅回 null。 */
+export async function getWorkbuddyPoolRegionKey(
+  region: "cn" | "intl",
+  create: boolean,
+): Promise<{ ok: boolean; created: boolean; key: GatewayApiKey | null }> {
+  return call("get_workbuddy_pool_region_key", { region, create: create ? "1" : "0" });
 }
 
 export async function deleteGatewayKey(id: string): Promise<{ ok: boolean }> {
@@ -745,6 +823,120 @@ export async function getChannelHealthDetail(gatewayId: string, hours: number): 
  *  所以这里不会 throw，调用方直接读结果即可。 */
 export async function testModel(input: ModelTestRequest): Promise<ModelTestResult> {
   return call("model_test", input as unknown as Record<string, unknown>);
+}
+
+// ---- 模型目录自动同步（model-sync · 仅 webui 后端支持；契约 docs/model-sync-contract.md §四/§五）----
+
+/** 同步模式：auto=有上游清单源（定时拉取 diff）；manual=无清单概念，仅页面手动补录（glmweb/qoder）。 */
+export type ModelSyncMode = "auto" | "manual";
+
+/** GET /api/model-sync/status 的单网关行。
+ *  可选字段容错：首次使用（state 文件不存在=未同步）时 ok/lastSyncTs/total/addedCount
+ *  可为 null 或缺省，调用方按「未同步」正常态展示。 */
+export interface ModelSyncGatewayStatus {
+  /** 网关标识（glm/glmweb/kimi/grok/qwen/qoder/loomy/miaoshou/trae/workbuddy/workbuddy-pool/opencode）。 */
+  gateway: string;
+  mode?: ModelSyncMode;
+  /** 上游清单来源描述（如「www.kimi.com GetAvailableModels」）。 */
+  source?: string | null;
+  /** 上一轮该网关是否成功；从未同步为 null。 */
+  ok?: boolean | null;
+  /** 上次同步时刻（ms epoch）；从未同步为 null/0。 */
+  lastSyncTs?: number | null;
+  /** 上次同步后的目录总数。 */
+  total?: number | null;
+  /** 近一轮新增数。 */
+  addedCount?: number | null;
+  lastError?: string | null;
+}
+
+/** GET /api/model-sync/status 响应（读 state，秒开不触发拉取）。 */
+export interface ModelSyncStatus {
+  enabled: boolean;
+  intervalMinutes: number;
+  /** 下轮预计运行提示（ms epoch 或后端自定义文案）；暂停/未知为 null。 */
+  nextRunHint?: number | string | null;
+  gateways: ModelSyncGatewayStatus[];
+}
+
+/** 新增模型明细（id + 可选显示名/倍率——倍率目前仅 WorkBuddy ACP 目录提供）。 */
+export interface ModelSyncAddedModel {
+  id: string;
+  name?: string | null;
+  multiplier?: number | null;
+}
+
+/** 单网关单轮结果（契约 §3.4）。 */
+export interface ModelSyncGatewayResult {
+  gateway: string;
+  mode?: ModelSyncMode;
+  ok?: boolean | null;
+  total?: number | null;
+  /** 本轮相对上次快照新增的模型（保序）；基线轮/失败轮为空。 */
+  added?: ModelSyncAddedModel[] | null;
+  /** 首轮基线：只记录存量清单，不计「新增」。 */
+  baseline?: boolean;
+  error?: string | null;
+}
+
+/** 一轮同步结果（run 返回值 / log 元素共用形状）。 */
+export interface ModelSyncRound {
+  ts?: number;
+  trigger?: "auto" | "manual";
+  durationMs?: number;
+  results?: ModelSyncGatewayResult[] | null;
+}
+
+/** GET/POST /api/model-sync/config 的配置体。 */
+export interface ModelSyncConfig {
+  enabled: boolean;
+  intervalMinutes: number;
+}
+
+/** 同步总览（含每网关状态；未同步是首次使用的正常态）。 */
+export async function getModelSyncStatus(): Promise<ModelSyncStatus> {
+  return call("get_model_sync_status");
+}
+
+/** 立即跑一轮（可选 gateways 过滤）；busy 时后端 409，原样抛错由调用方做友好提示。 */
+export async function runModelSync(gateways?: string[]): Promise<ModelSyncRound> {
+  const res = await call<ModelSyncRound & { round?: ModelSyncRound }>(
+    "run_model_sync",
+    gateways && gateways.length > 0 ? { gateways } : {},
+  );
+  // 兼容后端可能的 { round: {...} } 包裹；裸轮次形状直接透传。
+  return res.round ?? res;
+}
+
+/** 环形日志倒序（近 N 轮，默认 10）；兼容裸数组与 { rounds | log } 包裹两种返回。 */
+export async function getModelSyncLog(limit = 10): Promise<ModelSyncRound[]> {
+  const res = await call<
+    ModelSyncRound[] | { rounds?: ModelSyncRound[]; log?: ModelSyncRound[] }
+  >("get_model_sync_log", { limit });
+  if (Array.isArray(res)) return res;
+  return res.rounds ?? res.log ?? [];
+}
+
+/** 读取同步配置（enabled + intervalMinutes）。 */
+export async function getModelSyncConfig(): Promise<ModelSyncConfig> {
+  return call("get_model_sync_config");
+}
+
+/** 保存同步配置（热更新，即写盘，定时轮下一轮生效）。 */
+export async function saveModelSyncConfig(
+  patch: Partial<ModelSyncConfig>,
+): Promise<ModelSyncConfig> {
+  return call("save_model_sync_config", patch as unknown as Record<string, unknown>);
+}
+
+/** 手动补录（仅 glmweb/qoder 两个 Manual 网关接收；Auto 网关后端 400 并说明原因）。 */
+export async function addModelSyncRegistry(input: {
+  gateway: string;
+  modelId: string;
+  displayName?: string;
+  note?: string;
+}): Promise<{ ok: boolean; message?: string }> {
+  return call("add_model_sync_registry", input as unknown as Record<string, unknown>);
 }
 
 // ---- ChatGLM 网页协议网关（仅 webui 后端支持）----
@@ -880,6 +1072,8 @@ export async function captureGrokRegister(): Promise<{
   accountName?: string;
   cookieCount?: number;
   error?: string;
+  /** 后端人话（not_registered 时给出会话失效/重新登录指引） */
+  message?: string;
 }> {
   return call("capture_grok_register");
 }
@@ -1065,6 +1259,117 @@ export async function getMiaoshouCredits(): Promise<{
   return call("get_miaoshou_credits");
 }
 
+// ---- DuMate（百度搭子）渠道（契约 docs/dumate-channel-contract.md §4.1；仅 webui 后端支持）----
+
+/** GET /api/dumate/status——渠道聚合状态（桌面端/引擎/凭据/网关 + 积分快照）。 */
+export async function getDumateStatus(): Promise<DumateStatus> {
+  return call("get_dumate_status");
+}
+
+/** GET /api/dumate/credits——积分余额（totalPoints/usedPoints 为上游字符串数值）。 */
+export async function getDumateCredits(): Promise<DumateCredits> {
+  return call("get_dumate_credits");
+}
+
+/** GET /api/dumate/config——网关接入配置（密钥/开关）。 */
+export async function getDumateConfig(): Promise<DumateConfigInfo> {
+  return call("get_dumate_config");
+}
+
+/** POST /api/dumate/config——保存网关开关/密钥；regenerateKey 为 true 时轮换密钥。 */
+export async function saveDumateConfig(patch: {
+  enabled?: boolean;
+  apiKey?: string;
+  regenerateKey?: boolean;
+}): Promise<DumateConfigInfo> {
+  return call("save_dumate_config", patch as unknown as Record<string, unknown>);
+}
+
+/** POST /api/dumate/checkin——本机账号一键签到（幂等：服务端 hasIssued 短路，already=今日已领）。 */
+export async function dumateCheckin(): Promise<DumateCheckinResult> {
+  return call("dumate_checkin");
+}
+
+/** GET /api/dumate/checkin-status——今日签到状态（loginBonusInfo 聚合）。 */
+export async function getDumateCheckinStatus(): Promise<DumateCheckinStatus> {
+  return call("get_dumate_checkin_status");
+}
+
+/** 网关测试对话结果（前端 fetch 直连 /dumate/v1 的聚合返回）。 */
+export interface DumateTestChatResult {
+  ok: boolean;
+  /** assistant 回复文本（空回复时为占位文案） */
+  content: string;
+  /** 实际服务的模型名（取响应体 model，缺省回请求模型） */
+  model: string;
+  latencyMs: number;
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+  } | null;
+  error?: string;
+}
+
+/**
+ * DuMate 网关测试对话：fetch 直连 POST /dumate/v1/chat/completions（非流式聚合），
+ * 鉴权 = DuMate 网关密钥或主网关密钥（后端三态放行），对齐其他网关「测试模型」的做法。
+ * 注意：fetch 直连不走 `call`（/dumate/v1 是网关命名空间，不是 /api 命名空间命令）。
+ */
+export async function dumateTestChat(input: {
+  model: string;
+  prompt: string;
+  /** 网关密钥；空串 = 不带鉴权头（后端对未配置密钥的网关放行） */
+  apiKey: string;
+}): Promise<DumateTestChatResult> {
+  const started = Date.now();
+  const base: DumateTestChatResult = {
+    ok: false,
+    content: "",
+    model: input.model,
+    latencyMs: 0,
+  };
+  try {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (input.apiKey) headers.Authorization = `Bearer ${input.apiKey}`;
+    const res = await fetch("/dumate/v1/chat/completions", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: input.model,
+        messages: [{ role: "user", content: input.prompt }],
+        stream: false,
+      }),
+    });
+    const data = (await res.json().catch(() => ({}))) as {
+      model?: string;
+      choices?: Array<{ message?: { content?: string } }>;
+      usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+      error?: { message?: string } | string;
+      message?: string;
+    };
+    const latencyMs = Date.now() - started;
+    if (!res.ok) {
+      const errMsg =
+        (typeof data.error === "object" && data.error?.message) ||
+        (typeof data.error === "string" ? data.error : undefined) ||
+        data.message ||
+        `请求失败 (HTTP ${res.status})`;
+      return { ...base, latencyMs, error: errMsg };
+    }
+    const content = data.choices?.[0]?.message?.content ?? "";
+    return {
+      ok: true,
+      content: content || "(空回复)",
+      model: data.model || input.model,
+      latencyMs,
+      usage: data.usage ?? null,
+    };
+  } catch (e) {
+    return { ...base, latencyMs: Date.now() - started, error: asError(e) };
+  }
+}
+
 // ---- TRAE / WorkBuddy 模型代理（仅 webui 后端支持）----
 
 export interface TraeProxyStatus {
@@ -1149,12 +1454,68 @@ export async function getWorkbuddyProxyConfig(): Promise<WorkbuddyProxyConfigInf
   return httpCall("get_workbuddy_proxy_config");
 }
 
-/** WorkBuddy 桌面端自带模型目录（/workbuddy-native/v1/models，实时探测内嵌会话 --model）。 */
-export async function getWorkbuddyNativeModels(): Promise<{
+/** WorkBuddy 内置模型目录来源（契约 §3.1）：acp-live=实时 ACP 探测 /
+ *  acp-cache=300s TTL 缓存 / static-fallback=桌面端未运行的静态兜底。 */
+export type WorkbuddyNativeModelsSource = "acp-live" | "acp-cache" | "static-fallback";
+
+/** WorkBuddy 内置模型条目（GET /workbuddy-native/v1/models）：
+ *  旧字段 {id,object,created,owned_by} 原样保留；name/multiplier/kind 为 2026-09-25
+ *  native 多模型改造扩展字段（旧后端缺省 → 可选，向后兼容）。 */
+export type WorkbuddyNativeModel = {
+  id: string;
   object: string;
-  data: { id: string; object: string; created: number; owned_by: string }[];
-}> {
+  created: number;
+  owned_by: string;
+  /** 模型名（如「快速」「GLM-5.3-Flash」）；旧后端缺省。 */
+  name?: string | null;
+  /** 计价倍率（模型选择项描述里的 x0.06 → 0.06）；解析失败为 null。 */
+  multiplier?: number | null;
+  /** 条目类别：tier=档位别名 / model=实模 / custom=用户自定义接入（?include=custom 才下发）；旧后端缺省。 */
+  kind?: "tier" | "model" | "custom" | null;
+};
+
+/** WorkBuddy 桌面端自带模型目录响应（契约 §3.1）：
+ *  默认只列 native（kind=tier|model）；source/probedAt/currentModelId 为扩展字段（旧后端缺省）。 */
+export type WorkbuddyNativeModelsResponse = {
+  object: string;
+  /** 目录来源；static-fallback 时 probedAt / currentModelId 为 null。 */
+  source?: WorkbuddyNativeModelsSource | null;
+  /** 探测时刻（ms epoch）；static-fallback 时为 null。 */
+  probedAt?: number | null;
+  /** 会话默认模型；static-fallback 时为 null。 */
+  currentModelId?: string | null;
+  /** 桌面端登录区域（cn=国内版 / intl=国外版 / unknown）；旧后端缺省。 */
+  region?: string | null;
+  data: WorkbuddyNativeModel[];
+};
+
+/** WorkBuddy 桌面端自带模型目录（/workbuddy-native/v1/models，实时探测内嵌 ACP 会话模型目录）。 */
+export async function getWorkbuddyNativeModels(): Promise<WorkbuddyNativeModelsResponse> {
   return httpCall("get_workbuddy_native_models");
+}
+
+/** 目录刷新返回的条目（POST /api/workbuddy-native/catalog/refresh，契约 §3.1）：
+ *  后端 catalog_to_payload 以 snake_case 直出；exposed=false 表示该条目
+ *  仅来自客户端产品配置补充（ACP availableModels 暂未暴露）。 */
+export type WbCatalogEntry = {
+  id: string;
+  name: string;
+  /** 计价倍率；上游未提供为 null（展示为 —）。 */
+  multiplier: number | null;
+  /** tier=档位别名 / model=内置实模 / custom=用户自定义接入。 */
+  kind: "tier" | "model" | "custom";
+  /** ACP availableModels 命中=true；仅来自产品配置=false。 */
+  exposed: boolean;
+  owned_by: string;
+};
+
+/** 清缓存重探 WorkBuddy 内置模型目录（绕 300s TTL；契约 §2.4/§3.1）。
+ *  后端失败时返回 502 + 错误串，httpCall 会抛 Error（message 取自响应体）。 */
+export async function refreshWorkbuddyCatalog(): Promise<{
+  object: string;
+  data: WbCatalogEntry[];
+}> {
+  return call("refresh_workbuddy_catalog");
 }
 
 /** 保存 WorkBuddy 反代接入配置；regenerateKey 为 true 时轮换密钥。 */
@@ -1171,13 +1532,33 @@ export async function saveWorkbuddyProxyConfig(patch: {
 /* WorkBuddy 多账号网关（cloud 账号池 · /workbuddy-pool/v1 · 2026-09-24 重构）   */
 /* -------------------------------------------------------------------------- */
 
-/** GET /workbuddy-pool/v1/status 响应信封（api.rs:5208-5215）：池状态嵌套在
- *  `pool` 下，配置在顶层 `config`（camelCase）；一个请求拿全。 */
-export interface WorkbuddyPoolStatusResponse {
-  ok?: boolean;
-  pool: WorkbuddyPoolStatus;
-  config?: WorkbuddyGatewayConfig;
+/** 池区域聚合条目（契约 workbuddy-pool-region-contract.md §3.5 status.regions）：
+ *  各区域的账号数 / 可用数 / 目录模型数。models 取自区域目录缓存，缓存未建为 null。 */
+export interface WorkbuddyPoolRegionStatus {
+  accounts: number;
+  healthy: number;
+  models?: number | null;
 }
+
+/** GET /workbuddy-pool/v1/status 响应：池状态**扁平直出**（total/healthy/cooling/
+ *  model_cooling/breaker/accounts 在顶层），另带顶层 config（camelCase）与 apiKey。
+ *
+ *  2026-09-24 修复：旧版误按 { ok, pool, config } 嵌套信封声明并读取（res.pool），
+ *  与后端扁平输出不匹配 → res.pool 恒 undefined → setPoolStatus 永不执行 →
+ *  账号表恒显「账号池暂无账号」。后端形状以 api.rs status handler 实测为准。
+ *
+ *  2026-09-25 区域隔离（契约 §3.5）：新增顶层 regions 聚合（cn/intl 的
+ *  accounts/healthy/models）。**仍是扁平响应**——前端 setPoolStatus(res) 直接读顶层，
+ *  regions 为 additive 可选字段（旧后端缺省 → undefined，区域概况行不渲染）。 */
+export type WorkbuddyPoolStatusResponse = WorkbuddyPoolStatus & {
+  config?: WorkbuddyGatewayConfig;
+  apiKey?: string;
+  /** 区域聚合（契约 §3.5）；旧后端缺省 → undefined */
+  regions?: {
+    cn?: WorkbuddyPoolRegionStatus;
+    intl?: WorkbuddyPoolRegionStatus;
+  } | null;
+};
 
 /** 池状态总览（total/healthy/cooling/model_cooling/breaker + 账号明细）。 */
 export async function getWorkbuddyPoolStatus(): Promise<WorkbuddyPoolStatusResponse> {
@@ -1191,19 +1572,60 @@ export async function patchWorkbuddyPoolConfig(
   return call("patch_workbuddy_pool_config", patch as Record<string, unknown>);
 }
 
-/** 池内模型目录（首个可用账号的上游目录，失败回落内置表）。 */
-export async function getWorkbuddyPoolModels(): Promise<{
+/** 池模型目录条目：OpenAI list 扁平形状 + 附加 region 字段（契约 §3.4 additive）。
+ *  region: "cn"|"intl"；旧后端缺省 → undefined（前端分组退化为单一组）。
+ *  跨区同名模型（glm-5.3）两区各保留一条，靠 region 区分。 */
+export interface WorkbuddyPoolModelEntry {
+  id: string;
+  object?: string;
+  created?: number;
+  owned_by?: string;
+  /** 条目所属区域（契约 §3.4）；旧后端缺省 → undefined */
+  region?: string;
+  /** cloud 上游元数据（intl 区特有）：上下文长度 / 输出上限 tokens */
+  context_length?: number;
+  max_output_tokens?: number;
+  /** 上游显示名（如 "Auto" / "GLM-5.3-Flash"）；2026-09-26 起下发，旧后端缺省 */
+  name?: string;
+  /** 计价倍率（credits 原文 "x0.34 credits" 解析）；未标价/解析失败为 null，旧后端缺省 */
+  multiplier?: number | null;
+}
+
+/** 池模型目录区域来源元信息（契约 §3.4 regions）：cn 区 dynamic=动态目录 /
+ *  fallback=回落内置表；intl 区 dynamic=动态 / static=静态表。旧后端缺省 → undefined。 */
+export interface WorkbuddyPoolRegionCatalogMeta {
+  source?: "dynamic" | "static" | "fallback";
+  /** 提供目录的账号 uid；缺省 → 不展示 */
+  account?: string;
+}
+
+/** GET /workbuddy-pool/v1/models 响应（契约 §3.4）：**保持 OpenAI list 扁平形状**，
+ *  regions 与 data[].region 均为 additive 可选字段；不带 region 参数 = 两区全量
+ *  （?region=cn|intl 过滤后只含单区，由后端处理）。旧后端无 region → 单一组容错。 */
+export interface WorkbuddyPoolModelsResponse {
   object: string;
-  data: { id: string; object?: string; created?: number; owned_by?: string }[];
-}> {
+  /** 各区目录来源（契约 §3.4）；旧后端缺省 → undefined（来源徽标不渲染） */
+  regions?: {
+    cn?: WorkbuddyPoolRegionCatalogMeta | null;
+    intl?: WorkbuddyPoolRegionCatalogMeta | null;
+  } | null;
+  data: WorkbuddyPoolModelEntry[];
+}
+
+/** 池内模型目录（契约 §3.4 按区聚合：cn 取首个成功 cn 账号动态目录，失败回落内置表；
+ *  intl 取首个成功 intl 账号动态目录，无 intl 账号 / 失败回落 intl 静态表）。 */
+export async function getWorkbuddyPoolModels(): Promise<WorkbuddyPoolModelsResponse> {
   return call("get_workbuddy_pool_models");
 }
 
-/** 多账号网关试调（OpenAI 兼容；非流式聚合返回，错误已按分级表换号重试）。 */
+/** 多账号网关试调（OpenAI 兼容；非流式聚合返回，错误已按分级表换号重试）。
+ *  region（契约 T2，可选）：显式 "cn"|"intl" 精确约束选号区域；缺省按模型区域解析
+ *  （唯一命中 → 该区；两区同名 / 都无 → 不约束，上游校验兜底）。 */
 export async function workbuddyPoolChat(input: {
   model: string;
   messages: Array<{ role: string; content: string }>;
   stream?: boolean;
+  region?: "cn" | "intl";
 }): Promise<{
   id?: string;
   choices?: Array<{
@@ -1437,6 +1859,14 @@ export type GatewayModelInfo = {
   id: string | null;
   name: string | null;
   capabilities: string[];
+  /** 计价倍率（如 x0.21 → 0.21）；上游未提供为 null；旧后端缺省（契约 §3.1）。 */
+  multiplier?: number | null;
+  /** 条目类别：tier=档位别名 / model=实模 / custom=自定义接入；旧后端缺省（契约 §3.1）。 */
+  kind?: string;
+  /** 是否由 ACP availableModels 实时暴露；false=来自客户端产品配置补充（契约 §3.1）。 */
+  exposed?: boolean;
+  /** 所属区域（WorkBuddy 池：cn=国内版 / intl=国际版，跨区同名各留一条）；其余网关为 null。 */
+  region?: string | null;
 };
 
 export type GatewayInfo = {
@@ -1482,3 +1912,64 @@ export async function getQwenDesktopStatus(): Promise<QwenDesktopStatus> {
   return res.json();
 }
 
+
+// ---- ChatGPT 通道（gpt-reg-review 托管+注册机控制+账号表；契约 docs/chatgpt-channel-contract.md §4）----
+// 说明：v1 为 webui-first（桌面壳无对应 Tauri command，桌面模式报「不支持」属预期）。
+
+/** GET /api/chatgpt/channel/status——通道聚合状态（WebUI 存活/端口/注册机快照/账号与号池计数）。 */
+export function getChatGptChannelStatus(): Promise<ChatGptChannelStatus> {
+  return call("get_chatgpt_channel_status");
+}
+
+/** POST /api/chatgpt/webui/start——托管拉起 WebUI（不活时 spawn python start_webui.py --no-browser，等健康 ≤20s）。 */
+export function chatGptWebuiStart(): Promise<{ ok: boolean; port?: number }> {
+  return call("chatgpt_webui_start");
+}
+
+/** POST /api/chatgpt/webui/stop——停止 WebUI（后端先停注册机，再按命令行含 start_webui.py 匹配杀进程）。 */
+export function chatGptWebuiStop(): Promise<{ ok: boolean }> {
+  return call("chatgpt_webui_stop");
+}
+
+/** POST /api/chatgpt/registrar/start——批量注册启动（body 透传工具链 /api/auto/start；
+ *  target_count 必填 ≥1，0=不限量会无限跑）。已在外跑时后端透传 HTTP 400。 */
+export function chatGptRegistrarStart(
+  body: ChatGptRegistrarStartBody,
+): Promise<Record<string, unknown>> {
+  return call("chatgpt_registrar_start", body as unknown as Record<string, unknown>);
+}
+
+/** POST /api/chatgpt/registrar/pause——暂停批量注册循环。 */
+export function chatGptRegistrarPause(): Promise<Record<string, unknown>> {
+  return call("chatgpt_registrar_pause");
+}
+
+/** POST /api/chatgpt/registrar/resume——恢复批量注册循环。 */
+export function chatGptRegistrarResume(): Promise<Record<string, unknown>> {
+  return call("chatgpt_registrar_resume");
+}
+
+/** POST /api/chatgpt/registrar/stop——停止批量注册循环。 */
+export function chatGptRegistrarStop(): Promise<Record<string, unknown>> {
+  return call("chatgpt_registrar_stop");
+}
+
+/** GET /api/chatgpt/registrar/status——注册机快照透传（state/registered_ok/registered_fail/target_count）。 */
+export function chatGptRegistrarStatus(): Promise<ChatGptRegistrarStatus> {
+  return call("chatgpt_registrar_status");
+}
+
+/** GET /api/chatgpt/registered——已注册 ChatGPT 账号表透传（token 只回长度；账号表主源）。 */
+export function chatGptRegistered(args?: { limit?: number; offset?: number }): Promise<ChatGptRegisteredResponse> {
+  return call("chatgpt_registered", args as Record<string, unknown> | undefined);
+}
+
+/** GET /api/chatgpt/accounts——邮箱号池透传（outlook_accounts；用于池计数，非 ChatGPT 账号）。 */
+export function chatGptAccounts(args?: { limit?: number; offset?: number }): Promise<ChatGptAccountsResponse> {
+  return call("chatgpt_accounts", args as Record<string, unknown> | undefined);
+}
+
+/** POST /api/chatgpt/accounts/sync——把已注册账号镜像到本地池 ~/.wb-switch/chatgpt_accounts.json。 */
+export function chatGptAccountsSync(): Promise<Record<string, unknown>> {
+  return call("chatgpt_accounts_sync");
+}

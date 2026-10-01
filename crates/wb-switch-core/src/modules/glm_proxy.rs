@@ -160,7 +160,10 @@ impl GlmModelRoute {
     pub fn meta_summary(&self) -> Value {
         json!({
             "consumption": self.meta.get("creditConsumptionLevel").cloned().unwrap_or(Value::Null),
-            "contextWindow": self.meta.get("contextWindow").cloned().unwrap_or(Value::Null),
+            // 1.4.1：全网关统一口径——目录值缺失时用家族最长宣称值兜底
+            "contextWindow": crate::modules::config::max_context_window(&self.body_model)
+                .map(|v| json!(v))
+                .unwrap_or_else(|| self.meta.get("contextWindow").cloned().unwrap_or(Value::Null)),
             "maxTokens": self.meta.get("maxTokens").cloned().unwrap_or(Value::Null),
             "inputs": self.meta.get("input").cloned().unwrap_or(Value::Null),
             "reasoning": self.meta.get("reasoning").cloned().unwrap_or(Value::Null),
@@ -1198,36 +1201,84 @@ pub enum GlmChatCompletion {
 /// OpenAI `/v1/models` 响应。同名模型（两区目录都有）按模型目录顺序
 /// 只暴露一个 ID（settings.json 归属的本机区域优先）；`x_region` 标注归属。
 pub fn models_payload() -> Value {
+    models_payload_filtered(None)
+}
+
+/// 1.3.0：按区域过滤的模型清单（参照 workbuddy-pool 区域契约的分组方式——
+/// 每条带 `region` 字段（domestic/international）、顶层 `regions` 元信息（各组
+/// 条数）、支持按区过滤）。glm_web（ChatGLM，国内）归 domestic。
+/// `region`：None/"all"=全量；"domestic"/"cn"=国内版；"international"/"intl"=国际版；
+/// 其他值=空清单（前端/客户端应使用已知取值）。
+pub fn models_payload_filtered(region: Option<&str>) -> Value {
+    let want = match region {
+        None | Some("all") => None,
+        Some("cn") => Some("domestic"),
+        Some("intl") => Some("international"),
+        Some(other) => Some(other),
+    };
     let mut seen = std::collections::HashSet::new();
     let mut data = Vec::new();
+    let mut cn = 0usize;
+    let mut intl = 0usize;
     for route in model_routes() {
         if seen.insert(route.body_model.clone()) {
-            data.push(json!({
+            let r = route.region.as_str();
+            if let Some(w) = want {
+                if r != w {
+                    continue;
+                }
+            }
+            match r {
+                "domestic" => cn += 1,
+                "international" => intl += 1,
+                _ => {}
+            }
+            let mut entry = json!({
                 "id": route.body_model,
                 "object": "model",
                 "created": 0,
                 "owned_by": "autoclaw",
-                "x_region": route.region.as_str(),
-            }));
+                "region": r,
+            });
+            if let Some(cw) = crate::modules::config::max_context_window(&route.body_model) {
+                entry["contextWindow"] = json!(cw);
+            }
+            data.push(entry);
         }
     }
-    if crate::modules::glm_web::has_usable_token() {
+    if want.map(|w| w == "domestic").unwrap_or(true)
+        && crate::modules::glm_web::has_usable_token()
+    {
         if let Some(list) = crate::modules::glm_web::models_payload().get("data").and_then(Value::as_array) {
             for m in list {
                 if let Some(id) = m.get("id").and_then(Value::as_str) {
                     if seen.insert(id.to_string()) {
-                        data.push(json!({
+                        cn += 1;
+                        let mut entry = json!({
                             "id": id,
                             "object": "model",
                             "created": 0,
                             "owned_by": "chatglm",
-                        }));
+                            "region": "domestic",
+                        });
+                        // 透传 glm_web 清单已带的 contextWindow（家族最长口径）
+                        if let Some(cw) = m.get("contextWindow") {
+                            entry["contextWindow"] = cw.clone();
+                        }
+                        data.push(entry);
                     }
                 }
             }
         }
     }
-    json!({"object": "list", "data": data})
+    let mut regions = serde_json::Map::new();
+    if want.map(|w| w == "domestic").unwrap_or(true) {
+        regions.insert("domestic".to_string(), json!({ "models": cn }));
+    }
+    if want.map(|w| w == "international").unwrap_or(true) {
+        regions.insert("international".to_string(), json!({ "models": intl }));
+    }
+    json!({"object": "list", "data": data, "regions": Value::Object(regions)})
 }
 
 #[cfg(test)]

@@ -44,6 +44,17 @@
 //! `sticky_set(key, 实际 uid)` 重绑（对齐参考实现 session.Bind 的「粘性跟随最终成功号」），
 //! 失败则 `sticky_clear(key)` 解绑；未命中直接 `pick_account(model, &[])`。
 //! 因为 `pick_account` 的统一候选过滤（健康 / 模型冷却 / 在途 / tried）对粘性号一视同仁。
+//!
+//! # 区域隔离（workbuddy-pool-region 契约 §3.1/§3.2）
+//!
+//! 账号 region 由登录域后缀派生（`.cn→cn` / `.ai→intl`，见 `pool_account_from_value`），
+//! 上游端点已按区域分域——缺口纯在路由与聚合，本文件补三件：
+//! ① 区域目录缓存 [`region_catalog`]（TTL 10min，两区独立成败，intl 无账号回落静态表）；
+//! ② 解析 [`resolve_model_region`]（hint 优先 > 唯一命中 > 无约束）与区域约束选号
+//!    [`pick_account_for_region`]（候选收集与全冷却兜底同步过滤，pinned/rotate 前置比对）；
+//! ③ 11102 跨区翻转 [`region_flip`] 与粘性区域一致性 [`sticky_region_mismatch`]
+//!    （判定在 core，接线在 api.rs dispatch）。
+//! 旧签名 `pick_account(model, tried)` 保留为 region=Unknown 委托（回归红线 3）。
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1189,32 +1200,63 @@ impl Pool {
     }
 
     /// 按模式选号（balance/rotate/pinned），跳过 `tried` 中的 UID。
+    ///
+    /// 旧签名保留（workbuddy-pool-region 契约回归红线 3）：无区域约束，
+    /// 委托 [`Pool::pick_account_for_region`] 的 Unknown 分支，语义逐字节等价。
     pub fn pick_account(&mut self, model: &str, tried: &[String]) -> Option<PoolAccount> {
+        self.pick_account_for_region(model, tried, RegionFilter::Unknown)
+    }
+
+    /// 区域约束版选号（workbuddy-pool-region 契约 §3.2）：只在 wanted 区候选里挑。
+    /// pinned / rotate 的 `pick_by_uid` 前先比对区域，不匹配直接跳过该路径回落
+    /// 区域化 pick（不硬塞跨区请求）；wanted = Unknown 时与旧签名完全等价。
+    pub fn pick_account_for_region(
+        &mut self,
+        model: &str,
+        tried: &[String],
+        wanted: RegionFilter,
+    ) -> Option<PoolAccount> {
         match self.mode.as_str() {
             "pinned" => {
-                // 指定模式： pinned 号可用就用它；不可用（冷却/熔断/模型限流/在途/tried）
-                // 回落普通选号，避免指定号故障时整个池不可用。
+                // 指定模式： pinned 号可用就用它；不可用（冷却/熔断/模型限流/在途/tried/
+                // 区域不匹配）回落普通选号，避免指定号故障时整个池不可用。
                 let pinned = self.pinned_uid.clone();
-                if !pinned.is_empty() && !tried.iter().any(|t| t == &pinned) {
+                if !pinned.is_empty()
+                    && !tried.iter().any(|t| t == &pinned)
+                    && self.uid_in_region(&pinned, wanted)
+                {
                     if let Some(acc) = self.pick_by_uid(&pinned, model) {
                         return Some(acc);
                     }
                 }
-                self.pick(model, tried)
+                self.pick_region(model, tried, wanted)
             }
             "rotate" => {
-                // 烧号模式：当前号仍可用就继续用，不可用才换下一个（换的仍是选号算法挑的）。
+                // 烧号模式：当前号仍可用就继续用，不可用（含区域不匹配）才换下一个
+                // （换的仍是选号算法挑的，且同样受区域约束）。
                 let current = self.rotate_uid.clone();
-                if !current.is_empty() && !tried.iter().any(|t| t == &current) {
+                if !current.is_empty()
+                    && !tried.iter().any(|t| t == &current)
+                    && self.uid_in_region(&current, wanted)
+                {
                     if let Some(acc) = self.pick_by_uid(&current, model) {
                         return Some(acc);
                     }
                 }
-                let acc = self.pick(model, tried)?;
+                let acc = self.pick_region(model, tried, wanted)?;
                 self.rotate_uid = acc.uid.clone();
                 Some(acc)
             }
-            _ => self.pick(model, tried),
+            _ => self.pick_region(model, tried, wanted),
+        }
+    }
+
+    /// uid 对应条目的区域是否满足 wanted（Unknown 恒 true；uid 不在池内 = 不满足，
+    /// 与 `pick_by_uid` 查不到返回 None 的口径一致）。
+    fn uid_in_region(&self, uid: &str, wanted: RegionFilter) -> bool {
+        match self.by_uid.get(uid) {
+            Some(&idx) => wanted.allows(&self.entries[idx].acc.region),
+            None => false,
         }
     }
 
@@ -1230,9 +1272,22 @@ impl Pool {
         Some(self.entries[idx].acc.clone())
     }
 
-    /// 挑号，跳过 `tried` 中的 UID。到期分层→Top5 加权→防惊群→LRU 兜底。
-    /// 对照 pool.rs:840 `pick_excluding` + pool.go:725 `pick`（model 过滤照 Go 版）。
+    /// 挑号（无区域约束；旧形态，仅测试矩阵使用——生产路径一律走
+    /// [`Pool::pick_region`]，无约束等价于 wanted=Unknown）。
+    #[cfg(test)]
     fn pick(&mut self, model: &str, tried: &[String]) -> Option<PoolAccount> {
+        self.pick_region(model, tried, RegionFilter::Unknown)
+    }
+
+    /// 挑号（区域约束版），跳过 `tried` 中的 UID。到期分层→Top5 加权→防惊群→LRU 兜底。
+    /// 对照 pool.rs:840 `pick_excluding` + pool.go:725 `pick`（model 过滤照 Go 版）。
+    /// wanted ≠ Unknown 时候选收集与全冷却兜底同步按区域过滤（契约 §3.2）。
+    fn pick_region(
+        &mut self,
+        model: &str,
+        tried: &[String],
+        wanted: RegionFilter,
+    ) -> Option<PoolAccount> {
         let now = now_ms();
 
         // 顺手清理已过期的模型冷却，避免 map 随模型种类无限增长（Go pick 同款）。
@@ -1246,12 +1301,13 @@ impl Pool {
             self.dirty = true;
         }
 
-        // 1) 收集 healthy 且未在途占满、不在 tried、该模型未被模型级冷却的候选
-        // （按 UID 排序保证确定性）
+        // 1) 收集 healthy 且未在途占满、不在 tried、该模型未被模型级冷却、区域满足
+        // wanted 的候选（按 UID 排序保证确定性）
         let mut cands: Vec<usize> = (0..self.entries.len())
             .filter(|&i| {
                 let e = &self.entries[i];
                 !tried.iter().any(|t| t == &e.acc.uid)
+                    && wanted.allows(&e.acc.region)
                     && e.healthy(now)
                     && !self.in_flight_full(e)
                     && !e.model_cooled(model, now)
@@ -1260,8 +1316,8 @@ impl Pool {
         cands.sort_by(|&a, &b| self.entries[a].acc.uid.cmp(&self.entries[b].acc.uid));
 
         if cands.is_empty() {
-            // 全冷却兜底（soft/breaker 号可参与，hard 冷却排除）。
-            return self.pick_earliest_expiry(tried, model, now);
+            // 全冷却兜底（soft/breaker 号可参与，hard 冷却排除；区域约束同步生效）。
+            return self.pick_earliest_expiry(tried, model, now, wanted);
         }
 
         // 2) 到期分层：只保留最早到期的一档
@@ -1320,14 +1376,24 @@ impl Pool {
     /// 全冷却兜底：在非禁用的软冷却/熔断账号中选截止最早的一个。
     /// 分级：disabled 永不参与；硬冷却（余额耗尽）账号若仍处于有效冷却期也排除
     /// （调了必 402）；软冷却与熔断号允许参与（可能已恢复）。被 tried / 在途占满
-    /// / 该模型被限流的账号同样跳过。对照 pool.rs:934 `pick_earliest_expiry`
-    /// + pool.go:886 `pickEarliestExpiryLocked`（model 过滤照 Go 版）。
-    fn pick_earliest_expiry(&mut self, tried: &[String], model: &str, now: i64) -> Option<PoolAccount> {
+    /// / 该模型被限流 / **区域不满足 wanted** 的账号同样跳过。对照 pool.rs:934
+    /// `pick_earliest_expiry` + pool.go:886 `pickEarliestExpiryLocked`（model 过滤照 Go 版）。
+    fn pick_earliest_expiry(
+        &mut self,
+        tried: &[String],
+        model: &str,
+        now: i64,
+        wanted: RegionFilter,
+    ) -> Option<PoolAccount> {
         let mut best: Option<usize> = None;
         let mut best_exp = 0i64;
         for i in 0..self.entries.len() {
             let e = &self.entries[i];
             if tried.iter().any(|t| t == &e.acc.uid) {
+                continue;
+            }
+            // 区域约束（§3.2）：对侧账号不参与兜底——兜底选了它照样 11102。
+            if !wanted.allows(&e.acc.region) {
                 continue;
             }
             if e.disabled {
@@ -1503,8 +1569,40 @@ impl Pool {
 
     /// 池状态 JSON（total/healthy/cooling/model_cooling/breaker/accounts[]，脱敏）。
     /// token 不出现；uid 仅保留前 8 位。
+    ///
+    /// 增 regions 聚合（workbuddy-pool-region 契约 §3.5）：
+    /// `{cn:{accounts,healthy,models?},intl:{...}}`——models 数取自区域目录缓存，
+    /// 缓存未建/过期为 null（status 是只读透出，不因查询而触发上游探测）。
     pub fn status_value(&self) -> Value {
         let now = now_ms();
+        // 区域聚合（§3.5）：accounts/healthy 按条目区域计数（healthy 口径与总数一致：
+        // 未禁用且不在任一冷却/熔断期）。
+        let catalog = region_catalog_cached();
+        let mut regions = serde_json::Map::new();
+        for region in ["cn", "intl"] {
+            let mut accounts = 0i64;
+            let mut healthy = 0i64;
+            for e in &self.entries {
+                if e.acc.region != region {
+                    continue;
+                }
+                accounts += 1;
+                if e.healthy(now) {
+                    healthy += 1;
+                }
+            }
+            let models = catalog.as_ref().map(|c| {
+                if region == "cn" {
+                    c.cn_ids.len() as i64
+                } else {
+                    c.intl_ids.len() as i64
+                }
+            });
+            regions.insert(
+                region.to_string(),
+                json!({"accounts": accounts, "healthy": healthy, "models": models}),
+            );
+        }
         let mut total = 0i64;
         let mut healthy = 0i64;
         let mut cooling = 0i64;
@@ -1554,6 +1652,7 @@ impl Pool {
             "cooling": cooling,
             "model_cooling": model_cooling,
             "breaker": breaker,
+            "regions": Value::Object(regions),
             "accounts": accounts,
         })
     }
@@ -1679,6 +1778,381 @@ pub fn release(uid: &str) {
 /// 巡检回填余额与到期日（驱动分层选号）。
 pub fn set_credits(uid: &str, credits: i64, credit_expires_at: i64) {
     with_pool(|p| p.set_credits(uid, credits, credit_expires_at));
+}
+
+/// 选号（区域约束版，workbuddy-pool-region 契约 §3.2）：只在 wanted 区候选里挑
+/// （含全冷却兜底同步过滤）。`pick_account`（无约束旧签名）保留为 Unknown 委托，
+/// 粘性等既有调用点语义不变；本期 dispatch 全部走本入口。
+pub fn pick_account_for_region(
+    model: &str,
+    tried: &[String],
+    wanted: RegionFilter,
+) -> Option<PoolAccount> {
+    with_pool(|p| p.pick_account_for_region(model, tried, wanted))
+}
+
+// ---------------------------------------------------------------------------
+// 区域隔离（契约 docs/workbuddy-pool-region-contract.md §3.1/§3.2/§3.4）
+// ---------------------------------------------------------------------------
+
+/// 区域过滤（§3.1）：选号只在 wanted 区候选里挑；[`RegionFilter::Unknown`] = 无约束
+/// （两区同名 / 两边都没有 / 缓存不可用降级——维持现状交上游校验）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RegionFilter {
+    /// 无约束（默认；等价旧签名的 region=None 语义）。
+    #[default]
+    Unknown,
+    /// 只挑国服（.cn 派生）账号。
+    Cn,
+    /// 只挑国际版（.ai 派生）账号。
+    Intl,
+}
+
+impl RegionFilter {
+    /// 请求体显式 `region` 字段（"cn"/"intl"，大小写/首尾空白不敏感）→ 过滤；
+    /// 缺席 / 非法值返回 None（交区域目录解析，§3.3 优先级①）。
+    pub fn from_hint(hint: Option<&str>) -> Option<RegionFilter> {
+        match hint.map(str::trim).map(|s| s.to_ascii_lowercase()).as_deref() {
+            Some("cn") => Some(RegionFilter::Cn),
+            Some("intl") => Some(RegionFilter::Intl),
+            _ => None,
+        }
+    }
+
+    /// wanted 区域名（None = 无约束）；日志与错误文案用。
+    pub fn wanted_region(self) -> Option<&'static str> {
+        match self {
+            RegionFilter::Cn => Some("cn"),
+            RegionFilter::Intl => Some("intl"),
+            RegionFilter::Unknown => None,
+        }
+    }
+
+    /// 纯判定：账号区域是否满足过滤（Unknown 恒 true）。
+    fn allows(self, acc_region: &str) -> bool {
+        match self {
+            RegionFilter::Unknown => true,
+            RegionFilter::Cn => acc_region == "cn",
+            RegionFilter::Intl => acc_region == "intl",
+        }
+    }
+}
+
+/// 11102 跨区翻转（§3.3）：上游「model service info not found」说明本轮实际使用的
+/// 账号区域与模型区域不匹配 → 把 filter 翻到对侧继续重试。已是明确约束 → 直接取
+/// 对侧；无约束（Unknown）→ 从本轮实际使用的 acc.region 反推对侧。
+pub fn region_flip(current: RegionFilter, used_region: &str) -> RegionFilter {
+    match current {
+        RegionFilter::Cn => RegionFilter::Intl,
+        RegionFilter::Intl => RegionFilter::Cn,
+        RegionFilter::Unknown => {
+            if used_region.trim().eq_ignore_ascii_case("intl") {
+                RegionFilter::Cn
+            } else {
+                RegionFilter::Intl
+            }
+        }
+    }
+}
+
+/// T4 粘性区域一致性判定：wanted 有约束且粘性号区域不满足 → 应解绑粘性走常规
+/// （不硬塞跨区请求）。`sticky_region` = 粘性 uid 在账号库里的 region；查不到视为
+/// 不匹配（绑定的号已不在池内，粘性本就该重选）。wanted 无约束恒 false（现状不变）。
+pub fn sticky_region_mismatch(sticky_region: Option<&str>, wanted: RegionFilter) -> bool {
+    match wanted.wanted_region() {
+        None => false,
+        Some(w) => sticky_region != Some(w),
+    }
+}
+
+/// 区域目录（§3.1）：两区模型 id 集（区域路由判据）+ 构建时刻（TTL 判据）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RegionCatalog {
+    pub cn_ids: HashSet<String>,
+    pub intl_ids: HashSet<String>,
+    pub probed_at: i64,
+}
+
+impl RegionCatalog {
+    /// 模型落在哪区（(in_cn, in_intl)）；解析唯一判据。
+    fn locate(&self, model: &str) -> (bool, bool) {
+        (self.cn_ids.contains(model), self.intl_ids.contains(model))
+    }
+}
+
+/// 区域目录 TTL：10 分钟（§3.2 T2：chat 时零额外上游调用）。
+const REGION_CATALOG_TTL_MS: i64 = 10 * 60 * 1000;
+
+/// 区域目录 TTL 缓存（进程内共享）。仿 trae_acp `NATIVE_CATALOG_CACHE` 范式：
+/// 锁只护快照读写，重建（网络）在锁外做。
+static REGION_CATALOG_CACHE: Mutex<Option<RegionCatalog>> = Mutex::new(None);
+
+/// 区域目录快照（TTL 内有效才返回；未建/过期返回 None——解析与 status 共用）。
+fn region_catalog_cached() -> Option<RegionCatalog> {
+    let guard = REGION_CATALOG_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard
+        .as_ref()
+        .filter(|c| now_ms() - c.probed_at < REGION_CATALOG_TTL_MS)
+        .cloned()
+}
+
+/// 区域目录（§3.1）：TTL 内直接返回缓存；过期/未建则重建一次。
+/// 重建失败返回 Err——调用方（dispatch）降级为无约束路由，绝不让 chat 挂死。
+pub async fn region_catalog() -> Result<RegionCatalog, String> {
+    if let Some(c) = region_catalog_cached() {
+        return Ok(c);
+    }
+    region_catalog_refresh().await
+}
+
+/// 强制重建区域目录（绕过 TTL；成功才写缓存）。
+pub async fn region_catalog_refresh() -> Result<RegionCatalog, String> {
+    let catalog = build_region_catalog().await?;
+    let mut guard = REGION_CATALOG_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *guard = Some(catalog.clone());
+    Ok(catalog)
+}
+
+/// 区域目录重建（§3.1）：cn 区 = 首个成功 cn 账号 `fetch_models` 的 id 集；
+/// intl 区 = 首个成功 intl 账号，无 intl 账号或全失败 → `intl_static_models()` 的
+/// id 集（静态表就是为「本机无国际版账号」场景准备的，契约 §五-6）。两区独立成败，
+/// 互不阻塞。**不在任何锁内 await**：账号快照直接读 accounts.json（不经池锁），
+/// fetch_models 是纯网络调用。
+async fn build_region_catalog() -> Result<RegionCatalog, String> {
+    let accounts = load_pool_accounts();
+    let mut cn_ids = HashSet::new();
+    for acc in accounts.iter().filter(|a| a.region == "cn") {
+        if let Ok(payload) = workbuddy_upstream::fetch_models(acc).await {
+            cn_ids = ids_from_models_payload(&payload);
+            break;
+        }
+    }
+    let mut intl_ids = HashSet::new();
+    for acc in accounts.iter().filter(|a| a.region == "intl") {
+        if let Ok(payload) = workbuddy_upstream::fetch_models(acc).await {
+            intl_ids = ids_from_models_payload(&payload);
+            break;
+        }
+    }
+    if intl_ids.is_empty() {
+        // 无 intl 账号或 intl 动态目录全失败：静态表兜底（§3.1）。
+        intl_ids = workbuddy_upstream::intl_static_models()
+            .iter()
+            .filter_map(|m| m.get("id").and_then(Value::as_str).map(String::from))
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+    if cn_ids.is_empty() && intl_ids.is_empty() {
+        return Err("区域目录构建失败：cn/intl 两区均无可判定的模型目录".to_string());
+    }
+    Ok(RegionCatalog {
+        cn_ids,
+        intl_ids,
+        probed_at: now_ms(),
+    })
+}
+
+/// 纯函数：fetch_models 的 OpenAI models list 载荷 → 模型 id 集（目录构建与测试共用）。
+pub fn ids_from_models_payload(payload: &Value) -> HashSet<String> {
+    payload
+        .get("data")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.get("id").and_then(Value::as_str).map(String::from))
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 模型 → 区域解析（§3.1 契约签名）：hint 优先（§3.3①）；区域目录唯一命中 → 该区；
+/// 两区同名或两边都没有 → 无约束；缓存不可用（TTL 内未成功）→ 无约束并写降级日志
+/// （可用性优先于隔离；R1：TTL 内新上架模型同样落 Unknown，上游校验兜底）。
+pub fn resolve_model_region(model: &str, hint: Option<&str>) -> RegionFilter {
+    let catalog = region_catalog_cached();
+    if catalog.is_none() && RegionFilter::from_hint(hint).is_none() {
+        eprintln!(
+            "[wb-gateway] region catalog unavailable（TTL 内未构建成功）→ {model} 区域解析降级为无约束（可用性优先）"
+        );
+    }
+    resolve_model_region_with(catalog.as_ref(), model, hint)
+}
+
+/// 解析纯函数核心（目录注入，供无网络矩阵测试；无日志副作用）。
+pub fn resolve_model_region_with(
+    catalog: Option<&RegionCatalog>,
+    model: &str,
+    hint: Option<&str>,
+) -> RegionFilter {
+    if let Some(f) = RegionFilter::from_hint(hint) {
+        return f;
+    }
+    let Some(c) = catalog else {
+        return RegionFilter::Unknown;
+    };
+    match c.locate(model) {
+        (true, false) => RegionFilter::Cn,
+        (false, true) => RegionFilter::Intl,
+        // 两区同名（glm-5.3）或两边都没有（全新模型）：不约束，上游校验兜底（§3.1③）。
+        _ => RegionFilter::Unknown,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// models 端点按区聚合纯函数（契约 §3.4；fetch 注入，IO 全在 api.rs 接线层）
+// ---------------------------------------------------------------------------
+
+/// 单区模型目录聚合结果：source 标记 + 动态目录来源账号 + 已带 region 字段的条目
+/// （区内已按 id 去重）。
+#[derive(Debug, Clone)]
+pub struct RegionModels {
+    pub region: &'static str,
+    /// "dynamic"（该区账号动态目录）| "fallback"（cn 内置表回落）| "static"（intl 静态表回落）。
+    pub source: &'static str,
+    /// 动态目录来源账号 uid；回落为空串（载荷里不落 account 字段）。
+    pub account: String,
+    pub items: Vec<Value>,
+}
+
+/// 纯函数：单区目录聚合（§3.4）。`fetch` 注入：None = 该区无账号；
+/// `Some((uid, Err))` = 该区账号全失败（uid 为末次尝试账号，供日志）。两区回落
+/// source 语义不同（§3.4）：cn → "fallback"（builtin 内置表）、intl → "static"
+/// （intl_static_models——「本机无国际版账号」是正常态，静态表显性化，R2）。
+pub fn region_models_part(
+    wanted: RegionFilter,
+    fetch: Option<(String, Result<Value, String>)>,
+    fallback_items: Vec<Value>,
+) -> RegionModels {
+    let region = match wanted {
+        RegionFilter::Cn => "cn",
+        _ => "intl",
+    };
+    let fallback_source = if region == "cn" { "fallback" } else { "static" };
+    let (source, account, items) = match fetch {
+        Some((uid, Ok(payload))) => {
+            let data = payload
+                .get("data")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let items = entries_with_region(&data, region);
+            if items.is_empty() {
+                // 动态目录空表按回落处理（fetch_models 本身会拒绝空列表，防御为主）。
+                (fallback_source, String::new(), entries_with_region(&fallback_items, region))
+            } else {
+                ("dynamic", uid, items)
+            }
+        }
+        _ => (fallback_source, String::new(), entries_with_region(&fallback_items, region)),
+    };
+    RegionModels {
+        region,
+        source,
+        account,
+        items,
+    }
+}
+
+/// 纯函数：两区部分 → 最终 models 载荷（§3.4）。`only` 为单区过滤（?region=cn|intl，
+/// Unknown = 两区全量）；`regions` 元数据只含纳入的区。**跨区同名（glm-5.3）保留
+/// 两条**（region 字段区分）——「同名模型两区各有一套后端映射」的诚实表达；
+/// 区内去重在 [`region_models_part`] 已完成。
+pub fn assemble_region_models(cn: RegionModels, intl: RegionModels, only: RegionFilter) -> Value {
+    let mut regions = serde_json::Map::new();
+    let mut data = Vec::new();
+    for part in [&cn, &intl] {
+        let part_filter = if part.region == "cn" {
+            RegionFilter::Cn
+        } else {
+            RegionFilter::Intl
+        };
+        if only != RegionFilter::Unknown && only != part_filter {
+            continue;
+        }
+        let mut meta = serde_json::Map::new();
+        meta.insert("source".to_string(), json!(part.source));
+        if !part.account.is_empty() {
+            meta.insert("account".to_string(), json!(part.account));
+        }
+        regions.insert(part.region.to_string(), Value::Object(meta));
+        data.extend(part.items.iter().cloned());
+    }
+    json!({
+        "object": "list",
+        "regions": Value::Object(regions),
+        "data": data,
+    })
+}
+
+/// 条目集加 `region` 字段（区内按 id 去重、剔除空 id，保持原顺序）。
+fn entries_with_region(items: &[Value], region: &str) -> Vec<Value> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::with_capacity(items.len());
+    for m in items {
+        let id = m.get("id").and_then(Value::as_str).unwrap_or_default();
+        if id.is_empty() || !seen.insert(id.to_string()) {
+            continue;
+        }
+        let mut entry = m.clone();
+        if let Some(obj) = entry.as_object_mut() {
+            obj.insert("region".to_string(), json!(region));
+        }
+        out.push(entry);
+    }
+    out
+}
+
+/// 区域内逐账号尝试 `fetch_models`，首个成功即返回 `(uid, Ok)`；全败返回
+/// 末个 `(uid, Err)`。无该区账号返回 `None`。
+/// （自 api.rs `workbuddy_pool_fetch_region_models` 上移为 pub，供总览复用。）
+pub async fn fetch_region_models(
+    accounts: &[PoolAccount],
+    region: &str,
+) -> Option<(String, Result<Value, String>)> {
+    let mut last: Option<(String, Result<Value, String>)> = None;
+    for acc in accounts.iter().filter(|a| a.region == region) {
+        match crate::modules::workbuddy_upstream::fetch_models(acc).await {
+            Ok(v) => return Some((acc.uid.clone(), Ok(v))),
+            Err(e) => last = Some((acc.uid.clone(), Err(e))),
+        }
+    }
+    last
+}
+
+/// 总览用：两区目录聚合（条目带 region 字段，跨区同名各留一条；cn 回落内置表、
+/// intl 回落静态表，与 `/workbuddy-pool/v1/models` 同口径，不含观测 note）。
+/// 两区全空返回 Err（总览按 health=error 降级）。
+pub async fn overview_models_catalog() -> Result<Vec<Value>, String> {
+    let accounts = load_pool_accounts();
+    let (cn_fetch, intl_fetch) = tokio::join!(
+        fetch_region_models(&accounts, "cn"),
+        fetch_region_models(&accounts, "intl"),
+    );
+    let builtin = crate::modules::workbuddy_proxy::builtin_models_payload();
+    let builtin_items = builtin
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let intl_static = crate::modules::workbuddy_upstream::intl_static_models();
+    let cn_part = region_models_part(RegionFilter::Cn, cn_fetch, builtin_items);
+    let intl_part = region_models_part(RegionFilter::Intl, intl_fetch, intl_static);
+    let payload = assemble_region_models(cn_part, intl_part, RegionFilter::Unknown);
+    let items = payload
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if items.is_empty() {
+        Err("池两区目录均为空（账号库无 WorkBuddy 账号或上游不可达）".to_string())
+    } else {
+        Ok(items)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2933,5 +3407,423 @@ mod tests {
             now + 2 * 86_400_000,
             "credit_expires_at 0 = 未知，不清到期日"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 区域隔离（workbuddy-pool-region 契约 §3.1/§3.2/§3.4；无网络：纯函数矩阵）
+    // -----------------------------------------------------------------------
+
+    /// 指定区域的池账号（mk_acc 默认 cn，intl 用本助手）。
+    fn mk_acc_region(uid: &str, region: &str) -> PoolAccount {
+        let mut a = mk_acc(uid);
+        a.region = region.to_string();
+        a
+    }
+
+    /// 解析矩阵测试目录：cn=deepseek-v4-flash + 同名 glm-5.3；intl=gpt-5.6-sol + 同名 glm-5.3
+    /// （对照真实分布：同名模型两区各有一套后端映射，契约 §3.1③）。
+    fn mk_catalog() -> RegionCatalog {
+        RegionCatalog {
+            cn_ids: ["deepseek-v4-flash".to_string(), "glm-5.3".to_string()]
+                .into_iter()
+                .collect(),
+            intl_ids: ["gpt-5.6-sol".to_string(), "glm-5.3".to_string()]
+                .into_iter()
+                .collect(),
+            probed_at: now_ms(),
+        }
+    }
+
+    #[test]
+    fn region_filter_from_hint_matrix() {
+        // 显式 region 字段（§3.3①）：大小写/空白不敏感；缺席/非法 → None 交目录解析。
+        assert_eq!(RegionFilter::from_hint(Some("cn")), Some(RegionFilter::Cn));
+        assert_eq!(RegionFilter::from_hint(Some("intl")), Some(RegionFilter::Intl));
+        assert_eq!(RegionFilter::from_hint(Some(" INTL ")), Some(RegionFilter::Intl));
+        assert_eq!(RegionFilter::from_hint(Some("CN")), Some(RegionFilter::Cn));
+        assert_eq!(RegionFilter::from_hint(Some("")), None, "空串 = 未提供");
+        assert_eq!(RegionFilter::from_hint(Some("bogus")), None, "非法值不约束");
+        assert_eq!(RegionFilter::from_hint(None), None);
+        // wanted_region：日志/文案取值。
+        assert_eq!(RegionFilter::Cn.wanted_region(), Some("cn"));
+        assert_eq!(RegionFilter::Unknown.wanted_region(), None);
+    }
+
+    #[test]
+    fn region_resolve_matrix() {
+        let cat = mk_catalog();
+        // 唯一命中 → 该区。
+        assert_eq!(
+            resolve_model_region_with(Some(&cat), "deepseek-v4-flash", None),
+            RegionFilter::Cn,
+            "cn 独有模型 → 唯一命中 cn"
+        );
+        assert_eq!(
+            resolve_model_region_with(Some(&cat), "gpt-5.6-sol", None),
+            RegionFilter::Intl,
+            "intl 独有模型 → 唯一命中 intl"
+        );
+        // 两区同名 → 无约束（§3.1③：上游校验兜底）。
+        assert_eq!(
+            resolve_model_region_with(Some(&cat), "glm-5.3", None),
+            RegionFilter::Unknown,
+            "两区同名模型不约束"
+        );
+        // 两边都没有（全新模型）→ 无约束。
+        assert_eq!(
+            resolve_model_region_with(Some(&cat), "brand-new-model", None),
+            RegionFilter::Unknown
+        );
+        // hint 覆盖目录：显式 region 优先（§3.3① > ②）。
+        assert_eq!(
+            resolve_model_region_with(Some(&cat), "deepseek-v4-flash", Some("intl")),
+            RegionFilter::Intl,
+            "hint 应覆盖目录唯一命中"
+        );
+        assert_eq!(
+            resolve_model_region_with(Some(&cat), "brand-new-model", Some("cn")),
+            RegionFilter::Cn,
+            "hint 对目录未知模型仍生效"
+        );
+        // 缓存不可用（None）→ 无约束（降级路径，§3.1）。
+        assert_eq!(
+            resolve_model_region_with(None, "deepseek-v4-flash", None),
+            RegionFilter::Unknown,
+            "目录不可用 → 无约束（可用性优先）"
+        );
+        // 目录不可用但 hint 在 → 仍按 hint 约束。
+        assert_eq!(resolve_model_region_with(None, "m", Some("intl")), RegionFilter::Intl);
+        // 空目录（两区 id 集全空）→ 一律无约束。
+        let empty = RegionCatalog::default();
+        assert_eq!(resolve_model_region_with(Some(&empty), "m", None), RegionFilter::Unknown);
+    }
+
+    #[test]
+    fn region_catalog_cache_ttl_and_global_resolve() {
+        // 全局静态缓存（进程级）：本测试是测试模块里唯一触碰 REGION_CATALOG_CACHE 的
+        // 用例（无并行竞争），结束前复位防止污染。
+        *REGION_CATALOG_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        assert_eq!(
+            resolve_model_region("deepseek-v4-flash", None),
+            RegionFilter::Unknown,
+            "缓存未建 → 无约束（TTL 内未成功，§3.1）"
+        );
+
+        let fresh = mk_catalog();
+        *REGION_CATALOG_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(fresh.clone());
+        assert_eq!(
+            resolve_model_region("gpt-5.6-sol", None),
+            RegionFilter::Intl,
+            "TTL 内缓存生效：intl 独有模型命中 intl"
+        );
+        assert_eq!(region_catalog_cached(), Some(fresh), "快照与缓存一致");
+
+        // 过期（TTL 外）→ 视为不可用 → 无约束。
+        let stale = RegionCatalog {
+            probed_at: now_ms() - REGION_CATALOG_TTL_MS - 1,
+            ..mk_catalog()
+        };
+        *REGION_CATALOG_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(stale);
+        assert_eq!(
+            resolve_model_region("deepseek-v4-flash", None),
+            RegionFilter::Unknown,
+            "过期缓存视为不可用"
+        );
+        // hint 不依赖目录：缓存过期仍按 hint 约束。
+        assert_eq!(
+            resolve_model_region("deepseek-v4-flash", Some("cn")),
+            RegionFilter::Cn,
+            "显式 region 不受缓存可用性影响"
+        );
+
+        *REGION_CATALOG_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        assert_eq!(region_catalog_cached(), None, "复位后不可见");
+    }
+
+    #[test]
+    fn pick_region_filter_matrix() {
+        // cn a + intl b：区域约束把候选切成两个互不相交的集合。
+        let mut p = mk_pool();
+        p.upsert(mk_acc("a-cn"));
+        p.upsert(mk_acc_region("b-intl", "intl"));
+        assert_eq!(
+            p.pick_account_for_region("m", &[], RegionFilter::Cn).unwrap().uid,
+            "a-cn",
+            "cn 约束只出 cn 号"
+        );
+        assert_eq!(
+            p.pick_account_for_region("m", &[], RegionFilter::Intl).unwrap().uid,
+            "b-intl",
+            "intl 约束只出 intl 号"
+        );
+        // Unknown：两区都可选（选中号必属其一）。
+        let uid = p
+            .pick_account_for_region("m", &[], RegionFilter::Unknown)
+            .unwrap()
+            .uid;
+        assert!(uid == "a-cn" || uid == "b-intl");
+        // tried 与区域约束叠加。
+        assert!(
+            p.pick_account_for_region("m", &["a-cn".to_string()], RegionFilter::Cn).is_none(),
+            "cn 区唯一账号进 tried → 无候选"
+        );
+        // 旧签名等价性：pick_account == for_region(Unknown)。
+        assert_eq!(
+            p.pick_account("m", &["b-intl".to_string()]).unwrap().uid,
+            "a-cn",
+            "旧签名排除 intl 号（tried）后选 cn"
+        );
+    }
+
+    #[test]
+    fn pick_region_rejects_missing_region() {
+        // G4 前提：池内只有 cn 账号时，intl 约束选不到号（返回 None，
+        // 由 dispatch 报「intl 区无可用账号」，绝不误用 cn 号打上游）。
+        let mut p = mk_pool();
+        p.upsert(mk_acc("a-cn"));
+        assert!(p.pick_account_for_region("m", &[], RegionFilter::Intl).is_none());
+        assert!(p.pick_account_for_region("m", &[], RegionFilter::Cn).is_some());
+    }
+
+    #[test]
+    fn pick_region_fallback_respects_region() {
+        // 全冷却兜底路径的区域过滤（§3.2）：cn 区全员软冷却时，cn 约束经兜底选回
+        // 软冷却 cn 号；intl 约束不受 cn 冷却影响选 intl 号；对侧健康号绝不被
+        // 借来硬塞。
+        let mut p = mk_pool();
+        p.upsert(mk_acc("a-cn"));
+        p.upsert(mk_acc_region("b-intl", "intl"));
+        p.note_error("a-cn", "", ErrKind::SoftRate, "");
+        assert_eq!(
+            p.pick_account_for_region("m", &[], RegionFilter::Cn).unwrap().uid,
+            "a-cn",
+            "cn 全冷却 → 兜底选软冷却 cn 号（区域内）"
+        );
+        assert_eq!(
+            p.pick_account_for_region("m", &[], RegionFilter::Intl).unwrap().uid,
+            "b-intl",
+            "intl 约束无视 cn 冷却选 intl"
+        );
+
+        // 对比：cn 区唯一账号硬冷却（余额耗尽）→ cn 约束兜底也拿不到 → None。
+        let mut p2 = mk_pool();
+        p2.upsert(mk_acc("a-cn"));
+        p2.upsert(mk_acc_region("b-intl", "intl"));
+        p2.note_error("a-cn", "", ErrKind::HardCredit, "");
+        assert!(
+            p2.pick_account_for_region("m", &[], RegionFilter::Cn).is_none(),
+            "硬冷却不参与兜底，且不得借 intl 号"
+        );
+        assert_eq!(
+            p2.pick_account_for_region("m", &[], RegionFilter::Intl).unwrap().uid,
+            "b-intl"
+        );
+        // Unknown 维持旧行为：硬冷却排除后兜底软冷却/熔断号或健康号均可。
+        assert!(p2.pick_account("m", &[]).is_some(), "无约束时 intl 号可选");
+    }
+
+    #[test]
+    fn pick_region_modes_pinned_rotate_mismatch_falls_back() {
+        // pinned：指定号区域与 wanted 不匹配 → 跳过 pick_by_uid 回落区域化 pick
+        // （§3.2：不硬塞跨区请求）。
+        let cfg = GatewayConfig {
+            mode: "pinned".to_string(),
+            pinned_uid: "b-intl".to_string(),
+            ..Default::default()
+        };
+        let mut p = Pool::new(PathBuf::new(), &cfg);
+        p.upsert(mk_acc("a-cn"));
+        p.upsert(mk_acc_region("b-intl", "intl"));
+        assert_eq!(
+            p.pick_account_for_region("m", &[], RegionFilter::Cn).unwrap().uid,
+            "a-cn",
+            "pinned 是 intl 号 → cn 请求跳过指定号"
+        );
+        assert_eq!(
+            p.pick_account_for_region("m", &[], RegionFilter::Intl).unwrap().uid,
+            "b-intl",
+            "pinned 区域匹配时优先指定号"
+        );
+        // Unknown 维持 pinned 原语义。
+        assert_eq!(p.pick_account("m", &[]).unwrap().uid, "b-intl");
+
+        // rotate：当前号区域不匹配 → 换区域内账号并推进 rotate_uid。
+        let cfg = GatewayConfig {
+            mode: "rotate".to_string(),
+            ..Default::default()
+        };
+        let mut p = Pool::new(PathBuf::new(), &cfg);
+        p.upsert(mk_acc("a-cn"));
+        p.upsert(mk_acc_region("b-intl", "intl"));
+        p.set_random_source(Some(Box::new(|_| 0)));
+        let first = p.pick_account("m", &[]).unwrap().uid; // 烧号起步
+        let second = p
+            .pick_account_for_region("m", &[], RegionFilter::Intl)
+            .unwrap()
+            .uid;
+        assert_ne!(first, second, "区域约束应把烧号轮转到 intl 号");
+        assert_eq!(p.rotate_uid, second, "rotate_uid 跟随区域化选号");
+        assert_eq!(
+            p.pick_account_for_region("m", &[], RegionFilter::Intl).unwrap().uid,
+            second,
+            "intl 请求粘在 intl 烧号上"
+        );
+    }
+
+    #[test]
+    fn region_flip_matrix() {
+        // 已是明确约束 → 取对侧。
+        assert_eq!(region_flip(RegionFilter::Cn, "cn"), RegionFilter::Intl);
+        assert_eq!(region_flip(RegionFilter::Intl, "intl"), RegionFilter::Cn);
+        // 无约束 → 从本轮实际使用的 acc.region 反推对侧（§3.3）。
+        assert_eq!(region_flip(RegionFilter::Unknown, "cn"), RegionFilter::Intl);
+        assert_eq!(region_flip(RegionFilter::Unknown, "intl"), RegionFilter::Cn);
+        // used_region 大小写/空白不敏感。
+        assert_eq!(region_flip(RegionFilter::Unknown, " INTL "), RegionFilter::Cn);
+        // 未知区域串按非 intl 处理（与 is_intl 口径一致）。
+        assert_eq!(region_flip(RegionFilter::Unknown, ""), RegionFilter::Intl);
+    }
+
+    #[test]
+    fn sticky_region_mismatch_matrix() {
+        // T4：wanted 有约束且粘性号区域不满足 → 解绑。
+        assert!(!sticky_region_mismatch(Some("cn"), RegionFilter::Cn), "区域匹配不解绑");
+        assert!(!sticky_region_mismatch(Some("intl"), RegionFilter::Intl));
+        assert!(sticky_region_mismatch(Some("intl"), RegionFilter::Cn), "跨区 → 解绑");
+        assert!(sticky_region_mismatch(Some("cn"), RegionFilter::Intl));
+        assert!(
+            sticky_region_mismatch(None, RegionFilter::Cn),
+            "粘性号已不在账号库 → 解绑重选"
+        );
+        // wanted 无约束：粘性区域永远不算不匹配（维持现状）。
+        assert!(!sticky_region_mismatch(Some("cn"), RegionFilter::Unknown));
+        assert!(!sticky_region_mismatch(None, RegionFilter::Unknown));
+    }
+
+    #[test]
+    fn ids_from_models_payload_extracts_ids() {
+        let payload = json!({"object":"list","data":[
+            {"id":"m1","object":"model"},
+            {"id":"m2"},
+            {"id":"m1"},          // 重复 id → 集合自然去重
+            {"id":""},            // 空 id 剔除
+            {"object":"model"}    // 无 id 剔除
+        ]});
+        let ids = ids_from_models_payload(&payload);
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains("m1") && ids.contains("m2"));
+        // 非 list 载荷 → 空集（防御）。
+        assert!(ids_from_models_payload(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn region_models_part_dynamic_tags_region_and_dedups() {
+        // 动态目录：条目加 region 字段；区内按 id 去重。
+        let payload = json!({"object":"list","data":[
+            {"id":"glm-5.3","object":"model","owned_by":"workbuddy"},
+            {"id":"deepseek-v4-flash","object":"model"},
+            {"id":"glm-5.3","object":"model"}   // 区内重复 → 只保留一条
+        ]});
+        let part = region_models_part(
+            RegionFilter::Cn,
+            Some(("uid-cn-1".to_string(), Ok(payload))),
+            vec![json!({"id":"builtin-fallback"})],
+        );
+        assert_eq!(part.region, "cn");
+        assert_eq!(part.source, "dynamic");
+        assert_eq!(part.account, "uid-cn-1");
+        assert_eq!(part.items.len(), 2, "区内重复 id 去重");
+        assert!(
+            part.items.iter().all(|m| m["region"] == "cn"),
+            "每条目必须带 region=cn"
+        );
+        assert_eq!(part.items[0]["owned_by"], "workbuddy", "原有字段保留");
+    }
+
+    #[test]
+    fn region_models_part_fallback_sources() {
+        // cn 全失败 → builtin 回落，source=fallback（§3.4）。
+        let cn_fallback = vec![
+            json!({"id":"builtin-1","object":"model"}),
+            json!({"id":"builtin-2","object":"model"}),
+        ];
+        let cn = region_models_part(
+            RegionFilter::Cn,
+            Some(("uid-cn-1".to_string(), Err("models api status 401".to_string()))),
+            cn_fallback,
+        );
+        assert_eq!(cn.source, "fallback");
+        assert!(cn.account.is_empty(), "回落不落 account 字段");
+        assert_eq!(cn.items.len(), 2);
+        assert!(cn.items.iter().all(|m| m["region"] == "cn"));
+
+        // intl 无账号（None）→ 静态表回落，source=static（§五-6 正常态）。
+        let intl_static = workbuddy_upstream::intl_static_models();
+        let intl = region_models_part(RegionFilter::Intl, None, intl_static.clone());
+        assert_eq!(intl.source, "static");
+        assert_eq!(intl.items.len(), intl_static.len(), "静态表条目全量带出");
+        assert!(intl.items.iter().all(|m| m["region"] == "intl"));
+        assert_eq!(intl.items[0]["owned_by"], "workbuddy-intl", "静态表来源标记保留");
+
+        // 动态 200 但 data 为空 → 同样按回落处理。
+        let empty = region_models_part(
+            RegionFilter::Cn,
+            Some(("uid".to_string(), Ok(json!({"object":"list","data":[]})))),
+            vec![json!({"id":"builtin"})],
+        );
+        assert_eq!(empty.source, "fallback", "空动态目录按回落");
+    }
+
+    #[test]
+    fn assemble_region_models_cross_region_and_filter() {
+        // 跨区同名（glm-5.3）保留两条（§3.4：region 字段区分，不跨区去重）。
+        let cn = region_models_part(
+            RegionFilter::Cn,
+            Some(("uid-cn".to_string(), Ok(json!({"object":"list","data":[
+                {"id":"glm-5.3"},{"id":"deepseek-v4-flash"}
+            ]})))),
+            vec![],
+        );
+        let intl = region_models_part(
+            RegionFilter::Intl,
+            Some(("uid-intl".to_string(), Ok(json!({"object":"list","data":[
+                {"id":"glm-5.3"},{"id":"gpt-5.6-sol"}
+            ]})))),
+            vec![],
+        );
+        let all = assemble_region_models(cn.clone(), intl.clone(), RegionFilter::Unknown);
+        let data = all["data"].as_array().unwrap();
+        assert_eq!(data.len(), 4, "跨区同名保留两条，两区共 4 条");
+        assert_eq!(
+            data.iter().filter(|m| m["id"] == "glm-5.3").count(),
+            2,
+            "glm-5.3 两区各一条"
+        );
+        assert_eq!(all["object"], "list", "OpenAI list 形状保持");
+        assert_eq!(all["regions"]["cn"]["source"], "dynamic");
+        assert_eq!(all["regions"]["cn"]["account"], "uid-cn");
+        assert_eq!(all["regions"]["intl"]["source"], "dynamic");
+        assert_eq!(all["regions"]["intl"]["account"], "uid-intl");
+
+        // ?region=cn → 只含 cn 条目，regions 元数据只含 cn。
+        let only_cn = assemble_region_models(cn.clone(), intl.clone(), RegionFilter::Cn);
+        let data = only_cn["data"].as_array().unwrap();
+        assert!(data.iter().all(|m| m["region"] == "cn"), "?region=cn 只出 cn 条目");
+        assert_eq!(data.len(), 2);
+        assert!(only_cn["regions"].get("intl").is_none(), "过滤后不落 intl 元数据");
+
+        // ?region=intl 同理。
+        let only_intl = assemble_region_models(cn, intl, RegionFilter::Intl);
+        let data = only_intl["data"].as_array().unwrap();
+        assert!(data.iter().all(|m| m["region"] == "intl"));
+        assert!(only_intl["regions"].get("cn").is_none());
     }
 }

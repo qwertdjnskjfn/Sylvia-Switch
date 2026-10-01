@@ -770,6 +770,9 @@ const AGENT_BASE: &str = "https://ai.catpaw.meituan.com";
 pub const DEFAULT_MODEL: &str = "claude-sonnet-4.6";
 /// 非流式轮询 history 的上限（妙手单轮生成实测约 80s，留足余量）。
 const HISTORY_POLL_TIMEOUT_SECS: u64 = 240;
+/// SSE 主路已有正文但持续无新增的静默收尾阈值——正常工具轮（搜索等）的
+/// 思考间隔远小于此值，超过基本可判定上游卡死。
+const SSE_QUIET_CLOSE_SECS: u64 = 90;
 
 /// SSE/长请求专用客户端（无总超时，只限连续无数据 300s）。
 fn stream_client() -> &'static reqwest::Client {
@@ -1160,6 +1163,33 @@ pub fn extract_history_text(history: &Value) -> String {
     out
 }
 
+/// 从 history 提取最后一条非空 assistant 的正文与 finished 标志。
+/// history 兜底路径专用：finished 只表示「该条消息写完」，不代表会话结束，
+/// 所以兜底还要靠稳定窗口近似完成判定（见 chat_completions）。
+fn extract_last_assistant(history: &Value) -> Option<(String, bool)> {
+    let items = history.pointer("/data/items")?.as_array()?;
+    let mut last: Option<(String, bool)> = None;
+    for item in items {
+        if item.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let mut t = String::new();
+        if let Some(parts) = item.get("content").and_then(Value::as_array) {
+            for part in parts {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    t.push_str(text);
+                }
+            }
+        }
+        if t.trim().is_empty() {
+            continue;
+        }
+        let finished = item.get("finished").and_then(Value::as_bool).unwrap_or(false);
+        last = Some((t, finished));
+    }
+    last
+}
+
 /// 从 history 提取 usage（assistant 条目的 totalUsage，无则零值）。
 fn extract_history_usage(history: &Value) -> Value {
     if let Some(items) = history.pointer("/data/items").and_then(Value::as_array) {
@@ -1204,28 +1234,137 @@ pub async fn chat_completions(account: &Value, body: &Value) -> Result<Value, St
     let chat_id = create_chat(&token, &prompt).await?;
     let conversation_id = kick_agent_stream(&token, &chat_id, &prompt, model).await?;
 
-    // 轮询 history 直到出现 assistant 非空内容（生成约 80s）
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(HISTORY_POLL_TIMEOUT_SECS);
+    let deadline = Instant::now() + Duration::from_secs(HISTORY_POLL_TIMEOUT_SECS);
     let mut text = String::new();
     let mut usage = json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0});
-    while std::time::Instant::now() < deadline {
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        match conversation_history(&token, &conversation_id).await {
-            Ok(history) => {
-                let full = extract_history_text(&history);
-                if !full.trim().is_empty() {
-                    text = full;
-                    usage = extract_history_usage(&history);
-                    break;
+
+    // ── 主路：SSE 聚合到真正的结束信号 ──
+    // 🔴 2026-09-25 修复「中间态被当最终答案」：此前轮询 history 一出现非空正文
+    // 就返回，而 history 条目的 finished 只表示「该条消息写完」——多轮 agent
+    // （先搜索再作答）第一轮的过程叙述（实测如「搜索结果比较零散，我再获取
+    // 更权威的…：」）会被当成最终答案，真正的结论被丢弃。会话级的结束信号
+    // 只有 SSE 的 statusUpdate 终止帧，因此非流式也必须按流聚合到收尾。
+    let mut sse_done = false;
+    match stream_connect(&token, &conversation_id).await {
+        Ok(mut resp) => {
+            let mut line_buf = String::new();
+            let mut carry: Vec<u8> = Vec::new();
+            let mut last_text_at = Instant::now();
+            while Instant::now() < deadline && !sse_done {
+                match tokio::time::timeout(Duration::from_secs(6), resp.chunk()).await {
+                    Ok(Ok(Some(chunk))) => {
+                        let decoded =
+                            crate::modules::glm_anthropic::decode_stream_chunk(&mut carry, &chunk);
+                        line_buf.push_str(&decoded);
+                        while let Some(pos) = line_buf.find('\n') {
+                            let line: String = line_buf.drain(..=pos).collect();
+                            // 帧前缀实测是 data:（无空格），trim 兼容带空格变体
+                            let Some(payload) = line
+                                .trim_end_matches(['\r', '\n'])
+                                .strip_prefix("data:")
+                                .map(str::trim)
+                                .filter(|p| !p.is_empty())
+                            else {
+                                continue;
+                            };
+                            if payload == "[DONE]" {
+                                sse_done = true;
+                                break;
+                            }
+                            let Ok(frame) = serde_json::from_str::<Value>(payload) else {
+                                continue;
+                            };
+                            if frame.get("statusUpdate").is_some() {
+                                sse_done = true;
+                                break;
+                            }
+                            let Some(agent) = frame.pointer("/headlessRemoteAgentResp") else {
+                                continue;
+                            };
+                            // 历史回放是本轮之前的内容，非流式只聚合实时增量
+                            if agent.get("isHistoryMessage").and_then(Value::as_bool) == Some(true)
+                            {
+                                continue;
+                            }
+                            if let Some(delta) = agent
+                                .pointer("/message/content")
+                                .and_then(Value::as_array)
+                                .map(|parts| {
+                                    parts
+                                        .iter()
+                                        .filter_map(|p| p.get("text").and_then(Value::as_str))
+                                        .collect::<String>()
+                                })
+                                .filter(|t| !t.is_empty())
+                            {
+                                text.push_str(&delta);
+                                last_text_at = Instant::now();
+                            }
+                        }
+                    }
+                    Ok(Ok(None)) => {
+                        // 连接正常关闭 = 上游认为生成结束
+                        sse_done = !text.trim().is_empty();
+                        break;
+                    }
+                    Ok(Err(_)) => break, // 流中断 → 落 history 兜底
+                    Err(_) => {
+                        // 分片读超时：已有正文但持续 90s 无新增，视为上游卡死，
+                        // 按已有内容收尾（正常工具轮的思考间隔远小于此值）
+                        if !text.trim().is_empty()
+                            && last_text_at.elapsed() >= Duration::from_secs(SSE_QUIET_CLOSE_SECS)
+                        {
+                            sse_done = true;
+                            break;
+                        }
+                    }
                 }
             }
-            Err(e) => {
-                eprintln!("[妙手] history 轮询失败（继续）: {e}");
+        }
+        Err(_) => {} // SSE 不可用 → history 兜底
+    }
+
+    // ── 兜底：history 轮询（SSE 中断/不可用/零正文时）──
+    // 只求可用、不保证多轮完整性：取最后一条 assistant，连续 4 轮（8s）无增长
+    // 视为完成。多轮 agent 的中间叙述在此路径下仍可能被提前取走——已知妥协。
+    if text.trim().is_empty() {
+        let mut prev = String::new();
+        let mut stable = 0u32;
+        while Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            match conversation_history(&token, &conversation_id).await {
+                Ok(history) => {
+                    if let Some((t, _finished)) = extract_last_assistant(&history) {
+                        if !t.is_empty() && t == prev {
+                            stable += 1;
+                        } else {
+                            stable = 0;
+                        }
+                        prev = t;
+                        if stable >= 4 {
+                            text = prev.clone();
+                            usage = extract_history_usage(&history);
+                            break;
+                        }
+                    }
+                }
+                Err(_) => {}
             }
         }
+        if text.trim().is_empty() && !prev.trim().is_empty() {
+            // 到期仍不稳定：带上最后一次看到的非空内容（好过空手报错）
+            text = prev;
+        }
     }
+
     if text.trim().is_empty() {
-        return Err("妙手生成超时未返回内容（history 轮询 240s 无正文）".to_string());
+        return Err("妙手生成超时未返回内容（SSE 聚合与 history 兜底均无正文）".to_string());
+    }
+    // SSE 主路拿不到计量：结束后补拉一次 history 取 usage（best-effort）
+    if usage.get("total_tokens").and_then(Value::as_i64) == Some(0) {
+        if let Ok(history) = conversation_history(&token, &conversation_id).await {
+            usage = extract_history_usage(&history);
+        }
     }
     Ok(json!({
         "id": format!("chatcmpl-miaoshou-{}", uuid::Uuid::new_v4().simple()),
@@ -1378,5 +1517,34 @@ mod tests {
             return; // 环境已有导入数据，跳过以保持测试稳定。
         }
         assert!(discover_accounts().is_empty());
+    }
+
+    #[test]
+    fn extract_last_assistant_takes_last_nonempty_and_finished_flag() {
+        // 多轮场景：中间叙述（finished=true）之后还有未写完的最终答案，
+        // 必须取「最后一条非空 assistant」，而不是第一条或全文拼接。
+        let history = json!({
+            "data": { "items": [
+                { "type": "user", "content": [{ "type": "text", "text": "问天气" }] },
+                { "type": "assistant", "finished": true,
+                  "content": [{ "type": "text", "text": "搜索结果比较零散，我再获取更权威的：" }] },
+                { "type": "assistant", "finished": false,
+                  "content": [{ "type": "text", "text": "长沙晴 25℃" }] }
+            ] }
+        });
+        let (text, finished) = extract_last_assistant(&history).unwrap();
+        assert_eq!(text, "长沙晴 25℃");
+        assert!(!finished);
+    }
+
+    #[test]
+    fn extract_last_assistant_none_when_only_user_or_empty() {
+        assert_eq!(extract_last_assistant(&json!({ "data": { "items": [] } })), None);
+        assert_eq!(
+            extract_last_assistant(&json!({ "data": { "items": [
+                { "type": "user", "content": [{ "type": "text", "text": "hi" }] }
+            ] } })),
+            None
+        );
     }
 }

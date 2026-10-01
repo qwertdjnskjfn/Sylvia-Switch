@@ -603,12 +603,31 @@ async fn sync_once(cfg: &GrokSsoConfig) -> Result<(bool, Value), String> {
 // 公开接口（API/循环用）
 // ---------------------------------------------------------------------------
 
+/// D3：接管状态下手动同步返回体附 warning 字段（不改动既有字段）。纯函数。
+fn with_takeover_warning(mut v: Value) -> Value {
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            "warning".to_string(),
+            json!("浏览器正被账号轮询接管，本次同步未回写自动同步账号；请稍后在轮询空闲时再同步"),
+        );
+    }
+    v
+}
+
 /// 手动触发同步（用户在 UI 点「立即同步」）：视为确认当前浏览器登录态，
 /// 重置「已被接管」标记，让同步把当前登录态写回 autosync 账号。
 ///
 /// 刻意**不受** `enabled` 约束：`enabled=false` 的语义是「不要在后台无人值守地
 /// 自动打开浏览器」，用户主动点击时仍应始终可同步。
+///
+/// D3（堵手动同步漏洞）：浏览器已被程序切号接管时，当前登录态是轮询账号而非
+/// 用户原始登录态 —— 此时**不**重置接管标记、不清驻留、不回写 autosync
+/// （`sync_once` 的接管分支只写 token 文件，不会把轮询账号的 sso 写成
+/// `grok_web_autosync`），返回体附 `warning` 字段供前端提示。
 pub async fn run_sync_manual() -> Value {
+    if is_browser_taken_over() {
+        return with_takeover_warning(run_sync_with(&load_config()).await);
+    }
     reset_browser_taken_over();
     clear_resident();
     run_sync_with(&load_config()).await
@@ -825,7 +844,7 @@ async fn keepalive_cold_accounts() -> Result<(), String> {
         }
         {
             let mut guard = RESIDENT.lock().unwrap();
-            *guard = Some((account_id.to_string(), now_ms() + RESIDENT_TTL_MS));
+            *guard = Some((account_id.to_string(), now_ms() + resident_ttl_ms()));
         }
         mark_browser_taken_over();
         touched += 1;
@@ -844,8 +863,21 @@ async fn keepalive_cold_accounts() -> Result<(), String> {
 /// 保留 cf_clearance / __cf_bm 等 Cloudflare 通行 cookie（绑 IP+UA，跨账号共享）。
 const IDENTITY_COOKIES: &[&str] = &["sso", "sso-rw", "x-userid"];
 
-/// 账号驻留期（毫秒）：同一账号在该时段内不切号，避免高频身份横跳触发风控。
-const RESIDENT_TTL_MS: i64 = 30 * 60 * 1000;
+/// 账号驻留期（毫秒，D4 可配）：由账号池策略 `residentTtlMin`（范围 5-120 分钟，
+/// 默认 30，clamp 与兼容旧配置文件均在 grok_pool::load_policy 侧完成）推导，
+/// 替代原 30 分钟硬编码常量 RESIDENT_TTL_MS。
+///
+/// 用 OnceLock 缓存策略值（契约给定的最小侵入方案）：不改动 ui_chat_with_account /
+/// probe_account / keepalive 的调用签名，仅首次取号时读盘一次；策略改动需重启后端
+/// 生效。grok_pool → grok_sso（probe_account）既有单向依赖因此不再反向加深——
+/// grok_sso 只在初始化时读一次策略值。
+fn resident_ttl_ms() -> i64 {
+    static TTL: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *TTL.get_or_init(|| {
+        let min = crate::modules::grok_pool::load_policy().resident_ttl_min;
+        min as i64 * 60_000
+    })
+}
 
 /// 当前驻留账号 (account_id, expire_ms)
 static RESIDENT: Mutex<Option<(String, i64)>> = Mutex::new(None);
@@ -1030,6 +1062,89 @@ async fn switch_account_to(cookie_string: &str) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// D1：注册机让路（web 通道给注册流程让路）
+// ---------------------------------------------------------------------------
+
+/// 注册机注册流程进行中时 web 通道的让路文案（契约 D1 固定文案；
+/// grok.rs 侧对该错误按冷却 60s 处理、不标 error）。
+const REGISTRATION_IN_PROGRESS_MSG: &str = "注册机注册流程进行中，web 通道稍后自动重试";
+
+/// D1：判定一个 page target URL 是否处于「注册机注册流程进行中」。纯函数。
+///
+/// 命中任一即让路：
+/// - host 为 `accounts.x.ai`（及其子域）—— grok 注册/登录的专属认证域；
+/// - grok 系站点（grok.com 及子域）路径含 `sign-up` / `register` ——
+///   注册流程在 grok.com 侧的过渡页。
+///
+/// 其它域一律 false：异域页面与注册无关，即便路径恰好含 register 也不得
+/// 误伤正常对话。
+fn is_registration_in_progress(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    // 跳过 scheme，取 authority（到第一个 '/' 为止）；无 scheme 时整体视作 authority。
+    let after_scheme = lower
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(&lower);
+    let authority_end = after_scheme.find('/').unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+    // 去掉 userinfo（user@host）与端口（host:port）。
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = host.split(':').next().unwrap_or(host);
+    // path（仅路径部分，剥离 query 与 fragment）—— 「路径含 sign-up/register」
+    // 按字面取路径；查询串里的关键词不算（避免无关 URL 误伤）。
+    let path_part = &after_scheme[authority_end..];
+    let path = path_part.split(['?', '#']).next().unwrap_or(path_part);
+
+    if host == "accounts.x.ai" || host.ends_with(".accounts.x.ai") {
+        return true;
+    }
+    if host == "grok.com" || host.ends_with(".grok.com") {
+        return path.contains("sign-up") || path.contains("register");
+    }
+    false
+}
+
+/// D1：对 CDP `/json` 返回的 target 列表判定是否注册进行中。纯函数。
+///
+/// 语义：任一 page target 命中即让路 —— 注册机的 tab 可能已从 grok.com
+/// 导航到 accounts.x.ai（此时按 url 前缀已找不到「grok.com page target」，
+/// 必须按注册特征扫全部 page target 才能拦住）。非 page target 与缺 url
+/// 字段的条目跳过。
+fn targets_registration_in_progress(targets: &[Value]) -> bool {
+    targets.iter().any(|t| {
+        t.get("type").and_then(Value::as_str) == Some("page")
+            && t.get("url")
+                .and_then(Value::as_str)
+                .map(is_registration_in_progress)
+                .unwrap_or(false)
+    })
+}
+
+/// D1：探测专用浏览器当前是否有 page target 处于注册流程。
+/// CDP 不可达时返回 false（不拦截 —— 浏览器未启动时不存在注册进行中，
+/// 后续 ensure_browser 链路自会处理）。
+async fn registration_in_progress() -> bool {
+    let Ok(list) = cdp_http_client()
+        .get(format!("http://127.0.0.1:{CDP_PORT}/json"))
+        .send()
+        .await
+    else {
+        return false;
+    };
+    let Ok(list) = list.json::<Vec<Value>>().await else {
+        return false;
+    };
+    targets_registration_in_progress(&list)
+}
+
+/// D1：注册机让路错误（ChatError::Infra + 固定文案 + 60s 冷却覆盖；
+/// is_account_fatal 为 false，grok.rs 分流只冷却不标 error）。
+fn registration_in_progress_error() -> ChatError {
+    ChatError::new(ChatErrorKind::Infra, REGISTRATION_IN_PROGRESS_MSG)
+        .with_cooldown_secs(60)
+}
+
 /// UI 对话失败的分类（v1.5.0）。
 ///
 /// 关键：必须区分「临时问题」与「账号失效」。限流/超时/页面抖动若被误判为
@@ -1052,11 +1167,21 @@ pub enum ChatErrorKind {
 pub struct ChatError {
     pub kind: ChatErrorKind,
     pub message: String,
+    /// D1：覆盖按 kind 推导的默认冷却秒数（None = 按 kind 默认）。
+    /// 注册机让路错误用 60s（契约：该错误按冷却 60s 处理且不标 error），
+    /// 通用 Infra 维持 15s 不变。
+    pub cooldown_override_secs: Option<u64>,
 }
 
 impl ChatError {
     pub fn new(kind: ChatErrorKind, message: impl Into<String>) -> Self {
-        Self { kind, message: message.into() }
+        Self { kind, message: message.into(), cooldown_override_secs: None }
+    }
+
+    /// D1：附带冷却秒数覆盖（builder 风格，既有构造点不受影响）。
+    pub fn with_cooldown_secs(mut self, secs: u64) -> Self {
+        self.cooldown_override_secs = Some(secs);
+        self
     }
 
     /// 是否应把账号标记为 error（永久失效）。
@@ -1066,6 +1191,9 @@ impl ChatError {
 
     /// 非致命错误建议的冷却秒数（0 = 不冷却，仅重试）。
     pub fn cooldown_seconds(&self) -> u64 {
+        if let Some(secs) = self.cooldown_override_secs {
+            return secs;
+        }
         match self.kind {
             ChatErrorKind::RateLimited => 60,
             ChatErrorKind::Timeout => 30,
@@ -1134,6 +1262,11 @@ pub async fn ui_chat_with_account(
 ) -> Result<String, ChatError> {
     // 先就绪（启动动作不占对话锁），再串行化对话。
     ensure_browser_ready().await?;
+    // D1：注册机让路 —— 注册进行中在切号之前直接返回：不清 cookie、不切号、
+    // 不导航（导航侧由 ui_chat 内的同一检查兜底）。稍后自动重试。
+    if registration_in_progress().await {
+        return Err(registration_in_progress_error());
+    }
     let _chat_guard =
         match tokio::time::timeout(Duration::from_secs(LOCK_WAIT_SECS), UI_CHAT_LOCK.lock()).await {
             Ok(g) => g,
@@ -1163,7 +1296,7 @@ pub async fn ui_chat_with_account(
                 .map_err(|e| ChatError::new(ChatErrorKind::Invalid, e))?;
         }
         let mut guard = RESIDENT.lock().unwrap();
-        *guard = Some((account_id.to_string(), now_ms() + RESIDENT_TTL_MS));
+        *guard = Some((account_id.to_string(), now_ms() + resident_ttl_ms()));
         // 标记浏览器已被程序接管（同步循环据此跳过回写 autosync）。
         mark_browser_taken_over();
     }
@@ -1212,7 +1345,11 @@ pub struct ProbeOutcome {
 ///
 /// 复用 UI_CHAT_LOCK 串行化，避免与真实对话/保活抢浏览器（实测并发会互相踩）。
 /// 注入成功但页面无输入框 → 视为登录态失效（sso 过期）。
-pub async fn probe_account(cookie_string: &str) -> Result<ProbeOutcome, String> {
+///
+/// D2：体检成功 = 浏览器当前已是该账号的登录态，成功路径补写 RESIDENT 驻留
+/// （与 ui_chat_with_account 成功路径对齐，expire = now + 策略驻留时长），
+/// 之后的真实请求命中驻留可省一次重复切号 —— 因此需要调用方传入 account_id。
+pub async fn probe_account(account_id: &str, cookie_string: &str) -> Result<ProbeOutcome, String> {
     // 就绪动作不占对话锁（与 ui_chat_with_account 同一套两段锁）。
     ensure_browser_ready().await.map_err(|e| e.message)?;
     let _guard = UI_CHAT_LOCK.lock().await;
@@ -1251,6 +1388,12 @@ pub async fn probe_account(cookie_string: &str) -> Result<ProbeOutcome, String> 
             let parsed: Value =
                 serde_json::from_str(v.as_str().unwrap_or("{}")).unwrap_or(json!({}));
             if parsed.get("hasPM").and_then(Value::as_bool).unwrap_or(false) {
+                // D2：体检成功即驻留 —— 与 ui_chat_with_account 成功路径对齐，
+                // 写 RESIDENT（expire = now + 策略驻留时长）供选号层复用，
+                // 省一次重复切号。接管标记仅在真正注入过 cookie 时置位
+                // （见上方 switch 分支），此处不重复标记。
+                let mut guard = RESIDENT.lock().unwrap();
+                *guard = Some((account_id.to_string(), now_ms() + resident_ttl_ms()));
                 return Ok(ProbeOutcome { logged_in: true });
             }
         }
@@ -1307,6 +1450,11 @@ pub async fn ui_chat(prompt: &str) -> Result<String, ChatError> {
         .json()
         .await
         .map_err(|e| ChatError::new(ChatErrorKind::Infra, format!("CDP /json 解析失败: {e}")))?;
+    // D1：注册机让路 —— 导航前最终检查（接管注册机 tab 的场景在这里拦截；
+    // 切号前的检查在 ui_chat_with_account 入口）。不导航、不动 cookie。
+    if targets_registration_in_progress(&list) {
+        return Err(registration_in_progress_error());
+    }
     let grok = list
         .iter()
         .find(|t| {
@@ -1573,5 +1721,115 @@ mod tests {
         .iter()
         .any(|k| PathBuf::from(k).is_file());
         assert_eq!(resolved.is_some(), any_known);
+    }
+
+    // -------------------------------------------------------------------------
+    // D1：注册机让路 —— target URL 判定纯函数
+    // -------------------------------------------------------------------------
+
+    /// 契约三例：signup → 让路；普通主页 → 不让路；异域 → 不让路。
+    #[test]
+    fn is_registration_in_progress_three_cases() {
+        // ① signup：注册/登录认证域（注册机的两步式注册主战场）。
+        assert!(is_registration_in_progress("https://accounts.x.ai/sign-up"));
+        assert!(is_registration_in_progress("https://accounts.x.ai/sign-up?step=2"));
+        assert!(is_registration_in_progress("http://accounts.x.ai/login"));
+        //    grok.com 侧的注册过渡路径同样命中。
+        assert!(is_registration_in_progress("https://grok.com/sign-up"));
+        assert!(is_registration_in_progress("https://grok.com/register?ref=home"));
+        // ② 普通主页：正常对话页，不得让路（查询串里的关键词不算注册路径）。
+        assert!(!is_registration_in_progress("https://grok.com/"));
+        assert!(!is_registration_in_progress("https://grok.com/discover"));
+        assert!(!is_registration_in_progress("https://grok.com/chat?q=sign-up"));
+        // ③ 异域：与注册无关的域一律不命中（即便路径含 register 也不误伤）。
+        assert!(!is_registration_in_progress("https://example.com/"));
+        assert!(!is_registration_in_progress("https://example.com/register"));
+        assert!(!is_registration_in_progress("https://www.google.com/"));
+    }
+
+    /// host 解析边界：带端口 / userinfo / 大写 / 子域。
+    #[test]
+    fn is_registration_in_progress_handles_host_variants() {
+        assert!(is_registration_in_progress("https://ACCOUNTS.X.AI/sign-up"));
+        assert!(is_registration_in_progress("https://accounts.x.ai:443/sign-up"));
+        assert!(is_registration_in_progress("https://user@accounts.x.ai/sign-up"));
+        assert!(is_registration_in_progress("https://sub.accounts.x.ai/"));
+        assert!(is_registration_in_progress("accounts.x.ai/sign-up")); // 无 scheme 容错
+        assert!(is_registration_in_progress("https://chat.grok.com/register"));
+        // 相似域不误伤：域名必须是完整 host 匹配。
+        assert!(!is_registration_in_progress("https://fakeaccounts.x.ai.evil.com/sign-up"));
+        assert!(!is_registration_in_progress("https://grok.com.evil.com/"));
+        // 空/异常输入容错。
+        assert!(!is_registration_in_progress(""));
+        assert!(!is_registration_in_progress("not a url"));
+    }
+
+    /// /json target 列表扫描：任一 page target 命中即让路；非 page target
+    /// 与缺 url 字段跳过。
+    #[test]
+    fn targets_registration_in_progress_scans_page_targets() {
+        let page = |url: &str| json!({"type": "page", "url": url});
+        // 注册 tab 存在（哪怕 grok tab 已被导航走，url 前缀不再是 grok.com）→ 让路。
+        assert!(targets_registration_in_progress(&[page("https://accounts.x.ai/sign-up")]));
+        assert!(targets_registration_in_progress(&[
+            page("https://accounts.x.ai/sign-up"),
+            page("https://grok.com/"),
+        ]));
+        assert!(targets_registration_in_progress(&[
+            page("https://grok.com/"),
+            page("https://grok.com/register"),
+        ]));
+        // 仅普通页面 → 不让路。
+        assert!(!targets_registration_in_progress(&[page("https://grok.com/")]));
+        // 非 page target（iframe/worker 等）不计入。
+        assert!(!targets_registration_in_progress(&[json!({
+            "type": "iframe", "url": "https://accounts.x.ai/sign-up"
+        })]));
+        // 缺 url / 缺 type 字段容错。
+        assert!(!targets_registration_in_progress(&[json!({"type": "page"})]));
+        assert!(!targets_registration_in_progress(&[json!({"url": "https://accounts.x.ai/"})]));
+        // 空列表。
+        assert!(!targets_registration_in_progress(&[]));
+    }
+
+    /// D1 grok.rs 侧分流契约：让路错误冷却 60s 且不标 error（is_account_fatal=false）；
+    /// 通用 Infra 维持 15s、RateLimited 维持 60s 不变（现状不被改坏）。
+    #[test]
+    fn registration_busy_error_cooldowns_60s_and_is_not_fatal() {
+        let err = registration_in_progress_error();
+        assert_eq!(err.kind, ChatErrorKind::Infra);
+        assert_eq!(err.message, "注册机注册流程进行中，web 通道稍后自动重试");
+        assert_eq!(err.cooldown_seconds(), 60);
+        assert!(!err.is_account_fatal());
+        // 既有分流矩阵回归确认。
+        assert_eq!(ChatError::new(ChatErrorKind::Infra, "页面未加载").cooldown_seconds(), 15);
+        assert_eq!(ChatError::new(ChatErrorKind::RateLimited, "限流").cooldown_seconds(), 60);
+        assert_eq!(ChatError::new(ChatErrorKind::Timeout, "超时").cooldown_seconds(), 30);
+    }
+
+    /// D3：接管状态下手动同步返回体附 warning，且既有字段原样保留。
+    #[test]
+    fn takeover_warning_added_without_touching_existing_fields() {
+        let v = with_takeover_warning(json!({
+            "status": "ok",
+            "written": false,
+            "attempt": 1,
+        }));
+        assert!(v.get("warning").and_then(Value::as_str).unwrap_or("").contains("未回写自动同步账号"));
+        assert_eq!(v.get("status").and_then(Value::as_str), Some("ok"));
+        assert_eq!(v.get("written").and_then(Value::as_bool), Some(false));
+        assert_eq!(v.get("attempt").and_then(Value::as_i64), Some(1));
+        // 非对象返回体（如 run_sync 的 disabled 分支不会走到这里，但容错）原样返回。
+        assert_eq!(with_takeover_warning(json!("scalar")), json!("scalar"));
+    }
+
+    /// D4 grok_sso 读取侧：驻留毫秒数 = 策略 resident_ttl_min × 60_000
+    /// （OnceLock 缓存值与 load_policy 当前值同源一致）。
+    #[test]
+    fn resident_ttl_ms_derives_from_pool_policy() {
+        let expected = crate::modules::grok_pool::load_policy().resident_ttl_min as i64 * 60_000;
+        assert_eq!(resident_ttl_ms(), expected);
+        // 默认 30 分钟 = 1_800_000ms（与迁出前的 RESIDENT_TTL_MS 常量一致）。
+        assert_eq!(30i64 * 60_000, 1_800_000);
     }
 }

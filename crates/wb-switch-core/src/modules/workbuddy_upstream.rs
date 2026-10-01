@@ -810,6 +810,8 @@ fn build_models_list(env: &ModelsEnv) -> Vec<Value> {
                 context_window: m.max_input_tokens,
                 max_tokens: m.max_output_tokens,
                 efforts: m.reasoning.supported_efforts.clone(),
+                name: m.name.clone(),
+                credits: m.credits.clone(),
             },
         );
         if m.disabled {
@@ -859,12 +861,86 @@ fn model_entry(id: &str, meta: Option<&ModelMeta>) -> Value {
     entry.insert("object".to_string(), json!("model"));
     entry.insert("created".to_string(), json!(0));
     entry.insert("owned_by".to_string(), json!("workbuddy"));
+    if let Some(cw) = crate::modules::config::max_context_window(id) {
+        entry.insert("context_length".to_string(), json!(cw));
+    }
     if let Some(m) = meta {
-        entry.insert("context_length".to_string(), json!(m.context_window));
+        if !entry.contains_key("context_length") {
+            entry.insert("context_length".to_string(), json!(m.context_window));
+        }
         entry.insert("max_output_tokens".to_string(), json!(m.max_tokens));
         entry.insert("efforts".to_string(), json!(m.efforts));
+        // 名称与倍率（2026-09-26：上游一直有下发，此前被 serde 丢弃）：
+        // name 非空才带；multiplier 解析失败/未标价 → null（前端显示「—」）。
+        if !m.name.is_empty() {
+            entry.insert("name".to_string(), json!(m.name));
+        }
+        entry.insert(
+            "multiplier".to_string(),
+            json!(crate::modules::trae_acp::parse_multiplier(&m.credits)),
+        );
     }
     Value::Object(entry)
+}
+
+/// 国际版（INTL）静态模型表 —— 按网关现有 OpenAI models 条目格式，
+/// `owned_by: "workbuddy-intl"` 标记来源，与国服条目（`owned_by: "workbuddy"`）区分。
+///
+/// 来源：momo0410/workbuddy-switch-gateway 参考实现的 `staticModelsIntl`
+/// （条目捕获自国际版 `https://www.workbuddy.ai/v3/config` 的
+/// `data.agents[name=="cli"].models`，2026-09-15）；**2026-09-25 已按本机国际版
+/// 账号（domain www.workbuddy.ai）实时拉取校准**：+deepseek-v4.1-flash-sg、
+/// +glm-5.3-flash，多档 context_length 按实时值更新（gpt-6-astra/hy4-preview-f/
+/// deepseek-v4.1-flash/kimi-k2.8-preview 升至 1M，default/deep-model 降至 176K）。
+/// hy4-preview 不在 cli 清单但实测可用（hy4-preview-f 的试用目标模型），保留。
+/// **2026-09-26 名称/倍率 enrichment**：name 与 multiplier（credits 原文如
+/// "x0.34 credits" 解析）按实时拉取校准——国际账号不在线时走静态兜底，
+/// 前端表格同样要有名称与倍率，不能只剩 id。
+///
+/// ⚠️ 与国服的差异（模型名不通用，跨区调用上游报 11102 model service info not found）：
+///   国服   deepseek-v4-flash / glm-5.2 / kimi-k2.7 / minimax-m3
+///   国际版 deepseek-v4.1-flash / glm-5.3 / kimi-k3 / gpt-5.6-* / gemini-3.5-flash
+/// 同名模型（glm-5.2 / glm-5.3 / hy3 / glm-5.3-flash 等）两区各有一套后端映射，不可混用。
+pub fn intl_static_models() -> Vec<Value> {
+    // (id, context_length, name, multiplier)
+    const INTL: &[(&str, i64, &str, Option<f64>)] = &[
+        ("default-model", 176_000, "Auto", None),
+        ("fast-model", 200_000, "Fast", Some(0.34)),
+        ("balanced-model", 256_000, "Balanced", Some(0.59)),
+        ("primary-model", 272_000, "Primary", Some(3.31)),
+        ("deep-model", 176_000, "Deep", Some(3.33)),
+        ("hy4-preview-f", 1_000_000, "Hy4 preview", Some(0.0)),
+        ("hy4-preview", 200_000, "Hy4 preview", Some(0.0)),
+        ("hy3", 192_000, "Hy3", Some(0.0)),
+        ("deepseek-v4.1-flash", 1_000_000, "Deepseek-V4.1-Flash", Some(0.0)),
+        ("deepseek-v4.1-flash-sg", 1_000_000, "Deepseek-V4.1-Flash", Some(0.03)),
+        ("gpt-6-astra", 1_000_000, "GPT-6-Astra", Some(6.67)),
+        ("gpt-5.6-sol", 1_000_000, "GPT-5.6-Sol", Some(3.47)),
+        ("gpt-5.6-terra", 1_000_000, "GPT-5.6-Terra", Some(1.39)),
+        ("gpt-5.6-luna", 1_000_000, "GPT-5.6-Luna", Some(0.14)),
+        ("gpt-5.5", 1_000_000, "GPT-5.5", Some(3.31)),
+        ("gpt-5.4", 272_000, "GPT-5.4", Some(1.65)),
+        ("gemini-3.5-flash", 1_000_000, "Gemini-3.5-Flash", Some(0.99)),
+        ("glm-5.3-flash", 1_000_000, "GLM-5.3-Flash", Some(0.06)),
+        ("glm-5.3", 1_000_000, "GLM-5.3", Some(0.79)),
+        ("glm-5.2", 1_000_000, "GLM-5.2", Some(0.79)),
+        ("kimi-k3", 1_000_000, "Kimi-K3", Some(1.62)),
+        ("kimi-k2.8-preview", 1_000_000, "Kimi-K2.8-Preview", Some(0.77)),
+        ("kimi-k2.6", 256_000, "Kimi-K2.6", Some(0.52)),
+    ];
+    INTL.iter()
+        .map(|(id, ctx, name, mult)| {
+            json!({
+                "id": id,
+                "object": "model",
+                "created": 0,
+                "owned_by": "workbuddy-intl",
+                "context_length": ctx,
+                "name": name,
+                "multiplier": mult,
+            })
+        })
+        .collect()
 }
 
 /// 余额与到期日（契约 §13 钉定签名；驱动分层选号，先烧快过期的额度）。
@@ -1045,6 +1121,14 @@ struct ModelsData {
 struct ModelsModel {
     #[serde(default)]
     id: String,
+    /// 上游显示名（如 "Auto" / "Fast" / "GLM-5.3-Flash"）；2026-09-26 实测国际服
+    /// /v3/config 一直有下发该字段，此前未解析被 serde 丢弃（前端名称列只能回退显示 id）。
+    #[serde(default)]
+    name: String,
+    /// 计价倍率原文（如 "x0.34 credits" / "x0.00" / 空串=未标价）；
+    /// 由 parse_multiplier 统一解析为数值（ACP 目录同口径）。
+    #[serde(default)]
+    credits: String,
     #[serde(default, rename = "maxInputTokens")]
     max_input_tokens: i64,
     #[serde(default, rename = "maxOutputTokens")]
@@ -1078,6 +1162,10 @@ struct ModelMeta {
     max_tokens: i64,
     /// reasoning.supportedEfforts（空=未知/固定档）
     efforts: Vec<String>,
+    /// 上游显示名（空=未提供）
+    name: String,
+    /// credits 原文（倍率由 model_entry 解析）
+    credits: String,
 }
 
 /// billing get-user-resource 返回的单个套餐（字段名与上游一致，PascalCase）。
@@ -1219,6 +1307,37 @@ struct ResourceData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn intl_static_models_shape_and_provenance() {
+        let list = intl_static_models();
+        // 参考实现捕获 + 2026-09-25 本机国际版实测校准后的 23 个国际版模型。
+        assert_eq!(list.len(), 23);
+        let mut ids: Vec<&str> = Vec::new();
+        for m in &list {
+            assert_eq!(m["object"], json!("model"));
+            // 来源标记：全部 owned_by = workbuddy-intl，与国服区分。
+            assert_eq!(m["owned_by"], json!("workbuddy-intl"));
+            assert!(m["context_length"].as_i64().unwrap_or(0) > 0);
+            ids.push(m["id"].as_str().unwrap_or(""));
+        }
+        // id 无重复。
+        let unique = ids.iter().collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), ids.len());
+        // 国际版独有代表模型必须在场。
+        for must in ["gpt-5.6-sol", "gemini-3.5-flash", "hy4-preview", "deepseek-v4.1-flash"] {
+            assert!(ids.contains(&must), "缺少 {must}");
+        }
+        // 2026-09-26 enrichment：名称与倍率必须在场（国际账号不在线走静态兜底时，
+        // 前端表格同样要有名称与倍率，不能只剩 id）。
+        for m in &list {
+            assert!(m["name"].as_str().is_some_and(|s| !s.is_empty()), "缺少 name: {m}");
+            assert!(m.get("multiplier").is_some(), "缺少 multiplier 字段: {m}");
+        }
+        let fast = list.iter().find(|m| m["id"] == json!("fast-model"));
+        assert_eq!(fast.and_then(|m| m["name"].as_str()), Some("Fast"));
+        assert_eq!(fast.and_then(|m| m["multiplier"].as_f64()), Some(0.34));
+    }
 
     /// 构造测试账号（字段与契约 §13 的 PoolAccount 逐字对应，防漂移）。
     fn acc(region: &str) -> PoolAccount {
@@ -1670,6 +1789,37 @@ mod tests {
         assert!(list[1].get("context_length").is_none());
         assert!(list[1].get("max_output_tokens").is_none());
         assert!(list[1].get("efforts").is_none());
+    }
+
+    #[test]
+    fn build_models_list_carries_name_and_multiplier() {
+        // 2026-09-26：上游 /v3/config 的 data.models 一直带 name 与 credits
+        // （倍率原文，如 "x0.34 credits"），此前被 serde 丢弃——前端名称列只能
+        // 回退显示 id、倍率列全「—」。此处钉住透传与解析口径。
+        let env = models_env(json!({
+            "code": 0,
+            "data": {
+                "models": [
+                    {"id": "fast", "name": "Fast", "credits": "x0.34 credits", "maxInputTokens": 1, "maxOutputTokens": 1},
+                    {"id": "free", "name": "Free", "credits": "x0.00", "maxInputTokens": 1, "maxOutputTokens": 1},
+                    {"id": "unprice", "name": "Auto", "credits": "", "maxInputTokens": 1, "maxOutputTokens": 1},
+                    {"id": "noname", "credits": "x1.50", "maxInputTokens": 1, "maxOutputTokens": 1}
+                ],
+                "agents": [{"name": "cli", "models": ["fast", "free", "unprice", "noname", "ghost"]}]
+            }
+        }));
+        let list = build_models_list(&env);
+        let by_id = |id: &str| list.iter().find(|m| m["id"] == json!(id)).cloned().unwrap_or(Value::Null);
+        // 名称透传（有 name 才带）
+        assert_eq!(by_id("fast")["name"], json!("Fast"));
+        assert!(by_id("noname").get("name").is_none());
+        // 倍率解析（与 ACP parse_multiplier 同口径）：
+        // "x0.34 credits"→0.34；"x0.00"→0（免费也是明确的 0，不是 null）；
+        // 空串→null（未标价）；"ghost"（无元数据）→整个字段缺失。
+        assert_eq!(by_id("fast")["multiplier"], json!(0.34));
+        assert_eq!(by_id("free")["multiplier"], json!(0.0));
+        assert_eq!(by_id("unprice")["multiplier"], json!(Value::Null));
+        assert!(by_id("ghost").get("multiplier").is_none());
     }
 
     #[test]

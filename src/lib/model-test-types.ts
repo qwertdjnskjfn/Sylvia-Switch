@@ -72,8 +72,10 @@ export interface ModelTestRequest {
   prompt?: string;
   /** 输出上限，默认 64，最大 8192 */
   maxTokens?: number;
-  /** 超时秒数，默认 90，范围 5–600 */
+  /** 超时秒数，默认 210（妙手等工具型 agent 的完整回答需要 2-3 分钟），范围 5–600 */
   timeoutSecs?: number;
+  /** 区域提示（WorkBuddy 池：cn=国内版 / intl=国际版）；透传进上游请求体精确切区，其余网关忽略 */
+  region?: string;
 }
 
 /** 前端渲染用的失败码文案与配色（表驱动，避免 JSX 里堆三元表达式）。 */

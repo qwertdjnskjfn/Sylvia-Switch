@@ -247,6 +247,8 @@ fn pool_account_status(account_id: &str) -> Option<String> {
 }
 
 /// 人话 message：按 phase × loginState × browserRunning 组合给中文提示。
+/// 注意 login_state 读的是最近一次抓取/同步留下的 token 文件（**非实时**——
+/// 实时会话可能已失效），措辞避免把陈旧记录说成「当前已登录」。
 fn message_for(phase: &str, login_state: &str, browser_running: bool) -> String {
     if !browser_running {
         return match phase {
@@ -261,14 +263,14 @@ fn message_for(phase: &str, login_state: &str, browser_running: bool) -> String 
     }
     match login_state {
         "logged_in" => {
-            "注册机运行中且已登录 grok.com：点「抓取注册成果」即可把当前登录态写入账号池"
+            "注册机运行中：最近一次抓取记录为已登录。点「抓取注册成果」把窗口里的实时登录态写入账号池（新登录会新建账号；若会话已失效会明确提示）"
                 .to_string()
         }
         "not_logged_in" => {
-            "注册机运行中、尚未登录：在窗口内完成 grok.com 注册（邮箱验证等由你本人操作），完成后点「抓取注册成果」"
+            "注册机运行中、实时会话无登录态：在窗口内完成 grok.com 注册/登录（邮箱验证等由你本人操作），完成后点「抓取注册成果」"
                 .to_string()
         }
-        _ => "注册机运行中：登录态探测中（token 文件可能尚未生成）".to_string(),
+        _ => "注册机运行中：登录态以「抓取注册成果」的结果为准".to_string(),
     }
 }
 
@@ -362,13 +364,21 @@ pub fn status() -> Value {
     let browser_running = cdp_alive(CDP_PORT);
     let (login_state, sso_preview, cookie_count) =
         login_from_token(grok_sso::read_token_raw().as_ref());
-    let pool_status = pool_account_status(POOL_ACCOUNT_ID);
-    let pool_account_id = match &pool_status {
-        Some(_) => Some(POOL_ACCOUNT_ID.to_string()),
-        None => state
-            .get("poolAccountId")
-            .and_then(Value::as_str)
-            .map(String::from),
+    // 池账号显示口径（2026-09-26 多账号升级）：优先展示「最近一次抓取」的账号
+    // （可能是 grok_register_2/3…），而非固定 grok_register。
+    let last_pool_id = state
+        .get("poolAccountId")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let pool_status = last_pool_id
+        .as_deref()
+        .and_then(pool_account_status)
+        .or_else(|| pool_account_status(POOL_ACCOUNT_ID));
+    let pool_account_id = match (&pool_status, &last_pool_id) {
+        (Some(_), Some(id)) => Some(id.clone()),
+        (Some(_), None) => Some(POOL_ACCOUNT_ID.to_string()),
+        (None, id) => id.clone(),
     };
     json!({
         "phase": phase,
@@ -441,7 +451,8 @@ pub async fn open() -> Value {
 /// 抓取注册成果并入池（`POST /api/grok/register/capture`）。
 ///
 /// 经 CDP `Network.getCookies` 读该实例全部 grok/x.ai cookie，无 sso 且无 sso-rw 时
-/// 干净返回 `not_registered`；否则以固定 ID `grok_register` upsert 写账号池。
+/// 干净返回 `not_registered`；否则按 **sso 去重**入池：同 sso 原位刷新、新 sso 新建
+/// 独立账号（支持逐个注册多个账号批量入池）。
 /// 刻意不调 `ensure_browser` —— 抓取是纯读取，注册机没开时就老实失败。
 pub async fn capture() -> Value {
     let cookies = match grok_sso::fetch_grok_cookies().await {
@@ -462,33 +473,35 @@ pub async fn capture() -> Value {
             "ok": false,
             "status": "not_registered",
             "cookieCount": cookies.len(),
-            "message": "未抓到 sso / sso-rw cookie：注册机里还没有完成注册，请先在窗口内完成 grok.com 注册",
+            "message": "注册机窗口的实时会话里没有 sso / sso-rw cookie（未登录或会话已失效）：请在窗口内完成注册/重新登录后，再点「抓取注册成果」",
         }));
     }
-    if let Err(error) = feed_pool(&sso_value, &cookie_string) {
-        eprintln!("[grok-register] 入池失败: {error}");
-        return with_status(json!({
-            "ok": false,
-            "status": "error",
-            "error": error,
-            "cookieCount": cookies.len(),
-            "message": "抓取成功但写入账号池失败，请重试",
-        }));
-    }
+    let account_id = match feed_pool(&sso_value, &cookie_string) {
+        Ok(id) => id,
+        Err(error) => {
+            eprintln!("[grok-register] 入池失败: {error}");
+            return with_status(json!({
+                "ok": false,
+                "status": "error",
+                "error": error,
+                "cookieCount": cookies.len(),
+                "message": "抓取成功但写入账号池失败，请重试",
+            }));
+        }
+    };
     if let Err(error) = update_state(&[
         ("phase", json!("captured")),
         ("lastCapturedAt", json!(now_ms())),
-        ("poolAccountId", json!(POOL_ACCOUNT_ID)),
+        ("poolAccountId", json!(account_id.clone())),
     ]) {
         eprintln!("[grok-register] 状态落盘失败: {error}");
     }
     with_status(json!({
         "ok": true,
         "status": "ok",
-        "accountId": POOL_ACCOUNT_ID,
-        "accountName": POOL_ACCOUNT_NAME,
+        "accountId": account_id,
         "cookieCount": cookies.len(),
-        "message": "注册成果已抓取并入池：账号参与 web 通道轮询调度，无需重复注册",
+        "message": format!("注册成果已抓取入池（账号 {account_id}）：同 sso 重复抓取会原位刷新，新登录会新建账号；账号参与 web 通道轮询调度"),
     }))
 }
 
@@ -498,24 +511,31 @@ pub async fn capture() -> Value {
 pub async fn close() -> Value {
     // 探测结果只用于回报文案；杀进程本身无条件执行（无命中时幂等无害）。
     let was_running = cdp_alive(CDP_PORT);
-    let killed = kill_register_browser();
+    let (matched, killed) = kill_register_browser();
     if let Err(error) = update_state(&[("phase", json!("idle"))]) {
         eprintln!("[grok-register] 状态落盘失败: {error}");
         return with_status(json!({
             "ok": true,
             "killed": killed,
+            "matched": matched,
             "error": error,
             "message": "注册机进程已处理，但状态落盘失败",
         }));
     }
+    let message = match (was_running, killed) {
+        (true, n) if n > 0 => {
+            format!("注册机已关闭：结束了 {n} 个注册机 Chrome 进程，日常浏览器不受影响")
+        }
+        (true, 0) => format!(
+            "关闭注册机失败：匹配到 {matched} 个注册机 Chrome 进程但未能结束（可能权限不足），可手动关掉该窗口后重试"
+        ),
+        _ => "注册机当前未在运行（没有带 grok-chrome-profile 的 Chrome 进程）".to_string(),
+    };
     with_status(json!({
-        "ok": true,
+        "ok": killed > 0 || !was_running,
         "killed": killed,
-        "message": match (was_running, killed) {
-            (true, true) => "注册机已关闭：只结束了带 grok-chrome-profile 的 Chrome 进程，日常浏览器不受影响",
-            (true, false) => "关闭注册机失败：没能结束带 grok-chrome-profile 的 Chrome 进程，可手动关掉该窗口",
-            _ => "注册机当前未在运行（没有带 grok-chrome-profile 的 Chrome 进程）",
-        },
+        "matched": matched,
+        "message": message,
     }))
 }
 
@@ -545,82 +565,151 @@ fn collect_grok_cookies(cookies: &[Value]) -> (String, String) {
     (sso_value, pairs.join("; "))
 }
 
-/// 以固定账号 ID `grok_register` upsert 写账号池。
-///
-/// 存在则更新 token/status，不存在则 push（写法照 `grok_sso.rs:657-694`
-/// `feed_gateway_pool`）。**不要**改用 `grok::import_account`：它每次生成随机 ID
-/// `grok_web_<uuid8>` 且不去重，反复抓取会产生重复账号。
-fn feed_pool(sso_value: &str, cookie_string: &str) -> Result<(), String> {
-    let mut accounts = crate::modules::grok::load_accounts();
-    let existing = accounts
-        .iter_mut()
-        .find(|a| a.get("id").and_then(Value::as_str) == Some(POOL_ACCOUNT_ID));
-    match existing {
-        Some(entry) => {
-            entry["token"] = json!(cookie_string);
-            entry["updatedAt"] = json!(now_ms());
-            if !sso_value.is_empty() {
-                entry["status"] = json!("ok");
-                entry["error"] = Value::Null;
-                entry["enabled"] = json!(true);
-            }
+/// 从 cookie 串/池账号 token 中提取 sso 值（token 形如 "sso=xxx; sso-rw=yyy; ..."）。
+/// 纯函数，供同 sso 去重判定与单测。
+fn sso_of_token(token: &str) -> Option<String> {
+    token.split(';').find_map(|pair| {
+        let pair = pair.trim();
+        let (name, value) = pair.split_once('=')?;
+        if name.trim() == "sso" && !value.trim().is_empty() {
+            Some(value.trim().to_string())
+        } else {
+            None
         }
-        None => {
-            if sso_value.is_empty() {
-                return Ok(()); // 从未登录过：不入池
-            }
-            accounts.push(json!({
-                "id": POOL_ACCOUNT_ID,
-                "name": POOL_ACCOUNT_NAME,
-                "provider": "web",
-                "token": cookie_string,
-                "tier": "free",
-                "enabled": true,
-                "status": "ok",
-                "error": null,
-                "cooldownUntil": 0,
-                "lastUsedAt": null,
-                "addedAt": now_ms(),
-                "updatedAt": now_ms(),
-            }));
-        }
-    }
-    crate::modules::grok::save_accounts(&accounts)
+    })
 }
 
-/// 只结束「命令行带 grok-chrome-profile」的 Chrome 进程。
+/// 按既有账号推下一个注册机账号 ID：`grok_register` 空位优先，其后
+/// `grok_register_2`、`grok_register_3`…（跳过占用）。纯函数，便于单测。
+/// 注意：刻意不用无限循环关键字——本模块守卫测试（no_background_loop_registered）
+/// 对源码做零常驻循环的静态审计，注释里也不能出现该模式串。
+fn next_register_account_id(existing_ids: &[String]) -> String {
+    if !existing_ids.iter().any(|id| id == POOL_ACCOUNT_ID) {
+        return POOL_ACCOUNT_ID.to_string();
+    }
+    let mut n = 2u64;
+    let mut candidate = format!("{POOL_ACCOUNT_ID}_{n}");
+    while existing_ids.iter().any(|id| id == &candidate) {
+        n += 1;
+        candidate = format!("{POOL_ACCOUNT_ID}_{n}");
+    }
+    candidate
+}
+
+/// 把抓取到的登录态写入账号池，返回实际入池/刷新的账号 ID。
 ///
-/// 🔴 严禁按进程名无差别杀 chrome —— 那会连用户日常浏览器一起杀掉。因此必须按
+/// 2026-09-26 升级（用户要求支持多账号批量注册）：去重口径从「固定 ID 覆盖」
+/// 升级为「按 sso 值去重」——
+/// - 抓到的 sso 与池里某账号相同 → 原位刷新该账号（反复抓取同一登录不堆重复）；
+/// - 抓到的 sso 是新登录 → **新建独立账号**（`grok_register` 空位优先，其后
+///   `grok_register_2…`），支持逐个注册多个账号批量入池。
+/// 依旧**不要**改用 `grok::import_account`：它随机 ID 且完全不去重。
+fn feed_pool(sso_value: &str, cookie_string: &str) -> Result<String, String> {
+    let mut accounts = crate::modules::grok::load_accounts();
+    // 1) 同 sso 已在池 → 原位刷新（token 覆盖 + 启用）。
+    if let Some(entry) = accounts.iter_mut().find(|a| {
+        a.get("token")
+            .and_then(Value::as_str)
+            .and_then(sso_of_token)
+            .as_deref()
+            == Some(sso_value)
+    }) {
+        entry["token"] = json!(cookie_string);
+        entry["updatedAt"] = json!(now_ms());
+        entry["status"] = json!("ok");
+        entry["error"] = Value::Null;
+        entry["enabled"] = json!(true);
+        let id = entry
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or(POOL_ACCOUNT_ID)
+            .to_string();
+        crate::modules::grok::save_accounts(&accounts)?;
+        return Ok(id);
+    }
+    // 2) 新 sso → 新建独立账号（id 递增避让）。
+    let existing_ids: Vec<String> = accounts
+        .iter()
+        .filter_map(|a| a.get("id").and_then(Value::as_str).map(String::from))
+        .collect();
+    let account_id = next_register_account_id(&existing_ids);
+    let display_name = if account_id == POOL_ACCOUNT_ID {
+        POOL_ACCOUNT_NAME.to_string()
+    } else {
+        format!("{POOL_ACCOUNT_NAME}（{account_id}）")
+    };
+    accounts.push(json!({
+        "id": account_id,
+        "name": display_name,
+        "provider": "web",
+        "token": cookie_string,
+        "tier": "free",
+        "enabled": true,
+        "status": "ok",
+        "error": null,
+        "cooldownUntil": 0,
+        "lastUsedAt": null,
+        "addedAt": now_ms(),
+        "updatedAt": now_ms(),
+    }));
+    crate::modules::grok::save_accounts(&accounts)?;
+    Ok(account_id)
+}
+
+/// 只结束「命令行带 grok-chrome-profile」的 Chrome 进程，返回 (匹配数, 杀成数)。
+///
+/// 🔴 严禁按进程名无差别杀 chrome —— 那会连用户日常浏览器一起杀掉。因此按
 /// CommandLine 匹配本注册机实例的 profile 目录。
-fn kill_register_browser() -> bool {
+///
+/// 🔴 实现教训（2026-09-26 实测）：不要用 `... | Stop-Process -Force` 管道——
+/// Win32_Process 的属性绑定到 Stop-Process 会报「找不到名为 chrome.exe 的进程」
+/// 且整条管道失败（12 个进程一个没杀，`killed:false`，前端看起来毫无反应）。
+/// 必须先取出 ProcessId，再逐个 `Stop-Process -Id`（实测 12/12 成功）。
+fn kill_register_browser() -> (usize, usize) {
     #[cfg(target_os = "windows")]
     {
         let script = format!(
-            "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | Where-Object CommandLine -like '*{PROFILE_DIR_NAME}*' | Stop-Process -Force"
+            "$procs = Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | Where-Object CommandLine -like '*{PROFILE_DIR_NAME}*'; \
+             $killed = 0; $failed = 0; \
+             foreach ($p in $procs) {{ try {{ Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop; $killed++ }} catch {{ $failed++ }} }}; \
+             Write-Output \"$($procs.Count) $($killed) $($failed)\""
         );
         let mut cmd = Command::new("powershell");
         cmd.args(["-NoProfile", "-Command", &script]);
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW：不闪控制台窗口
-        match cmd.status() {
-            Ok(status) => status.success(),
+        match cmd.output() {
+            Ok(out) => {
+                // 解析 "matched killed failed" 三元组；解析失败按 (0,0) 处理（幂等无害）
+                let text = String::from_utf8_lossy(&out.stdout);
+                let nums: Vec<usize> = text
+                    .split_whitespace()
+                    .filter_map(|t| t.parse::<usize>().ok())
+                    .collect();
+                if nums.len() >= 2 {
+                    let matched = nums[0];
+                    let killed = nums[1];
+                    if matched > 0 && killed == 0 {
+                        // 全部杀失败（如权限不足）：显式失败，让 message 如实反映
+                        (matched, 0)
+                    } else {
+                        (matched, killed)
+                    }
+                } else {
+                    (0, 0)
+                }
+            }
             Err(error) => {
                 eprintln!("[grok-register] 关闭进程失败: {error}");
-                false
+                (0, 0)
             }
         }
     }
     #[cfg(not(target_os = "windows"))]
     {
-        match Command::new("pkill")
-            .args(["-f", PROFILE_DIR_NAME])
-            .status()
-        {
-            Ok(status) => status.success(),
-            Err(error) => {
-                eprintln!("[grok-register] 关闭进程失败: {error}");
-                false
-            }
+        match Command::new("pkill").args(["-f", PROFILE_DIR_NAME]).status() {
+            Ok(status) if status.success() => (1, 1),
+            _ => (0, 0),
         }
     }
 }
@@ -764,5 +853,46 @@ mod tests {
             "无浏览器时应干净失败，实际 status = {status}"
         );
         assert!(out.get("message").and_then(Value::as_str).is_some());
+    }
+
+    /// 2026-09-26 多账号 capture 的两个纯函数：sso 提取与 ID 递增避让。
+    #[test]
+    fn sso_of_token_extracts_first_sso_pair() {
+        assert_eq!(
+            sso_of_token("sso=abc123; sso-rw=def456; other=x"),
+            Some("abc123".to_string())
+        );
+        // 无 sso 但有 sso-rw：capture 用 sso-rw 兜底后 token 里没有 sso= → None
+        assert_eq!(sso_of_token("sso-rw=def456"), None);
+        assert_eq!(sso_of_token(""), None);
+        assert_eq!(sso_of_token("referrer=grok-com; sso=xyz; a=b"), Some("xyz".to_string()));
+    }
+
+    #[test]
+    fn next_register_account_id_skips_taken_slots() {
+        // 空位优先
+        assert_eq!(next_register_account_id(&[]), "grok_register");
+        assert_eq!(
+            next_register_account_id(&["other".to_string(), "abc".to_string()]),
+            "grok_register"
+        );
+        // 固定 ID 被占（旧 sso 不同）→ 递增避让
+        assert_eq!(
+            next_register_account_id(&["grok_register".to_string()]),
+            "grok_register_2"
+        );
+        assert_eq!(
+            next_register_account_id(&[
+                "grok_register".to_string(),
+                "grok_register_2".to_string(),
+                "x".to_string()
+            ]),
+            "grok_register_3"
+        );
+        // 缺号复用：_2 存在但 _3 不存在 → 取 _3（递增语义不回填空洞，简单可预测）
+        assert_eq!(
+            next_register_account_id(&["grok_register".to_string(), "grok_register_3".to_string()]),
+            "grok_register_2"
+        );
     }
 }

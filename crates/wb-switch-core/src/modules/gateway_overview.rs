@@ -25,8 +25,12 @@ const GATEWAYS: &[GatewayEntry] = &[
     GatewayEntry { id: "qwen-flash", name: "Qwen3.8-Flash", page: "/qoder", base: "/qwen-flash/v1" },
     GatewayEntry { id: "grok", name: "Grok", page: "/grok", base: "/grok/v1" },
     GatewayEntry { id: "loomy", name: "Loomy", page: "/loomy", base: "/loomy/v1" },
-    // 妙手（美团智能体）：反代未通，base 先占位；账号数来自本机登录态发现。
-    GatewayEntry { id: "miaoshou", name: "妙手", page: "/miaoshou", base: "—" },
+    // 妙手（美团智能体）：OpenAI 兼容反代已实装（/miaoshou/v1/models 与
+    // /miaoshou/v1/chat/completions，见 server api.rs 妙手反代段），此处 2026-09-25
+    // 接入总览——此前 base 还是「反代未通」时期的占位符「—」，导致总览无模型、
+    // 模型测试页永远显示「妙手（无模型）」且探测端点拼不出合法 URL。
+    // 账号数来自本机登录态发现。
+    GatewayEntry { id: "miaoshou", name: "妙手", page: "/miaoshou", base: "/miaoshou/v1" },
     // ── 2026-09-22 三拆：原先 TRAE 与 WorkBuddy 共用一个「TRAE/WB 模型」页，
     //    现按上游来源拆成相互独立的网关（OpenCode 网关见 /opencode 页，其模块待建）。
     GatewayEntry {
@@ -41,12 +45,36 @@ const GATEWAYS: &[GatewayEntry] = &[
         page: "/workbuddy",
         base: "/workbuddy/v1",
     },
+    // WorkBuddy 内置模型网关（契约 §2.2）：ACP 直连内置模型（/workbuddy-native/v1，
+    // 端点免鉴权）；page 为 WorkBuddy 页（/trae-workbuddy 三拆后仅剩重定向，不可用）。
+    GatewayEntry {
+        id: "workbuddy-native",
+        name: "WorkBuddy 内置",
+        page: "/workbuddy",
+        base: "/workbuddy-native/v1",
+    },
+    // WorkBuddy 多账号池网关（2026-09-25）：模型条目自带 region（cn/intl，跨区同名
+    // 各留一条），测试页据此做「国内版/国际版」区域切换；chat 按请求体 region 精确切区。
+    GatewayEntry {
+        id: "workbuddy-pool",
+        name: "WorkBuddy 池",
+        page: "/workbuddy",
+        base: "/workbuddy-pool/v1",
+    },
     // OpenCode 网关：本机 OpenCode server 的**免费模型专用**入口（独立密钥）。
     GatewayEntry {
         id: "opencode",
         name: "OpenCode",
         page: "/opencode",
         base: "/opencode/v1",
+    },
+    // DuMate（百度搭子）网关（2026-10-01 接入）：OpenAI 兼容反代 /dumate/v1
+    //（静态 4 模型：dumate-lite/turbo/ultra/points），账号 = 本机客户端登录态单账号。
+    GatewayEntry {
+        id: "dumate",
+        name: "DuMate（百度搭子）",
+        page: "/dumate",
+        base: "/dumate/v1",
     },
 ];
 
@@ -143,16 +171,28 @@ async fn fetch_models(gateway: &str) -> Result<Vec<Value>, String> {
         "qwen-flash" => crate::modules::qoder::qwen_flash_models_payload(),
         "grok" => crate::modules::grok::models_payload(),
         "glm" => crate::modules::glm_proxy::models_payload(),
+        // 妙手：动态拉桌面端真实目录（10 分钟缓存，上游不可达时回退静态兜底表，不会为空）
+        "miaoshou" => crate::modules::miaoshou::models_payload_async().await,
         // ── 2026-09-22 三拆新增 ──
         "trae-work-cn" => crate::modules::trae_proxy::models_payload().await,
         // 2026-09-23：WorkBuddy **只暴露内置模型** —— 上游 provider 全量清单（原 591 条 / 14 渠道）
         // 按设计归 OpenCode 网关呈现（见 docs/gateway-split-20260922.md）。总览的 modelCount
         // 必须与 WorkBuddy 页一致，否则侧栏仍显示 591。OpenCode 侧继续用 models_payload()。
         "workbuddy" => crate::modules::workbuddy_proxy::channel_pick_models_payload().await,
+        // WorkBuddy 内置模型目录（契约 §2.2）：native ACP 实时探测 + 产品配置补充源
+        // （300s TTL 缓存同源）；默认只列 tier|model（含 exposed=false 补充实模），
+        // 条目自带 id/name/multiplier/kind/exposed。
+        "workbuddy-native" => crate::modules::workbuddy_proxy::native_models_payload(false).await,
+        // WorkBuddy 池：两区目录聚合（条目自带 region；cn 回落内置表、intl 回落静态表）。
+        "workbuddy-pool" => crate::modules::workbuddy_gateway::overview_models_catalog()
+            .await
+            .map(|items| json!({ "data": items }))?,
         // OpenCode 网关只暴露免费模型，故总览里的 modelCount 即为免费数
         "opencode" => crate::modules::opencode::models_payload()
             .await
             .unwrap_or_else(|_| json!({ "data": [] })),
+        // DuMate：静态 4 模型目录（同步返回，同 qoder/grok 形态）。
+        "dumate" => crate::modules::dumate::models_payload(),
         _ => return Ok(Vec::new()),
     };
     let list = payload
@@ -193,12 +233,42 @@ fn fetch_accounts(gateway: &str) -> Vec<Value> {
                 })
             })
             .collect(),
+        // DuMate（百度搭子）：账号 = 本机客户端登录态（qianfan cookie 解密成功
+        // 即产出 dumate:local 单账号；解密失败为空 = 未登录）。
+        "dumate" => crate::modules::platform_checkin::discover_dumate_accounts()
+            .into_iter()
+            .map(|a| {
+                json!({
+                    "name": a.get("nickname").or_else(|| a.get("email")).cloned().unwrap_or(Value::Null),
+                    "status": "ok",
+                    "enabled": true,
+                })
+            })
+            .collect(),
         // ── 2026-09-22 三拆新增 ──
         // TRAE Work CN：自有账号池（trae_accounts.json），与 GLM / 其它网关互不相干。
         "trae-work-cn" => crate::modules::trae_accounts::list_for_display(),
         // WorkBuddy：无自有账号池 —— 它的"账号"= 借道 OpenCode server 的已鉴权 provider 清单，
         // 而保护/保活对象是该 server 进程（见 workbuddy_proxy 的 watchdog/端口探测）。
         "workbuddy" => Vec::new(),
+        // WorkBuddy 内置模型网关（契约 §2.2）：无账号概念，合成单条账号；目录探测是
+        // 异步而 fetch_accounts 同步，用注册表心跳同步信号（trae_acp::has_active_session，
+        // 5 分钟内有活跃 WorkBuddy 会话）近似「ACP 通道可用」。
+        "workbuddy-native" => vec![json!({
+            "name": "WorkBuddy ACP",
+            "status": if crate::modules::trae_acp::has_active_session() { "ok" } else { "error" },
+            "enabled": true,
+        })],
+        // WorkBuddy 池：账号 = accounts.json 桥接条目（region 由登录域派生），
+        // 状态聚合一个合成健康位（逐账号健康在 /api/workbuddy-pool/status 细分）。
+        "workbuddy-pool" => {
+            let accounts = crate::modules::workbuddy_gateway::load_pool_accounts();
+            vec![json!({
+                "name": format!("WorkBuddy 池（{} 账号）", accounts.len()),
+                "status": if accounts.is_empty() { "error" } else { "ok" },
+                "enabled": true,
+            })]
+        }
         _ => Vec::new(),
     }
 }
@@ -281,6 +351,8 @@ pub async fn gateway_snapshot(id: &str) -> Value {
                 capabilities.push(cap);
             }
         }
+        // 契约 §2.2：multiplier/kind/exposed 直传（模型条目缺该字段时为 Null；
+        // 纯加法——其余网关的模型条目无这些字段，透传为 Null 不影响既有消费方）。
         simplified.push(json!({
             "id": model.get("id").cloned().unwrap_or(Value::Null),
             "name": model
@@ -289,6 +361,11 @@ pub async fn gateway_snapshot(id: &str) -> Value {
                 .cloned()
                 .unwrap_or_else(|| model.get("id").cloned().unwrap_or(Value::Null)),
             "capabilities": caps,
+            "multiplier": model.get("multiplier").cloned().unwrap_or(Value::Null),
+            "kind": model.get("kind").cloned().unwrap_or(Value::Null),
+            "exposed": model.get("exposed").cloned().unwrap_or(Value::Null),
+            // WorkBuddy 池条目携带区域（cn/intl），测试页据此做区域切换与精确路由。
+            "region": model.get("region").cloned().unwrap_or(Value::Null),
         }));
     }
 

@@ -680,6 +680,8 @@ export interface GatewayApiKey {
   enabled: boolean;
   /** 仅创建响应里返回完整密钥 */
   key?: string;
+  /** 区域归属：cn=WorkBuddy 国内版专用 / intl=国际版专用；null=通用（无区域约束） */
+  region?: string | null;
 }
 
 export interface GatewayLogEntry {
@@ -919,6 +921,8 @@ export interface GrokPoolPolicy {
   minPoolSize: number;
   /** 低于容量下限时暂停调度（选号直接失败并给出原因）；关闭时仅告警不暂停 */
   pauseWhenBelowMin: boolean;
+  /** 账号驻留时长（分钟）：轮询切号后账号保持使用的最短时长，范围 5-120，缺省 30（旧配置文件/旧后端缺字段时前端显示 30） */
+  resident_ttl_min?: number;
 }
 
 export interface GrokPoolSnapshot {
@@ -1171,3 +1175,206 @@ export interface WorkbuddyGatewayConfig {
   balanceRefreshMinutes: number;
 }
 
+
+// ---- ChatGPT 通道（契约 docs/chatgpt-channel-contract.md §3/§4/§6；字段对齐后端
+//      chatgpt_channel::status_value() 聚合与工具链 webui 透传键，2026-09-30 grep 实测）----
+
+/** GET /api/chatgpt/channel/status 响应（后端 chatgpt_channel::status_value()）。 */
+export interface ChatGptChannelStatus {
+  /** 通道开关（~/.wb-switch/chatgpt_channel.json 的 enabled） */
+  enabled: boolean;
+  /** WebUI 托管进程是否存活（后端 GET /api/health 探活） */
+  webuiRunning: boolean;
+  /** WebUI 端口（配置 webui_port，默认 8765） */
+  webuiPort: number;
+  /** gpt-reg-review 项目目录；未找到为空串（页面给出指引） */
+  projectDir: string;
+  /** 注册机实时快照（= 工具链 GET /api/auto/status 透传）；WebUI 未运行为 null */
+  registrar: ChatGptRegistrarStatus | null;
+  /** 已注册 ChatGPT 账号数（= /api/registered 的 total） */
+  accountCount: number;
+  /** 邮箱号池可用数（= /api/accounts 的 available） */
+  poolCount: number;
+}
+
+/** 注册机快照（工具链 webui/auto_loop.py:215-249 _snapshot()；枚举 :45-48）。 */
+export interface ChatGptRegistrarStatus {
+  /** stopped | running | paused */
+  state: "stopped" | "running" | "paused" | string;
+  started_at: number | null;
+  /** 本轮已运行秒数 */
+  elapsed: number;
+  registered_ok: number;
+  registered_fail: number;
+  /** 目标成功数（0=不限量；通道页启动时显式传 ≥1） */
+  target_count: number;
+  remaining: number | null;
+  concurrency: number;
+  last_message: string | null;
+}
+
+/** 批量注册启动请求体（透传工具链 AutoLoopStartReq，webui/app.py:2047-2072；
+ *  target_count 必填 ≥1——0=不限量会导致无限跑，通道页前端强制拦截）。 */
+export interface ChatGptRegistrarStartBody {
+  target_count: number;
+  concurrency?: number;
+  engine?: "protocol" | "browser" | string;
+  proxy?: string;
+  proxy_pool?: string[];
+  otp_timeout?: number;
+}
+
+/** 已注册 ChatGPT 账号条目（GET /api/chatgpt/registered items；
+ *  工具链 webui/db.py:1097-1145——token 只回长度不回原文）。 */
+export interface ChatGptAccount {
+  email: string;
+  /** access_token 长度（0=无） */
+  at_len: number;
+  /** session_token 长度（0=无） */
+  st_len: number;
+  /** refresh_token 长度（0=无） */
+  rt_len: number;
+  /** 注册完成时刻（unix 秒，SQLite REAL） */
+  created_at: number | null;
+  /** 邮箱类型（icloud_relay / mail_com / outlook 等） */
+  mail_kind?: string | null;
+}
+
+/** GET /api/chatgpt/registered 响应（app.py:823-827）。 */
+export interface ChatGptRegisteredResponse {
+  ok: boolean;
+  items: ChatGptAccount[];
+  total: number;
+}
+
+/** 邮箱号池条目（GET /api/chatgpt/accounts items = outlook_accounts 表 SELECT *，
+ *  db.py:332-354；是邮箱号池，不是 ChatGPT 账号——勿混用）。 */
+export interface ChatGptPoolAccount {
+  email: string;
+  status?: string | null;
+  kind?: string | null;
+  imported_at?: number | null;
+}
+
+/** GET /api/chatgpt/accounts 响应（app.py:465-476）。 */
+export interface ChatGptAccountsResponse {
+  ok: boolean;
+  items: ChatGptPoolAccount[];
+  total: number;
+  /** 按邮箱类型分组统计：{ kind: { status: n, ..., total: n } } */
+  by_kind?: Record<string, Record<string, number>> | null;
+}
+
+// ---- DuMate（百度搭子）渠道（契约 docs/dumate-channel-contract.md §2.3/§4.1）----
+// 说明：上游 console.bce.baidu.com 的积分数值为字符串（如 "55.73"），前端按
+// string | number 容错展示；键不省略（后端恒输出全部键，缺省仅兼容旧后端）。
+
+/** 订阅包 / 加油包条目（quota_overview 的 subscription[] / incremental[] 元素）。 */
+export interface DumatePointsPackage {
+  packageId?: string | null;
+  usedPoints?: string | number | null;
+  totalPoints?: string | number | null;
+  startDate?: string | null;
+  expireDate?: string | null;
+  packageType?: string | null;
+  source?: string | null;
+  status?: string | null;
+  autoRenewStatus?: string | null;
+}
+
+/** 积分余额（GET /api/dumate/credits = dumate::get_credits() 组装，契约 §2.2）。 */
+export interface DumateCredits {
+  ok: boolean;
+  /** 积分总额（上游为字符串，如 "16020.00"） */
+  totalPoints?: string | number | null;
+  /** 已用积分（上游为字符串，如 "55.73"） */
+  usedPoints?: string | number | null;
+  /** 可用积分（后端按 total-used 计算） */
+  availablePoints?: string | number | null;
+  isSubscribed?: boolean;
+  subscription?: DumatePointsPackage[];
+  incremental?: DumatePointsPackage[];
+  /** 模型限流中（modelThrottleInfo.throttled） */
+  throttled?: boolean;
+  /** 上游限流原因（throttleReason/throttleType 为 additive 容错字段） */
+  throttleReason?: string | null;
+  throttleType?: string | null;
+  error?: string | null;
+}
+
+/** DuMate 渠道状态（GET /api/dumate/status，契约 §2.3；camelCase、键不省略）。 */
+export interface DumateStatus {
+  ok: boolean;
+  /** tasklist 有 DuMate.exe / dumate-*.exe */
+  desktopRunning: boolean;
+  /** 引擎发现成功（dumate-opencode.exe 进程环境读取） */
+  engineDiscovered: boolean;
+  /** 引擎地址（如 http://127.0.0.1:52002）；未发现为 null */
+  engineUrl: string | null;
+  /** GET /global/health 探活 */
+  engineAlive: boolean;
+  /** inapp key 前 6 位 + "…"；未发现为 null */
+  inappKeyPreview: string | null;
+  /** auth.json + .cookie-key 都存在 */
+  credentialsPresent: boolean;
+  /** /dumate/v1 网关开关 */
+  gatewayEnabled: boolean;
+  /** 网关密钥掩码预览 */
+  apiKeyPreview: string | null;
+  /** 积分快照（查询失败为 null） */
+  credits: DumateCredits | null;
+  /** 中文人话状态说明 */
+  message: string;
+}
+
+/**
+ * 每日签到状态（GET /api/dumate/checkin-status）。
+ * 后端聚合 loginBonusInfo：ok=false + reason="login_expired" 表示登录态失效。
+ */
+export interface DumateCheckinStatus {
+  ok: boolean;
+  /** 今日是否已领（result.hasIssued） */
+  todayCheckedIn: boolean;
+  /** 累计签到次数（result.totalTimes） */
+  totalTimes?: number | null;
+  /** 累计获得积分（result.totalPoints） */
+  totalPoints?: string | number | null;
+  /** 已签日期列表（YYYY-MM-DD，result.signInDays） */
+  signInDays?: string[];
+  /** 失败原因标记（如 "login_expired"） */
+  reason?: string | null;
+  /** 人话说明 */
+  message?: string | null;
+  error?: string | null;
+  /** loginBonusInfo 原始 result（容错保留；顶层字段缺失时前端从这里兜底） */
+  raw?: {
+    hasIssued?: boolean;
+    totalTimes?: number | null;
+    totalPoints?: string | number | null;
+    signInDays?: string[] | null;
+  } | null;
+}
+
+/** 每日签到结果（POST /api/dumate/checkin）：幂等，already 表示今日已领。 */
+export interface DumateCheckinResult {
+  ok: boolean;
+  /** success=本次签到成功(+500) / already=今日已领 / error=失败 */
+  result: "success" | "already" | "error" | string;
+  /** 人话说明（如「签到成功，+500 积分」） */
+  message?: string | null;
+  error?: string | null;
+}
+
+/** DuMate 网关接入配置（GET/POST /api/dumate/config，形态对齐 opencode 网关 config_info）。 */
+export interface DumateConfigInfo {
+  enabled: boolean;
+  /** 网关密钥（前端测试卡用它鉴权 /dumate/v1；后端脱敏实现时前端回退主网关密钥） */
+  apiKey: string;
+  /** OpenAI 兼容调用基址，如 http://127.0.0.1:57890/dumate/v1 */
+  endpoint: string;
+  note?: string | null;
+  /** 引擎地址（additive 容错） */
+  opencodeUrl?: string | null;
+  /** 引擎 inapp key 预览（additive 容错） */
+  inappKeyPreview?: string | null;
+}

@@ -1083,12 +1083,36 @@ pub fn models_payload() -> Value {
         "glm-deep-research",
         "glm-image-1",
     ];
+    let mut data: Vec<Value> = models
+        .iter()
+        .map(|id| {
+            let mut entry = json!({"id": id, "object": "model", "created": 0, "owned_by": "chatglm"});
+            if let Some(cw) = crate::modules::config::max_context_window(id) {
+                entry["contextWindow"] = json!(cw);
+            }
+            entry
+        })
+        .collect::<Vec<_>>();
+    // model-sync 注册表合并尾步（契约 model-sync-contract.md §3.3）：glmweb 无上游
+    // 清单端点，仅页面手动补录进注册表后在此合并展示。去重：已存在 id 跳过。
+    // 注册表为空时本循环零迭代，输出与既有实现逐字节一致。
+    for entry in crate::modules::model_sync::registry_entries_for("glmweb") {
+        if data
+            .iter()
+            .any(|m| m.get("id").and_then(Value::as_str) == Some(entry.id.as_str()))
+        {
+            continue;
+        }
+        data.push(json!({
+            "id": entry.id,
+            "object": "model",
+            "created": 0,
+            "owned_by": "chatglm",
+        }));
+    }
     json!({
         "object": "list",
-        "data": models
-            .iter()
-            .map(|id| json!({"id": id, "object": "model", "created": 0, "owned_by": "chatglm"}))
-            .collect::<Vec<_>>(),
+        "data": data,
     })
 }
 
@@ -1207,3 +1231,76 @@ pub async fn perform_daily_checkin(access_token: &str) -> Result<Value, String> 
     Ok(val)
 }
 
+
+/// model-sync 注册表合并尾步回归（契约 model-sync-contract.md §六 1 / G1）。
+#[cfg(test)]
+mod model_sync_registry_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 🔴 红线：注册表为空时输出与改造前逐字节一致。
+    #[test]
+    fn empty_registry_matches_legacy_byte_for_byte() {
+        let dir = std::env::temp_dir()
+            .join(format!("wb-glmweb-payload-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let payload = crate::modules::model_sync::with_test_store(&dir, || models_payload());
+        let expect = json!({
+            "object": "list",
+            "data": [
+                {"id": "auto", "object": "model", "created": 0, "owned_by": "chatglm", "contextWindow": 1048576},
+                {"id": "auto-fast", "object": "model", "created": 0, "owned_by": "chatglm", "contextWindow": 1048576},
+                {"id": "glm-5.3-flash", "object": "model", "created": 0, "owned_by": "chatglm", "contextWindow": 1048576},
+                {"id": "glm-5.3", "object": "model", "created": 0, "owned_by": "chatglm", "contextWindow": 1048576},
+                {"id": "cogView-4-250304", "object": "model", "created": 0, "owned_by": "chatglm"},
+                {"id": "glm-5.2", "object": "model", "created": 0, "owned_by": "chatglm", "contextWindow": 1048576},
+                {"id": "glm-5.1", "object": "model", "created": 0, "owned_by": "chatglm", "contextWindow": 1048576},
+                {"id": "glm-5v-turbo", "object": "model", "created": 0, "owned_by": "chatglm", "contextWindow": 1048576},
+                {"id": "glm-5-turbo", "object": "model", "created": 0, "owned_by": "chatglm", "contextWindow": 1048576},
+                {"id": "glm-5", "object": "model", "created": 0, "owned_by": "chatglm", "contextWindow": 1048576},
+                {"id": "glm-4.7-flash", "object": "model", "created": 0, "owned_by": "chatglm", "contextWindow": 1048576},
+                {"id": "glm-4.7", "object": "model", "created": 0, "owned_by": "chatglm", "contextWindow": 1048576},
+                {"id": "glm-4.6v-flash", "object": "model", "created": 0, "owned_by": "chatglm", "contextWindow": 200000},
+                {"id": "glm-4.6", "object": "model", "created": 0, "owned_by": "chatglm", "contextWindow": 200000},
+                {"id": "glm-4.5", "object": "model", "created": 0, "owned_by": "chatglm", "contextWindow": 1048576},
+                {"id": "glm-4.1v-thinking-flashx", "object": "model", "created": 0, "owned_by": "chatglm", "contextWindow": 1048576},
+                {"id": "glm-4", "object": "model", "created": 0, "owned_by": "chatglm", "contextWindow": 1048576},
+                {"id": "glm-4-flash", "object": "model", "created": 0, "owned_by": "chatglm", "contextWindow": 1048576},
+                {"id": "glm-4-air", "object": "model", "created": 0, "owned_by": "chatglm", "contextWindow": 1048576},
+                {"id": "glm-4v", "object": "model", "created": 0, "owned_by": "chatglm", "contextWindow": 1048576},
+                {"id": "glm-zero-preview", "object": "model", "created": 0, "owned_by": "chatglm", "contextWindow": 1048576},
+                {"id": "glm-deep-research", "object": "model", "created": 0, "owned_by": "chatglm", "contextWindow": 1048576},
+                {"id": "glm-image-1", "object": "model", "created": 0, "owned_by": "chatglm", "contextWindow": 1048576}
+            ]
+        });
+        assert_eq!(
+            serde_json::to_string(&payload).unwrap(),
+            serde_json::to_string(&expect).unwrap(),
+            "空注册表输出必须逐字节等于当前契约（2026-09-30 起含 contextWindow 家族最长宣称）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 手动补录条目追加到尾部（owned_by=chatglm）；同 id 去重。
+    #[test]
+    fn manual_registry_entry_is_appended() {
+        let dir = std::env::temp_dir()
+            .join(format!("wb-glmweb-payload-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::modules::model_sync::with_test_store(&dir, || {
+            let _ = crate::modules::model_sync::add_registry_entry(
+                "glmweb", "glm-9", None, "manual", None,
+            );
+            let _ = crate::modules::model_sync::add_registry_entry(
+                "glmweb", "auto", None, "manual", None,
+            );
+            let payload = models_payload();
+            let data = payload.get("data").and_then(Value::as_array).unwrap();
+            assert_eq!(data.len(), 24, "23 静态 + 1 补录（auto 已存在不重复）");
+            assert_eq!(data[23]["id"], "glm-9");
+            assert_eq!(data[23]["owned_by"], "chatglm");
+            assert_eq!(data[23]["created"], 0);
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

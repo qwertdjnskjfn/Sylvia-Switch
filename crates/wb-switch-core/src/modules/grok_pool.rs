@@ -47,6 +47,9 @@ pub struct PoolPolicy {
     pub min_pool_size: usize,
     /// 低于容量下限时暂停调度（chat/test 选号直接失败并给出可读原因）
     pub pause_when_below_min: bool,
+    /// 驻留时长（分钟，D4）：同一账号在该时段内不切号（grok_sso RESIDENT 语义，
+    /// 原 grok_sso::RESIDENT_TTL_MS 常量迁入）。范围 5-120，默认 30。
+    pub resident_ttl_min: u64,
 }
 
 impl Default for PoolPolicy {
@@ -65,6 +68,8 @@ impl Default for PoolPolicy {
             // 容量守卫默认值与现状语义兼容：min=1 时仅「无可用账号」触发。
             min_pool_size: 1,
             pause_when_below_min: true,
+            // 驻留时长默认 30 分钟（与原 grok_sso::RESIDENT_TTL_MS 一致）。
+            resident_ttl_min: 30,
         }
     }
 }
@@ -73,34 +78,38 @@ fn policy_path() -> PathBuf {
     store_dir().join("grok_pool_policy.json")
 }
 
-pub fn load_policy() -> PoolPolicy {
-    let d = PoolPolicy::default();
-    std::fs::read_to_string(policy_path())
-        .ok()
-        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-        .map(|v| PoolPolicy {
-            auto_check_enabled: v.get("autoCheckEnabled").and_then(Value::as_bool).unwrap_or(d.auto_check_enabled),
-            check_interval_minutes: v.get("checkIntervalMinutes").and_then(Value::as_u64).unwrap_or(d.check_interval_minutes),
-            batch_size: v.get("batchSize").and_then(Value::as_u64).unwrap_or(d.batch_size as u64) as usize,
-            risk_low_threshold: v.get("riskLowThreshold").and_then(Value::as_i64).unwrap_or(d.risk_low_threshold),
-            risk_high_threshold: v.get("riskHighThreshold").and_then(Value::as_i64).unwrap_or(d.risk_high_threshold),
-            pause_high_risk: v.get("pauseHighRisk").and_then(Value::as_bool).unwrap_or(d.pause_high_risk),
-            success_delta: v.get("successDelta").and_then(Value::as_i64).unwrap_or(d.success_delta),
-            rate_limit_penalty: v.get("rateLimitPenalty").and_then(Value::as_i64).unwrap_or(d.rate_limit_penalty),
-            timeout_penalty: v.get("timeoutPenalty").and_then(Value::as_i64).unwrap_or(d.timeout_penalty),
-            fatal_penalty: v.get("fatalPenalty").and_then(Value::as_i64).unwrap_or(d.fatal_penalty),
-            min_pool_size: v.get("minPoolSize").and_then(Value::as_u64).unwrap_or(d.min_pool_size as u64) as usize,
-            pause_when_below_min: v.get("pauseWhenBelowMin").and_then(Value::as_bool).unwrap_or(d.pause_when_below_min),
-        })
-        .unwrap_or(d)
+/// 驻留时长（分钟）合法范围：5-120（D4）。
+pub fn clamp_resident_ttl_min(v: u64) -> u64 {
+    v.clamp(5, 120)
 }
 
-pub fn save_policy(p: &PoolPolicy) -> Result<(), String> {
-    let path = policy_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+/// 从 JSON 对象解析策略，缺字段用 `d` 的默认值补齐（D4：旧配置文件无
+/// `residentTtlMin` 字段时自然落到默认 30，天然向后兼容）。
+/// 抽出为纯函数便于单测（不读盘、无环境依赖）。
+fn policy_from_json(v: &Value, d: &PoolPolicy) -> PoolPolicy {
+    PoolPolicy {
+        auto_check_enabled: v.get("autoCheckEnabled").and_then(Value::as_bool).unwrap_or(d.auto_check_enabled),
+        check_interval_minutes: v.get("checkIntervalMinutes").and_then(Value::as_u64).unwrap_or(d.check_interval_minutes),
+        batch_size: v.get("batchSize").and_then(Value::as_u64).unwrap_or(d.batch_size as u64) as usize,
+        risk_low_threshold: v.get("riskLowThreshold").and_then(Value::as_i64).unwrap_or(d.risk_low_threshold),
+        risk_high_threshold: v.get("riskHighThreshold").and_then(Value::as_i64).unwrap_or(d.risk_high_threshold),
+        pause_high_risk: v.get("pauseHighRisk").and_then(Value::as_bool).unwrap_or(d.pause_high_risk),
+        success_delta: v.get("successDelta").and_then(Value::as_i64).unwrap_or(d.success_delta),
+        rate_limit_penalty: v.get("rateLimitPenalty").and_then(Value::as_i64).unwrap_or(d.rate_limit_penalty),
+        timeout_penalty: v.get("timeoutPenalty").and_then(Value::as_i64).unwrap_or(d.timeout_penalty),
+        fatal_penalty: v.get("fatalPenalty").and_then(Value::as_i64).unwrap_or(d.fatal_penalty),
+        min_pool_size: v.get("minPoolSize").and_then(Value::as_u64).unwrap_or(d.min_pool_size as u64) as usize,
+        pause_when_below_min: v.get("pauseWhenBelowMin").and_then(Value::as_bool).unwrap_or(d.pause_when_below_min),
+        resident_ttl_min: clamp_resident_ttl_min(
+            v.get("residentTtlMin").and_then(Value::as_u64).unwrap_or(d.resident_ttl_min),
+        ),
     }
-    let content = serde_json::to_string_pretty(&json!({
+}
+
+/// 策略序列化为落盘 JSON（camelCase，与既有字段命名一致）。抽出为纯函数
+/// 便于单测（save/load 键名往返不漂移）。
+fn policy_to_json(p: &PoolPolicy, updated_at: i64) -> Value {
+    json!({
         "autoCheckEnabled": p.auto_check_enabled,
         "checkIntervalMinutes": p.check_interval_minutes,
         "batchSize": p.batch_size,
@@ -113,9 +122,29 @@ pub fn save_policy(p: &PoolPolicy) -> Result<(), String> {
         "fatalPenalty": p.fatal_penalty,
         "minPoolSize": p.min_pool_size,
         "pauseWhenBelowMin": p.pause_when_below_min,
-        "updatedAt": now_ms(),
-    }))
-    .map_err(|e| e.to_string())?;
+        "residentTtlMin": p.resident_ttl_min,
+        "updatedAt": updated_at,
+    })
+}
+
+pub fn load_policy() -> PoolPolicy {
+    let d = PoolPolicy::default();
+    match std::fs::read_to_string(policy_path())
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+    {
+        Some(v) => policy_from_json(&v, &d),
+        None => d,
+    }
+}
+
+pub fn save_policy(p: &PoolPolicy) -> Result<(), String> {
+    let path = policy_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let content = serde_json::to_string_pretty(&policy_to_json(p, now_ms()))
+        .map_err(|e| e.to_string())?;
     atomic_write(&path, &content).map_err(|e| e.to_string())
 }
 
@@ -188,7 +217,8 @@ pub async fn check_one_account(account_id: &str) -> Result<Value, String> {
         return Err("账号 token 为空".to_string());
     }
 
-    let probe = crate::modules::grok_sso::probe_account(token).await;
+    // D2：传入账号 ID —— 体检成功路径要写 RESIDENT 驻留（需要账号身份）。
+    let probe = crate::modules::grok_sso::probe_account(account_id, token).await;
     let (ok, err_kind) = match probe {
         Ok(outcome) => (outcome.logged_in, if outcome.logged_in { "" } else { "not_logged_in" }),
         Err(_) => (false, "infra"),
@@ -604,5 +634,60 @@ mod tests {
         let (av_ok, below_ok) = compute_capacity(&accounts, &d, now);
         assert_eq!(av_ok, 2);
         assert!(!below_ok);
+    }
+
+    /// D4：驻留时长默认 30 分钟，clamp 范围 5-120。
+    #[test]
+    fn resident_ttl_default_is_30_and_clamps_to_5_120() {
+        assert_eq!(PoolPolicy::default().resident_ttl_min, 30);
+        assert_eq!(clamp_resident_ttl_min(0), 5);
+        assert_eq!(clamp_resident_ttl_min(4), 5);
+        assert_eq!(clamp_resident_ttl_min(5), 5);
+        assert_eq!(clamp_resident_ttl_min(30), 30);
+        assert_eq!(clamp_resident_ttl_min(45), 45);
+        assert_eq!(clamp_resident_ttl_min(120), 120);
+        assert_eq!(clamp_resident_ttl_min(121), 120);
+        assert_eq!(clamp_resident_ttl_min(u64::MAX), 120);
+    }
+
+    /// D4：旧配置文件缺 residentTtlMin 字段 → 用默认 30（向后兼容）；
+    /// 新文件带值 → 落盘前 clamp 到 5-120。
+    #[test]
+    fn policy_json_missing_resident_ttl_uses_default_and_clamps() {
+        let d = PoolPolicy::default();
+        // 旧文件：除 residentTtlMin 外的字段照常解析，缺失字段补默认。
+        let old = policy_from_json(&json!({"batchSize": 2, "checkIntervalMinutes": 90}), &d);
+        assert_eq!(old.resident_ttl_min, 30);
+        assert_eq!(old.batch_size, 2);
+        assert_eq!(old.check_interval_minutes, 90);
+        // 带值但越界 → clamp。
+        assert_eq!(
+            policy_from_json(&json!({"residentTtlMin": 999}), &d).resident_ttl_min,
+            120
+        );
+        assert_eq!(policy_from_json(&json!({"residentTtlMin": 1}), &d).resident_ttl_min, 5);
+        assert_eq!(
+            policy_from_json(&json!({"residentTtlMin": 45}), &d).resident_ttl_min,
+            45
+        );
+        // 字段类型异常（字符串）→ 用默认。
+        assert_eq!(
+            policy_from_json(&json!({"residentTtlMin": "45"}), &d).resident_ttl_min,
+            30
+        );
+    }
+
+    /// D4：save 的键名与 load 的解析往返一致（residentTtlMin 不漂移）。
+    #[test]
+    fn policy_json_roundtrip_keeps_resident_ttl() {
+        let mut p = PoolPolicy::default();
+        p.resident_ttl_min = 45;
+        let v = policy_to_json(&p, 1_000);
+        assert_eq!(v.get("residentTtlMin").and_then(Value::as_u64), Some(45));
+        let back = policy_from_json(&v, &PoolPolicy::default());
+        assert_eq!(back.resident_ttl_min, 45);
+        // 默认策略往返不变形。
+        let d = policy_from_json(&policy_to_json(&PoolPolicy::default(), 0), &PoolPolicy::default());
+        assert_eq!(d.resident_ttl_min, 30);
     }
 }
