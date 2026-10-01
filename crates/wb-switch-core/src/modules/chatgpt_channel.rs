@@ -325,10 +325,44 @@ fn kill_webui_processes() -> bool {
 // 注册机控制 + 账号表透传（契约 §3 / §4）
 // ---------------------------------------------------------------------------
 
-/// 批量注册启动：body（AutoLoopStartReq）透传 /api/auto/start。
+/// 批量注册启动：**先校验邮箱池非空**，再透传 /api/auto/start。
 /// 注意 target_count=0 = 不限量，调用方（通道页）必须显式传 ≥1。
+///
+/// 🔴 为什么要在 Sylvia 侧再拦一道（2026-10-01 实测）：
+/// 邮箱池为空时，gpt-reg-review 的批量循环**不报错、只空转** ——
+/// 实测空转 **1285 秒**后停止，`last_message = "已停止（成功 0 / 失败 0）"`。
+/// 「成功 0 **且** 失败 0」正是"一次都没尝试过"的铁证：没有邮箱就收不到 OTP，
+/// 连失败的机会都没有。用户在界面上只会看到"一直没进展"，无从判断原因。
+/// 这里提前拦下，把 21 分钟的白等换成一条可操作的提示。
 pub async fn auto_start(cfg: &ChatGptChannelConfig, body: Value) -> Result<Value, String> {
+    let acc = accounts(cfg).await;
+    if let Some(reason) = empty_pool_reason(&acc, &webui_base(cfg)) {
+        return Err(reason);
+    }
     http_post_json(&format!("{}/api/auto/start", webui_base(cfg)), Some(&body)).await
+}
+
+/// 启动前置校验（纯函数，便于单测）：邮箱池为空 → 返回拒绝原因；否则 None。
+///
+/// 判据用 `/api/accounts` 的 **`total`**（邮箱总条数）而非 available ——
+/// available 会因邮箱被 worker 占用而临时为 0，那不该拦住启动。
+/// 注意 `ok:false`（WebUI 不可达）时 total 也是 0，同样拒绝 —— 此时启动必然失败。
+pub(crate) fn empty_pool_reason(accounts_json: &Value, webui: &str) -> Option<String> {
+    let total = accounts_json
+        .get("total")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    if total > 0 {
+        return None;
+    }
+    Some(format!(
+        "邮箱池为空（0 个邮箱），无法开始批量注册。\n\
+         请先打开 {} → 「邮箱池」导入账号\
+         （outlook 需要 email / password / client_id / refresh_token 四项），\
+         配置就绪后再启动。\n\
+         （若强行启动，循环只会空转：上次实测空转 1285 秒后自动停止，成功 0 / 失败 0）",
+        webui
+    ))
 }
 
 /// 批量注册状态：GET /api/auto/status。WebUI 不可达时返回
@@ -648,6 +682,34 @@ mod tests {
             }
         });
         assert_eq!(pool_available_count(&v), 20);
+    }
+
+    #[test]
+    #[test]
+    fn empty_pool_blocks_auto_start() {
+        let webui = "http://127.0.0.1:8765";
+        // 空池 → 拒绝，且原因里要有可操作的指引与代价说明
+        let reason = empty_pool_reason(&json!({"ok": true, "items": [], "total": 0}), webui)
+            .expect("空池必须拒绝启动");
+        assert!(reason.contains("邮箱池为空"), "{reason}");
+        assert!(reason.contains(webui), "应给出 WebUI 地址: {reason}");
+        assert!(reason.contains("client_id"), "应说明要导入哪些字段: {reason}");
+        assert!(reason.contains("空转"), "应说明不拦的代价: {reason}");
+
+        // 有邮箱 → 放行
+        assert!(empty_pool_reason(&json!({"ok": true, "total": 3}), webui).is_none());
+
+        // available=0 但 total>0（邮箱全被 worker 占用）→ 仍放行，不能误拦
+        assert!(empty_pool_reason(
+            &json!({"ok": true, "total": 5, "by_kind": {"outlook": {"available": 0}}}),
+            webui
+        )
+        .is_none());
+
+        // WebUI 不可达（accounts 返回 ok:false / total:0）→ 同样拒绝
+        assert!(empty_pool_reason(&json!({"ok": false, "error": "connect refused"}), webui).is_some());
+        // 字段缺失也不能 panic
+        assert!(empty_pool_reason(&json!({}), webui).is_some());
     }
 
     #[test]

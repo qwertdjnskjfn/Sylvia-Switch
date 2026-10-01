@@ -7,6 +7,59 @@
 
 ---
 
+## 1.0.22 — 2026-10-01
+
+### 修复：注册机「空转 21 分钟」+ 停止后 elapsed 一直涨
+
+用户报「注册机怎么没有工作」。排查发现**它不是故障，是无米下锅**：
+
+#### 症状与根因（数据实锤）
+`/api/chatgpt/channel/status`：
+```
+state: "stopped"   last_message: "已停止（成功 0 / 失败 0）"
+elapsed: 1285.8s   registered_ok: 0   registered_fail: 0
+pool_stats: {total: 0, available: 0}   proxy_pool_size: 0
+```
+🔑 **「成功 0 **且** 失败 0」= 一次都没尝试过** —— 不是失败，是没事可做。
+
+`gateways/gpt-reg-review/webui/webui.db`：
+| 表 | 行数 |
+| --- | --- |
+| `outlook_accounts`（邮箱池） | **0** |
+| `settings`（代理池等） | **0** |
+| `runs` / `registered` / `environment_ledger` / `plus_activations` | 0 |
+
+⇒ 没有邮箱 → 收不到 OTP → 无法注册任何一个 → 循环空转 21 分钟后停止。
+
+#### ① Sylvia 侧：启动前校验邮箱池（`chatgpt_channel.rs`）
+`auto_start()` 先查 `/api/accounts` 的 **`total`**，为 0 直接拒绝并给出可操作指引
+（WebUI 地址 + 要导入的四个字段 + 不拦的代价），不再让用户白等 21 分钟。
+
+- 判据用 **`total`** 而非 available：available 会因邮箱被 worker 占用而临时为 0，
+  那不该拦住启动（已加断言防误拦）；
+- WebUI 不可达（`ok:false`）时 total 也是 0 → 同样拒绝（此时启动必然失败）；
+- 抽成纯函数 `empty_pool_reason()` 便于单测。
+
+#### ② gpt-reg-review 侧：停止后 elapsed 不再增长（`webui/auto_loop.py`）
+```python
+# 旧：只要 _started_at 非 0 就一直累加
+"elapsed": (time.time() - self._started_at) if self._started_at else 0,
+```
+**根因**：`stop()` 只置 `_stop_event`、**不清 `_started_at`**（也不能立即清 ——
+state 要等 worker 跑完才变 STOPPED，清了会把运行中的计时显示成 0）→
+停止后 elapsed 继续涨（实测停在 1285s 后仍在增长）。
+
+**修法**：按 state 归零 —— 只要不是 RUNNING/PAUSED，`elapsed` 与 `started_at` 恒为 0。
+原文件备份为 `auto_loop.py.bak-20261001-elapsed`。
+
+#### 单测
+`empty_pool_blocks_auto_start`（空池拒绝 / 有池放行 / available=0 但 total>0 不误拦 /
+WebUI 不可达也拒绝 / 字段缺失不 panic）；`chatgpt_channel` 共 **13 passed**。
+
+### ⚠️ 用户仍需完成的前置配置（代码无法代劳）
+打开 `http://127.0.0.1:8765` → 「邮箱池」导入 outlook 账号
+（`email` / `password` / `client_id` / `refresh_token`）+ 配置代理池。
+
 ## 1.0.21 — 2026-10-01
 
 ### 修 1.0.20 上线后实测暴露的两点：耗时波动 2.4× + turbo 超时是边缘值
