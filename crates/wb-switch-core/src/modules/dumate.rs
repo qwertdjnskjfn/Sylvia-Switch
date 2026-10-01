@@ -49,10 +49,37 @@ const DEFAULT_ENGINE_PORT: u16 = 52795;
 /// 消息提交超时（秒）：POST message 同步阻塞到生成完成，超时必须覆盖
 /// 模型生成时长（契约：lite 120s / turbo 240s / ultra 300s）。
 fn message_timeout_secs(model: &str) -> u64 {
+    // 1.0.16：恢复原始上限（1.0.15 曾放宽到 300/600/600 试图救"长输出超时"，但实验证明
+    // 那不是慢、而是**引擎进入内部 agent 流程后永久挂住**，放宽上限只会让人多等 10 分钟）。
+    // 真正解法见 NO_AGENT_DIRECTIVE。
     match model {
         MODEL_LITE => 120,
         MODEL_TURBO => 240,
         _ => 300,
+    }
+}
+
+/// 1.0.16：**必须注入的「纯文本回答」约束**（本通道的关键修复）。
+///
+/// 实测（2026-10-01，网关侧直连 A/B）：
+/// - 提示词「用 Python 写一个脚本…」→ **挂住，200s / 240s / 600s 均不返回**；
+/// - 同一需求 + 「不得调用工具/不得执行，直接把代码作为回复文本输出」→ **4 秒返回**；
+/// - 「把代码写在回复正文里」→ **3 秒返回**；纯问答 → 2–3 秒。
+/// 即：引擎会把"动手类"请求当成要它**实际执行**（写文件/跑命令），从而进入内部 agent 流程并卡死；
+/// 明确声明"只要文本"即可让它退回普通问答路径。
+///
+/// 本通道是纯文本补全接口（文件/命令由**客户端**自己负责，如 ZCode 自己写盘），
+/// 故该约束与语义完全一致，对普通问答无副作用。可用环境变量
+/// `DUMATE_NO_AGENT_DIRECTIVE=off` 关闭。
+const NO_AGENT_DIRECTIVE: &str = "【回答方式（必须严格遵守）】\n\
+你是纯文本助手：只把答案写在回复正文里。\n\
+禁止写文件、禁止执行命令或脚本、禁止调用任何工具、禁止进行任何实际操作。\n\
+需要代码时，直接把完整代码以文本形式输出在回复中。";
+
+fn no_agent_directive() -> Option<&'static str> {
+    match std::env::var("DUMATE_NO_AGENT_DIRECTIVE") {
+        Ok(v) if v.eq_ignore_ascii_case("off") => None,
+        _ => Some(NO_AGENT_DIRECTIVE),
     }
 }
 
@@ -1132,7 +1159,15 @@ pub async fn chat_completions_json(model: &str, body: &Value) -> Result<Value, D
         .cloned()
         .unwrap_or_default();
     let (system_text, headless_messages) = split_system(&messages);
-    let prompt = flatten_messages(&headless_messages);
+    let prompt = {
+        let flat = flatten_messages(&headless_messages);
+        // 1.0.16：前置「纯文本回答」约束，避免引擎把"动手类"请求当成要实际执行而挂死。
+        match no_agent_directive() {
+            Some(d) if !flat.trim().is_empty() => format!("{d}\n\n{flat}"),
+            Some(d) => d.to_string(),
+            None => flat,
+        }
+    };
     if prompt.trim().is_empty() {
         return Err(DumateChatError::new(
             DumateChatErrorKind::EngineError,
