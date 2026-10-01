@@ -109,3 +109,24 @@ curl http://<LAN IP>:57900/opencode/v1/models -H "Authorization: Bearer <lan key
 （LAN key 变更**不需要**重启：key 走文件 mtime 热更新。）
 
 **给朋友的正确用法**：只选 `dumate-lite`（3 秒级）→ 其次 `dumate-turbo` / `dumate-ultra`；开流式；别连点/并发。
+
+---
+
+## 2026-10-01 启动器加固：解决"双击看不到窗口 / 窗口一闪即逝"
+
+**问题**：`funnel-share-on.bat` 曾在末尾加了用外部脚本宿主做的自检。若机器存在**命令黑名单**
+（本机 `wmic` 即被拦），被拦程序可能**连带结束整个 cmd 进程** → 窗口一闪即逝，用户看不到任何输出。
+
+**两条启动器（互补）**
+
+| 启动器 | 特点 | 适用 |
+| --- | --- | --- |
+| **`start-funnel-proxy.vbs`**（推荐） | 纯 VBS 宿主 + `MSXML2.ServerXMLHTTP`，**不调用任何外部辅助程序**；隐藏启动 8443 反代 → 3s 后 HTTP 自检 → **弹 MsgBox 告知成功/失败** + 写一行 `VBS-LAUNCH ... ok=True/False` 到 `funnel-share-on.log` | 平时启动、需要明确反馈 |
+| `funnel-share-on.bat` | **零外部程序**（纯 cmd）；自记录包装：无参运行时 `call "%~f0" --logged >> funnel-share-on.log 2>&1` 再 `pause`，窗口即使闪退也能从日志查因 | 需要看完整流程 / 重新下发 Funnel 配置 |
+
+**约束（血泪）**
+- .bat 必须 **纯 ASCII + CRLF**：含中文的 `echo` 在 cmd 里会乱码；LF 换行会让 `goto :label` 失效。
+- .vbs 必须 **纯 ASCII**（宿主按 ANSI 读；CJK 路径与中文提示一律用 `ChrW` 构造）。
+- **不要**在面向用户双击的脚本里引入任何可能被黑名单拦的外部程序。
+- **代理进程必须由用户双击启动**：沙箱会回收自动化会话启动的一切进程（含独立派生进程），
+  但**验证可完全自动化**（netstat + `/global/health` + 公网四项）。
