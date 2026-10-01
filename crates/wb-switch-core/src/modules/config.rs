@@ -153,6 +153,11 @@ pub fn workbuddy_exe_cache_file() -> PathBuf {
     store_dir().join("workbuddy_exe.json")
 }
 
+/// 「近期到期」窗口配置文件（2026-10-01：此前是硬编码常量，改配置要重新构建）。
+pub fn expiring_soon_config_file() -> PathBuf {
+    store_dir().join("expiring_soon_config.json")
+}
+
 fn parse_workbuddy_exe_cache_json(text: &str) -> Option<PathBuf> {
     let v: Value = serde_json::from_str(text).ok()?;
     let exe = v.get("exe")?.as_str()?.trim();
@@ -240,6 +245,62 @@ pub fn save_checkin_config(cfg: &Value) -> std::io::Result<()> {
     std::fs::create_dir_all(store_dir())?;
     let content = serde_json::to_string_pretty(&merged).unwrap_or_default();
     atomic_write(&checkin_config_file(), &content)
+}
+
+// ---------------------------------------------------------------------------
+// 「近期到期」窗口（2026-10-01 由硬编码常量改为可配置）
+//
+// 背景：原为 `EXPIRING_SOON_DAYS = 7`，导致 10/31 到期（29 天）的包不亮；
+// 放宽到 30 后仍可能不合不同用户的预期 → 改为配置化，改完即时生效、无需重建。
+// ---------------------------------------------------------------------------
+
+/// 「近期到期」窗口的**默认**天数（2026-10-01 由 7 放宽到 30）。
+pub const DEFAULT_EXPIRING_SOON_DAYS: i64 = 30;
+
+fn default_expiring_soon_config() -> Value {
+    json!({"days": DEFAULT_EXPIRING_SOON_DAYS})
+}
+
+/// 规范化「近期到期」窗口配置（暴露为 pub 便于单测直接校验夹取逻辑）。
+pub fn merge_expiring_soon_config(input: &Value) -> Value {
+    let mut merged = default_expiring_soon_config();
+    let Some(map) = input.as_object() else {
+        return merged;
+    };
+    if let Some(days) = map.get("days").and_then(Value::as_i64) {
+        // 1..=365：0 会让「近期到期」永不亮，过大则失去提醒意义。
+        merged["days"] = json!(days.clamp(1, 365));
+    }
+    merged
+}
+
+/// 读取「近期到期」窗口配置（缺失/损坏时合并默认值）。
+pub fn load_expiring_soon_config() -> Value {
+    let f = expiring_soon_config_file();
+    if f.exists() {
+        if let Ok(text) = std::fs::read_to_string(&f) {
+            if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                return merge_expiring_soon_config(&value);
+            }
+        }
+    }
+    default_expiring_soon_config()
+}
+
+/// 保存「近期到期」窗口配置（只保留已知字段）。
+pub fn save_expiring_soon_config(cfg: &Value) -> std::io::Result<()> {
+    let merged = merge_expiring_soon_config(cfg);
+    std::fs::create_dir_all(store_dir())?;
+    let content = serde_json::to_string_pretty(&merged).unwrap_or_default();
+    atomic_write(&expiring_soon_config_file(), &content)
+}
+
+/// 「近期到期」窗口天数（`unified_accounts` / `credits` 读这里，不再用常量）。
+pub fn expiring_soon_days() -> i64 {
+    load_expiring_soon_config()
+        .get("days")
+        .and_then(Value::as_i64)
+        .unwrap_or(DEFAULT_EXPIRING_SOON_DAYS)
 }
 
 /// 读取签到日志。

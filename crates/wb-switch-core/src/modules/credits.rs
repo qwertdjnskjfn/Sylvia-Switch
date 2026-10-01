@@ -21,10 +21,10 @@ const RESOURCE_SUMMARY_PATH: &str = "/billing/meter/get-user-resource-summary";
 const RESOURCE_PAID_PACKAGES_PATH: &str = "/billing/meter/get-user-resource-paid-packages";
 const RESOURCE_FREE_PACKAGES_PATH: &str = "/billing/meter/get-user-resource-free-packages";
 const PRODUCT_CODE: &str = "p_tcaca";
-/// 「近期到期」窗口（天）。2026-10-01 由 7 放宽到 30：7 天过窄，
-/// 10/31 到期（29 天）这类包用户直觉算「近期」却不亮。与
-/// `unified_accounts::EXPIRING_SOON_DAYS` 保持同值。
-const EXPIRING_SOON_DAYS: i64 = 30;
+/// 「近期到期」窗口天数**不再写死**：统一走 `config::expiring_soon_days()`
+/// （设置页可改、改完即时生效，默认 30）。历史：初版 7 天过窄 ——
+/// 10/31 到期（29 天）这类包用户直觉算「近期」却不亮，实测全站仅 1 个包命中。
+/// ⚠️ 与 `unified_accounts` 必须是同一口径，谁都别再引入本地常量。
 
 // WorkBuddy CN UserCenter 的商品码（来自其公开套餐配置）。解析器不会依赖
 // 这些常量，因此上游新增商品时仍可通过 summary/明细返回资源。
@@ -231,8 +231,10 @@ fn resource_summary(raw: &Value, now: i64) -> Value {
         ],
     ));
     let expired = expire_at.map(|value| value <= now).unwrap_or(false);
+    // 窗口读配置（设置页可改，默认 30 天）；与 unified_accounts 共用同一口径。
+    let soon_days = crate::modules::config::expiring_soon_days();
     let expiring_soon = expire_at
-        .map(|value| value > now && value - now <= EXPIRING_SOON_DAYS * 24 * 3600 * 1000)
+        .map(|value| value > now && value - now <= soon_days * 24 * 3600 * 1000)
         .unwrap_or(false);
     let status = first_value(raw, &["Status", "status"])
         .and_then(|value| parse_number(Some(value)))

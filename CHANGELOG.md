@@ -7,6 +7,41 @@
 
 ---
 
+## 1.0.19 — 2026-10-01
+
+### 「近期到期」窗口改为**设置页可配置**（默认 30 天）
+
+1.0.17/1.0.18 把窗口从 7 天放宽到 30 天，但仍是**硬编码常量** —— 想改成 14 天或 60 天
+都得重新构建部署。本次改为配置化：**改完保存即生效，无需重启或重建**。
+
+**后端**
+- `config.rs` 新增 `expiring_soon_config_file()` → `~/.wb-switch/expiring_soon_config.json`，
+  以及 `load/save/merge_expiring_soon_config()` + `expiring_soon_days()`；
+  沿用既有配置模式（缺失/损坏回落默认值、`atomic_write` 落盘）。
+- `DEFAULT_EXPIRING_SOON_DAYS = 30`，**保存时夹取 1–365**
+  （0 会让「近期到期」永不亮；过大则失去提醒意义）。
+- `unified_accounts.rs` / `credits.rs` 两处使用点统一改读 `config::expiring_soon_days()`。
+  🔴 两处**必须同口径**，文件内已写明「谁都不要再引入本地常量」。
+- `unified_accounts` 改为**在 `credits_summary` 里读一次**再把 `soon_days` 传进
+  `packages_from_resources` / `packages_from_dumate` —— 否则 26 个账号 × 最多 10 个包
+  会触发 260 次文件读。
+
+**API**：`GET/POST /api/config/expiring-soon`（`{days: number}`）。
+
+**前端**
+- `types.ts` 新增 `ExpiringSoonConfig`；`api.ts` 加 ROUTES 映射与
+  `getExpiringSoonConfig()` / `saveExpiringSoonConfig()`（沿用 checkin config 的同一套模式）。
+- 设置页新增卡片「**积分「近期到期」判定**」：数字输入（1–365）+ 保存 + 成功/失败提示；
+  输入框用字符串存，避免用户清空时被强制变 0；被夹取时提示「已按范围 1–365 夹取」。
+
+### 单测（新增 1 个，unified_accounts 共 15 个）
+`expiring_soon_config_clamps_and_defaults` —— 覆盖 0→1、9999→365、正常值透传、
+缺字段→30、非对象→30（原 `expiring_soon_window_is_thirty_days` 改用
+`DEFAULT_EXPIRING_SOON_DAYS`，避免受用户已改配置影响而不确定）。
+
+### 校验
+`npx tsc --noEmit` **0 错误**；`cargo test --lib unified_accounts` **15 passed**。
+
 ## 1.0.18 — 2026-10-01
 
 ### 修 1.0.17 的同源误判：不同 AutoClaw 账号被错标成同源

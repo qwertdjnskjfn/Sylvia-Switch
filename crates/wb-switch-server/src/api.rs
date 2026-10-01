@@ -101,6 +101,11 @@ pub fn router() -> Router {
             get(api_checkin_config).post(api_save_checkin_config),
         )
         .route("/api/checkin/logs", get(api_checkin_logs))
+        // 「近期到期」窗口天数（设置页可配置，默认 30 天）
+        .route(
+            "/api/config/expiring-soon",
+            get(api_expiring_soon_config).post(api_save_expiring_soon_config),
+        )
         .route("/api/platform/accounts", get(api_platform_accounts))
         // 统一账号管理（契约 unified-accounts-contract.md §2）：全平台聚合 schema。
         .route("/api/accounts/unified", get(api_unified_accounts))
@@ -913,6 +918,20 @@ async fn api_save_checkin_config(Json(body): Json<Value>) -> Response {
 
 async fn api_checkin_logs() -> Response {
     json_ok(json!({ "logs": config::load_checkin_logs() }))
+}
+
+/// GET /api/config/expiring-soon：读取「近期到期」窗口天数。
+async fn api_expiring_soon_config() -> Response {
+    json_ok(config::load_expiring_soon_config())
+}
+
+/// POST /api/config/expiring-soon：保存「近期到期」窗口天数（1–365，越界自动夹取）。
+async fn api_save_expiring_soon_config(Json(body): Json<Value>) -> Response {
+    let submitted = body.get("config").unwrap_or(&body);
+    match config::save_expiring_soon_config(submitted) {
+        Ok(()) => json_ok(config::load_expiring_soon_config()),
+        Err(e) => json_err(e.to_string(), StatusCode::BAD_REQUEST),
+    }
 }
 
 /// 平台账号（AutoClaw / TRAE Work CN）签到状态 + 积分/额度，供账号卡片展示。

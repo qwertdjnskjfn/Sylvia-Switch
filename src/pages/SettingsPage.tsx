@@ -19,6 +19,7 @@ import {
 } from "@/lib/accent";
 import type {
   CheckinConfig,
+  ExpiringSoonConfig,
   CheckinLog,
   GithubConfig,
   UpdateInfo,
@@ -302,6 +303,100 @@ function AutoCheckinCard() {
             </div>
           )}
         </div>
+      </CardContent>
+    </SettingsGroup>
+  );
+}
+
+/** 「近期到期」窗口卡片：统一账号页的积分包「近期到期」判定天数。
+ *  后端夹取 1–365，改完保存即生效（无缓存，下次请求就读新值）。 */
+function ExpiringSoonCard() {
+  const [cfg, setCfg] = useState<ExpiringSoonConfig | null>(null);
+  /** 输入框用字符串存，避免用户清空时被强制变 0 */
+  const [days, setDays] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
+
+  useEffect(() => {
+    void load();
+  }, []);
+
+  async function load() {
+    try {
+      const c = await api.getExpiringSoonConfig();
+      setCfg(c);
+      setDays(String(c.days));
+    } catch (e) {
+      setMsg({ type: "err", text: api.asError(e) });
+    }
+  }
+
+  async function save() {
+    const n = Number(days);
+    if (!Number.isFinite(n) || days.trim() === "") {
+      setMsg({ type: "err", text: "请输入 1–365 之间的数字" });
+      return;
+    }
+    setSaving(true);
+    setMsg(null);
+    try {
+      const saved = await api.saveExpiringSoonConfig({ days: n });
+      setCfg(saved);
+      setDays(String(saved.days));
+      const clamped = saved.days !== Math.trunc(n);
+      setMsg({
+        type: "ok",
+        text: `已保存：距到期 ${saved.days} 天内算「近期到期」${clamped ? "（已按范围 1–365 夹取）" : ""}`,
+      });
+    } catch (e) {
+      setMsg({ type: "err", text: api.asError(e) });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <SettingsGroup id="settings-expiring-soon" title="积分「近期到期」判定">
+      <CardContent className="space-y-0 p-0">
+        {cfg ? (
+          <>
+            <SettingsFieldRow
+              label="近期到期窗口"
+              description="天；距到期在这个天数内（含已过期）的积分包，会在统一账号页标「近期到期」并高亮。默认 30"
+              htmlFor="es-days"
+              operational
+            >
+              <Input
+                id="es-days"
+                className="w-full sm:w-48"
+                type="number"
+                min={1}
+                max={365}
+                value={days}
+                onChange={(e) => setDays(e.target.value)}
+              />
+            </SettingsFieldRow>
+
+            <div className="flex flex-wrap gap-2 border-b-0 border-border/60 px-4 py-3 sm:px-5">
+              <DemoAction>
+                <Button size="sm" onClick={save} disabled={saving}>
+                  {saving ? <Loader2 className="animate-spin" /> : <Save />}保存
+                </Button>
+              </DemoAction>
+            </div>
+          </>
+        ) : (
+          <p className="px-4 py-3 text-sm text-muted-foreground sm:px-5">加载配置中…</p>
+        )}
+
+        {msg && (
+          <Alert
+            variant={msg.type === "err" ? "destructive" : "default"}
+            className="!w-auto mx-4 my-4 sm:mx-5"
+          >
+            <AlertDescription>{msg.text}</AlertDescription>
+          </Alert>
+        )}
       </CardContent>
     </SettingsGroup>
   );
@@ -784,6 +879,7 @@ export default function SettingsPage() {
         <AppearanceCard />
         <PermissionCheckCard />
         <AutoCheckinCard />
+        <ExpiringSoonCard />
         {api.isDesktop() || api.isDemoMode() ? <StartupCard /> : null}
         {api.isWebui() && !api.isDemoMode() ? null : <UpdateCard />}
       </div>

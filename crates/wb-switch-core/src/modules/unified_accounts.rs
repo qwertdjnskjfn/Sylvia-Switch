@@ -241,9 +241,11 @@ fn credits_summary(credits: &Value) -> Value {
     let total = num(&["totalRemaining", "totalPoints"]).unwrap_or(available);
     let used = (total - available).max(0.0);
 
-    let mut packages = packages_from_resources(credits);
+    // 窗口只读一次配置，避免每个包都去读文件（26 个账号 × 最多 10 个包）。
+    let soon_days = config::expiring_soon_days();
+    let mut packages = packages_from_resources(credits, soon_days);
     if packages.is_empty() {
-        packages = packages_from_dumate(credits);
+        packages = packages_from_dumate(credits, soon_days);
     }
     // 排序：临期优先，其次按到期时间升序（无到期时间的排最后）。
     packages.sort_by(|a, b| {
@@ -289,7 +291,7 @@ fn credits_summary(credits: &Value) -> Value {
 }
 
 /// 来源 ①：CreditExpiry.resources（AutoClaw / WorkBuddy / TRAE 等）。
-fn packages_from_resources(credits: &Value) -> Vec<Value> {
+fn packages_from_resources(credits: &Value, soon_days: i64) -> Vec<Value> {
     let Some(list) = credits.get("resources").and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -311,7 +313,7 @@ fn packages_from_resources(credits: &Value) -> Vec<Value> {
             let expire_at = json_num(r.get("expireAt")).map(|f| normalize_epoch(f as i64));
             // 上游 expiringSoon 为权威标志；缺失时按到期时间兜底计算。
             let expiring_soon = r.get("expiringSoon").and_then(Value::as_bool) == Some(true)
-                || is_expiring_within_days(expire_at, EXPIRING_SOON_DAYS);
+                || is_expiring_within_days(expire_at, soon_days);
             Some(json!({
                 "name": name,
                 "remaining": fmt_num(remaining),
@@ -326,7 +328,7 @@ fn packages_from_resources(credits: &Value) -> Vec<Value> {
 }
 
 /// 来源 ②：DuMate quota_overview 的 subscription[]/incremental[]。
-fn packages_from_dumate(credits: &Value) -> Vec<Value> {
+fn packages_from_dumate(credits: &Value, soon_days: i64) -> Vec<Value> {
     let mut out = Vec::new();
     for (key, kind) in [("subscription", "subscription"), ("incremental", "incremental")] {
         let Some(list) = credits.get(key).and_then(Value::as_array) else {
@@ -349,7 +351,7 @@ fn packages_from_dumate(credits: &Value) -> Vec<Value> {
                 "total": fmt_num(total),
                 "used": fmt_num(used),
                 "expireAt": expire_at,
-                "expiringSoon": is_expiring_within_days(expire_at, EXPIRING_SOON_DAYS),
+                "expiringSoon": is_expiring_within_days(expire_at, soon_days),
                 "kind": kind,
             }))
             .map(|v| out.push(v));
@@ -381,7 +383,13 @@ fn dumate_package_name(pkg_type: &str, source: &str) -> String {
 /// 「近期到期」窗口（天）。
 /// 2026-10-01 由 **7 天放宽到 30 天**：7 天过窄，像 10/31 到期（29 天）这类包
 /// 在用户直觉里就算「近期」，但按 7 天口径不会亮 —— 实测全站仅 1 个包命中。
-const EXPIRING_SOON_DAYS: i64 = 30;
+/// 「近期到期」窗口天数由 **`config::expiring_soon_days()`** 提供（可配置，默认 30）。
+///
+/// 历史：初版 7 天过窄 —— 像 10/31 到期（29 天）这类包用户直觉算「近期」却不亮，
+/// 实测全站仅 1 个包命中；2026-10-01 先放宽到 30，随后改为配置化（设置页可改，
+/// 改完即时生效、不需重新构建）。
+///
+/// ⚠️ 不要再在这里写常量：窗口口径必须与 `credits.rs` 一致，统一走配置。
 
 /// 同源标注：同一平台内「积分视图逐项一致」的账号，视为同一账号的不同入口。
 ///
@@ -520,19 +528,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn expiring_soon_window_is_thirty_days() {
+    fn expiring_soon_window_default_is_thirty_days() {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        // 30 天窗口（2026-10-01 由 7 天放宽）：29 天后的包必须算「近期」。
-        assert_eq!(EXPIRING_SOON_DAYS, 30);
-        assert!(is_expiring_within_days(Some(now + 29 * 86400), EXPIRING_SOON_DAYS));
-        assert!(!is_expiring_within_days(Some(now + 31 * 86400), EXPIRING_SOON_DAYS));
+        // 用**默认值**做确定性断言（不读用户可能改过的配置）。
+        let d = config::DEFAULT_EXPIRING_SOON_DAYS;
+        assert_eq!(d, 30);
+        // 29 天后的包必须算「近期」，31 天后的不算。
+        assert!(is_expiring_within_days(Some(now + 29 * 86400), d));
+        assert!(!is_expiring_within_days(Some(now + 31 * 86400), d));
         // 无到期时间不算近期（如 AutoClaw 奖励积分）。
-        assert!(!is_expiring_within_days(None, EXPIRING_SOON_DAYS));
+        assert!(!is_expiring_within_days(None, d));
         // 已过期仍算近期（前端据此标「已过期」）。
-        assert!(is_expiring_within_days(Some(now - 86400), EXPIRING_SOON_DAYS));
+        assert!(is_expiring_within_days(Some(now - 86400), d));
+    }
+
+    #[test]
+    fn expiring_soon_config_clamps_and_defaults() {
+        // 越界值被夹住：0（永不亮）→ 1，过大 → 365；非对象/缺字段 → 默认 30。
+        assert_eq!(config::merge_expiring_soon_config(&json!({"days": 0}))["days"], 1);
+        assert_eq!(config::merge_expiring_soon_config(&json!({"days": 9999}))["days"], 365);
+        assert_eq!(config::merge_expiring_soon_config(&json!({"days": 14}))["days"], 14);
+        assert_eq!(config::merge_expiring_soon_config(&json!({}))["days"], 30);
+        assert_eq!(config::merge_expiring_soon_config(&json!("bad"))["days"], 30);
     }
 
     #[test]
