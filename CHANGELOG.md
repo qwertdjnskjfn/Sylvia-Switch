@@ -7,7 +7,49 @@
 
 ---
 
+## 1.0.12 — 2026-10-01
+
+### 新增：dumate 通道支持引擎**原生 `system` 字段**（工具调用桥的地基）
+
+**背景**：为让客户端（Operit 等）能用"理解任务/工具调用"，在分享层做了**工具调用桥**
+（把 tools 编成协议说明 → 解析模型文本里的 `tool_calls` → 改写成标准 OpenAI 响应）。
+但实测 **dumate-lite / turbo / ultra 三个档位全部无视 user 文本里的协议**（甚至直接编造答案），
+原因：引擎自带框架压制 user 指令。
+
+**改动**（`dumate.rs`，纯增量）
+- 新增 `split_system()`：把 `role=system` 的消息**拆出来**，其余消息照旧 `flatten_messages` 拍平；
+- payload 在原 `parts`/`headers` 之外，**system 非空时追加 `"system": <文本>`**（引擎 message API
+  契约里 `system` 是原生字段，优先级高于拍平文本）；
+- 未带 system 的请求**行为完全不变**（字段不追加）。
+
+**动机来源（契约实测）**：`POST /session/{id}/message` 的可选字段
+`[messageID, model, agent, noReply, tools, format, system, variant, parts]`，其中
+`tools` 是 `{toolName: boolean}` 内置开关（**不能**注入客户端自定义函数），
+`system` 才是能覆盖引擎默认行为的通道。
+
+---
+
 ## 1.0.11 — 2026-10-01
+
+### 新增：DuMate 多账号 + 统一账号管理 —— 多账号池 / 一号一 IP / 全平台统一账号表 / 全界面去隐私遮罩
+
+契约：`docs/unified-accounts-contract.md`（唯一事实来源）；交付报告：`docs/unified-accounts-report.md`。
+
+**四件套**
+
+| # | 交付 | 说明 |
+| --- | --- | --- |
+| 1 | DuMate 多账号池 | 「导入本机登录态」或粘贴 cookies 添加池账号（`dumate:pool_N`），签到与积分 per 账号独立执行，全部进统一签到调度（`platform_checkin` 按 id 分发，幂等/成功判定/日志口径与本机账号同款） |
+| 2 | 一号一 IP | 池账号可配独立出站代理（`http://` / `socks5://`，reqwest socks feature），签到/积分请求按账号走各自代理，切断 IP 维度风控关联；模型调用层仍走本机主账号（引擎 INAPP_KEY/USER_ID 绑定桌面端进程，UI 已说明） |
+| 3 | 统一账号管理 | 新增 `GET /api/accounts/unified` 聚合全平台账号（登录态/积分/今日签到/代理/备注 + summary 统计）；账号管理页升级（总览条 + 统一账号表 + 平台筛选 + 跳转渠道页） |
+| 4 | 全面移除前端隐私遮罩 | 删除 `privacyMask`/`maskIdentity`/`getPrivacyMask` 机制，名称一律显示完整全名（备注名优先）；上游脱敏手机号无法还原全名，同样以备注优先展示 |
+
+**验证**（2026-10-01 门禁全过）
+- `cargo check -p wb-switch-core -p wb-switch-server` 通过；
+- 单测：`dumate` **37/37**、`platform_checkin` **17/17**、`unified` **8/8**、core 全量 **669/669**（另 2 ignored）；
+- `tsc --noEmit` **0 错误**；前端无遮罩审计（`maskIdentity` / `getPrivacyMask`）**0 命中**。
+
+---
 
 ### 新增：DuMate 4 个档位模型并入 `/opencode/v1` 共享入口 —— 朋友用同一 base_url + 同一把 key 即可选用
 

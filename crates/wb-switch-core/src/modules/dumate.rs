@@ -729,14 +729,30 @@ fn is_dumate_image(name: &str) -> bool {
 /// Cookie（域匹配 + 未过期 + 特殊字符值加引号）+ `csrftoken`（取 bce-user-info
 /// cookie 的值）+ `X-Requested-With: XMLHttpRequest` + Origin/Referer。
 /// 不跟随重定向（登录失效时上游 302 → 登录页，必须原样暴露给调用方判定）。
+/// `proxy`：None/空 = 直连（现状）；Some(url) = 该请求走 `reqwest::Proxy::all`
+/// 出站代理（DuMate 账号池「一号一 IP」，契约 unified-accounts §1.3；
+/// 代理地址无效时由 `http_request_raw` 返回 status=0 并带中文报错）。
 /// 返回 `(HTTP 状态码, 解析后的 JSON)`；解密失败 / cookie 为空 / 网络失败 → Err（人话）。
 pub(crate) async fn bce_api(
     method: &str,
     path: &str,
     body: Option<Value>,
+    proxy: Option<&str>,
 ) -> Result<(u16, Value), String> {
     let cookies = dumate_credentials::decrypt_cookies()?;
-    let (cookie, csrf) = dumate_credentials::bce_cookie_header(&cookies, "console.bce.baidu.com");
+    bce_api_with_cookies(method, path, body, &cookies, proxy).await
+}
+
+/// 指定 cookie 集的 bce API 请求（DuMate 多账号池用：per-account 凭据 +
+/// per-account 出站代理；本机路径 `bce_api` 解密客户端凭据后也汇入此处）。
+pub(crate) async fn bce_api_with_cookies(
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+    cookies: &[dumate_credentials::DumateCookie],
+    proxy: Option<&str>,
+) -> Result<(u16, Value), String> {
+    let (cookie, csrf) = dumate_credentials::bce_cookie_header(cookies, "console.bce.baidu.com");
     if cookie.is_empty() {
         return Err(
             "未解析到 console.bce.baidu.com 域的有效 cookie，请打开 DuMate 客户端重新登录"
@@ -750,8 +766,9 @@ pub(crate) async fn bce_api(
     headers.insert("Origin".to_string(), "https://console.bce.baidu.com".to_string());
     headers.insert("Referer".to_string(), "https://console.bce.baidu.com/".to_string());
     let url = format!("https://console.bce.baidu.com{path}");
+    // 空 proxy 串视同直连（http_request_raw 会过滤空白）。
     let (status, _resp_headers, text) =
-        http_request_raw(&url, method, body, Some(&headers), None, false).await;
+        http_request_raw(&url, method, body, Some(&headers), proxy, false).await;
     if status == 0 {
         return Err(format!("请求 console.bce.baidu.com 失败: {text}"));
     }
@@ -760,7 +777,7 @@ pub(crate) async fn bce_api(
 }
 
 /// `code` 字段取值（数字或数字字符串兼容）。
-fn code_num(body: &Value) -> Option<i64> {
+pub(crate) fn code_num(body: &Value) -> Option<i64> {
     match body.get("code") {
         Some(Value::Number(n)) => n.as_i64(),
         Some(Value::String(s)) => s.trim().parse::<i64>().ok(),
@@ -790,7 +807,7 @@ fn credits_error(reason: &str, message: &str) -> Value {
 /// `{ok,totalPoints,usedPoints,availablePoints,isSubscribed,subscription[],incremental[],throttled}`。
 /// 上游数字是字符串（如 "16020.00"），原样透传；HTTP 302/401 或 code=401 → 登录态失效。
 pub async fn get_credits() -> Value {
-    match bce_api("GET", "/api/dumate/points/quota_overview", None).await {
+    match bce_api("GET", "/api/dumate/points/quota_overview", None, None).await {
         Err(e) => credits_error("credentials_missing", &e),
         Ok((status, body)) => {
             if status == 302 || status == 401 {
@@ -938,6 +955,42 @@ fn flatten_messages(messages: &[Value]) -> String {
     chunks.join("\n\n")
 }
 
+/// 拆出 system 消息 → 引擎**原生 `system` 字段**，其余消息照旧拍平。
+///
+/// 为什么需要：引擎自带框架会压制 user 文本里的指令（2026-10-01 实测：三层档位
+/// dumate-lite/turbo/ultra 均无视 user 里的"工具调用协议"，反而直接编造答案）；
+/// 而 message API 的原生 `system` 字段优先级更高，是唯一能覆盖默认行为的通道。
+/// 用途：工具调用桥（分享层）把协议放进 system，让模型按协议输出 tool_calls。
+fn split_system(messages: &[Value]) -> (String, Vec<Value>) {
+    let mut system = Vec::new();
+    let mut rest = Vec::new();
+    for message in messages {
+        if message.get("role").and_then(Value::as_str) == Some("system") {
+            let text = match message.get("content") {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Array(parts)) => parts
+                    .iter()
+                    .filter_map(|p| {
+                        if p.get("type").and_then(Value::as_str) == Some("text") {
+                            p.get("text").and_then(Value::as_str).map(String::from)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                _ => String::new(),
+            };
+            if !text.trim().is_empty() {
+                system.push(text);
+            }
+        } else {
+            rest.push(message.clone());
+        }
+    }
+    (system.join("\n\n"), rest)
+}
+
 /// 创建引擎会话：`POST /session`（title=Sylvia Switch，directory 空串 = 客户端默认目录）。
 async fn post_session(client: &reqwest::Client, engine: &DumateEngine) -> Result<Value, String> {
     let mut req = client
@@ -1078,7 +1131,8 @@ pub async fn chat_completions_json(model: &str, body: &Value) -> Result<Value, D
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let prompt = flatten_messages(&messages);
+    let (system_text, headless_messages) = split_system(&messages);
+    let prompt = flatten_messages(&headless_messages);
     if prompt.trim().is_empty() {
         return Err(DumateChatError::new(
             DumateChatErrorKind::EngineError,
@@ -1115,10 +1169,15 @@ pub async fn chat_completions_json(model: &str, body: &Value) -> Result<Value, D
         ));
     }
     // 档位头在消息体 headers 字段（不是 HTTP 头）。
-    let payload = json!({
+    // 1.0.12：system 消息走引擎**原生 `system` 字段**（优先级高于拍平文本），
+    // 供工具调用桥下发协议说明 —— 引擎默认框架会压制 user 文本里的同类指令。
+    let mut payload = json!({
         "parts": [{"type": "text", "text": prompt}],
         "headers": {"X-Dumate-AutoModel-Level": level_for_model(normalized)},
     });
+    if !system_text.trim().is_empty() {
+        payload["system"] = json!(system_text);
+    }
     let reply = match post_message(
         &client,
         &engine,
