@@ -49,14 +49,105 @@ const DEFAULT_ENGINE_PORT: u16 = 52795;
 /// 消息提交超时（秒）：POST message 同步阻塞到生成完成，超时必须覆盖
 /// 模型生成时长（契约：lite 120s / turbo 240s / ultra 300s）。
 fn message_timeout_secs(model: &str) -> u64 {
-    // 1.0.16：恢复原始上限（1.0.15 曾放宽到 300/600/600 试图救"长输出超时"，但实验证明
-    // 那不是慢、而是**引擎进入内部 agent 流程后永久挂住**，放宽上限只会让人多等 10 分钟）。
-    // 真正解法见 NO_AGENT_DIRECTIVE。
+    // 1.0.16 曾「恢复原始上限 120/240/300」并写明：1.0.15 的放宽是错方向，
+    // 因为当时那批超时**不是慢、而是引擎进入内部 agent 流程后永久挂住**
+    // （600s 仍不返回）→ 放宽只会让人多等 10 分钟。真正解法是 NO_AGENT_DIRECTIVE。
+    //
+    // 🔄 1.0.21 再次上调 turbo/ultra，但**这次有实测支撑、性质不同**：
+    //   NO_AGENT_DIRECTIVE 生效后，「动手类」挂死已消除；剩下的超时是**大请求体
+    //   导致的真慢**，且**确实会返回** —— 实测 1422K 字符在 turbo 上
+    //   **230.4s 成功返回 200**（同一体积另一次仅 97.4s，波动 2.4×）。
+    //   240s 上限对它是"边缘值"，故上调到 360s 留出余量。
+    //   lite 保持 120s：它是快速档，大请求本就应该被 payload_guard 拦下。
     match model {
         MODEL_LITE => 120,
-        MODEL_TURBO => 240,
-        _ => 300,
+        MODEL_TURBO => 360,
+        _ => 480,
     }
+}
+
+/// 廉价估算请求体字符数：只累加 system / messages 里的文本字段，**不整体序列化**
+/// （请求体可达 2MB，序列化一遍虽只几十毫秒，但没必要）。
+fn estimate_body_chars(body: &Value) -> usize {
+    fn text_len(v: &Value) -> usize {
+        match v {
+            Value::String(s) => s.len(),
+            Value::Array(a) => a.iter().map(text_len).sum(),
+            Value::Object(o) => o
+                .iter()
+                .filter(|(k, _)| matches!(k.as_str(), "text" | "content" | "thinking"))
+                .map(|(_, v)| text_len(v))
+                .sum(),
+            _ => 0,
+        }
+    }
+    text_len(body.get("system").unwrap_or(&Value::Null))
+        + text_len(body.get("messages").unwrap_or(&Value::Null))
+}
+
+/// 实测：请求体字符数 → 本机 DuMate 引擎处理耗时（2026-10-01 阶梯实验）
+/// ```
+/// 1K→1.9s  30K→4.2s  100K→16.2s  300K→45.4s  700K→61.5s  1422K→97.4s
+/// ```
+/// 拟合：`est_secs ≈ 27 + 0.050 × 千字符`。
+///
+/// 🔑 **关键洞察**：这段耗时来自**请求体传输 + JSON 解析**，**不是推理** ——
+/// 一个 1422K 字符的请求，引擎回报的 `usage.input_tokens` 只有 **3522**，
+/// 说明它根本没把这 1.4MB 当上下文去读。所以「体积→耗时」是可预测的，
+/// 因而可以**提前拦截**，而不是让用户干等满超时。
+fn estimate_payload_secs(chars: usize) -> f64 {
+    27.0 + 0.050 * (chars as f64 / 1000.0)
+}
+
+/// 请求体护栏：预计耗时超过本档位超时的 `ratio` 就提前拒绝。
+///
+/// 阈值实测对照（ratio 默认 0.5，超时见 `message_timeout_secs`）：
+/// | 档位 | 超时 | 触发点 | 实测校验 |
+/// | --- | --- | --- | --- |
+/// | lite  | 120s | 约 660K | 1422K 实测 120.5s 必超时 → **拦对了** ✅ |
+/// | turbo | 360s | 约 3060K | 1422K 实测 97–230s 能成 → **放行** ✅ |
+/// | ultra | 480s | 约 4260K | — |
+///
+/// `DUMATE_PAYLOAD_GUARD=off` 可关闭；`DUMATE_PAYLOAD_GUARD_RATIO` 可调比例。
+fn payload_guard(body: &Value, model: &str) -> Option<DumateChatError> {
+    if std::env::var("DUMATE_PAYLOAD_GUARD")
+        .map(|v| v.eq_ignore_ascii_case("off"))
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    // ratio 默认 0.5（1.0.21 由 0.75 收紧）：实测同一体积耗时可波动 **2.4×**
+    //（1422K：97.4s ~ 230.4s，随引擎负载变化），按均值 0.75 会把
+    // "放行后仍可能撞超时"的请求放进去。取 0.5 即按**最坏情况**留一倍余量。
+    let ratio: f64 = std::env::var("DUMATE_PAYLOAD_GUARD_RATIO")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.5)
+        .clamp(0.1, 1.0);
+
+    let chars = estimate_body_chars(body);
+    // 小请求直接放行：不做任何多余计算（绝大多数请求走这条）。
+    if chars < 100_000 {
+        return None;
+    }
+    let budget = message_timeout_secs(model);
+    let est = estimate_payload_secs(chars);
+    if est <= budget as f64 * ratio {
+        return None;
+    }
+    Some(DumateChatError::new(
+        DumateChatErrorKind::UpstreamRejected,
+        format!(
+            "请求体过大：约 {:.0} 万字符。按实测速率预计需约 {:.0} 秒，已超过本档位 {} 秒的可用窗口，\
+             继续等待只会拿到超时（白白占用 {} 秒）。\n\
+             建议：① 在 ZCode 里**开一个新会话** —— 会话历史是体积主因，实测 14 万字符只需 84 秒且回复更完整；\
+             ② 减少 @ 引用的文件；③ 或改用超时更长的档位（turbo 240s / ultra 300s）。",
+            chars as f64 / 10_000.0,
+            est,
+            budget,
+            budget
+        ),
+    ))
 }
 
 /// 1.0.16：**必须注入的「纯文本回答」约束**（本通道的关键修复）。
@@ -1153,6 +1244,12 @@ pub async fn chat_completions_json(model: &str, body: &Value) -> Result<Value, D
     if normalized == MODEL_POINTS {
         return points_completion().await;
     }
+    // 体积护栏：在**所有路径的唯一汇聚点**做（openai 非流式直接调本函数；
+    // openai 流式经 chat_completions_stream → 本函数；Anthropic 经
+    // dumate_anthropic → 最终同样落到本函数）。避免干等满超时才报错。
+    if let Some(err) = payload_guard(body, normalized) {
+        return Err(err);
+    }
     let messages: Vec<Value> = body
         .get("messages")
         .and_then(Value::as_array)
@@ -1497,9 +1594,11 @@ mod tests {
         assert_eq!(level_for_model(MODEL_LITE), "L0");
         assert_eq!(level_for_model(MODEL_TURBO), "L1");
         assert_eq!(level_for_model(MODEL_ULTRA), "L2");
+        // 1.0.21：turbo/ultra 上调（实测 1422K 在 turbo 上需 230.4s，
+        // 240s 是边缘值）；lite 保持 120s（大请求由 payload_guard 拦）。
         assert_eq!(message_timeout_secs(MODEL_LITE), 120);
-        assert_eq!(message_timeout_secs(MODEL_TURBO), 240);
-        assert_eq!(message_timeout_secs(MODEL_ULTRA), 300);
+        assert_eq!(message_timeout_secs(MODEL_TURBO), 360);
+        assert_eq!(message_timeout_secs(MODEL_ULTRA), 480);
     }
 
     #[test]
@@ -1658,6 +1757,59 @@ mod tests {
         assert!(!is_dumate_image("workbuddy.exe"));
         assert!(!is_dumate_image("dumate.exe.bak"));
         assert!(!is_dumate_image(""));
+    }
+
+    #[test]
+    #[test]
+    fn payload_estimate_matches_measured_ladder() {
+        // 与 2026-10-01 实测阶梯（1K→1.9s 700K→61.5s 1422K→97.4s）对齐，
+        // 容差放宽到 ±25%：拟合式是工程近似，不是精确模型。
+        for (chars, measured) in [
+            (300_000usize, 45.4f64),
+            (700_000, 61.5),
+            (1_422_000, 97.4),
+        ] {
+            let est = estimate_payload_secs(chars);
+            let err = (est - measured).abs() / measured;
+            assert!(err < 0.25, "chars={chars} est={est:.1}s 实测={measured:.1}s 偏差{:.0}%", err * 100.0);
+        }
+    }
+
+    #[test]
+    fn body_chars_counts_message_text_only() {
+        let body = json!({
+            "model": "dumate-turbo",
+            "system": [{"type": "text", "text": "abc"}],
+            "messages": [
+                {"role": "user", "content": "12345"},
+                {"role": "assistant", "content": "67"}
+            ]
+        });
+        // 只累加 system/messages 的 text/content：3 + 5 + 2 = 10
+        assert_eq!(estimate_body_chars(&body), 10);
+        // 无 messages/system 时为 0，不 panic
+        assert_eq!(estimate_body_chars(&json!({})), 0);
+    }
+
+    #[test]
+    fn payload_guard_blocks_oversized_on_lite_but_allows_on_turbo() {
+        // 小请求一律放行（不触发任何计算）
+        let small = json!({"messages": [{"role": "user", "content": "hi"}]});
+        assert!(payload_guard(&small, MODEL_LITE).is_none());
+        assert!(payload_guard(&small, MODEL_TURBO).is_none());
+
+        // 1422K 字符：实测 lite 120.5s 必超时 → 必须拦；turbo 实测 97.4s 能成 → 放行
+        let huge = json!({"messages": [{"role": "user", "content": "x".repeat(1_422_000)}]});
+        let blocked = payload_guard(&huge, MODEL_LITE);
+        assert!(blocked.is_some(), "lite 应拦截 1422K 字符的请求");
+        let msg = blocked.unwrap().message;
+        assert!(msg.contains("请求体过大"), "错误文案应说明体积: {msg}");
+        assert!(msg.contains("开一个新会话"), "错误文案应给可操作建议: {msg}");
+        assert!(payload_guard(&huge, MODEL_TURBO).is_none(), "turbo 不该误拦能成功的请求");
+
+        // 3.5M 字符：turbo 也会超，应拦
+        let insane = json!({"messages": [{"role": "user", "content": "x".repeat(3_500_000)}]});
+        assert!(payload_guard(&insane, MODEL_TURBO).is_some());
     }
 
     #[test]
