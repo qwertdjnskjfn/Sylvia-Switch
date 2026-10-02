@@ -7,6 +7,56 @@
 
 ---
 
+## 1.0.23 — 2026-10-02
+
+### fix(opencode)：把「200 但正文为空」纳入 fallback —— 免费池最常见的伪成功
+
+#### 起因
+给 WorkBuddy 接入 opencode 免费模型时（`~/.workbuddy/models.json`，共 25 个），
+实测发现免费池**大量返回「HTTP 200 + 空正文」**：
+- `unorouter/gpt-5.5:free` 跑 **84.8s** 后返回空
+- 部分模型 **6.8s** 即返回空，且 `usage.prompt_tokens == 0`
+  （说明上游根本没处理请求，不是模型答不出来）
+
+而这些**不会触发已有的 fallback** —— 因为 `chat_completions_json` 只在
+`Err(...)` 时降级，`Ok(value)` 直接返回，**不看正文是否为空**。
+结果：用户拿到一个"成功但空白"的回复，比报错还困惑。
+
+#### 改动（`opencode.rs`）
+1. 新增 `completion_has_text()`：判断 `choices[0].message.content` 是否真有正文
+   （纯空白算空；只有 `reasoning_content` 也算空 —— 正文为空时推理块对用户无意义）。
+2. 成功分支改为：**正文为空 → 当可降级错误处理，继续换模型**。
+3. 🔴 **加了重试额度** `EMPTY_RETRY_BUDGET = 3`：否则 14 个候选 × 最坏 60s
+   会把一次请求拖到十几分钟。额度耗尽或候选走完 → **返回最后一次结果**
+   （`last_value`），保证「有界」且不把空回答升级成硬错误。
+
+#### 相关：fallback 链已用最新实测更新（**纯配置，无需改代码/重构建**）
+`fallback_chain` 可用 `~/.wb-switch/opencode_proxy_config.json` 覆盖
+（`fallback_enabled` 本就默认 `true`）。本次按 2026-10-02 实测速度把内置
+8 条链换成为 **14 条（均 ≤5s）**，实测经 `/api/opencode-proxy/status` 确认已生效：
+```
+openrouter/thinkingmachines/inkling-small:free          2.4s
+opencode/nemotron-3.5-lightning-free                    3.2s
+openrouter/liquid/lfm-2.5-2.6b:free                     3.6s
+openrouter/inclusionai/ling-3.0-flash-fin:free          3.7s
+openrouter/cohere/north-mini-code:free                  3.7s
+openrouter/apodex/apodex-1.1-mini:free                  3.7s
+openrouter/openrouter/free                              3.8s
+openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free  3.9s
+openrouter/nex-agi/nex-n2.5-pro:free                    4.2s
+openrouter/thinkingmachines/inkling:free                4.4s
+opencode/fledge-alpha-free                              4.4s
+openrouter/dots-studio/dots-3-note-preview:free         4.4s
+openrouter/nvidia/nemotron-3-super-120b-a12b:free       4.5s
+openrouter/inclusionai/ling-3.0-flash-sante:free        4.8s
+```
+⚠️ fallback **只在可重试错误时触发**（超时 / 连接断开 / 5xx / 空正文），
+4xx 等确定性错误不降级（避免掩盖真实问题）。
+
+#### 单测
+`completion_has_text_detects_empty_body`（有正文 / 空串 / 纯空白 / 只有
+reasoning_content / 结构缺失 / null 共 6 种）；`opencode` 共 **9 passed**。
+
 ## 1.0.22 — 2026-10-01
 
 ### 修复：注册机「空转 21 分钟」+ 停止后 elapsed 一直涨

@@ -193,6 +193,21 @@ fn is_retryable_upstream_error(msg: &str) -> bool {
     workbuddy_proxy::is_connect_error(msg)
 }
 
+/// 判断一次 completion 是否**真有正文**。
+///
+/// 免费池常见「HTTP 200 但 `choices[0].message.content` 为空」——
+/// 实测：`unorouter/gpt-5.5:free` 84.8s 返回空、部分模型 6.8s 即返回空且
+/// `usage.prompt_tokens == 0`（说明上游根本没处理请求）。
+/// 对调用方而言这等于没回答，故应视作可降级错误、继续换模型。
+/// 只认 `message.content`（不含 reasoning_content）：正文为空时推理块对用户无意义。
+fn completion_has_text(value: &Value) -> bool {
+    value
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+}
+
 /// 0.1.84 的可操作建议原样保留：提交失败多为上游免费额度/限流，别让用户误以为网络断了。
 fn decorate_upstream_error(e: String) -> String {
     if e.contains("提交消息失败") {
@@ -313,6 +328,13 @@ pub async fn chat_completions_json(mut body: Value) -> Result<Value, String> {
     let mut tried: Vec<String> = Vec::new();
     let mut last_err = String::new();
     let mut catalog_loaded = false;
+    // 2026-10-02：免费池常出现「HTTP 200 但正文为空」（实测 gpt-5.5 84.8s 返回空、
+    // 部分模型 6.8s 即返回空且 prompt_tokens=0）。对用户等于没回答，应触发 fallback；
+    // 但不能无上限重试（14 个候选 × 最坏 60s 会拖到十几分钟），故给一个额度。
+    // 额度耗尽即返回最后一次结果（哪怕是空的），保证有界。
+    const EMPTY_RETRY_BUDGET: usize = 3;
+    let mut empty_budget = EMPTY_RETRY_BUDGET;
+    let mut last_value: Option<Value> = None;
     let mut idx = 0usize;
     loop {
         if idx >= candidates.len() {
@@ -337,8 +359,21 @@ pub async fn chat_completions_json(mut body: Value) -> Result<Value, String> {
         body["model"] = json!(model.as_str());
         tried.push(model);
         match workbuddy_proxy::chat_completions_json(body.clone()).await {
-            // 成功即返回：响应 model 字段 = 本次实际使用的模型（回显由 workbuddy_proxy 按 body 完成）
-            Ok(value) => return Ok(value),
+            Ok(value) => {
+                // 「200 但正文为空」= 免费池常见的伪成功 → 当可降级错误处理，继续换模型。
+                // 记住最后一次结果：额度耗尽或链走完时把它返回，避免把空回答变成硬错误。
+                if completion_has_text(&value) {
+                    // 成功：响应 model 字段 = 本次实际使用的模型（回显由 workbuddy_proxy 按 body 完成）
+                    return Ok(value);
+                }
+                if cfg.fallback_enabled && empty_budget > 0 && idx < candidates.len() {
+                    empty_budget -= 1;
+                    last_err = "上游返回 200 但正文为空".to_string();
+                    last_value = Some(value);
+                    continue;
+                }
+                return Ok(value);
+            }
             Err(e) => {
                 last_err = e;
                 if !is_retryable_upstream_error(&last_err) {
@@ -350,6 +385,11 @@ pub async fn chat_completions_json(mut body: Value) -> Result<Value, String> {
         }
     }
 
+    // 试过多个候选但都只是「空正文」→ 把最后一次的空结果返回给调用方，
+    // 比抛错误更贴近旧行为（调用方能拿到 model 字段做展示）。
+    if let Some(v) = last_value {
+        return Ok(v);
+    }
     if tried.len() <= 1 {
         // 只试了一个模型（fallback 关闭等场景）→ 保持旧行为：原始错误直出
         return Err(decorate_upstream_error(last_err));
@@ -538,6 +578,30 @@ mod tests {
             "未发现 OpenCode server 进程（未在监听端口）"
         ));
         assert!(!is_retryable_upstream_error("等待回复超时（模型可能排队中或不可用）"));
+    }
+
+    #[test]
+    #[test]
+    fn completion_has_text_detects_empty_body() {
+        // 有正文 → true
+        assert!(completion_has_text(&serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "收到"}}]
+        })));
+        // 空串 / 纯空白 → false（免费池最常见的伪成功）
+        assert!(!completion_has_text(&serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": ""}}]
+        })));
+        assert!(!completion_has_text(&serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "   \n "}}]
+        })));
+        // 只有 reasoning_content、无 content → false（正文为空对用户无意义）
+        assert!(!completion_has_text(&serde_json::json!({
+            "choices": [{"message": {"reasoning_content": "思考中…"}}]
+        })));
+        // 结构缺失 → false，不 panic
+        assert!(!completion_has_text(&serde_json::json!({"choices": []})));
+        assert!(!completion_has_text(&serde_json::json!({})));
+        assert!(!completion_has_text(&serde_json::json!(null)));
     }
 
     #[test]
