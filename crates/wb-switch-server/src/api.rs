@@ -8004,6 +8004,8 @@ async fn api_minimax_status() -> Response {
                 "balance": a.balance, "creditConsumed": a.credit_consumed, "balanceAt": a.balance_at,
                 // 2026-10-05：前端据此渲染“当前账号 / 可用性”
                 "usable": minimax::account_usable(a, minimax::now_ms()),
+                // 2026-10-05：熔断计数（连续失败，成功清零），供前端展示
+                "failStreak": a.fail_streak,
                 "isLocal": a.source == "desktop",
                 "pinned": cfg_pin == a.id,
             })
@@ -8130,6 +8132,7 @@ async fn api_minimax_accounts_add(Json(body): Json<Value>) -> Response {
         balance: None,
         credit_consumed: None,
         balance_at: 0,
+        fail_streak: 0,
     });
     if !cfg.enabled {
         cfg.enabled = true;

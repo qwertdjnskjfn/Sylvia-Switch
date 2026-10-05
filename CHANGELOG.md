@@ -1,3 +1,71 @@
+## 1.0.40 — 2026-10-05
+
+### 修复：MiniMax 渠道「模型名被丢弃 + Anthropic 格式 prompt 变空」
+
+#### 排查背景（用户报：接入 ZCode 后回复恒为 `How can I help you today?`）
+
+**逐项排除法**（直连上游 vs 经网关对比，全部用同一 token）：
+
+| 假设 | 结论 | 证据 |
+| --- | --- | --- |
+| 端点错（应用 `api.minimaxi.com/anthropic`）| ❌ | 该端点要官方 API key，不吃 OAuth token（401）；现用 `agent.minimaxi.com/mavis/api/v1/llm/v1/messages` 正确 |
+| `model` 硬编码 `M3.1-Flash-Preview` 本身坏 | ❌ | 4 个模型直连**全部正常**返回正确答案 |
+| `max_tokens:4096` | ❌ | 直连正常 |
+| `anthropic-version` header | ❌ | 4 种组合全部成功 |
+| Chrome `User-Agent` | ❌ | 4 种 UA 全部成功 |
+| **完全复刻本模块 payload+header 直连上游** | ✅ **成功** | ⇒ 本模块的请求构造**是对的** |
+
+**🔑 决定性判据**：对比 `usage.input_tokens`
+- 直连上游：`45`（**随 prompt 变化**）→ 正确答案
+- 经本网关：`204`（**prompt 从 2 字符到 2000 字符都恒定**）→ 固定问候语
+⇒ `input_tokens` 恒定 = 上游没收到我们的 messages。
+
+#### 🔴 真因一：prompt 提取不支持 Anthropic 数组格式
+`api_minimax_chat` 里：
+```rust
+let prompt = body.pointer("/messages/-1/content")
+    .and_then(Value::as_str)     // 只认字符串
+    .unwrap_or("")               // Anthropic 数组 → 变空串
+```
+ZCode 等 Anthropic 协议调用方发 `content: [{"type":"text","text":"…"}]` →
+`as_str()` 返回 `None` → **prompt 恒为空** → 上游收到空输入 → 固定问候语。
+
+**修复**：新增 `minimax_last_message_text()`，**同时兼容**字符串与数组两种 content 形状。
+
+#### 🔴 真因二：model 名硬编码（4 处）
+`chat_once` 的 desktop 直连 payload 里 `"model"` 写死为 `MiniMax-M3.1-Flash-Preview`，
+**调用方指定的模型名被丢弃**（实测请求 `MiniMax-M3` 却回显 `M3.1-Flash-Preview`）。
+
+**修复**：
+- `chat_once(prompt, region_hint, model: Option<&str>)` —— 新增第三参数；
+- 新增 `DEFAULT_CHAT_MODEL = "MiniMax-M3"`（空/未指定时用它）；
+- 4 处硬编码（2 处请求 payload + 2 处响应回显 fallback）全部改为**用请求参数**；
+- `api_minimax_chat` / `api_minimax_test` 两个调用点传入 `body.model`。
+
+> 说明：`minimax.rs` 内 desktop 直连分支存在**两处重复代码块**（早返回 + 旧的 agent_id 后分支），
+> 本次**只改硬编码、未动结构**，以免与并行开发冲突。
+
+#### 验证
+| 项 | 结果 |
+| --- | --- |
+| `cargo check --release`（core+server） | ✅ 0 error |
+| 端点/header/UA/payload 直连上游 | ✅ 全部返回正确答案 |
+
+### 新增：MiniMax **失败自动换号 + 熔断（指数退避冷却）**（同一版本号下并列交付）
+
+**背景**：1.0.39 给了「有序候选池 + 选号策略」，但单个账号失败时不会自动换号；本轮补齐。
+
+| 项 | 内容 |
+| --- | --- |
+| 结构 | `chat_once` 的单账号逻辑抽为 `chat_with_account(acc, …)`；`chat_once` 外层改为**按 `ordered_pool` 候选顺序循环尝试**（上限 `MAX_FAILOVER = 3`） |
+| 换号判定 | `is_retryable_status()`：网络错(0)/403/408/425/429/5xx 才换号；**400/401/404/422 等业务错直接透出**，不把同一个错扩散到整个池 |
+| 熔断 | `mark_account_failure()`：`fail_streak += 1` + 写 `last_error` + 置冷却；`cooldown_after_failure()` 指数退避（普通错 60s 起、429/403 风控 120s 起，按 2^n 放大，**上限 30 分钟**）；`mark_account_success()` 成功即清零（仅在有变化时落盘） |
+| 严格模式 | `account_mode = pinned` → **失败不换号**（符合「固定账号」语义） |
+| 可观测 | 响应体新增 `failover`（第几个候选成功）；`/api/minimax/status` 每账号新增 `failStreak` |
+
+**测试**：`cargo test -p wb-switch-core minimax` → **10 passed**（新增换号判定白/黑名单、退避冷却数值含上限、上限常量）。
+**验证**：注入一个坏账号 → 请求出现 `failover=1` 且坏账号被熔断冷却 → 移除后恢复（见本轮交付说明）。
+
 ## 1.0.39 — 2026-10-05
 
 ### 新增：MiniMax 多账号（识别 / 隔离 / 切换）—— 对齐 GLM 代理范式

@@ -160,6 +160,8 @@ pub struct MmAccount {
     /// 同一轮探测的已消耗积分
     pub credit_consumed: Option<f64>,
     pub balance_at: u64,
+    /// 熔断：连续失败次数（成功即清零）。2026-10-05
+    pub fail_streak: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -189,6 +191,9 @@ pub const MM_MODE_LOCAL_FIRST: &str = "local_first";
 pub const MM_MODE_LOCAL_ONLY: &str = "local_only";
 /// 固定账号：只用 `pinned_account_id` 指定的账号（严格，失败不换号）。
 pub const MM_MODE_PINNED: &str = "pinned";
+
+/// 单次请求最多尝试的候选账号数（换号重试上限，防止把延迟放大成倍）。
+pub const MAX_FAILOVER: usize = 3;
 
 /// 归一化账号模式：未知值一律回落到 round_robin（防配置手改写坏）。
 pub fn normalize_account_mode(value: &str) -> String {
@@ -285,6 +290,7 @@ pub fn load_config() -> MmConfig {
                     balance: a.get("balance").and_then(Value::as_f64),
                     credit_consumed: a.get("credit_consumed").and_then(Value::as_f64),
                     balance_at: a.get("balance_at").and_then(Value::as_u64).unwrap_or(0),
+                    fail_streak: a.get("fail_streak").and_then(Value::as_u64).unwrap_or(0) as u32,
                 })
             })
             .collect();
@@ -306,6 +312,7 @@ pub fn save_config(cfg: &MmConfig) {
                 "signin_last_date": a.signin_last_date, "signin_points_total": a.signin_points_total,
                 "source": a.source, "auth_path": a.auth_path, "auth_key": a.auth_key,
                 "balance": a.balance, "credit_consumed": a.credit_consumed, "balance_at": a.balance_at,
+                "fail_streak": a.fail_streak,
             })
         })
         .collect();
@@ -508,15 +515,42 @@ fn sign_request(acc: &MmAccount, path: &str, body: &str, yy_absolute: bool) -> (
 // 上游调用
 // ---------------------------------------------------------------------------
 
+const MINIMAX_UA: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0 Safari/537.36";
+
 fn upstream_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .no_proxy()
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0 Safari/537.36")
+            .user_agent(MINIMAX_UA)
             .timeout(Duration::from_secs(120))
             .build()
             .expect("failed to build minimax client")
+    })
+}
+
+/// **对话专用**客户端：强制 HTTP/1.1。
+///
+/// 🔴 2026-10-05 实测（同一 payload / 同一 header / 同一 token，唯一变量是客户端）：
+/// | 客户端 | 协议 | `usage.input_tokens` | 回复 |
+/// | --- | --- | --- | --- |
+/// | reqwest（默认 ALPN 协商 h2）| HTTP/2 | **21（恒定）** | 答非所问（`How can I help you today?`）|
+/// | curl `--http1.1` | HTTP/1.1 | **41** | 正确 |
+/// | Python urllib | HTTP/1.1 | **41** | 正确 |
+///
+/// `input_tokens` 差 20 且 h1.1 恒定得到正确回答 ⇒ 该上游对 HTTP/2 请求走了**另一条分支**
+/// （表现为不注入其内部 system 提示、忽略 messages）。故对话路径固定 h1.1。
+fn chat_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .no_proxy()
+            .http1_only()
+            .user_agent(MINIMAX_UA)
+            .timeout(Duration::from_secs(120))
+            .build()
+            .expect("failed to build minimax chat client")
     })
 }
 
@@ -913,40 +947,25 @@ pub const DEFAULT_CHAT_MODEL: &str = "MiniMax-M3";
 ///
 /// `model`：调用方指定的模型名（如 `MiniMax-M3` / `MiniMax-M2.7`）；
 /// 传 `None` 或空白则用 [`DEFAULT_CHAT_MODEL`]。
-pub async fn chat_once(
+/// 单账号执行（2026-10-05 从 chat_once 抽出）：不再自行选号，账号由调用方给定。
+/// 这样 chat_once 才能在外层实现「按候选池顺序换号 + 熔断」。
+async fn chat_with_account(
+    acc: &MmAccount,
     prompt: &str,
-    region_hint: Option<&str>,
-    model: Option<&str>,
+    model: &str,
+    yy_absolute_chat: bool,
+    template: &str,
 ) -> Result<Value, (u16, String)> {
-    let cfg = load_config();
-    if !cfg.enabled {
-        return Err((503, "MiniMax 网关未启用".to_string()));
-    }
-    // 模型名：优先请求参数，其次内置默认；两端去空白，空串视为未指定
-    let model: String = model
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(DEFAULT_CHAT_MODEL)
-        .to_string();
-    let region = normalize_region(region_hint);
-    let Some(acc) = pick_account(&cfg, region) else {
-        // 2026-10-05：把 ordered_pool 的可操作报错透出（区分“全在冷却”/“没号”/“固定号不可用”）
-        let msg = ordered_pool(&cfg, region).err().unwrap_or_else(|| {
-            "MiniMax 账号池无可用账号：请先添加账号（网页端 JWT + 指纹三件套）".to_string()
-        });
-        return Err((503, msg));
-    };
-    // desktop 来源 → 官方模型直连端点（Bearer 免签名，实测 200；无需 agent_id）
-    if is_bearer_only(&acc) {
-        let mavis = format!("{}/mavis/api/v1/llm/v1/messages", cloud_model_host(&acc));
+    if is_bearer_only(acc) {
+        let mavis = format!("{}/mavis/api/v1/llm/v1/messages", cloud_model_host(acc));
         let payload = json!({
-            "model": model.as_str(),
+            "model": model,
             "max_tokens": 4096,
             "messages": [{ "role": "user", "content": prompt }],
         });
-        let resp = upstream_client()
+        let resp = chat_client()
             .post(&mavis)
-            .bearer_auth(effective_token(&acc))
+            .bearer_auth(effective_token(acc))
             .header("Content-Type", "application/json")
             .header("anthropic-version", "2023-06-01")
             .json(&payload)
@@ -984,10 +1003,10 @@ pub async fn chat_once(
         }));
     }
 
-    let host = account_host(&acc);
+    let host = account_host(acc);
     let agent_id = if acc.agent_id.is_empty() {
         // 未提供 agent_id → 走 /agent 发现（Prepare 序列的第一个 GET 会建立）
-        let v = cloud_get(&acc, "/minimax-cloud/api/v1/agent", None)
+        let v = cloud_get(acc, "/minimax-cloud/api/v1/agent", None)
             .await
             .map_err(|e| (502u16, e))?;
         v.pointer("/data/agent_id")
@@ -1009,16 +1028,16 @@ pub async fn chat_once(
 
     // desktop 来源 → 官方模型直连端点（2026-10-04 实测 200：Bearer 免签名、
     // Anthropic 协议；比网页会话流简单可靠，且国际/国内由域名区分）
-    if is_bearer_only(&acc) {
-        let mavis = format!("{}/mavis/api/v1/llm/v1/messages", cloud_model_host(&acc));
+    if is_bearer_only(acc) {
+        let mavis = format!("{}/mavis/api/v1/llm/v1/messages", cloud_model_host(acc));
         let payload = json!({
-            "model": model.as_str(),
+            "model": model,
             "max_tokens": 4096,
             "messages": [{ "role": "user", "content": prompt }],
         });
-        let resp = upstream_client()
+        let resp = chat_client()
             .post(&mavis)
-            .bearer_auth(effective_token(&acc))
+            .bearer_auth(effective_token(acc))
             .header("Content-Type", "application/json")
             .header("anthropic-version", "2023-06-01")
             .json(&payload)
@@ -1060,11 +1079,11 @@ pub async fn chat_once(
         (format!("{host}/minimax-cloud/api/v1"), stream_host_for(&host))
     };
     let create_url = format!("{session_path_prefix}/agent/{agent_id}/session");
-    let (wire, ts, xs, yy) = sign_request(&acc, &format!("/agent/{agent_id}/session"), "{}", cfg.yy_absolute_chat);
+    let (wire, ts, xs, yy) = sign_request(acc, &format!("/agent/{agent_id}/session"), "{}", yy_absolute_chat);
     // 会话创建签名串不含 query 尾（相对路径 + 参数序）——与 GET 签名一致
     let create_resp = upstream_client()
         .post(&format!("{create_url}?{wire}"))
-        .header("token", effective_token(&acc))
+        .header("token", effective_token(acc))
         .header("x-timestamp", &ts)
         .header("x-signature", &xs)
         .header("yy", &yy)
@@ -1097,10 +1116,10 @@ pub async fn chat_once(
     // ② 空闲轮询（status.type==0，最多 5×1s，snake 口径）
     for _ in 0..5 {
         let idle_url = format!("{session_path_prefix}/session/{session_id}");
-        let (w2, t2, x2, y2) = sign_request(&acc, &format!("/session/{session_id}"), "{}", cfg.yy_absolute_chat);
+        let (w2, t2, x2, y2) = sign_request(acc, &format!("/session/{session_id}"), "{}", yy_absolute_chat);
         let r = upstream_client()
             .get(&format!("{idle_url}?{w2}"))
-            .header("token", effective_token(&acc))
+            .header("token", effective_token(acc))
             .header("x-timestamp", &t2)
             .header("x-signature", &x2)
             .header("yy", &y2)
@@ -1118,22 +1137,22 @@ pub async fn chat_once(
 
     // ③ 发消息（SSE 域 + 绝对/相对 yy 按配置；payload 模板注入）
     let msg_path = format!("/session/{session_id}/message");
-    let payload_str = render_chat_payload(&cfg.chat_payload_template, prompt, &acc);
+    let payload_str = render_chat_payload(template, prompt, acc);
     let stream_host = if acc.region == PROVIDER_BIGMODEL {
         stream_host.replace("agent.minimaxi.com", "agent-stream.minimaxi.com")
     } else {
         stream_host
     };
     let msg_url_base = format!("{stream_host}{session_path_prefix}{msg_path}");
-    let (wire3, ts3, xs3, yy3) = sign_request(&acc, &msg_path, &payload_str, cfg.yy_absolute_chat);
-    let msg_url = if cfg.yy_absolute_chat {
+    let (wire3, ts3, xs3, yy3) = sign_request(acc, &msg_path, &payload_str, yy_absolute_chat);
+    let msg_url = if yy_absolute_chat {
         format!("{msg_url_base}?{wire3}")
     } else {
         format!("{msg_url_base}?{wire3}")
     };
     let resp = upstream_client()
         .post(&msg_url)
-        .header("token", effective_token(&acc))
+        .header("token", effective_token(acc))
         .header("x-timestamp", &ts3)
         .header("x-signature", &xs3)
         .header("yy", &yy3)
@@ -1159,6 +1178,101 @@ pub async fn chat_once(
         "minimax": {"account": acc.label, "region": acc.region, "sessionId": session_id},
     }))
 }
+
+/// 对话入口（2026-10-05 增强）：**按 ordered_pool 候选顺序换号重试 + 失败熔断**。
+///
+/// - 候选顺序由选号模式决定（轮询 / 本机优先 / 仅本机 / 固定账号）；
+/// - 单个账号失败且属于「可换号错误」时，自动取下一个账号（最多 `MAX_FAILOVER` 个），
+///   失败账号写入 `last_error` + 指数退避冷却（`cooldown_after_failure`），连续失败计数 `fail_streak`；
+/// - 成功则清零计数；`pinned` 模式**严格不换号**（失败直接抛出，符合“固定账号”语义）；
+/// - 返回体带 `failover`（第几个候选成功）与 `minimax.account`（实际账号），便于排障。
+pub async fn chat_once(
+    prompt: &str,
+    region_hint: Option<&str>,
+    model: Option<&str>,
+) -> Result<Value, (u16, String)> {
+    let cfg = load_config();
+    if !cfg.enabled {
+        return Err((503, "MiniMax 网关未启用".to_string()));
+    }
+    // 模型名：优先请求参数，其次内置默认；两端去空白，空串视为未指定
+    let model: String = model
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_CHAT_MODEL)
+        .to_string();
+    let region = normalize_region(region_hint);
+    let pool = ordered_pool(&cfg, region).map_err(|e| (503, e))?;
+    if pool.is_empty() {
+        return Err((503, "MiniMax 账号池无可用账号：请先添加账号（网页端 JWT + 指纹三件套）".to_string()));
+    }
+    let start = CHAT_CURSOR.fetch_add(1, Ordering::Relaxed) % pool.len();
+    let attempts = pool.len().min(MAX_FAILOVER);
+    let mut last: Option<(u16, String)> = None;
+    for k in 0..attempts {
+        let acc = &pool[(start + k) % pool.len()];
+        match chat_with_account(acc, prompt, &model, cfg.yy_absolute_chat, &cfg.chat_payload_template).await {
+            Ok(mut v) => {
+                mark_account_success(&acc.id);
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("failover".to_string(), json!(k));
+                }
+                return Ok(v);
+            }
+            Err((st, msg)) => {
+                let retryable = is_retryable_status(st);
+                if retryable || st == 0 {
+                    mark_account_failure(&acc.id, st, &msg);
+                }
+                let strict = cfg.account_mode == MM_MODE_PINNED;
+                if strict || !retryable {
+                    return Err((st, msg));
+                }
+                last = Some((st, msg));
+            }
+        }
+    }
+    Err(last.unwrap_or((503, "候选账号均已尝试，无可用结果".to_string())))
+}
+
+/// 该失败是否值得**换号重试**：网络错/限流/风控/服务端错 → 换号有意义；
+/// 业务参数错（400/401/404/422 等）→ 换号无用，直接透出，避免把同一个错扩散到整个池。
+pub fn is_retryable_status(status: u16) -> bool {
+    status == 0 || status == 403 || status == 408 || status == 425 || status == 429 || status >= 500
+}
+
+/// 失败后的**指数退避**冷却（毫秒）：限流/风控（429/403）起步更高；连续失败按 2^n 放大，上限 30 分钟。
+pub fn cooldown_after_failure(streak: u32, status: u16) -> u64 {
+    let base_ms: u64 = if status == 429 || status == 403 { 120_000 } else { 60_000 };
+    let shift = streak.saturating_sub(1).min(5);
+    (base_ms << shift).min(30 * 60_000)
+}
+
+/// 记一次失败：累加 `fail_streak`、写 `last_error`、置冷却（熔断）。
+fn mark_account_failure(id: &str, status: u16, msg: &str) {
+    let mut cfg = load_config();
+    if let Some(a) = cfg.accounts.iter_mut().find(|x| x.id == id) {
+        a.fail_streak = a.fail_streak.saturating_add(1);
+        let brief: String = msg.chars().take(160).collect();
+        a.last_error = Some(format!("HTTP {status}: {brief}"));
+        a.cooldown_until_ms = now_ms() + cooldown_after_failure(a.fail_streak, status);
+    }
+    save_config(&cfg);
+}
+
+/// 记一次成功：清零熔断计数与错误（仅在需要变化时落盘，避免每次请求都写配置）。
+fn mark_account_success(id: &str) {
+    let mut cfg = load_config();
+    if let Some(a) = cfg.accounts.iter_mut().find(|x| x.id == id) {
+        if a.fail_streak > 0 || a.last_error.is_some() {
+            a.fail_streak = 0;
+            a.last_error = None;
+            save_config(&cfg);
+        }
+    }
+}
+
+
 
 /// 扫描桌面端登录态（~/.minimax/auth/prod/{cn,en}/mcode-public/auth.json，只读）。
 pub fn discover_desktop() -> Value {
@@ -1332,6 +1446,7 @@ pub fn capture_from_desktop() -> Value {
             balance: None,
             credit_consumed: None,
             balance_at: 0,
+            fail_streak: 0,
         });
         added += 1;
     }
@@ -1565,6 +1680,7 @@ mod tests {
             balance: None,
             credit_consumed: None,
             balance_at: 0,
+            fail_streak: 0,
         }
     }
 
@@ -1672,6 +1788,38 @@ mod tests {
         cool[1].cooldown_until_ms = now_ms() + 60_000;
         let e4 = ordered_pool(&cfg_with(MM_MODE_PINNED, "w2", cool), Some("domestic")).unwrap_err();
         assert!(e4.contains("冷却"), "e4={e4}");
+    }
+
+    #[test]
+    fn retryable_status_selects_failover_worthy_errors() {
+        // 网络错与限流/风控/服务端错 → 值得换号
+        for st in [0u16, 403, 408, 425, 429, 500, 502, 503, 504] {
+            assert!(is_retryable_status(st), "status {st} 应可换号");
+        }
+        // 业务参数错 → 换号无用，直接透出
+        for st in [400u16, 401, 404, 405, 409, 422] {
+            assert!(!is_retryable_status(st), "status {st} 不应换号");
+        }
+    }
+
+    #[test]
+    fn cooldown_uses_exponential_backoff_with_cap() {
+        // 普通错误：60s 起，按 2^n 放大
+        assert_eq!(cooldown_after_failure(1, 500), 60_000);
+        assert_eq!(cooldown_after_failure(2, 500), 120_000);
+        assert_eq!(cooldown_after_failure(3, 500), 240_000);
+        // 限流/风控：起步 120s
+        assert_eq!(cooldown_after_failure(1, 429), 120_000);
+        assert_eq!(cooldown_after_failure(2, 403), 240_000);
+        // 上限 30 分钟（shift 截到 5、并整体封顶）
+        assert_eq!(cooldown_after_failure(99, 429), 30 * 60_000);
+        assert_eq!(cooldown_after_failure(99, 500), 30 * 60_000);
+    }
+
+    #[test]
+    fn failover_attempts_are_bounded() {
+        assert_eq!(MAX_FAILOVER, 3);
+        assert!(MAX_FAILOVER >= 1, "至少要能试一个候选");
     }
 
     #[test]
