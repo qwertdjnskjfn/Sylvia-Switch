@@ -8002,6 +8002,11 @@ async fn api_minimax_status() -> Response {
                 "agentId": a.agent_id, "baseUrl": a.base_url,
                 "enabled": a.enabled, "lastError": a.last_error,
                 "cooldown": a.cooldown_until_ms > minimax::now_ms(),
+                // 2026-10-05：冷却剩余秒数（0 = 未冷却），前端显示「还剩 Ns」
+                "cooldownRemainSecs": a
+                    .cooldown_until_ms
+                    .saturating_sub(minimax::now_ms())
+                    .div_ceil(1000),
                 "signinLastDate": a.signin_last_date, "signinPointsTotal": a.signin_points_total,
                 "balance": a.balance, "creditConsumed": a.credit_consumed, "balanceAt": a.balance_at,
                 // 2026-10-05：前端据此渲染“当前账号 / 可用性”
@@ -8106,11 +8111,33 @@ async fn api_minimax_accounts_clear_cooldown(Json(body): Json<Value>) -> Respons
 /// - `pinned=false` → 从固定集合移出（幂等）
 /// 返回更新后的集合与顺序；集合为空时**不会**自动切模式（由调用方决定）。
 async fn api_minimax_accounts_pin(Json(body): Json<Value>) -> Response {
+    let want = body.get("pinned").and_then(Value::as_bool).unwrap_or(true);
+    // 一键全固定 / 一键清空（2026-10-05）：{all:true, pinned:true|false}
+    // ⚠️ 必须放在 id 校验**之前**：该形态不带 id（曾因顺序问题被 400 拒掉）
+    if body.get("all").and_then(Value::as_bool).unwrap_or(false) {
+        let mut cfg = minimax::load_config();
+        cfg.pinned_account_ids = if want {
+            cfg.accounts.iter().map(|a| a.id.clone()).collect()
+        } else {
+            Vec::new()
+        };
+        cfg.pinned_account_id = cfg.pinned_account_ids.first().cloned().unwrap_or_default();
+        let total = cfg.pinned_account_ids.len();
+        minimax::save_config(&cfg);
+        return json_ok(json!({
+            "ok": true,
+            "all": true,
+            "pinned": want,
+            "count": total,
+            "pinnedAccountIds": cfg.pinned_account_ids,
+            "pinnedAccountId": cfg.pinned_account_id,
+            "accountMode": cfg.account_mode,
+        }));
+    }
     let id = body.get("id").and_then(Value::as_str).unwrap_or("").trim().to_string();
     if id.is_empty() {
         return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
     }
-    let want = body.get("pinned").and_then(Value::as_bool).unwrap_or(true);
     let mut cfg = minimax::load_config();
     if !cfg.accounts.iter().any(|a| a.id == id) {
         return json_err("账号不存在（可能已删除）".to_string(), StatusCode::NOT_FOUND);

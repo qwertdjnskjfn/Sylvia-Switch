@@ -37,6 +37,8 @@ type MmAccount = {
   pinned?: boolean;
   // 固定集合内的顺序（0 起；null/undefined = 未固定）
   pinOrder?: number | null;
+  // 2026-10-05：冷却剩余秒数（0 = 未冷却）
+  cooldownRemainSecs?: number;
   balance?: number | null;
   creditConsumed?: number | null;
   balanceAt?: number | null;
@@ -159,7 +161,7 @@ export default function MiniMaxPage() {
         return null;
       }
       if (prefix("pin")) {
-        const res = await api.pinMinimaxAccount(body as { id: string; pinned: boolean });
+        const res = await api.pinMinimaxAccount(body as { id?: string; pinned: boolean; all?: boolean });
         void res;
         setMsg({ type: "ok", text: okText });
         await refresh();
@@ -188,7 +190,7 @@ export default function MiniMaxPage() {
         // 2026-10-05：切换账号 / 选号策略（多账号支持）
         switchAccount: () => api.switchMinimaxAccount(body as { mode?: string; id?: string }),
         // 2026-10-05：固定集合增删（幂等；支持同时固定多个）
-        pinAccount: () => api.pinMinimaxAccount(body as { id: string; pinned: boolean }),
+        pinAccount: () => api.pinMinimaxAccount(body as { id?: string; pinned: boolean; all?: boolean }),
         clearCooldown: () => api.clearMinimaxCooldown(body as { id?: string }),
         "probe": async () => {
           const res = await fetch("/api/minimax/probe", {
@@ -428,7 +430,11 @@ export default function MiniMaxPage() {
                   <span className="text-xs font-medium">{a.label}</span>
                   <code className="text-[11px] text-muted-foreground">{a.tokenMasked}</code>
                   {a.pinned ? <Badge className="h-5 px-1.5 text-[10px]">当前账号</Badge> : null}
-                  {a.cooldown ? <Badge variant="warning" className="h-5 px-1.5 text-[10px]">冷却中</Badge> : null}
+                  {a.cooldown ? (
+                    <Badge variant="warning" className="h-5 px-1.5 text-[10px]">
+                      冷却中{a.cooldownRemainSecs ? ` 还剩 ${a.cooldownRemainSecs}s` : ""}
+                    </Badge>
+                  ) : null}
                   {a.usable === false && !a.cooldown ? <Badge variant="warning" className="h-5 px-1.5 text-[10px]">不可用</Badge> : null}
                   {a.isLocal ? <Badge variant="outline" className="h-5 px-1.5 text-[10px]">本机</Badge> : null}
                   {(a as { source?: string }).source === "desktop" ? (
@@ -635,6 +641,28 @@ export default function MiniMaxPage() {
                   {label}
                 </Button>
               ))}
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 px-2 text-xs"
+                disabled={busy === "pinAccount" || !status.accounts.length}
+                onClick={() =>
+                  void act("pinAccount", { all: true, pinned: true }, `已一键固定全部 ${status.accounts.length} 个账号`)
+                }
+                title="把账号池里所有账号一次性加入固定集合（顺序=列表顺序）"
+              >
+                全部固定
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 px-2 text-xs"
+                disabled={busy === "pinAccount" || !(status.pinnedAccountIds || []).length}
+                onClick={() => void act("pinAccount", { all: true, pinned: false }, "已清空固定集合")}
+                title="一键清空固定集合（不动账号，也不改选号策略）"
+              >
+                清空固定
+              </Button>
               <span className="text-[11px] text-muted-foreground">
                 {status.accountMode === "pinned"
                   ? (() => {

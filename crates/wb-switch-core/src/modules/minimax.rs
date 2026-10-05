@@ -612,9 +612,69 @@ fn upstream_client() -> &'static reqwest::Client {
 /// v1 的缺陷：在 `Command::output()` 返回**之前**就 `remove_file` 了，
 /// 竞态下 curl 仍在读 → `CURLE_READ_ERROR(26)`。stdin 方案无此竞态，
 /// 也不需要清理临时文件（更少 IO）。
+/// curl 并发闸门（2026-10-05）：实测反复出现 `os error 231（管道耗尽）` 与 `curl exit 26（读错误）`，
+/// 根因是**短时间大量 spawn 子进程 + 三条管道**把 Windows 的管道/句柄打满。
+/// 这里限制同时在飞的 curl 数量（超出则短暂等待，宁可慢一点也不失败）。
+static CURL_INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const CURL_MAX_CONCURRENT: usize = 3;
+const CURL_GATE_WAIT_MS: u64 = 8000;
+
+/// 拿一个 curl 并发名额（RAII：Drop 时归还）。
+struct CurlPermit;
+impl CurlPermit {
+    fn acquire() -> CurlPermit {
+        use std::sync::atomic::Ordering;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(CURL_GATE_WAIT_MS);
+        loop {
+            let cur = CURL_INFLIGHT.load(Ordering::SeqCst);
+            if cur < CURL_MAX_CONCURRENT
+                && CURL_INFLIGHT
+                    .compare_exchange(cur, cur + 1, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                return CurlPermit;
+            }
+            if std::time::Instant::now() >= deadline {
+                // 超时也放行：宁可冒一次管道风险，也不让请求卡死
+                CURL_INFLIGHT.fetch_add(1, Ordering::SeqCst);
+                return CurlPermit;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+}
+impl Drop for CurlPermit {
+    fn drop(&mut self) {
+        CURL_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// 对话 HTTP 出口（2026-10-05 加固）：**继续用 curl 子进程**，但补上三层稳定性措施。
+///
+/// 为什么不换回 reqwest：本仓库 reqwest 编译特性是 **rustls-tls**，而这条上游的证书链
+/// **Schannel 认、rustls 不认**（这正是原实现改用 curl.exe 的原因）。换回 reqwest 会直接握手失败；
+/// 而 `danger_accept_invalid_certs(true)` 等于放弃证书校验，不接受。
+/// ⇒ 正确做法是留在 curl，把它"不稳"的两处补上：
+///   1) **并发闸门**（`CurlPermit`，默认最多 3 个同时在飞）—— 治 `os error 231（管道耗尽）`；
+///   2) **瞬时重试**（最多 3 次，递增退避）—— 治 `curl exit 26（读错误）` 这类抖动。
 fn chat_via_curl(url: &str, payload: &Value, token: &str, timeout_secs: u64) -> Result<(u16, String), String> {
+    let mut last_err = String::new();
+    for attempt in 0..3u64 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(250 * (1 << (attempt - 1))));
+        }
+        match chat_via_curl_once(url, payload, token, timeout_secs) {
+            Ok(v) => return Ok(v),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(format!("curl 连续 3 次失败（已含并发闸门与退避重试）：{last_err}"))
+}
+
+fn chat_via_curl_once(url: &str, payload: &Value, token: &str, timeout_secs: u64) -> Result<(u16, String), String> {
     use std::io::Write;
     use std::process::{Command, Stdio};
+    let _permit = CurlPermit::acquire(); // 并发闸门：防管道/句柄耗尽（os error 231）
 
     // 中文经命令行传参会产出非法 UTF-8（AGENTS.md 坑 #6）→ 走 stdin
     let body_bytes = serde_json::to_vec(payload).map_err(|e| format!("payload 序列化失败: {e}"))?;
