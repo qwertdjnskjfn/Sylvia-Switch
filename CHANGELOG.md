@@ -1,3 +1,21 @@
+## 1.0.53 — 2026-10-05
+
+### ① 冷却倒计时自动刷新 ② 「全部固定」支持仅可用 ③ curl 闸门/重试可配置
+
+**① 冷却倒计时**：前端每秒本地重渲染（`statusAtRef` 记基线 + 1s tick），徽标显示
+「冷却中 还剩 Ns」→ 归零显示「即将恢复」；另加 **30s 后台自动刷新**真实状态。
+
+**② 仅可用**：`POST /api/minimax/accounts/pin` 的 `{{all:true}}` 新增 `onlyUsable`
+→ 只把**当前可用**（启用、未冷却、有凭据）的账号入集合；前端「全部固定」旁新增「仅可用」勾选框。
+
+**③ curl 闸门/重试可配置**：`MmConfig` += `curl_max_concurrent`(默认 3，1~32) / `curl_retries`(默认 3，1~10)；
+新增纯函数 `curl_retry_delay_ms(attempt)`（250/500/1000…封顶 2s，**单测覆盖**）；
+`status` 暴露 `curlMaxConcurrent`/`curlRetries`；`config` 接收；前端新增「curl 闸门：[__] 并发 · 重试 [__] 次 [保存]」。
+
+**测试**：`cargo test -p wb-switch-core minimax` → **19 passed**（新增退避纯函数测试）；`tsc --noEmit` 0 error。
+
+---
+
 ## 1.0.52 — 2026-10-05
 
 ### 修复：`pin {{all:true}}` 被 400 拒掉（一键全固定/清空不生效）

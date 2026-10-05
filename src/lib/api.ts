@@ -645,7 +645,7 @@ export async function switchMinimaxAccount(body: { mode?: string; id?: string; r
   return call("switch_minimax_account", body);
 }
 
-export async function pinMinimaxAccount(body: { id?: string; pinned: boolean; all?: boolean }) {
+export async function pinMinimaxAccount(body: { id?: string; pinned: boolean; all?: boolean; onlyUsable?: boolean }) {
   return call("pin_minimax_account", body);
 }
 

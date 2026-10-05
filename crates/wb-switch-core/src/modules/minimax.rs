@@ -175,6 +175,10 @@ pub struct MmConfig {
     pub yy_absolute_chat: bool,
     /// 账号选择模式（2026-10-05 新增，对齐 glm_proxy 的 ACCOUNT_MODE_* 范式）
     pub account_mode: String,
+    /// curl 并发闸门：最多同时在飞的 curl 子进程数（默认 3）。2026-10-05 可配
+    pub curl_max_concurrent: u32,
+    /// curl 最大尝试次数（默认 3；1 = 不重试）。2026-10-05 可配
+    pub curl_retries: u32,
     /// 单次请求换号上限：**0 = 不限制**（默认；按候选池顺序试完为止）。2026-10-05
     pub max_failover: u32,
     /// 熔断冷却基数（秒），默认 60；风控(429/403) 自动 ×2。2026-10-05 可配置
@@ -249,6 +253,8 @@ pub fn load_config() -> MmConfig {
         cache_enabled: false,
         chat_payload_template: r#"{"message":{"content":"{{message}}"}}"#.to_string(),
         yy_absolute_chat: true,
+        curl_max_concurrent: 3,
+        curl_retries: 3,
         max_failover: DEFAULT_MAX_FAILOVER,
         cooldown_base_secs: 60,
         cooldown_max_secs: 1800,
@@ -290,6 +296,16 @@ pub fn load_config() -> MmConfig {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    cfg.curl_max_concurrent = v
+        .get("curl_max_concurrent")
+        .and_then(Value::as_u64)
+        .unwrap_or(3)
+        .clamp(1, 32) as u32;
+    cfg.curl_retries = v
+        .get("curl_retries")
+        .and_then(Value::as_u64)
+        .unwrap_or(3)
+        .clamp(1, 10) as u32;
     cfg.max_failover = v
         .get("max_failover")
         .and_then(Value::as_u64)
@@ -374,6 +390,8 @@ pub fn save_config(cfg: &MmConfig) {
         "enabled": cfg.enabled, "api_key": cfg.api_key,
         "chat_payload_template": cfg.chat_payload_template,
         "yy_absolute_chat": cfg.yy_absolute_chat,
+        "curl_max_concurrent": cfg.curl_max_concurrent,
+        "curl_retries": cfg.curl_retries,
         "max_failover": cfg.max_failover,
         "cooldown_base_secs": cfg.cooldown_base_secs,
         "cooldown_max_secs": cfg.cooldown_max_secs,
@@ -616,18 +634,27 @@ fn upstream_client() -> &'static reqwest::Client {
 /// 根因是**短时间大量 spawn 子进程 + 三条管道**把 Windows 的管道/句柄打满。
 /// 这里限制同时在飞的 curl 数量（超出则短暂等待，宁可慢一点也不失败）。
 static CURL_INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-const CURL_MAX_CONCURRENT: usize = 3;
+const CURL_MAX_CONCURRENT_DEFAULT: usize = 3;
 const CURL_GATE_WAIT_MS: u64 = 8000;
 
-/// 拿一个 curl 并发名额（RAII：Drop 时归还）。
+/// 重试退避（**纯函数**）：第 n 次重试前的等待毫秒（250 → 500 → 1000 …，封顶 2s）。
+pub fn curl_retry_delay_ms(attempt: u32) -> u64 {
+    if attempt == 0 {
+        return 0;
+    }
+    (250u64 << (attempt.saturating_sub(1)).min(3)).min(2000)
+}
+
+/// 拿一个 curl 并发名额（RAII：Drop 时归还）。`max` 由配置给出（默认 3）。
 struct CurlPermit;
 impl CurlPermit {
-    fn acquire() -> CurlPermit {
+    fn acquire(max: usize) -> CurlPermit {
         use std::sync::atomic::Ordering;
+        let max = max.max(1);
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(CURL_GATE_WAIT_MS);
         loop {
             let cur = CURL_INFLIGHT.load(Ordering::SeqCst);
-            if cur < CURL_MAX_CONCURRENT
+            if cur < max
                 && CURL_INFLIGHT
                     .compare_exchange(cur, cur + 1, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
@@ -658,23 +685,37 @@ impl Drop for CurlPermit {
 ///   1) **并发闸门**（`CurlPermit`，默认最多 3 个同时在飞）—— 治 `os error 231（管道耗尽）`；
 ///   2) **瞬时重试**（最多 3 次，递增退避）—— 治 `curl exit 26（读错误）` 这类抖动。
 fn chat_via_curl(url: &str, payload: &Value, token: &str, timeout_secs: u64) -> Result<(u16, String), String> {
+    let cfg = load_config();
+    let tries = cfg.curl_retries.clamp(1, 10);
+    let gate = if cfg.curl_max_concurrent == 0 {
+        CURL_MAX_CONCURRENT_DEFAULT
+    } else {
+        cfg.curl_max_concurrent as usize
+    };
     let mut last_err = String::new();
-    for attempt in 0..3u64 {
-        if attempt > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(250 * (1 << (attempt - 1))));
+    for attempt in 0..tries {
+        let delay = curl_retry_delay_ms(attempt);
+        if delay > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay));
         }
-        match chat_via_curl_once(url, payload, token, timeout_secs) {
+        match chat_via_curl_once(url, payload, token, timeout_secs, gate) {
             Ok(v) => return Ok(v),
             Err(e) => last_err = e,
         }
     }
-    Err(format!("curl 连续 3 次失败（已含并发闸门与退避重试）：{last_err}"))
+    Err(format!("curl 连续 {tries} 次失败（已含并发闸门{gate} 与退避重试）：{last_err}"))
 }
 
-fn chat_via_curl_once(url: &str, payload: &Value, token: &str, timeout_secs: u64) -> Result<(u16, String), String> {
+fn chat_via_curl_once(
+    url: &str,
+    payload: &Value,
+    token: &str,
+    timeout_secs: u64,
+    gate: usize,
+) -> Result<(u16, String), String> {
     use std::io::Write;
     use std::process::{Command, Stdio};
-    let _permit = CurlPermit::acquire(); // 并发闸门：防管道/句柄耗尽（os error 231）
+    let _permit = CurlPermit::acquire(gate); // 并发闸门：防管道/句柄耗尽（os error 231）
 
     // 中文经命令行传参会产出非法 UTF-8（AGENTS.md 坑 #6）→ 走 stdin
     let body_bytes = serde_json::to_vec(payload).map_err(|e| format!("payload 序列化失败: {e}"))?;
@@ -2001,6 +2042,8 @@ mod tests {
             cache_enabled: false,
             chat_payload_template: String::new(),
             yy_absolute_chat: true,
+            curl_max_concurrent: 3,
+            curl_retries: 3,
             max_failover: 0,
             cooldown_base_secs: 60,
             cooldown_max_secs: 1800,
@@ -2238,6 +2281,15 @@ mod tests {
         assert_eq!(cooldown_after_failure_with(2, 500, base, max), 10_000);
         assert_eq!(cooldown_after_failure_with(1, 429, base, max), 10_000);
         assert_eq!(cooldown_after_failure_with(9, 500, base, max), 60_000, "受上限封顶");
+    }
+
+    #[test]
+    fn curl_retry_backoff_is_bounded() {
+        assert_eq!(curl_retry_delay_ms(0), 0, "首次不等待");
+        assert_eq!(curl_retry_delay_ms(1), 250);
+        assert_eq!(curl_retry_delay_ms(2), 500);
+        assert_eq!(curl_retry_delay_ms(3), 1000);
+        assert_eq!(curl_retry_delay_ms(9), 2000, "封顶 2s");
     }
 
     #[test]

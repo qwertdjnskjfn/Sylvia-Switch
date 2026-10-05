@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -60,6 +60,9 @@ type MmStatus = {
   cooldownMaxSecs?: number;
   // 2026-10-05：单次请求换号上限（0 = 不限制）
   maxFailover?: number;
+  // 2026-10-05：curl 闸门/重试
+  curlMaxConcurrent?: number;
+  curlRetries?: number;
   chatExperimental: boolean;
   endpoint: string;
   payloadTemplate: string;
@@ -99,6 +102,10 @@ export default function MiniMaxPage() {
   // 试一试
   // 熔断参数输入（空串=未改，显示服务端值）
   const [mf, setMf] = useState("");
+  const [curlMc, setCurlMc] = useState("");
+  const [curlRt, setCurlRt] = useState("");
+  const [onlyUsable, setOnlyUsable] = useState(false);
+  const [, setTick] = useState(0);
   const [cdBase, setCdBase] = useState("");
   const [cdMax, setCdMax] = useState("");
   const [testPrompt, setTestPrompt] = useState("只回复 OK");
@@ -117,6 +124,20 @@ export default function MiniMaxPage() {
 
   useEffect(() => {
     void refresh();
+  }, [refresh]);
+
+  // 2026-10-05：冷却倒计时（本地每秒重渲染）+ 每 30s 后台刷新一次真实状态
+  const statusAtRef = useRef<number>(Date.now());
+  useEffect(() => {
+    statusAtRef.current = Date.now();
+  }, [status]);
+  useEffect(() => {
+    const t = window.setInterval(() => setTick((x) => x + 1), 1000);
+    const r = window.setInterval(() => void refresh(), 30000);
+    return () => {
+      window.clearInterval(t);
+      window.clearInterval(r);
+    };
   }, [refresh]);
 
   async function addAccount() {
@@ -161,7 +182,7 @@ export default function MiniMaxPage() {
         return null;
       }
       if (prefix("pin")) {
-        const res = await api.pinMinimaxAccount(body as { id?: string; pinned: boolean; all?: boolean });
+        const res = await api.pinMinimaxAccount(body as { id?: string; pinned: boolean; all?: boolean; onlyUsable?: boolean });
         void res;
         setMsg({ type: "ok", text: okText });
         await refresh();
@@ -190,7 +211,7 @@ export default function MiniMaxPage() {
         // 2026-10-05：切换账号 / 选号策略（多账号支持）
         switchAccount: () => api.switchMinimaxAccount(body as { mode?: string; id?: string }),
         // 2026-10-05：固定集合增删（幂等；支持同时固定多个）
-        pinAccount: () => api.pinMinimaxAccount(body as { id?: string; pinned: boolean; all?: boolean }),
+        pinAccount: () => api.pinMinimaxAccount(body as { id?: string; pinned: boolean; all?: boolean; onlyUsable?: boolean }),
         clearCooldown: () => api.clearMinimaxCooldown(body as { id?: string }),
         "probe": async () => {
           const res = await fetch("/api/minimax/probe", {
@@ -432,7 +453,11 @@ export default function MiniMaxPage() {
                   {a.pinned ? <Badge className="h-5 px-1.5 text-[10px]">当前账号</Badge> : null}
                   {a.cooldown ? (
                     <Badge variant="warning" className="h-5 px-1.5 text-[10px]">
-                      冷却中{a.cooldownRemainSecs ? ` 还剩 ${a.cooldownRemainSecs}s` : ""}
+                      {(() => {
+                        const elapsed = Math.floor((Date.now() - statusAtRef.current) / 1000);
+                        const remain = Math.max(0, (a.cooldownRemainSecs ?? 0) - elapsed);
+                        return remain > 0 ? `冷却中 还剩 ${remain}s` : "冷却中 即将恢复";
+                      })()}
                     </Badge>
                   ) : null}
                   {a.usable === false && !a.cooldown ? <Badge variant="warning" className="h-5 px-1.5 text-[10px]">不可用</Badge> : null}
@@ -555,6 +580,46 @@ export default function MiniMaxPage() {
               {busy === "capture" ? <Loader2 className="animate-spin" /> : <Download />}从桌面端导入
             </Button>
             <div className="flex flex-wrap items-center gap-1.5">
+              <span className="text-xs text-muted-foreground">curl 闸门：</span>
+              <input
+                className="h-7 w-14 rounded-md border border-border bg-transparent px-2 text-xs"
+                value={curlMc || String(status.curlMaxConcurrent ?? 3)}
+                onChange={(e) => setCurlMc(e.target.value)}
+                inputMode="numeric"
+                title="最多同时在飞的 curl 子进程数（1~32，默认 3）"
+              />
+              <span className="text-[11px] text-muted-foreground">并发 · 重试</span>
+              <input
+                className="h-7 w-14 rounded-md border border-border bg-transparent px-2 text-xs"
+                value={curlRt || String(status.curlRetries ?? 3)}
+                onChange={(e) => setCurlRt(e.target.value)}
+                inputMode="numeric"
+                title="curl 最大尝试次数（1~10，默认 3）"
+              />
+              <span className="text-[11px] text-muted-foreground">次</span>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 px-2 text-xs"
+                disabled={busy === "saveMinimaxConfig"}
+                onClick={() =>
+                  void act(
+                    "saveMinimaxConfig",
+                    {
+                      curlMaxConcurrent: Number(curlMc || status.curlMaxConcurrent || 3),
+                      curlRetries: Number(curlRt || status.curlRetries || 3),
+                    },
+                    "curl 闸门参数已保存",
+                  ).then(() => {
+                    setCurlMc("");
+                    setCurlRt("");
+                  })
+                }
+              >
+                保存
+              </Button>
+            </div>
+            <div className="flex flex-wrap items-center gap-1.5">
               <span className="text-xs text-muted-foreground">换号上限：</span>
               <input
                 className="h-7 w-14 rounded-md border border-border bg-transparent px-2 text-xs"
@@ -641,15 +706,25 @@ export default function MiniMaxPage() {
                   {label}
                 </Button>
               ))}
+              <label className="flex items-center gap-1 text-[11px] text-muted-foreground" title="只把当前可用（启用、未冷却、有凭据）的账号入集合">
+                <input type="checkbox" checked={onlyUsable} onChange={(e) => setOnlyUsable(e.target.checked)} />
+                仅可用
+              </label>
               <Button
                 size="sm"
                 variant="outline"
                 className="h-7 px-2 text-xs"
                 disabled={busy === "pinAccount" || !status.accounts.length}
                 onClick={() =>
-                  void act("pinAccount", { all: true, pinned: true }, `已一键固定全部 ${status.accounts.length} 个账号`)
+                  void act(
+                    "pinAccount",
+                    { all: true, pinned: true, onlyUsable },
+                    onlyUsable
+                      ? `已固定「仅可用」账号（可用 ${status.accounts.filter((x) => x.usable).length} 个）`
+                      : `已一键固定全部 ${status.accounts.length} 个账号`,
+                  )
                 }
-                title="把账号池里所有账号一次性加入固定集合（顺序=列表顺序）"
+                title="把账号池账号一次性加入固定集合（勾选「仅可用」则只收可用账号；顺序=列表顺序）"
               >
                 全部固定
               </Button>

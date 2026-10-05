@@ -8027,6 +8027,9 @@ async fn api_minimax_status() -> Response {
         "accountMode": cfg.account_mode,
         "pinnedAccountIds": cfg.pinned_account_ids,
         "pinnedAccountId": cfg.pinned_account_id,
+        // 2026-10-05：curl 闸门/重试可配
+        "curlMaxConcurrent": cfg.curl_max_concurrent,
+        "curlRetries": cfg.curl_retries,
         // 2026-10-05：换号上限（0 = 不限制）
         "maxFailover": cfg.max_failover,
         // 2026-10-05：熔断冷却可配置（秒）
@@ -8062,6 +8065,13 @@ async fn api_minimax_config_save(Json(body): Json<Value>) -> Response {
         let id = id.trim().to_string();
         cfg.pinned_account_ids = if id.is_empty() { Vec::new() } else { vec![id.clone()] };
         cfg.pinned_account_id = id;
+    }
+    // curl 闸门/重试（1~32 并发 / 1~10 尝试）
+    if let Some(v) = body.get("curlMaxConcurrent").and_then(Value::as_u64) {
+        cfg.curl_max_concurrent = v.clamp(1, 32) as u32;
+    }
+    if let Some(v) = body.get("curlRetries").and_then(Value::as_u64) {
+        cfg.curl_retries = v.clamp(1, 10) as u32;
     }
     // 单次请求换号上限（0 = 不限制，默认；上限受 MAX_FAILOVER_HARD_CAP 约束）
     if let Some(v) = body.get("maxFailover").and_then(Value::as_u64) {
@@ -8115,9 +8125,15 @@ async fn api_minimax_accounts_pin(Json(body): Json<Value>) -> Response {
     // 一键全固定 / 一键清空（2026-10-05）：{all:true, pinned:true|false}
     // ⚠️ 必须放在 id 校验**之前**：该形态不带 id（曾因顺序问题被 400 拒掉）
     if body.get("all").and_then(Value::as_bool).unwrap_or(false) {
+        let only_usable = body.get("onlyUsable").and_then(Value::as_bool).unwrap_or(false);
         let mut cfg = minimax::load_config();
         cfg.pinned_account_ids = if want {
-            cfg.accounts.iter().map(|a| a.id.clone()).collect()
+            let now = minimax::now_ms();
+            cfg.accounts
+                .iter()
+                .filter(|a| !only_usable || minimax::account_usable(a, now))
+                .map(|a| a.id.clone())
+                .collect()
         } else {
             Vec::new()
         };
