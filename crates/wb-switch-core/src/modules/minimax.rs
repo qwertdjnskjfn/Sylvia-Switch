@@ -175,7 +175,10 @@ pub struct MmConfig {
     pub yy_absolute_chat: bool,
     /// 账号选择模式（2026-10-05 新增，对齐 glm_proxy 的 ACCOUNT_MODE_* 范式）
     pub account_mode: String,
-    /// account_mode=pinned 时生效：只使用该账号（严格，失败不换号）
+    /// account_mode=pinned 时生效：**固定集合**（有序、可同时多个）。
+    /// 单账号固定是它的特例；`pinned_account_id` 保留为兼容字段（= 集合首元素）。
+    pub pinned_account_ids: Vec<String>,
+    /// 兼容字段（旧配置/旧 exe 可读）：等于 `pinned_account_ids` 的首元素
     pub pinned_account_id: String,
     pub accounts: Vec<MmAccount>,
 }
@@ -189,7 +192,7 @@ pub const MM_MODE_ROUND_ROBIN: &str = "round_robin";
 pub const MM_MODE_LOCAL_FIRST: &str = "local_first";
 /// 只用本机：仅 desktop 来源账号；无可用则明确报错（提示去桌面端登录）。
 pub const MM_MODE_LOCAL_ONLY: &str = "local_only";
-/// 固定账号：只用 `pinned_account_id` 指定的账号（严格，失败不换号）。
+/// 固定账号：只用**固定集合** `pinned_account_ids`（有序、可同时多个；集合内换号，绝不换出集合）。
 pub const MM_MODE_PINNED: &str = "pinned";
 
 /// 单次请求最多尝试的候选账号数（换号重试上限，防止把延迟放大成倍）。
@@ -225,6 +228,7 @@ pub fn load_config() -> MmConfig {
         chat_payload_template: r#"{"message":{"content":"{{message}}"}}"#.to_string(),
         yy_absolute_chat: true,
         account_mode: MM_MODE_ROUND_ROBIN.to_string(),
+        pinned_account_ids: Vec::new(),
         pinned_account_id: String::new(),
         accounts: Vec::new(),
     };
@@ -261,6 +265,8 @@ pub fn load_config() -> MmConfig {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    // 固定集合（2026-10-05）：新字段优先，缺失时用旧单值迁移（逻辑见 parse_pin_set）
+    cfg.pinned_account_ids = parse_pin_set(v.get("pinned_account_ids"), &cfg.pinned_account_id);
     if let Some(list) = v.get("accounts").and_then(Value::as_array) {
         cfg.accounts = list
             .iter()
@@ -295,6 +301,12 @@ pub fn load_config() -> MmConfig {
             })
             .collect();
     }
+    // 固定集合规范化：去重 + 剔除悬空 id（见 normalize_pin_set）
+    {
+        let accounts = cfg.accounts.clone();
+        normalize_pin_set(&mut cfg.pinned_account_ids, &accounts);
+    }
+    cfg.pinned_account_id = cfg.pinned_account_ids.first().cloned().unwrap_or_default();
     cfg
 }
 
@@ -316,12 +328,15 @@ pub fn save_config(cfg: &MmConfig) {
             })
         })
         .collect();
+    // 双写：兼容字段恒等于集合首元素（旧版 exe 回滚仍可读）
+    let legacy_pin = cfg.pinned_account_ids.first().cloned().unwrap_or_default();
     let v = json!({
         "enabled": cfg.enabled, "api_key": cfg.api_key,
         "chat_payload_template": cfg.chat_payload_template,
         "yy_absolute_chat": cfg.yy_absolute_chat,
         "account_mode": cfg.account_mode,
-        "pinned_account_id": cfg.pinned_account_id,
+        "pinned_account_ids": cfg.pinned_account_ids,
+        "pinned_account_id": legacy_pin,
         "accounts": accounts, "updated_at": now_ms(),
     });
     if let Some(dir) = config_path().parent() {
@@ -530,28 +545,88 @@ fn upstream_client() -> &'static reqwest::Client {
     })
 }
 
-/// **对话专用**客户端：强制 HTTP/1.1。
+/// **对话专用**HTTP 路径：改用系统 `curl.exe` 子进程。
 ///
-/// 🔴 2026-10-05 实测（同一 payload / 同一 header / 同一 token，唯一变量是客户端）：
-/// | 客户端 | 协议 | `usage.input_tokens` | 回复 |
-/// | --- | --- | --- | --- |
-/// | reqwest（默认 ALPN 协商 h2）| HTTP/2 | **21（恒定）** | 答非所问（`How can I help you today?`）|
-/// | curl `--http1.1` | HTTP/1.1 | **41** | 正确 |
-/// | Python urllib | HTTP/1.1 | **41** | 正确 |
+/// 🔴 2026-10-05 实测（本渠道的根因，实验驱动）：
+/// 同一 IP / 同一 token / 同一 payload / 同一 header，仅换 HTTP 客户端：
+/// | 客户端 | `usage.input_tokens` | 回复 |
+/// | --- | --- | --- |
+/// | **curl.exe 8.16（Schannel）** | **40~41** | **正确** |
+/// | Python urllib（OpenSSL） | 41 | 正确 |
+/// | reqwest（rustls / native-tls / h1.1 / h2 均试过）| **21（恒定）** | 答非所问或 503/529 |
 ///
-/// `input_tokens` 差 20 且 h1.1 恒定得到正确回答 ⇒ 该上游对 HTTP/2 请求走了**另一条分支**
-/// （表现为不注入其内部 system 提示、忽略 messages）。故对话路径固定 h1.1。
-fn chat_client() -> &'static reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .no_proxy()
-            .http1_only()
-            .user_agent(MINIMAX_UA)
-            .timeout(Duration::from_secs(120))
-            .build()
-            .expect("failed to build minimax chat client")
-    })
+/// `input_tokens` **恒定 21**（与 prompt 长度无关，2 字符与 2000 字符都是 21）
+/// ⇒ 上游对 reqwest 发出的请求**未按内容处理**。
+/// 已逐一排除：端点 / payload 形状 / max_tokens / anthropic-version / User-Agent /
+/// content 字符串 vs 数组 / HTTP 版本（h1.1 vs h2）/ TLS 后端（rustls vs native-tls）/
+/// Accept-Encoding / Expect: 100-continue / accept 头 / 连接池复用。
+/// 剩余差异只能在 TLS ClientHello 字节层，**抓包才能确认**；
+/// 而 curl 已验证 100% 可用，故直接改用 curl 绕开 reqwest（不再猜）。
+///
+/// 代价：每次调用 fork 一个进程（~2s 启动开销，chat 场景可接受）。
+///
+/// 🔧 v1 → v2：payload 由**临时文件**改为 **stdin**（`--data-binary @-`）。
+/// v1 的缺陷：在 `Command::output()` 返回**之前**就 `remove_file` 了，
+/// 竞态下 curl 仍在读 → `CURLE_READ_ERROR(26)`。stdin 方案无此竞态，
+/// 也不需要清理临时文件（更少 IO）。
+fn chat_via_curl(url: &str, payload: &Value, token: &str, timeout_secs: u64) -> Result<(u16, String), String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    // 中文经命令行传参会产出非法 UTF-8（AGENTS.md 坑 #6）→ 走 stdin
+    let body_bytes = serde_json::to_vec(payload).map_err(|e| format!("payload 序列化失败: {e}"))?;
+
+    let mut child = Command::new("curl")
+        .arg("-s")                    // 静默（不要进度条污染 stdout）
+        .arg("--max-time").arg(timeout_secs.to_string())
+        .arg("-w").arg("\n%{http_code}")   // 末尾附状态码，便于区分「HTTP 错误」与「网络错误」
+        .arg("-X").arg("POST")
+        .arg(url)
+        .arg("-H").arg("Content-Type: application/json")
+        .arg("-H").arg("anthropic-version: 2023-06-01")
+        .arg("-H").arg(format!("Authorization: Bearer {token}"))
+        .arg("-H").arg(format!("User-Agent: {MINIMAX_UA}"))
+        .arg("--data-binary").arg("@-")   // 从 stdin 读 body
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("调起 curl 失败（系统需自带 curl.exe）: {e}"))?;
+
+    // 写 stdin 后关闭（curl 读到 EOF 才会发请求）
+    {
+        let mut sin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "取 curl stdin 失败".to_string())?;
+        sin.write_all(&body_bytes)
+            .map_err(|e| format!("写 curl stdin 失败: {e}"))?;
+        // sin 在此 drop → 关闭管道
+    }
+
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("等待 curl 失败: {e}"))?;
+
+    let mut body = String::from_utf8_lossy(&out.stdout).to_string();
+    // 拆出末尾的 http_code（curl 非 0 退出时 stdout 可能只有状态码行）
+    let status = body
+        .rfind('\n')
+        .and_then(|i| body.get(i + 1..))
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .unwrap_or(if out.status.success() { 200 } else { 502 });
+    if let Some(i) = body.rfind('\n') {
+        body.truncate(i);
+    }
+    if !out.status.success() && body.trim().is_empty() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(format!(
+            "curl 退出码 {:?}（传输层失败）：{}",
+            out.status.code(),
+            err.chars().take(160).collect::<String>()
+        ));
+    }
+    Ok((status, body))
 }
 
 /// 签名 GET（/minimax-cloud 族；GET 的签名 body 按约定为 "{}"）。
@@ -766,6 +841,34 @@ pub async fn signin_account(acc: &MmAccount) -> Value {
 
 static CHAT_CURSOR: AtomicUsize = AtomicUsize::new(0);
 
+/// 解析固定集合（**纯函数**，便于单测）：新字段 `pinned_account_ids` 优先；
+/// 缺失/为空时用旧单值 `pinned_account_id` 迁移（兼容 1.0.39 之前的配置）。
+pub fn parse_pin_set(value: Option<&Value>, legacy_single: &str) -> Vec<String> {
+    let mut ids: Vec<String> = value
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|x| !x.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    let legacy = legacy_single.trim();
+    if ids.is_empty() && !legacy.is_empty() {
+        ids.push(legacy.to_string());
+    }
+    ids
+}
+
+/// 固定集合规范化（**纯函数**）：去重 + 剔除已不存在的账号（悬空 id 自动清理），保持原顺序。
+pub fn normalize_pin_set(ids: &mut Vec<String>, accounts: &[MmAccount]) {
+    let known: std::collections::HashSet<&str> = accounts.iter().map(|a| a.id.as_str()).collect();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    ids.retain(|id| known.contains(id.as_str()) && seen.insert(id.clone()));
+}
+
 /// 账号可用性判定（唯一口径，供 ordered_pool / 状态页 / 测试复用）：
 /// 启用 + 未冷却 + 有凭据（desktop 来源 token 恒为空——现读 auth.json，不能按它过滤）。
 pub fn account_usable(a: &MmAccount, now: u64) -> bool {
@@ -783,7 +886,7 @@ pub fn account_usable(a: &MmAccount, now: u64) -> bool {
 /// - `round_robin`：全部可用账号（保持既有轮询行为）
 /// - `local_first`：desktop 来源（本机桌面端登录态）排前，其余其次
 /// - `local_only`：仅 desktop 来源，无则明确报错
-/// - `pinned`：仅 `pinned_account_id`（严格，失败不换号）
+/// - `pinned`：仅 `pinned_account_ids`（**固定集合**，保序；集合内跳过不可用者、集合内换号，绝不越界）
 ///
 /// 区域隔离：给定 region 时**只**在该区域内选号，禁止跨区借用。
 pub fn ordered_pool(cfg: &MmConfig, region: Option<&str>) -> Result<Vec<MmAccount>, String> {
@@ -839,32 +942,49 @@ pub fn ordered_pool(cfg: &MmConfig, region: Option<&str>) -> Result<Vec<MmAccoun
             Ok(list)
         }
         MM_MODE_PINNED => {
-            let id = cfg.pinned_account_id.trim();
-            if id.is_empty() {
+            // 固定集合（2026-10-05）：有序、可同时多个；集合内跳过不可用者（集合内换号），
+            // 但**绝不换出集合**（候选池恒等于 集合 ∩ 可用）。
+            let ids = &cfg.pinned_account_ids;
+            if ids.is_empty() {
                 return Err(
-                    "已选择「固定账号」但未指定账号：请在 MiniMax 页把一个账号设为「当前账号」"
+                    "已选择「固定账号」，但固定集合为空：请在 MiniMax 页把账号设为「固定」（可同时固定多个）"
                         .to_string(),
                 );
             }
-            match in_region.iter().find(|a| a.id == id) {
-                None => Err(format!(
-                    "固定账号不存在{region_hint}（id={id}）：它可能已被删除，请重新选择一个账号"
-                )),
-                Some(a) if !a.enabled => Err(format!(
-                    "固定账号「{}」已禁用：请启用它，或切换其他账号",
-                    a.label
-                )),
-                Some(a) if a.cooldown_until_ms >= now => Err(format!(
-                    "固定账号「{}」正处于冷却保护期（约 {} 秒后恢复）：请稍候，或切换其他账号",
-                    a.label,
-                    a.cooldown_until_ms.saturating_sub(now) / 1000
-                )),
-                Some(a) if !account_usable(a, now) => Err(format!(
-                    "固定账号「{}」凭据为空：请重新导入桌面端登录态或粘贴 JWT",
-                    a.label
-                )),
-                Some(a) => Ok(vec![a.clone()]),
+            let mut picked: Vec<MmAccount> = Vec::new();
+            let mut skipped: Vec<String> = Vec::new();
+            let mut missing: Vec<String> = Vec::new();
+            for id in ids {
+                match in_region.iter().find(|a| &a.id == id) {
+                    None => missing.push(id.clone()),
+                    Some(a) if !a.enabled => skipped.push(format!("「{}」已禁用", a.label)),
+                    Some(a) if a.cooldown_until_ms >= now => skipped.push(format!(
+                        "「{}」冷却中（约 {}s 后恢复）",
+                        a.label,
+                        a.cooldown_until_ms.saturating_sub(now) / 1000
+                    )),
+                    Some(a) if !account_usable(a, now) => {
+                        skipped.push(format!("「{}」凭据为空", a.label))
+                    }
+                    Some(a) => picked.push(a.clone()),
+                }
             }
+            if picked.is_empty() {
+                // 集合全不可用 → 报可操作错（不静默回落轮询）
+                let mut parts = vec![format!(
+                    "固定集合{region_hint}内没有可用账号（共 {} 个）",
+                    ids.len()
+                )];
+                if !missing.is_empty() {
+                    parts.push(format!("已删除：{}", missing.join("、")));
+                }
+                if !skipped.is_empty() {
+                    parts.push(format!("不可用：{}", skipped.join("、")));
+                }
+                parts.push("请在 MiniMax 页调整固定集合，或改用其他选号策略".to_string());
+                return Err(parts.join("；"));
+            }
+            Ok(picked)
         }
         _ => {
             if usable.is_empty() {
@@ -963,17 +1083,16 @@ async fn chat_with_account(
             "max_tokens": 4096,
             "messages": [{ "role": "user", "content": prompt }],
         });
-        let resp = chat_client()
-            .post(&mavis)
-            .bearer_auth(effective_token(acc))
-            .header("Content-Type", "application/json")
-            .header("anthropic-version", "2023-06-01")
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| (502u16, format!("模型直连失败: {e}")))?;
-        let st = resp.status().as_u16();
-        let text = resp.text().await.unwrap_or_default();
+        // 走 curl 子进程：reqwest 对该上游恒定返回 in=21（未按内容处理），
+        // 根因与全部排除过程见 chat_via_curl 的文档注释。
+        // ⚠️ 必须在闭包外取好 token：`acc` 是借用，`move` 闭包不能带走引用。
+        let chat_token = effective_token(acc);
+        let (st, text) = tokio::task::spawn_blocking(move || {
+            chat_via_curl(&mavis, &payload, &chat_token, 120)
+        })
+        .await
+        .map_err(|e| (502u16, format!("对话任务异常: {e}")))?
+        .map_err(|e| (502u16, e))?;
         if !(200..300).contains(&st) {
             return Err((st, format!("模型直连 HTTP {st}: {}", text.chars().take(150).collect::<String>())));
         }
@@ -1035,17 +1154,16 @@ async fn chat_with_account(
             "max_tokens": 4096,
             "messages": [{ "role": "user", "content": prompt }],
         });
-        let resp = chat_client()
-            .post(&mavis)
-            .bearer_auth(effective_token(acc))
-            .header("Content-Type", "application/json")
-            .header("anthropic-version", "2023-06-01")
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| (502u16, format!("模型直连失败: {e}")))?;
-        let st = resp.status().as_u16();
-        let text = resp.text().await.unwrap_or_default();
+        // 走 curl 子进程：reqwest 对该上游恒定返回 in=21（未按内容处理），
+        // 根因与全部排除过程见 chat_via_curl 的文档注释。
+        // ⚠️ 必须在闭包外取好 token：`acc` 是借用，`move` 闭包不能带走引用。
+        let chat_token = effective_token(acc);
+        let (st, text) = tokio::task::spawn_blocking(move || {
+            chat_via_curl(&mavis, &payload, &chat_token, 120)
+        })
+        .await
+        .map_err(|e| (502u16, format!("对话任务异常: {e}")))?
+        .map_err(|e| (502u16, e))?;
         if !(200..300).contains(&st) {
             return Err((st, format!("模型直连 HTTP {st}: {}", text.chars().take(150).collect::<String>())));
         }
@@ -1184,7 +1302,7 @@ async fn chat_with_account(
 /// - 候选顺序由选号模式决定（轮询 / 本机优先 / 仅本机 / 固定账号）；
 /// - 单个账号失败且属于「可换号错误」时，自动取下一个账号（最多 `MAX_FAILOVER` 个），
 ///   失败账号写入 `last_error` + 指数退避冷却（`cooldown_after_failure`），连续失败计数 `fail_streak`；
-/// - 成功则清零计数；`pinned` 模式**严格不换号**（失败直接抛出，符合“固定账号”语义）；
+/// - 成功则清零计数；`pinned` 模式：候选 = 固定集合 ∩ 可用，**集合内换号、绝不换出集合**（仅剩 1 个候选时严格不换）；
 /// - 返回体带 `failover`（第几个候选成功）与 `minimax.account`（实际账号），便于排障。
 pub async fn chat_once(
     prompt: &str,
@@ -1224,7 +1342,9 @@ pub async fn chat_once(
                 if retryable || st == 0 {
                     mark_account_failure(&acc.id, st, &msg);
                 }
-                let strict = cfg.account_mode == MM_MODE_PINNED;
+                // pinned 时**集合内**允许换号；只有候选只剩 1 个才严格不换。
+                // 越界保护：pool 在 pinned 模式下恒等于「固定集合 ∩ 可用」，天然不会换出集合。
+                let strict = cfg.account_mode == MM_MODE_PINNED && pool.len() <= 1;
                 if strict || !retryable {
                     return Err((st, msg));
                 }
@@ -1259,15 +1379,52 @@ pub fn cooldown_after_failure(streak: u32, status: u16) -> u64 {
 }
 
 /// 记一次失败：累加 `fail_streak`、写 `last_error`、置冷却（熔断）。
-fn mark_account_failure(id: &str, status: u16, msg: &str) {
+///
+/// **单账号豁免**（2026-10-05 实测教训）：若池里**没有其他可用账号**，则**不置冷却** ——
+/// 冷却的意义是"优先用健康的备选"，没有备选时它只会把整个渠道锁死（实测：
+/// 唯一账号连续失败 4 次 → 长冷却 → 渠道 503「均在冷却保护期」，比直接报上游错更难排查）。
+/// 此时仍记录 `fail_streak` 与 `last_error`，便于页面看原因。
+pub fn mark_account_failure(id: &str, status: u16, msg: &str) {
     let mut cfg = load_config();
+    let now = now_ms();
+    let usable_others = cfg
+        .accounts
+        .iter()
+        .filter(|a| a.id != id && account_usable(a, now))
+        .count();
     if let Some(a) = cfg.accounts.iter_mut().find(|x| x.id == id) {
         a.fail_streak = a.fail_streak.saturating_add(1);
         let brief: String = msg.chars().take(160).collect();
         a.last_error = Some(format!("HTTP {status}: {brief}"));
-        a.cooldown_until_ms = now_ms() + cooldown_after_failure(a.fail_streak, status);
+        a.cooldown_until_ms = if usable_others > 0 {
+            now + cooldown_after_failure(a.fail_streak, status)
+        } else {
+            0
+        };
     }
     save_config(&cfg);
+}
+
+/// 手动解除冷却（2026-10-05）：清 `cooldown_until_ms`、`fail_streak`、`last_error`。
+/// `id` 为空则解除全部账号。返回解除的账号 id 列表。
+pub fn clear_cooldown(id: &str) -> Vec<String> {
+    let mut cfg = load_config();
+    let mut hit = Vec::new();
+    for a in cfg.accounts.iter_mut() {
+        if !id.is_empty() && a.id != id {
+            continue;
+        }
+        if a.cooldown_until_ms > 0 || a.fail_streak > 0 || a.last_error.is_some() {
+            a.cooldown_until_ms = 0;
+            a.fail_streak = 0;
+            a.last_error = None;
+            hit.push(a.id.clone());
+        }
+    }
+    if !hit.is_empty() {
+        save_config(&cfg);
+    }
+    hit
 }
 
 /// 记一次成功：清零熔断计数与错误（仅在需要变化时落盘，避免每次请求都写配置）。
@@ -1702,6 +1859,7 @@ mod tests {
             chat_payload_template: String::new(),
             yy_absolute_chat: true,
             account_mode: mode.to_string(),
+            pinned_account_ids: if pin.is_empty() { Vec::new() } else { vec![pin.to_string()] },
             pinned_account_id: pin.to_string(),
             accounts,
         }
@@ -1774,30 +1932,129 @@ mod tests {
     }
 
     #[test]
-    fn pinned_is_strict_and_actionable() {
+    fn pinned_single_pin_is_strict_and_errors_are_actionable() {
         let base = vec![
             acc("w1", "", "domestic", true, 0, "t1"),
             acc("w2", "", "domestic", true, 0, "t2"),
         ];
+        // 单账号固定 = 集合只有一个元素：只返回它（严格语义）
         let list = ordered_pool(&cfg_with(MM_MODE_PINNED, "w2", base.clone()), Some("domestic")).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].id, "w2");
 
+        // 集合为空
         let e1 = ordered_pool(&cfg_with(MM_MODE_PINNED, "", base.clone()), Some("domestic")).unwrap_err();
-        assert!(e1.contains("未指定账号"), "e1={e1}");
+        assert!(e1.contains("固定集合为空"), "e1={e1}");
 
+        // 集合里的 id 已被删除（悬空）→ 报“已删除”
         let e2 = ordered_pool(&cfg_with(MM_MODE_PINNED, "nope", base.clone()), Some("domestic")).unwrap_err();
-        assert!(e2.contains("不存在"), "e2={e2}");
+        assert!(e2.contains("已删除"), "e2={e2}");
 
+        // 集合内的账号被禁用
         let mut off = base.clone();
         off[1].enabled = false;
         let e3 = ordered_pool(&cfg_with(MM_MODE_PINNED, "w2", off), Some("domestic")).unwrap_err();
         assert!(e3.contains("已禁用"), "e3={e3}");
 
+        // 集合内的账号在冷却
         let mut cool = base.clone();
         cool[1].cooldown_until_ms = now_ms() + 60_000;
         let e4 = ordered_pool(&cfg_with(MM_MODE_PINNED, "w2", cool), Some("domestic")).unwrap_err();
-        assert!(e4.contains("冷却"), "e4={e4}");
+        assert!(e4.contains("冷却中"), "e4={e4}");
+    }
+
+    #[test]
+    fn pin_set_migrates_from_legacy_single_value() {
+        // 旧配置只有单值 → 迁移为集合
+        assert_eq!(parse_pin_set(None, "a1"), vec!["a1".to_string()]);
+        assert_eq!(parse_pin_set(Some(&json!([])), " a1 "), vec!["a1".to_string()]);
+        // 新字段存在 → 以它为准（忽略旧单值）
+        assert_eq!(
+            parse_pin_set(Some(&json!(["a1", "a2"])), "a9"),
+            vec!["a1".to_string(), "a2".to_string()]
+        );
+        // 空白与空串过滤
+        assert_eq!(
+            parse_pin_set(Some(&json!(["a1", "  ", ""])), ""),
+            vec!["a1".to_string()]
+        );
+        assert!(parse_pin_set(None, "   ").is_empty());
+    }
+
+    #[test]
+    fn pin_set_normalizes_dedupe_and_drops_dangling() {
+        let accounts = vec![acc("a1", "", "domestic", true, 0, "t1"), acc("a2", "", "domestic", true, 0, "t2")];
+        let mut ids = vec!["a1".to_string(), "a1".to_string(), "ghost".to_string(), "a2".to_string()];
+        normalize_pin_set(&mut ids, &accounts);
+        assert_eq!(ids, vec!["a1".to_string(), "a2".to_string()], "去重 + 剔除悬空 + 保序");
+        let mut all_ghost = vec!["ghost".to_string()];
+        normalize_pin_set(&mut all_ghost, &accounts);
+        assert!(all_ghost.is_empty());
+    }
+
+    #[test]
+    fn pinned_set_returns_all_pinned_in_order() {
+        let cfg = cfg_with(
+            MM_MODE_PINNED,
+            "",
+            vec![
+                acc("a1", "", "domestic", true, 0, "t1"),
+                acc("a2", "", "domestic", true, 0, "t2"),
+                acc("a3", "", "domestic", true, 0, "t3"),
+            ],
+        );
+        let mut cfg = cfg;
+        cfg.pinned_account_ids = vec!["a2".to_string(), "a1".to_string()];
+        let ids: Vec<String> = ordered_pool(&cfg, Some("domestic"))
+            .unwrap()
+            .into_iter()
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(ids, vec!["a2", "a1"], "同时固定两个：按集合顺序返回，未固定的 a3 不参与");
+    }
+
+    #[test]
+    fn pinned_set_skips_unusable_but_keeps_others() {
+        let mut cfg = cfg_with(
+            MM_MODE_PINNED,
+            "",
+            vec![
+                acc("a1", "", "domestic", true, now_ms() + 60_000, "t1"),
+                acc("a2", "", "domestic", true, 0, "t2"),
+            ],
+        );
+        cfg.pinned_account_ids = vec!["a1".to_string(), "a2".to_string()];
+        let ids: Vec<String> = ordered_pool(&cfg, Some("domestic"))
+            .unwrap()
+            .into_iter()
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(ids, vec!["a2"], "集合内跳过冷却中的 a1，保留可用的 a2（集合内换号）");
+    }
+
+    #[test]
+    fn pinned_set_all_unusable_reports_actionable_error() {
+        let mut cfg = cfg_with(
+            MM_MODE_PINNED,
+            "",
+            vec![
+                acc("a1", "", "domestic", false, 0, "t1"),
+                acc("a2", "", "domestic", true, now_ms() + 60_000, "t2"),
+            ],
+        );
+        cfg.pinned_account_ids = vec!["a1".to_string(), "a2".to_string(), "ghost".to_string()];
+        let err = ordered_pool(&cfg, Some("domestic")).unwrap_err();
+        assert!(err.contains("固定集合"), "err={err}");
+        assert!(err.contains("已禁用"), "err={err}");
+        assert!(err.contains("冷却中"), "err={err}");
+        assert!(err.contains("已删除"), "err={err}");
+    }
+
+    #[test]
+    fn pinned_set_empty_reports_actionable_error() {
+        let cfg = cfg_with(MM_MODE_PINNED, "", vec![acc("a1", "", "domestic", true, 0, "t1")]);
+        let err = ordered_pool(&cfg, Some("domestic")).unwrap_err();
+        assert!(err.contains("固定集合为空"), "err={err}");
     }
 
     #[test]

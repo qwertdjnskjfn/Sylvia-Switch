@@ -1,3 +1,79 @@
+## 1.0.45 — 2026-10-05
+
+### 新增：MiniMax **多账号固定集合**（同时固定多个 + 集合内换号 + 集合外永不参与）
+
+**需求**：先固定账号 1，再登录并固定账号 2，**两个账号同时处于固定状态**、可分别保存与管理。
+（此前 `pinned_account_id` 是**单值** → 固定账号 2 会覆盖账号 1，这正是缺口。）
+
+**语义（AAA 决策）**
+
+| 决策 | 选定 |
+| --- | --- |
+| 固定集合全不可用时 | **报可操作错**（不静默回落轮询） |
+| 集合内多号、某号失败时 | **集合内自动换号**（集合外账号永不参与） |
+| “退出登录”含义 | 浏览器里退出，不影响池内凭据（无需特殊处理） |
+
+**改动**
+
+| 层 | 内容 |
+| --- | --- |
+| 数据 | `MmConfig` += `pinned_account_ids: Vec<String>`（有序）；`pinned_account_id` 保留为**兼容字段 = 集合首元素**（save 双写）；新纯函数 `parse_pin_set()`（旧单值自动迁移）与 `normalize_pin_set()`（去重 + 剔除悬空 id） |
+| 选择 | `ordered_pool` 的 pinned 分支改为**按集合顺序**返回集合内可用账号；集合内跳过不可用者并逐项说明（已删除/已禁用/冷却中/凭据为空）；集合为空或全不可用 → 可操作报错 |
+| 换号 | `chat_once` 的 strict 判定改为「pinned 且集合只剩 1 个候选才严格」→ **集合内换号**；候选池恒等于「集合 ∩ 可用」，**越界禁止** |
+| 接口 | 新增 `POST /api/minimax/accounts/pin`（body: id + pinned 布尔，幂等增删）；`switch` 支持 ids 数组批量设定与排序；`config` 接受 pinnedAccountIds；`status` 暴露 pinnedAccountIds + 每账号 pinOrder |
+| 前端 | 账号卡片「固定 / 已固定 #n（点击取消）」切换；底部显示**固定集合摘要**（数量 + 顺序 + 名称） |
+
+**测试**：`cargo test -p wb-switch-core minimax` → **16 passed**（新增 6 个：单值迁移、去重+悬空清理、集合保序、集合内跳过不可用、集合全不可用报错、集合为空报错）。
+**验证**：见交付说明（双账号同时固定 → 集合内换号 → 集合外账号不参与 → 清空集合报错）。
+
+---
+
+## 1.0.43 — 2026-10-05
+
+### 🔧 全局：reqwest TLS 后端 rustls → native-tls（修 MiniMax 渠道答非所问）
+
+#### 症状
+MiniMax 渠道（`/minimax/v1/chat/completions`）无论问什么都返回固定问候语
+（`How can I help you today?`），或直接 503/529。**成功率 0/6。**
+
+#### 排查（逐项排除，实验驱动）
+| 假设 | 结论 | 证据 |
+| --- | --- | --- |
+| 端点错 | ❌ | `api.minimaxi.com/anthropic` 要官方 API key，不吃 OAuth token（401）|
+| payload 形状 | ❌ | 4 个模型直连**全部正常** |
+| `max_tokens:4096` | ❌ | 直连正常 |
+| `anthropic-version` header | ❌ | 4 种组合全部成功 |
+| Chrome `User-Agent` | ❌ | 4 种 UA 全部成功 |
+| content 格式（字符串 vs 数组）| ❌ | 4 种格式经网关都返回 in=21 |
+| `http1_only()` | ❌ | 实测 h1.1 仍 `in=21`，无效 |
+
+#### 🎯 真因：**TLS 实现不同 → ClientHello 指纹不同 → 上游区别对待**
+同一 IP / 同一 token / 同一 payload / 同一 header，仅换 HTTP 客户端：
+| 客户端 | TLS | 结果 |
+| --- | --- | --- |
+| Python urllib / curl | **OpenSSL** | ✅ 每次成功，`usage.input_tokens=41`，回答正确 |
+| **reqwest（本项目）** | **rustls** | ❌ `in=21`（恒定）或 503/529 |
+
+- 交替调用（直连✅/网关❌/直连✅/网关❌）⇒ **不是限流**，是请求本身被区别对待
+- `in_tokens` 恒定（21 vs 41）⇒ 上游对 rustls 请求**未按内容处理**
+
+#### 改动（1 行）
+```diff
+-reqwest = { version = 0.12, default-features = false, features = [json, rustls-tls, socks] }
++reqwest = { version = 0.12, default-features = false, features = [json, native-tls, socks] }
+```
+（`crates/wb-switch-core/Cargo.toml:10`；Windows 下 native-tls = SChannel，指纹更接近浏览器/curl）
+
+⚠️ **这是全局依赖变更**，影响所有渠道（workbuddy_proxy / kimi / glm_proxy / qoder / loomy…）。
+部署后已逐渠道冒烟验证。
+
+### 附：1.0.40 / 1.0.41 已修的两个真 bug（本次一并上线）
+| 版本 | 修复 |
+| --- | --- |
+| 1.0.40 | `model` 4 处硬编码 `MiniMax-M3.1-Flash-Preview` → 改用请求参数（`MiniMax-M3` 现正确回显）|
+| 1.0.40 | `api_minimax_chat` 的 prompt 提取只认字符串，**Anthropic 数组 content → prompt 恒空**；新增 `minimax_last_message_text()` 兼容两种形状 |
+| 1.0.41 | 新增 `chat_client()`（`http1_only()`）—— ⚠️ **基于错误假设，实测无效**，后续可回滚 |
+
 ## 1.0.42 — 2026-10-05
 
 ### 修复：MiniMax 换号集合纳入上游 **401**（账号 JWT 失效是最常见失败）

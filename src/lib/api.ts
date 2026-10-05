@@ -156,6 +156,8 @@ const ROUTES: Record<string, Route> = {
   remove_minimax_account: { method: "POST", path: "/api/minimax/accounts/remove" },
   enable_minimax_account: { method: "POST", path: "/api/minimax/accounts/enable" },
   switch_minimax_account: { method: "POST", path: "/api/minimax/accounts/switch" },
+  pin_minimax_account: { method: "POST", path: "/api/minimax/accounts/pin" },
+  clear_minimax_cooldown: { method: "POST", path: "/api/minimax/accounts/clear-cooldown" },
   run_minimax_signin: { method: "POST", path: "/api/minimax/signin/run" },
   capture_minimax_desktop: { method: "POST", path: "/api/minimax/desktop/capture" },
   save_glmplan_config: { method: "POST", path: "/api/glmplan/config" },
@@ -641,6 +643,14 @@ export async function enableMinimaxAccount(body: { id: string; enabled: boolean 
 
 export async function switchMinimaxAccount(body: { mode?: string; id?: string; region?: string }) {
   return call("switch_minimax_account", body);
+}
+
+export async function pinMinimaxAccount(body: { id: string; pinned: boolean }) {
+  return call("pin_minimax_account", body);
+}
+
+export async function clearMinimaxCooldown(body: { id?: string }) {
+  return call("clear_minimax_cooldown", body);
 }
 /** MiniMax 立即全量签到 */
 /** 从桌面端登录态导入 MiniMax 账号（只读共享） */

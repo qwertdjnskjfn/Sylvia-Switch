@@ -124,6 +124,8 @@ pub fn router() -> Router {
         .route("/api/minimax/accounts/remove", post(api_minimax_accounts_remove))
         .route("/api/minimax/accounts/enable", post(api_minimax_accounts_enable))
         .route("/api/minimax/accounts/switch", post(api_minimax_accounts_switch))
+        .route("/api/minimax/accounts/pin", post(api_minimax_accounts_pin))
+        .route("/api/minimax/accounts/clear-cooldown", post(api_minimax_accounts_clear_cooldown))
         .route("/api/minimax/signin/run", post(api_minimax_signin_run))
         .route("/api/minimax/test", post(api_minimax_test))
         .route("/api/minimax/desktop/discover", get(api_minimax_desktop_discover))
@@ -7986,7 +7988,7 @@ fn minimax_key_ok(headers: &HeaderMap) -> bool {
 
 async fn api_minimax_status() -> Response {
     let cfg = minimax::load_config();
-    let cfg_pin = cfg.pinned_account_id.clone();
+    let cfg_pins = cfg.pinned_account_ids.clone();
     let accounts: Vec<Value> = cfg
         .accounts
         .iter()
@@ -8007,7 +8009,8 @@ async fn api_minimax_status() -> Response {
                 // 2026-10-05：熔断计数（连续失败，成功清零），供前端展示
                 "failStreak": a.fail_streak,
                 "isLocal": a.source == "desktop",
-                "pinned": cfg_pin == a.id,
+                "pinned": cfg_pins.iter().any(|x| x == &a.id),
+                "pinOrder": cfg_pins.iter().position(|x| x == &a.id),
             })
         })
         .collect();
@@ -8017,6 +8020,7 @@ async fn api_minimax_status() -> Response {
         "apiKey": cfg.api_key,
         // 2026-10-05：多账号选号模式（前端据此渲染策略按钮）
         "accountMode": cfg.account_mode,
+        "pinnedAccountIds": cfg.pinned_account_ids,
         "pinnedAccountId": cfg.pinned_account_id,
         "defaultModel": "MiniMax-M3.1-Flash-Preview",
         "models": minimax::desktop_models().as_array().cloned().unwrap_or_default().iter().filter_map(Value::as_str).map(String::from).collect::<Vec<_>>(),
@@ -8045,13 +8049,81 @@ async fn api_minimax_config_save(Json(body): Json<Value>) -> Response {
         cfg.account_mode = minimax::normalize_account_mode(m);
     }
     if let Some(id) = body.get("pinnedAccountId").and_then(Value::as_str) {
-        cfg.pinned_account_id = id.to_string();
+        let id = id.trim().to_string();
+        cfg.pinned_account_ids = if id.is_empty() { Vec::new() } else { vec![id.clone()] };
+        cfg.pinned_account_id = id;
+    }
+    if let Some(arr) = body.get("pinnedAccountIds").and_then(Value::as_array) {
+        let ids: Vec<String> = arr
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|x| !x.is_empty())
+            .map(String::from)
+            .collect();
+        cfg.pinned_account_id = ids.first().cloned().unwrap_or_default();
+        cfg.pinned_account_ids = ids;
     }
     minimax::save_config(&cfg);
     json_ok(json!({
         "ok": true,
         "accountMode": cfg.account_mode,
         "pinnedAccountId": cfg.pinned_account_id,
+    }))
+}
+
+/// POST /api/minimax/accounts/clear-cooldown：**手动解除冷却**（2026-10-05）。
+///
+/// body: `{ id?: <accountId> }`（缺省 = 解除全部账号）
+/// 场景：唯一账号被上游限流后进了冷却，但用户希望立即重试；或页面显示"冷却中"想手动恢复。
+/// 同时清 `fail_streak` 与 `last_error`（等价于"重新开始计数"）。
+async fn api_minimax_accounts_clear_cooldown(Json(body): Json<Value>) -> Response {
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let cleared = minimax::clear_cooldown(&id);
+    json_ok(json!({ "ok": true, "cleared": cleared, "scope": if id.is_empty() { "all" } else { "one" } }))
+}
+
+/// POST /api/minimax/accounts/pin：**固定集合**的幂等增删（2026-10-05，支撑“同时固定多个账号”）。
+///
+/// body: `{ id: <accountId>, pinned: true|false }`
+/// - `pinned=true`  → 追加到固定集合末尾（已存在则保持原位置，幂等）；不改选号模式
+/// - `pinned=false` → 从固定集合移出（幂等）
+/// 返回更新后的集合与顺序；集合为空时**不会**自动切模式（由调用方决定）。
+async fn api_minimax_accounts_pin(Json(body): Json<Value>) -> Response {
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    if id.is_empty() {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let want = body.get("pinned").and_then(Value::as_bool).unwrap_or(true);
+    let mut cfg = minimax::load_config();
+    if !cfg.accounts.iter().any(|a| a.id == id) {
+        return json_err("账号不存在（可能已删除）".to_string(), StatusCode::NOT_FOUND);
+    }
+    let before = cfg.pinned_account_ids.len();
+    if want {
+        if !cfg.pinned_account_ids.iter().any(|x| x == &id) {
+            cfg.pinned_account_ids.push(id.clone());
+        }
+    } else {
+        cfg.pinned_account_ids.retain(|x| x != &id);
+    }
+    cfg.pinned_account_id = cfg.pinned_account_ids.first().cloned().unwrap_or_default();
+    minimax::save_config(&cfg);
+    let label = cfg
+        .accounts
+        .iter()
+        .find(|a| a.id == id)
+        .map(|a| a.label.clone())
+        .unwrap_or_default();
+    json_ok(json!({
+        "ok": true,
+        "id": id,
+        "label": label,
+        "pinned": cfg.pinned_account_ids.iter().any(|x| x == &id),
+        "changed": cfg.pinned_account_ids.len() != before || !want,
+        "pinnedAccountIds": cfg.pinned_account_ids,
+        "pinnedAccountId": cfg.pinned_account_id,
+        "accountMode": cfg.account_mode,
     }))
 }
 
@@ -8072,7 +8144,32 @@ async fn api_minimax_accounts_switch(Json(body): Json<Value>) -> Response {
             if !cfg.accounts.iter().any(|a| a.id == id) {
                 return json_err("账号不存在（可能已删除）".to_string(), StatusCode::NOT_FOUND);
             }
+            // 单值语义（兼容）：把集合收敛为这一个账号
+            cfg.pinned_account_ids = vec![id.to_string()];
             cfg.pinned_account_id = id.to_string();
+            cfg.account_mode = minimax::MM_MODE_PINNED.to_string();
+        }
+    }
+    // 批量语义（2026-10-05）：{ids:[...]} 直接设定固定集合及其顺序
+    if let Some(arr) = body.get("ids").and_then(Value::as_array) {
+        let mut ids: Vec<String> = Vec::new();
+        for v in arr {
+            let Some(id) = v.as_str().map(str::trim).filter(|x| !x.is_empty()) else {
+                continue;
+            };
+            if !cfg.accounts.iter().any(|a| a.id == id) {
+                return json_err(
+                    format!("账号不存在（可能已删除）：{id}"),
+                    StatusCode::NOT_FOUND,
+                );
+            }
+            if !ids.iter().any(|x| x == id) {
+                ids.push(id.to_string());
+            }
+        }
+        cfg.pinned_account_ids = ids;
+        cfg.pinned_account_id = cfg.pinned_account_ids.first().cloned().unwrap_or_default();
+        if !cfg.pinned_account_ids.is_empty() {
             cfg.account_mode = minimax::MM_MODE_PINNED.to_string();
         }
     }
@@ -8090,6 +8187,7 @@ async fn api_minimax_accounts_switch(Json(body): Json<Value>) -> Response {
     json_ok(json!({
         "ok": true,
         "accountMode": cfg.account_mode,
+        "pinnedAccountIds": cfg.pinned_account_ids,
         "pinnedAccountId": cfg.pinned_account_id,
         "activeAccount": active.as_ref().map(|a| json!({"id": a.id, "label": a.label, "region": a.region, "source": a.source})),
         "candidates": candidates,

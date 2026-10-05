@@ -35,6 +35,8 @@ type MmAccount = {
   usable?: boolean;
   isLocal?: boolean;
   pinned?: boolean;
+  // 固定集合内的顺序（0 起；null/undefined = 未固定）
+  pinOrder?: number | null;
   balance?: number | null;
   creditConsumed?: number | null;
   balanceAt?: number | null;
@@ -49,6 +51,8 @@ type MmStatus = {
   // 2026-10-05：选号模式（多账号切换）
   accountMode?: string;
   pinnedAccountId?: string;
+  // 固定集合（有序，可同时多个）
+  pinnedAccountIds?: string[];
   chatExperimental: boolean;
   endpoint: string;
   payloadTemplate: string;
@@ -136,8 +140,22 @@ export default function MiniMaxPage() {
   async function act(name: string, body: Record<string, unknown>, okText: string): Promise<unknown> {
     setBusy(name);
     try {
-      // 动态 id 操作前缀拦截：probe:<id> / remove:<id> / enable:<id>
+      // 动态 id 操作前缀拦截：probe:<id> / remove:<id> / enable:<id> / pin:<id>
       const prefix = (pre: string) => name === pre || name.startsWith(pre + ":");
+      if (prefix("clearCooldown")) {
+        const id = name.slice("clearCooldown:".length);
+        await api.clearMinimaxCooldown({ id });
+        setMsg({ type: "ok", text: "已解除冷却，可立即重试" });
+        await refresh();
+        return null;
+      }
+      if (prefix("pin")) {
+        const res = await api.pinMinimaxAccount(body as { id: string; pinned: boolean });
+        void res;
+        setMsg({ type: "ok", text: okText });
+        await refresh();
+        return null;
+      }
       if (prefix("probe")) {
         const id = name.slice("probe:".length);
         const res = await fetch("/api/minimax/probe", {
@@ -160,6 +178,9 @@ export default function MiniMaxPage() {
         enableMinimaxAccount: () => api.enableMinimaxAccount(body as { id: string; enabled: boolean }),
         // 2026-10-05：切换账号 / 选号策略（多账号支持）
         switchAccount: () => api.switchMinimaxAccount(body as { mode?: string; id?: string }),
+        // 2026-10-05：固定集合增删（幂等；支持同时固定多个）
+        pinAccount: () => api.pinMinimaxAccount(body as { id: string; pinned: boolean }),
+        clearCooldown: () => api.clearMinimaxCooldown(body as { id?: string }),
         "probe": async () => {
           const res = await fetch("/api/minimax/probe", {
             method: "POST",
@@ -401,15 +422,33 @@ export default function MiniMaxPage() {
                     签到 {a.signinLastDate ? a.signinLastDate : "未签"} · 累计签到 {a.signinPointsTotal} 分
                   </Badge>
                   {a.lastError ? <span className="min-w-0 flex-1 truncate text-[11px] text-destructive">{a.lastError}</span> : <span className="flex-1" />}
+                  {a.cooldown ? (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-6 px-2 text-[10px]"
+                      disabled={busy === `clearCooldown:${a.id}`}
+                      onClick={() => void act(`clearCooldown:${a.id}`, {}, "已解除冷却，可立即重试")}
+                      title="清除冷却计数与错误，立即允许再次使用该账号"
+                    >
+                      解除冷却
+                    </Button>
+                  ) : null}
                   <Button
                     variant={a.pinned ? "default" : "outline"}
                     size="sm"
                     className="h-6 px-2 text-[10px]"
-                    disabled={busy === "switchAccount" || a.pinned}
-                    onClick={() => void act("switchAccount", { id: a.id }, `已把「${a.label}」设为当前账号（选号策略=固定账号）`)}
-                    title="切换到这个账号：此后请求只用它（严格，失败不换号）"
+                    disabled={busy === `pin:${a.id}`}
+                    onClick={() =>
+                      void act(
+                        `pin:${a.id}`,
+                        { id: a.id, pinned: !a.pinned },
+                        a.pinned ? `已把「${a.label}」移出固定集合` : `已把「${a.label}」加入固定集合（可继续固定其他账号）`,
+                      )
+                    }
+                    title={a.pinned ? "点击取消固定（从固定集合移出）" : "加入固定集合：可同时固定多个账号，集合内有顺序"}
                   >
-                    设为当前
+                    {a.pinned ? `已固定${typeof a.pinOrder === "number" ? ` #${a.pinOrder + 1}` : ""}` : "固定"}
                   </Button>
                   <Button
                     variant="outline"
@@ -474,8 +513,15 @@ export default function MiniMaxPage() {
               ))}
               <span className="text-[11px] text-muted-foreground">
                 {status.accountMode === "pinned"
-                  ? `当前固定：${status.accounts.find((x) => x.id === status.pinnedAccountId)?.label || "未指定"}`
-                  : "多账号同时可用：按策略依次取号"}
+                  ? (() => {
+                      const ids = status.pinnedAccountIds || [];
+                      if (!ids.length) return "固定集合为空：请先点账号卡片上的「固定」";
+                      const labels = ids.map(
+                        (id) => status.accounts.find((x) => x.id === id)?.label || id,
+                      );
+                      return `固定集合 ${ids.length} 个：${labels.map((l, i) => `${i + 1}.${l}`).join("  ")}`;
+                    })()
+                  : `多账号同时可用：按策略依次取号${(status.pinnedAccountIds || []).length ? `（已固定 ${(status.pinnedAccountIds || []).length} 个，切到「固定账号」即只用它们）` : ""}`}
               </span>
             </div>
             <Button size="sm" disabled={busy === "signin" || !status.enabled} onClick={() => void runSignin()}>
