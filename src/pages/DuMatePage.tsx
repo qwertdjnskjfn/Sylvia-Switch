@@ -5,10 +5,15 @@ import {
   CircleAlert,
   CircleCheck,
   Coins,
+  Download,
   Info,
   Loader2,
+  Pencil,
+  Plus,
   RefreshCw,
   Send,
+  Trash2,
+  Users,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -28,6 +33,7 @@ import { useRefreshAllListener } from "@/lib/refresh-all";
 import type {
   DumateCheckinStatus,
   DumateCredits,
+  DumatePoolAccount,
   DumatePointsPackage,
   DumateStatus,
 } from "@/lib/types";
@@ -102,6 +108,29 @@ function dayKey(d: Date): string {
   return `${y}-${m}-${day}`;
 }
 
+/** 池账号登录态徽标（契约 §1.1 status：ok | expired | unknown）。 */
+function PoolStatusBadge({ status }: { status?: string }) {
+  if (status === "ok") {
+    return (
+      <Badge variant="success" className="text-[10px]">
+        <CircleCheck />正常
+      </Badge>
+    );
+  }
+  if (status === "expired") {
+    return (
+      <Badge variant="destructive" className="text-[10px]">
+        已失效
+      </Badge>
+    );
+  }
+  return (
+    <Badge variant="outline" className="text-[10px] text-muted-foreground">
+      未知
+    </Badge>
+  );
+}
+
 export default function DuMatePage() {
   const [status, setStatus] = useState<DumateStatus | null>(null);
   const [credits, setCredits] = useState<DumateCredits | null>(null);
@@ -115,6 +144,17 @@ export default function DuMatePage() {
   const [testPrompt, setTestPrompt] = useState("只回复四个字：测试成功");
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<api.DumateTestChatResult | null>(null);
+
+  // 多账号池（契约 §1：多账号仅用于签到/积分，一号一 IP；模型调用仍走本机主账号）
+  const [poolAccounts, setPoolAccounts] = useState<DumatePoolAccount[]>([]);
+  const [poolError, setPoolError] = useState<string | null>(null);
+  const [addOpen, setAddOpen] = useState(false);
+  const [addName, setAddName] = useState("");
+  const [addCookies, setAddCookies] = useState("");
+  const [addProxy, setAddProxy] = useState("");
+  const [adding, setAdding] = useState(false);
+  /** 行内编辑代理：{ 账号 id, 输入框当前值 }；null = 无编辑中的行 */
+  const [proxyEdit, setProxyEdit] = useState<{ id: string; value: string } | null>(null);
 
   const loadCore = useCallback(async () => {
     const [st, cr, ck] = await Promise.allSettled([
@@ -143,9 +183,20 @@ export default function DuMatePage() {
     }
   }, []);
 
+  /** 多账号池列表（失败落 poolError，行内展示，不打断其他卡片）。 */
+  const loadPool = useCallback(async () => {
+    try {
+      const res = await api.getDumateAccounts();
+      setPoolAccounts(res.accounts);
+      setPoolError(null);
+    } catch (e) {
+      setPoolError(api.asError(e));
+    }
+  }, []);
+
   const loadAll = useCallback(async () => {
-    await Promise.all([loadCore(), loadConfig()]);
-  }, [loadCore, loadConfig]);
+    await Promise.all([loadCore(), loadConfig(), loadPool()]);
+  }, [loadCore, loadConfig, loadPool]);
 
   useEffect(() => {
     // 初次加载静默失败（后端未就绪时呈现空态，不打扰）
@@ -156,13 +207,13 @@ export default function DuMatePage() {
     });
   }, [loadAll]);
 
-  // 定时轮询：桌面端/引擎/积分可能在本页打开后变化，30s 自动同步一次（对齐妙手页轮询风格）。
+  // 定时轮询：桌面端/引擎/积分/账号池可能在本页打开后变化，30s 自动同步一次（对齐妙手页轮询风格）。
   useEffect(() => {
     const t = window.setInterval(() => {
-      void loadCore().catch(() => undefined);
+      void Promise.all([loadCore(), loadPool()]).catch(() => undefined);
     }, 30000);
     return () => window.clearInterval(t);
-  }, [loadCore]);
+  }, [loadCore, loadPool]);
 
   async function refresh() {
     setBusy("refresh");
@@ -202,6 +253,133 @@ export default function DuMatePage() {
       }
       // 签到后重拉签到状态与积分（+500 到账）
       await loadCore().catch(() => undefined);
+    } catch (e) {
+      toast.error(api.asError(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  /** 导入本机客户端登录态为池账号（后端按 bce-user-info 去重，重复直接报错）。 */
+  async function runImportClient() {
+    setBusy("pool-import");
+    try {
+      const res = await api.importDumateClient();
+      toast.success(res.message || "已导入本机登录态");
+      await Promise.all([loadPool(), loadCore()]).catch(() => undefined);
+    } catch (e) {
+      toast.error(api.asError(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  /** 添加池账号：客户端先校验 cookies JSON（数组或 {cookies:[...]}，逐条 name/value 非空）。 */
+  async function runAddAccount() {
+    const name = addName.trim();
+    const text = addCookies.trim();
+    if (!name) {
+      toast.error("请填写账号名称");
+      return;
+    }
+    if (!text) {
+      toast.error("请粘贴 cookies JSON");
+      return;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      toast.error("cookies JSON 解析失败：请粘贴完整的 JSON 数组或 {\"cookies\":[...]}");
+      return;
+    }
+    const list = Array.isArray(parsed)
+      ? parsed
+      : parsed && typeof parsed === "object" && Array.isArray((parsed as { cookies?: unknown }).cookies)
+        ? (parsed as { cookies: unknown[] }).cookies
+        : null;
+    if (!list || list.length === 0) {
+      toast.error('未识别到 cookie 列表：支持 JSON 数组或 {"cookies":[...]}');
+      return;
+    }
+    const bad = list.findIndex((c) => {
+      if (!c || typeof c !== "object") return true;
+      const o = c as { name?: unknown; value?: unknown };
+      return typeof o.name !== "string" || !o.name || typeof o.value !== "string" || !o.value;
+    });
+    if (bad >= 0) {
+      toast.error(`第 ${bad + 1} 条 cookie 缺少非空的 name / value 字段`);
+      return;
+    }
+    setAdding(true);
+    try {
+      await api.addDumateAccount({
+        name,
+        cookies: parsed,
+        proxy: addProxy.trim(),
+        note: "",
+      });
+      toast.success(`已添加账号「${name}」`);
+      setAddName("");
+      setAddCookies("");
+      setAddProxy("");
+      setAddOpen(false);
+      await loadPool();
+    } catch (e) {
+      toast.error(api.asError(e));
+    } finally {
+      setAdding(false);
+    }
+  }
+
+  /** 池账号/本机账号单账号签到（dumate:local 与 dumate:pool_* 都走 /api/dumate/account/checkin）。 */
+  async function runPoolCheckin(acc: DumatePoolAccount) {
+    setBusy(`pool-checkin:${acc.id}`);
+    try {
+      const res = await api.dumateAccountCheckin(acc.id);
+      if (res.result === "already") {
+        toast.info(res.message || `「${acc.name}」今日已签到`);
+      } else if (res.result === "success") {
+        toast.success(
+          res.message || `「${acc.name}」签到成功${res.points != null ? `，+${res.points} 积分` : ""}`,
+        );
+      } else {
+        toast.error(res.message || res.error || `「${acc.name}」签到失败`);
+      }
+      // 签到后刷新账号列表（lastCheckinDay/状态/积分缓存）与本机积分卡
+      await Promise.all([loadPool(), loadCore()]).catch(() => undefined);
+    } catch (e) {
+      toast.error(api.asError(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  /** 保存行内编辑的出站代理（空串 = 直连；仅池账号）。 */
+  async function runSaveProxy(acc: DumatePoolAccount) {
+    const proxy = (proxyEdit?.id === acc.id ? proxyEdit.value : acc.proxy ?? "").trim();
+    setBusy(`pool-proxy:${acc.id}`);
+    try {
+      await api.updateDumateAccount({ id: acc.id, proxy });
+      toast.success(proxy ? `「${acc.name}」代理已更新` : `「${acc.name}」已清除代理（直连）`);
+      setProxyEdit(null);
+      await loadPool();
+    } catch (e) {
+      toast.error(api.asError(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  /** 删除池账号（本机账号不可删，按钮已隐藏）。 */
+  async function runRemoveAccount(acc: DumatePoolAccount) {
+    if (!window.confirm(`确定删除账号「${acc.name}」？删除后不可恢复。`)) return;
+    setBusy(`pool-remove:${acc.id}`);
+    try {
+      await api.removeDumateAccount(acc.id);
+      toast.success(`已删除「${acc.name}」`);
+      if (proxyEdit?.id === acc.id) setProxyEdit(null);
+      await loadPool();
     } catch (e) {
       toast.error(api.asError(e));
     } finally {
@@ -291,7 +469,8 @@ export default function DuMatePage() {
         <div className="min-w-0">
           <h1 className="text-[28px] font-semibold tracking-tight">DuMate（百度搭子）</h1>
           <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
-            百度桌面 AI 办公智能体渠道：每日签到（+500 积分）、积分余额查询，以及内嵌
+            百度桌面 AI 办公智能体渠道：每日签到（+500 积分）、多账号签到（一号一 IP）、积分余额查询，
+            以及内嵌
             OpenCode 引擎的 <code className="rounded bg-muted px-1">/dumate/v1</code> OpenAI 兼容模型网关。
             引擎由 DuMate 客户端自行启动，本页只读报告其状态。
           </p>
@@ -638,6 +817,225 @@ export default function DuMatePage() {
               </>
             )}
           </CardContent>
+        </Card>
+      </section>
+
+      {/* 卡 3.5：多账号池（契约 unified-accounts-contract §1/§4.3；多账号仅用于签到/积分） */}
+      <section className="mt-10 min-w-0 space-y-2.5" aria-label="多账号">
+        <div className="px-1">
+          <h2 className="text-[13px] font-medium leading-5">多账号</h2>
+          <p className="mt-0.5 text-xs text-muted-foreground">
+            多账号用于每日签到与积分查询（一号一独立出站 IP，降低同 IP 关联风控）；
+            模型调用引擎绑定 DuMate 桌面端当前登录用户，仍走本机主账号
+          </p>
+        </div>
+        <Card className="min-w-0 gap-0 overflow-hidden rounded-xl py-0 shadow-none">
+          {/* 工具条：导入本机登录态 / 添加账号 */}
+          <div className="flex min-w-0 flex-wrap items-center justify-between gap-2 px-4 py-3 sm:px-5">
+            <div className="flex min-w-0 items-center gap-2">
+              <Users className="size-4 shrink-0 text-muted-foreground" />
+              <span className="text-sm font-medium">账号池（{poolAccounts.length}）</span>
+              {poolError ? (
+                <Badge variant="destructive" className="text-[10px]">
+                  加载失败
+                </Badge>
+              ) : null}
+            </div>
+            <div className="flex shrink-0 items-center gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => void runImportClient()}
+                disabled={busy === "pool-import"}
+                title="把本机 DuMate 客户端当前登录的百度账号导入账号池（与既有账号同一登录态时会提示）"
+              >
+                {busy === "pool-import" ? <Loader2 className="animate-spin" /> : <Download />}
+                导入本机登录态
+              </Button>
+              <Button
+                size="sm"
+                variant={addOpen ? "secondary" : "outline"}
+                onClick={() => setAddOpen((v) => !v)}
+              >
+                <Plus />
+                {addOpen ? "收起" : "添加账号"}
+              </Button>
+            </div>
+          </div>
+
+          {/* 添加账号（折叠表单：名称 / cookies JSON / 代理 URL） */}
+          {addOpen ? (
+            <div className="space-y-3 border-t border-border/50 bg-muted/30 px-4 py-4 sm:px-5">
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div>
+                  <label className="text-xs font-medium text-muted-foreground">账号名称</label>
+                  <Input
+                    className="mt-1"
+                    placeholder="如：二号机"
+                    value={addName}
+                    onChange={(e) => setAddName(e.target.value)}
+                  />
+                </div>
+                <div>
+                  <label className="text-xs font-medium text-muted-foreground">
+                    出站代理 URL（一号一 IP，可选）
+                  </label>
+                  <Input
+                    className="mt-1"
+                    placeholder="http:// 或 socks5://，留空 = 直连"
+                    value={addProxy}
+                    onChange={(e) => setAddProxy(e.target.value)}
+                  />
+                </div>
+              </div>
+              <div>
+                <label className="text-xs font-medium text-muted-foreground">
+                  Cookies JSON（浏览器 DevTools 导出的百度登录 cookie）
+                </label>
+                <textarea
+                  rows={4}
+                  placeholder='[{"name":"...","value":"...","domain":"..."},...] 或 {"cookies":[...]}'
+                  value={addCookies}
+                  onChange={(e) => setAddCookies(e.target.value)}
+                  className="mt-1 block w-full rounded-md border border-input bg-background p-2.5 font-mono text-xs shadow-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+                />
+              </div>
+              <div className="flex items-center gap-2">
+                <Button size="sm" onClick={() => void runAddAccount()} disabled={adding}>
+                  {adding ? <Loader2 className="animate-spin" /> : <Plus />}保存账号
+                </Button>
+                <Button size="sm" variant="ghost" onClick={() => setAddOpen(false)}>
+                  取消
+                </Button>
+              </div>
+            </div>
+          ) : null}
+
+          {/* 账号列表：name / 状态 / 最近签到日 / cookie 数 / 代理 + 行内操作 */}
+          <div className="divide-y divide-border/50 border-t border-border/50">
+            {poolAccounts.length === 0 ? (
+              <p className="px-4 py-6 text-center text-sm text-muted-foreground sm:px-5">
+                {poolError
+                  ? `账号池加载失败：${poolError}`
+                  : "暂无账号。点「导入本机登录态」或「添加账号」开始（多账号仅用于签到/积分）。"}
+              </p>
+            ) : (
+              poolAccounts.map((acc) => {
+                const checkingIn = busy === `pool-checkin:${acc.id}`;
+                const savingProxy = busy === `pool-proxy:${acc.id}`;
+                const removing = busy === `pool-remove:${acc.id}`;
+                return (
+                  <div
+                    key={acc.id}
+                    className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-2 px-4 py-2.5 sm:px-5"
+                  >
+                    <div className="flex min-w-0 items-center gap-2">
+                      <span className="max-w-[180px] truncate text-xs font-medium">
+                        {acc.name || acc.id}
+                      </span>
+                      {acc.isLocal ? (
+                        <Badge variant="secondary" className="text-[10px]">
+                          本机
+                        </Badge>
+                      ) : null}
+                      <PoolStatusBadge status={acc.status} />
+                    </div>
+                    <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
+                      <span>最近签到 {acc.lastCheckinDay || "—"}</span>
+                      <span>cookies {acc.cookieCount ?? 0}</span>
+                      <span className="max-w-[240px] truncate">
+                        {acc.proxy ? `代理 ${acc.proxy}` : "直连"}
+                      </span>
+                      {acc.credits?.availablePoints != null ? (
+                        <span>可用 {fmtPoints(acc.credits.availablePoints)}</span>
+                      ) : null}
+                    </div>
+                    <div className="ml-auto flex shrink-0 items-center gap-1.5">
+                      {proxyEdit?.id === acc.id ? (
+                        <>
+                          <Input
+                            className="h-7 w-48 text-xs"
+                            placeholder="http:// 或 socks5://，留空直连"
+                            value={proxyEdit.value}
+                            onChange={(e) => setProxyEdit({ id: acc.id, value: e.target.value })}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter" && !e.nativeEvent.isComposing)
+                                void runSaveProxy(acc);
+                            }}
+                          />
+                          <Button
+                            size="sm"
+                            className="h-7 px-2 text-xs"
+                            onClick={() => void runSaveProxy(acc)}
+                            disabled={savingProxy}
+                          >
+                            {savingProxy ? <Loader2 className="animate-spin" /> : null}保存
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="h-7 px-2 text-xs"
+                            onClick={() => setProxyEdit(null)}
+                          >
+                            取消
+                          </Button>
+                        </>
+                      ) : (
+                        <>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-7 px-2 text-xs"
+                            onClick={() => void runPoolCheckin(acc)}
+                            disabled={checkingIn}
+                            title={
+                              acc.isLocal
+                                ? "本机账号签到（与「每日签到」卡同款幂等逻辑）"
+                                : "以该账号的 cookies 与代理签到（幂等，今日已领不重复加积分）"
+                            }
+                          >
+                            {checkingIn ? <Loader2 className="animate-spin" /> : <CalendarCheck />}
+                            签到
+                          </Button>
+                          {!acc.isLocal ? (
+                            <>
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                className="h-7 px-2 text-xs"
+                                onClick={() => setProxyEdit({ id: acc.id, value: acc.proxy ?? "" })}
+                              >
+                                <Pencil />
+                                编辑代理
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                className="h-7 px-2 text-xs text-destructive hover:text-destructive"
+                                onClick={() => void runRemoveAccount(acc)}
+                                disabled={removing}
+                              >
+                                {removing ? <Loader2 className="animate-spin" /> : <Trash2 />}
+                                删除
+                              </Button>
+                            </>
+                          ) : null}
+                        </>
+                      )}
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </div>
+
+          <div className="border-t border-border/50 px-4 py-3 sm:px-5">
+            <p className="flex items-start gap-1.5 text-[11px] leading-5 text-muted-foreground">
+              <Info className="mt-0.5 size-3.5 shrink-0" />
+              多账号仅用于签到与积分查询（每个账号可配独立出站代理，实现一号一 IP）；模型调用不支持多账号——
+              内嵌引擎绑定 DuMate 桌面端当前登录用户，仍走本机主账号。
+            </p>
+          </div>
         </Card>
       </section>
 

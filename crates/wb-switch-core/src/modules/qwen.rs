@@ -130,7 +130,7 @@ pub fn parse_jwt_payload(token: &str) -> Option<Value> {
         return None;
     }
     let mut payload_b64 = parts[1].replace('-', "+").replace('_', "/");
-    while payload_b64.len() % 4 != 0 {
+    while !payload_b64.len().is_multiple_of(4) {
         payload_b64.push('=');
     }
     let decoded = general_purpose::STANDARD.decode(payload_b64).ok()?;

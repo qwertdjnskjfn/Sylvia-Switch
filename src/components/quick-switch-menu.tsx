@@ -13,7 +13,6 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import * as api from "@/lib/api";
-import { maskEmail, maskIdentity } from "@/lib/account-extras";
 import type { AccountMeta } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -42,7 +41,6 @@ interface Props {
   /** 打开完整切换弹窗（仅本地 WorkBuddy 账号有） */
   onAdvanced?: (account: AccountMeta) => void;
   disabled?: boolean;
-  privacyMask?: boolean;
   /** 紧凑样式（卡片 compact 模式） */
   compact?: boolean;
 }
@@ -59,11 +57,9 @@ function isCurrent(account: AccountMeta, current: Props["current"], platform?: s
   );
 }
 
-function displayName(account: AccountMeta, privacyMask: boolean): string {
-  const raw = account.nickname || account.email || account.uid || "未命名账号";
-  if (!privacyMask) return raw;
-  if (account.email) return maskEmail(account.email) || maskIdentity(account.nickname || "");
-  return maskIdentity(raw);
+/** 直显完整名称（无隐私遮罩，契约 docs/unified-accounts-contract.md §3）。 */
+function displayName(account: AccountMeta): string {
+  return account.nickname || account.email || account.uid || "未命名账号";
 }
 
 /**
@@ -79,7 +75,6 @@ export function QuickSwitchMenu({
   onDone,
   onAdvanced,
   disabled = false,
-  privacyMask = false,
   compact = false,
 }: Props) {
   const [switchingId, setSwitchingId] = useState<string | null>(null);
@@ -100,7 +95,7 @@ export function QuickSwitchMenu({
     if (switchingId) return;
     setSwitchingId(target.id);
     setError(null);
-    const nickname = displayName(target, false);
+    const nickname = displayName(target);
     try {
       if (platform) {
         const res = await api.switchPlatformAccount(
@@ -142,8 +137,8 @@ export function QuickSwitchMenu({
     ? `切换到该 ${platformLabel} 账号（会重启 ${platformLabel} 客户端）`
     : "选择一个账号直接切换（会重启 WorkBuddy）";
   /** 平台账号名带「平台 · 」前缀，下拉里去掉避免拥挤。 */
-  const shortName = (account: AccountMeta, masked: boolean) => {
-    const text = displayName(account, masked);
+  const shortName = (account: AccountMeta) => {
+    const text = displayName(account);
     return platformLabel ? text.replace(`${platformLabel} · `, "") : text;
   };
 
@@ -185,8 +180,8 @@ export function QuickSwitchMenu({
         <div className="flex items-center justify-between gap-2 px-2 py-1.5 text-xs font-normal text-muted-foreground">
           <span>一键切换{platformLabel ? `（${platformLabel}）` : "账号"}</span>
           {currentAccount ? (
-            <span className="min-w-0 truncate" title={displayName(currentAccount, privacyMask)}>
-              当前：{shortName(currentAccount, privacyMask)}
+            <span className="min-w-0 truncate" title={displayName(currentAccount)}>
+              当前：{shortName(currentAccount)}
             </span>
           ) : (
             <span className="text-amber-600">未检测到当前账号</span>
@@ -203,7 +198,7 @@ export function QuickSwitchMenu({
         ) : (
           targets.map((target) => {
             const busy = switchingId === target.id;
-            const name = shortName(target, privacyMask);
+            const name = shortName(target);
             const expired = typeof target.expiresAt === "number" && target.expiresAt < Date.now();
             return (
               <DropdownMenuItem

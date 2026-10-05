@@ -2195,7 +2195,7 @@ fn errored_uids_from_json(text: &str) -> HashSet<String> {
             account_platform(acc) == PLATFORM_WORKBUDDY
                 && acc.get("status").and_then(Value::as_str) == Some("error")
         })
-        .filter_map(|acc| account_uid(acc))
+        .filter_map(account_uid)
         .collect()
 }
 

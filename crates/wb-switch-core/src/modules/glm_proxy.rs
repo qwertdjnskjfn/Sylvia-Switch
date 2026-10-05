@@ -466,6 +466,26 @@ async fn send_once(
         .map_err(|e| format!("AutoClaw 网关请求失败: {e}"))
 }
 
+/// 1.5.0：账号健康探测（autoclaw_watch 专用）——最小 chat 请求，返回 (状态码, 响应原文)。
+/// 不走账号池/缓存/重试，纯单次直连，用于区分封禁(410004)/额度(810001)/登录态(401)。
+pub async fn probe_account_chat(region_str: &str, token: &str) -> (u16, String) {
+    let region = AccountRegion::from_str(region_str).unwrap_or(AccountRegion::Domestic);
+    let payload = json!({
+        "model": "glm-5.3",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "stream": false,
+        "max_tokens": 16,
+    });
+    match send_once(&payload, token, "zaicoding_glm-5.3", region).await {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let text = resp.text().await.unwrap_or_default();
+            (status, text)
+        }
+        Err(e) => (0, e),
+    }
+}
+
 /// 轮询计数：多账号时按请求轮换。
 static POOL_CURSOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -607,6 +627,20 @@ async fn try_send_for_account(
     }
     if resp.status() == reqwest::StatusCode::FORBIDDEN {
         let text = resp.text().await.unwrap_or_default();
+        // 1.4.2：上游封禁（410004/banned/封禁）落 12h 冷却并透出——此前直接
+        // 透传错误不留痕（账号 lastError 恒空、页面/渠道健康看不到封禁）。
+        if text.contains("410004") || text.contains("banned") || text.contains("封禁") {
+            let prot_cfg = crate::modules::account_protection::load_protection_config();
+            if prot_cfg.enabled {
+                crate::modules::account_protection::mark_account_cooling(
+                    &account.id,
+                    &account.label,
+                    "上游 403 封禁（410004）",
+                    720,
+                );
+            }
+            return Err(error_text(reqwest::StatusCode::FORBIDDEN, &text));
+        }
         if !(text.contains("繁忙") || text.contains("稍后重试")) {
             return Err(error_text(reqwest::StatusCode::FORBIDDEN, &text));
         }
@@ -1012,7 +1046,7 @@ pub(crate) fn record_and_notify_failure(
     crate::modules::notify::notify(
         "glm-proxy",
         "GLM 代理调用异常",
-        &format!("{error}"),
+        &error.to_string(),
     );
 }
 

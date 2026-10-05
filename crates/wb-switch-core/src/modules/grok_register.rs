@@ -603,7 +603,7 @@ fn next_register_account_id(existing_ids: &[String]) -> String {
 /// - 抓到的 sso 与池里某账号相同 → 原位刷新该账号（反复抓取同一登录不堆重复）；
 /// - 抓到的 sso 是新登录 → **新建独立账号**（`grok_register` 空位优先，其后
 ///   `grok_register_2…`），支持逐个注册多个账号批量入池。
-/// 依旧**不要**改用 `grok::import_account`：它随机 ID 且完全不去重。
+///   依旧**不要**改用 `grok::import_account`：它随机 ID 且完全不去重。
 fn feed_pool(sso_value: &str, cookie_string: &str) -> Result<String, String> {
     let mut accounts = crate::modules::grok::load_accounts();
     // 1) 同 sso 已在池 → 原位刷新（token 覆盖 + 启用）。

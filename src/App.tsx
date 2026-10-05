@@ -13,6 +13,7 @@ import type { UpdateInfo } from "@/lib/types";
 import AccountsPage from "@/pages/AccountsPage";
 import GlmProxyPage from "@/pages/GlmProxyPage";
 import GlmPlanPage from "@/pages/GlmPlanPage";
+import MiniMaxPage from "@/pages/MiniMaxPage";
 import QoderPage from "@/pages/QoderPage";
 import QwenPage from "@/pages/QwenPage";
 import KimiPage from "@/pages/KimiPage";
@@ -22,6 +23,8 @@ import ChatGptPage from "@/pages/ChatGptPage";
 import LoomyPage from "@/pages/LoomyPage";
 import MiaoshouPage from "@/pages/MiaoshouPage";
 import DuMatePage from "@/pages/DuMatePage";
+// ZCode 账号池页图标（独立 import 行：纯新增，不动既有 import 条目）
+import ZcodePage from "@/pages/ZcodePage";
 import OpencodePage from "@/pages/OpencodePage";
 import TraeWorkCnPage from "@/pages/TraeWorkCnPage";
 import WorkbuddyPage from "@/pages/WorkbuddyPage";
@@ -443,6 +446,7 @@ export default function App() {
             <Route path="/settings" element={<SettingsPage />} />
             <Route path="/glm-proxy" element={<GlmProxyPage />} />
             <Route path="/glm-plan" element={<GlmPlanPage />} />
+            <Route path="/minimax" element={<MiniMaxPage />} />
             <Route path="/qwen" element={<QwenPage />} />
             <Route path="/qoder" element={<QoderPage />} />
             <Route path="/kimi" element={<KimiPage />} />
@@ -457,6 +461,7 @@ export default function App() {
           <Route path="/trae-workbuddy" element={<Navigate to="/trae-work-cn" replace />} />
             <Route path="/miaoshou" element={<MiaoshouPage />} />
             <Route path="/dumate" element={<DuMatePage />} />
+            <Route path="/zcode" element={<ZcodePage />} />
             <Route path="/channel-health" element={<ChannelHealthPage />} />
             <Route path="/channel-health/:gatewayId" element={<ChannelHealthDetailPage />} />
             <Route path="/model-test" element={<ModelTestPage />} />

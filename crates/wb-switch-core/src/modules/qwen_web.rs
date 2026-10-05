@@ -6,7 +6,7 @@
 //! 也无效；`chats/new` 与 `/api/models` 不拦）。唯一稳定的过风控方式是
 //! **在真实 chat.qwen.ai 页面上下文里发 fetch**：专用 Chrome（独立 profile
 //! + 独立调试端口，与 grok_sso 的 19233 实例互不干扰）里由阿里 WAF 的
-//! 页面 JS（bx-ua/bx-v 等动态令牌）自动生成，网关侧零逆向。
+//!   页面 JS（bx-ua/bx-v 等动态令牌）自动生成，网关侧零逆向。
 //!
 //! ## 鉴权
 //! 桌面端深链 JWT（`qwen::extract_desktop_token`，30 天有效）直接作为
@@ -19,8 +19,8 @@
 //!   Qoder 通道（qoder::chat_completions_unified_for，独立 qwen 池）；
 //! - web：只用网页版，失败即报错（不回落）；
 //! - qoder：现状行为（纯 Qoder 算力池）。
-//! 响应头 `X-Qwen-Channel` 标注实际使用的通道（web / qoder），
-//! `X-Qwen-Channel-Note` 附回落原因（如有）。
+//!   响应头 `X-Qwen-Channel` 标注实际使用的通道（web / qoder），
+//!   `X-Qwen-Channel-Note` 附回落原因（如有）。
 
 use bytes::Bytes;
 use base64::engine::general_purpose;
@@ -76,7 +76,7 @@ fn opencode_config_path() -> Option<PathBuf> {
     let home = std::env::var("USERPROFILE")
         .ok()
         .map(PathBuf::from)
-        .or_else(|| dirs::home_dir())?;
+        .or_else(dirs::home_dir)?;
     Some(home.join(".config").join("opencode").join("opencode.json"))
 }
 
@@ -88,7 +88,7 @@ fn workbuddy_models_path() -> Option<PathBuf> {
     let home = std::env::var("USERPROFILE")
         .ok()
         .map(PathBuf::from)
-        .or_else(|| dirs::home_dir())?;
+        .or_else(dirs::home_dir)?;
     Some(home.join(".workbuddy").join("models.json"))
 }
 
@@ -486,7 +486,7 @@ async fn cdp_call_on(ws_url: &str, method: &str, params: Value) -> Result<Value,
     let (mut ws, _) = tokio_tungstenite::connect_async(ws_url)
         .await
         .map_err(|e| format!("CDP WebSocket 连接失败: {e}"))?;
-    ws.send(Message::Text(json!({"id": 1, "method": method, "params": params}).to_string().into()))
+    ws.send(Message::Text(json!({"id": 1, "method": method, "params": params}).to_string()))
         .await
         .map_err(|e| format!("CDP 发送失败: {e}"))?;
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -1788,7 +1788,7 @@ pub fn token_user_hint() -> Option<String> {
         return None;
     }
     let mut payload_b64 = parts[1].replace('-', "+").replace('_', "/");
-    while payload_b64.len() % 4 != 0 {
+    while !payload_b64.len().is_multiple_of(4) {
         payload_b64.push('=');
     }
     let decoded = general_purpose::STANDARD.decode(payload_b64).ok()?;

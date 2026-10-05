@@ -158,7 +158,7 @@ pub fn is_neg_cache_error(msg: &str) -> bool {
 
 fn http_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(|| reqwest::Client::new())
+    CLIENT.get_or_init(reqwest::Client::new)
 }
 
 /// 探测端口是否为 opencode server（/global/health 特征）。
@@ -651,7 +651,7 @@ pub fn builtin_models_payload() -> Value {
 /// - 实测 WorkBuddy 侧**不存在「14 个内置模型」这个集合**：客户端产品配置共 76 个模型
 ///   （51 个无 url 走订阅、25 个是自定义接入），native ACP 通道只有 1 个；
 ///   唯一稳定等于 14 的就是**渠道数**。
-/// ⇒ 折中：每个渠道保留 1 个代表，既覆盖全部 14 个渠道、又保持目录精简（约 14 条）。
+///   ⇒ 折中：每个渠道保留 1 个代表，既覆盖全部 14 个渠道、又保持目录精简（约 14 条）。
 ///
 /// 选取口径与页面「速度优先」一致：① 免费优先 ② 快速档 ③ 名称升序。
 /// 上游不可达 / 目录为空时回落 `builtin_models_payload()`（内置模型），保证目录永不为空。

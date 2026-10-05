@@ -173,7 +173,9 @@ pub fn is_local_login_account(account: &Value) -> bool {
         PLATFORM_LOOMY => crate::modules::loomy::is_local_login(account),
         PLATFORM_CHATGLM => id.starts_with("chatglm:"),
         PLATFORM_MIAOSHOU => id.starts_with("miaoshou:"),
-        PLATFORM_DUMATE => id.starts_with("dumate:"),
+        // 仅本机账号算「本机登录」；池账号（dumate:pool_N）不是 —— 它们来自
+        // 独立导入的登录态，与桌面端当前登录无关（契约 unified-accounts §1.4）。
+        PLATFORM_DUMATE => id == "dumate:local",
         _ => false,
     }
 }
@@ -263,14 +265,16 @@ pub fn all_checkin_accounts() -> Vec<Value> {
             }));
         }
     }
+    // DuMate：本机账号（dumate:local）+ 多账号池全部条目一并进统一调度
+    // （契约 unified-accounts §1.4；discover_dumate_accounts 内部已按 id 去重）。
     for candidate in [
         discover_autoclaw_account(),
         discover_trae_work_cn_account(),
         crate::modules::loomy::discover_loomy_account(),
-        discover_dumate_account(),
     ]
         .into_iter()
         .flatten()
+        .chain(discover_dumate_accounts())
     {
         let id = candidate
             .get("id")
@@ -467,8 +471,12 @@ pub async fn get_platform_status(account: &Value) -> Value {
         }
         PLATFORM_CHATGLM => get_chatglm_status(account).await,
         PLATFORM_MIAOSHOU => get_miaoshou_status(account).await,
-        // DuMate：本机单账号（qianfan 登录态），状态走 console.bce.baidu.com。
-        PLATFORM_DUMATE => get_dumate_status().await,
+        // DuMate：本机账号走客户端凭据路径；池账号（dumate:pool_N）用自身
+        // cookies + proxy 查询（契约 unified-accounts §1.4 多账号分发）。
+        PLATFORM_DUMATE => match account.get("dumatePoolId").and_then(Value::as_str) {
+            Some(pool_id) => crate::modules::dumate_accounts::account_status(pool_id).await,
+            None => get_dumate_status().await,
+        },
         _ => json!({"ok": false, "error": "未知签到平台"}),
     }
 }
@@ -573,7 +581,12 @@ pub async fn checkin_platform_account(account: &Value) -> Value {
         }
         PLATFORM_CHATGLM => perform_chatglm_checkin(account).await,
         PLATFORM_MIAOSHOU => perform_miaoshou_checkin().await,
-        PLATFORM_DUMATE => perform_dumate_checkin(account).await,
+        // DuMate：池账号走 dumate_accounts::account_checkin（幂等/判定/日志
+        // 同款）；本机账号维持原路径。
+        PLATFORM_DUMATE => match account.get("dumatePoolId").and_then(Value::as_str) {
+            Some(pool_id) => crate::modules::dumate_accounts::account_checkin(pool_id).await,
+            None => perform_dumate_checkin(account).await,
+        },
         _ => json!({"ok": false, "error": "未知签到平台"}),
     };
     if let Some(result) = res.get("result").and_then(Value::as_str) {
@@ -2458,7 +2471,7 @@ pub(crate) async fn get_trae_status_with(cred: &TraeCredential) -> Value {
     if code != 0 {
         // 高峰期状态查询也可能被限流：等待后重试一次。
         tokio::time::sleep(std::time::Duration::from_millis(1_000)).await;
-        resp = trae_post(&cred, TRAE_CHECKIN_STATUS_PATH).await;
+        resp = trae_post(cred, TRAE_CHECKIN_STATUS_PATH).await;
         code = resp.get("code").and_then(Value::as_i64).unwrap_or(-1);
     }
     if code != 0 {
@@ -3055,7 +3068,7 @@ pub async fn perform_chatglm_checkin(account: &Value) -> Value {
 
                 // 记录签到日志
                 let log_entry = json!({
-                    "ts": now_secs() as i64,
+                    "ts": now_secs(),
                     "accountId": account.get("id").and_then(Value::as_str).unwrap_or("chatglm"),
                     "email": account.get("email").and_then(Value::as_str).unwrap_or("ChatGLM"),
                     "result": "success",
@@ -3074,7 +3087,7 @@ pub async fn perform_chatglm_checkin(account: &Value) -> Value {
                 save_chatglm_cache(&lock);
 
                 let log_entry = json!({
-                    "ts": now_secs() as i64,
+                    "ts": now_secs(),
                     "accountId": account.get("id").and_then(Value::as_str).unwrap_or("chatglm"),
                     "email": account.get("email").and_then(Value::as_str).unwrap_or("ChatGLM"),
                     "result": "already",
@@ -3161,7 +3174,14 @@ pub async fn get_platform_credits(account: &Value) -> Value {
         }
         PLATFORM_CHATGLM => get_chatglm_credits(account).await,
         PLATFORM_MIAOSHOU => get_miaoshou_credits(account).await,
-        PLATFORM_DUMATE => get_dumate_credits().await,
+        // WorkBuddy：积分到期链路（新资源接口 + 旧接口回退），resources[]
+        // 即积分包明细（unified 账号管理的「近期到期」展示来源）。
+        PLATFORM_WORKBUDDY => crate::modules::credits::get_credit_expiry(account).await,
+        // DuMate：池账号查自己的积分概览（走账号 proxy）；本机账号原路径。
+        PLATFORM_DUMATE => match account.get("dumatePoolId").and_then(Value::as_str) {
+            Some(pool_id) => crate::modules::dumate_accounts::account_credits(pool_id).await,
+            None => get_dumate_credits().await,
+        },
         _ => json!({"ok": false, "error": "未知签到平台"}),
     };
     if result.get("ok").and_then(Value::as_bool) == Some(true) {
@@ -3287,7 +3307,7 @@ fn dumate_login_expired() -> Value {
 }
 
 /// JSON `code`/`errno` 类字段取值（数字或数字字符串兼容）。
-fn json_code_field(body: &Value, key: &str) -> Option<i64> {
+pub(crate) fn json_code_field(body: &Value, key: &str) -> Option<i64> {
     match body.get(key) {
         Some(Value::Number(n)) => n.as_i64(),
         Some(Value::String(s)) => s.trim().parse::<i64>().ok(),
@@ -3302,7 +3322,8 @@ fn json_brief(v: &Value, max: usize) -> String {
 
 /// loginBonus 成功判定（契约 §0 实测口径，纯函数便于单测）：
 /// `code==0 || errno==0 || (result 存在且无 error 字段) || points 为数字`。
-fn login_bonus_success(body: &Value) -> bool {
+/// DuMate 账号池（dumate_accounts）复用本函数，保证判定口径同款。
+pub(crate) fn login_bonus_success(body: &Value) -> bool {
     let code_zero = json_code_field(body, "code") == Some(0);
     let errno_zero = json_code_field(body, "errno") == Some(0);
     let result_clean = body
@@ -3317,7 +3338,8 @@ fn login_bonus_success(body: &Value) -> bool {
 }
 
 /// 重复领取的文本兜底判定（上游「已领语义」文案，纯函数便于单测）。
-fn login_bonus_already_text(body: &Value) -> bool {
+/// DuMate 账号池复用本函数（判定口径同款）。
+pub(crate) fn login_bonus_already_text(body: &Value) -> bool {
     let text = body
         .get("message")
         .and_then(Value::as_str)
@@ -3378,14 +3400,34 @@ pub fn discover_dumate_account() -> Option<Value> {
     }))
 }
 
-/// DuMate 账号列表形态（单元素；gateway_overview 等需要 Vec 的调用方用）。
+/// DuMate 账号列表形态：本机账号（`dumate:local`，客户端凭据存在时）+
+/// 账号池全部条目（dumate_accounts，多账号签到/积分，契约 unified-accounts
+/// §1.4），合并去重（id 唯一；池 id 形如 dumate:pool_N 不会与本机冲突）。
+/// 池账号带 `dumatePoolId` 标记，签到/状态/积分按它分发到池路径。
 pub fn discover_dumate_accounts() -> Vec<Value> {
-    discover_dumate_account().into_iter().collect()
+    let mut out = Vec::new();
+    if let Some(local) = discover_dumate_account() {
+        out.push(local);
+    }
+    for acc in crate::modules::dumate_accounts::load_accounts() {
+        let display = format!("DuMate · {}", acc.name);
+        out.push(json!({
+            "id": acc.id,
+            "email": display.clone(),
+            "nickname": display,
+            "platform": PLATFORM_DUMATE,
+            "dumatePoolId": acc.id,
+            "proxy": acc.proxy,
+            "note": acc.note,
+        }));
+    }
+    out
 }
 
 /// loginBonusInfo 响应 → 签到状态（纯函数便于单测；契约 §3.1 形态
 /// `{ok, todayCheckedIn: result.hasIssued, raw: result}`）。
-fn assemble_dumate_status(http_status: u16, body: &Value) -> Value {
+/// DuMate 账号池（dumate_accounts）复用本函数，保证组装口径同款。
+pub(crate) fn assemble_dumate_status(http_status: u16, body: &Value) -> Value {
     if http_status == 302 || http_status == 401 {
         return dumate_login_expired();
     }
@@ -3416,7 +3458,7 @@ fn assemble_dumate_status(http_status: u16, body: &Value) -> Value {
 
 /// DuMate 本机账号签到状态：GET loginBonusInfo。
 pub async fn get_dumate_status() -> Value {
-    match crate::modules::dumate::bce_api("GET", DUMATE_LOGIN_BONUS_INFO, None).await {
+    match crate::modules::dumate::bce_api("GET", DUMATE_LOGIN_BONUS_INFO, None, None).await {
         Err(e) => json!({"ok": false, "error": e}),
         Ok((http_status, body)) => assemble_dumate_status(http_status, &body),
     }
@@ -3451,7 +3493,7 @@ pub async fn perform_dumate_checkin(account: &Value) -> Value {
     }
     if status.get("todayCheckedIn").and_then(Value::as_bool) == Some(true) {
         add_checkin_log(&json!({
-            "ts": now_secs() as i64,
+            "ts": now_secs(),
             "accountId": account_id,
             "email": email,
             "result": "already",
@@ -3461,7 +3503,9 @@ pub async fn perform_dumate_checkin(account: &Value) -> Value {
 
     // 2) 提交领取：POST loginBonus body {}。
     let (http_status, body) =
-        match crate::modules::dumate::bce_api("POST", DUMATE_LOGIN_BONUS, Some(json!({}))).await {
+        match crate::modules::dumate::bce_api("POST", DUMATE_LOGIN_BONUS, Some(json!({})), None)
+            .await
+        {
             Ok(v) => v,
             Err(e) => return json!({"result": "error", "error": e}),
         };
@@ -3475,7 +3519,7 @@ pub async fn perform_dumate_checkin(account: &Value) -> Value {
     // 3) 成功判定（契约 §0）；重复领取的「已领语义」按文本兜底归 already。
     if login_bonus_success(&body) {
         add_checkin_log(&json!({
-            "ts": now_secs() as i64,
+            "ts": now_secs(),
             "accountId": account_id,
             "email": email,
             "result": "success",
@@ -3487,7 +3531,7 @@ pub async fn perform_dumate_checkin(account: &Value) -> Value {
         })
     } else if login_bonus_already_text(&body) {
         add_checkin_log(&json!({
-            "ts": now_secs() as i64,
+            "ts": now_secs(),
             "accountId": account_id,
             "email": email,
             "result": "already",
@@ -3589,14 +3633,35 @@ mod tests {
 
     #[test]
     fn dumate_local_login_account_by_prefix() {
-        // dumate: 前缀 = 本机登录账号；其他 id 不算。
+        // dumate:local = 本机登录账号；池账号（dumate:pool_N）不是。
         assert!(is_local_login_account(&json!({
             "id": "dumate:local", "platform": PLATFORM_DUMATE,
+        })));
+        assert!(!is_local_login_account(&json!({
+            "id": "dumate:pool_1", "platform": PLATFORM_DUMATE,
         })));
         assert!(!is_local_login_account(&json!({
             "id": "dumate-pool-1", "platform": PLATFORM_DUMATE,
         })));
         assert!(!is_local_login_account(&json!({"id": "dumate:local"})));
+    }
+
+    #[test]
+    fn dumate_pool_account_candidates_merge_with_local() {
+        // 纯构造验证：池条目经 discover 形态组装后带 dumatePoolId 标记，
+        // 签到/状态/积分按它分发（不触网）。
+        let pool_candidate = json!({
+            "id": "dumate:pool_7",
+            "email": "DuMate · 二号机",
+            "nickname": "DuMate · 二号机",
+            "platform": PLATFORM_DUMATE,
+            "dumatePoolId": "dumate:pool_7",
+        });
+        assert_eq!(
+            pool_candidate.get("dumatePoolId").and_then(Value::as_str),
+            Some("dumate:pool_7")
+        );
+        assert!(!is_local_login_account(&pool_candidate));
     }
 
     #[test]

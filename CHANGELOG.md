@@ -1,3 +1,263 @@
+## 1.0.39 — 2026-10-05
+
+### 新增：MiniMax 多账号（识别 / 隔离 / 切换）—— 对齐 GLM 代理范式
+### 修复：MiniMax 签到后积分不实时刷新
+
+#### A. 多账号（对齐 `glm_proxy::ordered_pool_with_region`）
+**原状**：`MmConfig.accounts` 已有账号池，但 `pick_account` **只按 region 过滤 + 全局游标轮询**；
+没有选号策略、无法指定/切换账号（这正是与 GLM 代理的差距）。
+
+**改动**
+| 层 | 内容 |
+| --- | --- |
+| `MmConfig` | 新增 `account_mode`（`round_robin`\|`local_first`\|`local_only`\|`pinned`）与 `pinned_account_id`，load/save 双向同步 + `normalize_account_mode` 归一化（未知值回落轮询） |
+| `minimax.rs` | 新增 `ordered_pool(cfg, region) -> Result<Vec<MmAccount>, String>`：**有序候选池**（调用方按序取用 = 多账号同时可用）；`account_usable()` 统一可用性口径；`pick_account` 改为基于 `ordered_pool` |
+| 识别 | 每账号 `id`/`label`/`region`/`source` 唯一标识；`status` 新增 `usable` / `isLocal` / `pinned` 三标记，前端据此渲染 |
+| 隔离 | 各账号独立持有 token/指纹三件套/cooldown/签到日期/积分快照；选号**只在该账号自己的凭据**上做（desktop 来源现读各自 `auth_path`，绝不跨账号借用）；区域隔离保留（给定 region 只在该区选号） |
+| 切换 | 新路由 `POST /api/minimax/accounts/switch`：`{mode}` 改策略；`{id}` 一步切到该账号（自动置 `pinned`）；返回**当前生效账号** + 候选列表 + 可操作错误 |
+| 前端 | `MiniMaxPage`：选号策略四按钮（轮询/本机优先/仅本机/固定账号）+ 账号卡片「设为当前」+ 「当前账号 / 本机 / 不可用」徽标 + 固定账号提示 |
+| 报错 | 无号可用时透出**可操作文案**（区分「全在冷却」/「池里没号」/「固定号被禁用/冷却/不存在」） |
+
+#### B. 积分实时刷新
+**根因**：`/api/minimax/status` 只读 `MmAccount.balance` 等**快照字段**，而快照仅在探测时写回。
+手动签到路由已于 2026-10-04 补了刷新逻辑，但**自动签到循环 `spawn_signin_loop` 没补** ——
+它只写回 `signin_last_date` / `signin_points_total`，于是「今日已签到但积分数值不变」。
+
+**改动**
+- 抽出公共函数 `refresh_credit_snapshot(acc)`（desktop → credit/details；web → membership_balance）
+  与 `refresh_and_save_credit(acc)`（重读配置后按 id 写回 balance/credit_consumed/balance_at）；
+- **自动签到循环签到成功后调用** `refresh_and_save_credit`；
+- 手动签到路由的内联逻辑**收敛到同一公共函数**（消除双份实现）。
+
+**测试**：`cargo test -p wb-switch-core minimax` → 新增 7 个单测（模式归一化 / 可用性口径 / 轮询区域与禁用冷却过滤 / local_first 排序 / local_only 报错 / pinned 严格性与四类可操作报错 / 冷却文案），**7 passed**。
+**验证方式**：见交付说明（status 的 accountMode/pinnedAccountId、switch 路由回执、签到后 balanceAt 刷新）。
+
+---
+
+## 1.0.38 — 2026-10-05
+
+### Laya 影子模式 P1 合入：网关入口 System 1 打标（只观测，不路由）
+
+| 项 | 内容 |
+| --- | --- |
+| 新增 core 模块 | `modules/laya_shadow.rs`：开关读取（`~/.wb-switch/laya_shadow.json`，默认关闭）、messages 双格式（OpenAI/Anthropic）最后一条 user 文本提取、官方 router_questions 预设（difficulty/domain/needs_tools/is_sensitive，逐字对齐 laya v0.3.27 presets.py）、500ms 超时 HTTP 旁路调用、JSONL 追加落盘（`~/.wb-switch/laya_shadow.jsonl`）。任何失败静默跳过——影子层绝不影响网关主链路 |
+| server 中间件 | `laya_shadow_middleware`（api.rs 全局层，照 access_log 模式）：按路径过滤 POST `/v1/chat/completions` + `/v1/messages`，body 整读后原样重建（上限同 MAX_BODY_BYTES），tokio::spawn 异步打标，handler 无感知 |
+| 依赖前置 | laya-serve sidecar（127.0.0.1:8000），启动器与协议样例在工作流 `laya-sidecar/`；模型缓存 `.models/hf`（multilingual 已缓存，english 421MB 按需） |
+
+**验证**：单测 694/0 失败（基线 694）；clippy 本变更零新增警告（总数 142 vs 棘轮基线 140：+2 归属并行未提交改动，非本变更引入）；中文四选项对照 5/5 全对（CPU ~190ms）；sidecar 全链路实测稳态 0.21-0.26s。注：src-tauri 桌面壳在本机构建失败为预存环境问题（windres 无法编译中文路径下的 icon.ico），与本次变更无关。
+
+---
+## 1.0.37 — 2026-10-03
+
+### 工作流基建：clippy 清零行动 + 漂移检查 + 端点冒烟
+
+| 项 | 内容 |
+| --- | --- |
+| clippy 清理 | 210 → 140（-33%）：JSON 批量修复脚本（span 精确替换，71 处机械类）+ json! 宏误伤修复（9 处：platform_checkin 5 / dumate_accounts 3 / grok_sso 1）；剩余 140 条为需人工判断类别，棘轮基线压至 140 防增长 |
+| 漂移检查 | 新增 check-drift.ps1：10 个关键共享文件 SHA256 基线，开工前对比（并发互踩防护工具化）；实测注入/还原双向 |
+| 端点冒烟 | 新增 check-endpoints.ps1：部署后 8 个关键端点一键健康检查；实测 8/8 |
+
+**验证**：单测 694/0 失败；cargo check 0 error；端点冒烟 8/8；漂移检测双向实测。
+
+---
+## 1.0.36 — 2026-10-03
+
+### 根因修复：CDP 返回值解包错误（mint 全部 "unknown" 的真凶）
+
+**探针实证无痕验证成功（success len=280）而 Rust 侧恒为 "unknown"** —— 对比定位：
+`cdp_eval_on_ws` 返回的是 CDP Runtime.evaluate 的 **RemoteObject 包装层**
+（`{"type":"object","value":{…}}`），而下游读 `out.ok/out.reason/out.failInfo` 全部落空 →
+永远走 unknown 分支。修复：解包 `result.result.value`（探针同款读取路径）。
+
+**验证**：mint 自检应返回 ok=true + paramLen≈280。
+
+---
+## 1.0.35 — 2026-10-03
+
+### CDP 铸码实证成功 + Rust 侧超时加固
+
+**探针实证**（Python CDP 直跑同款 JS）：ZCode 主页面内 SDK 已注入、instance ready、
+hasTraceless=true、**success len=280** —— 无痕验证在该环境**真实可用**。Rust 侧此前失败
+的原因：总超时 40s 太短（首注 SDK 加载+风控评分可超时）且失败时丢弃了 JS log。
+
+**加固**：等待窗口 11s→40s（400×100ms）、CDP 超时 40s→90s、失败信息携带完整 JS log
+（下次失败直接看到卡在 sdk/instance/traceless 哪一步）。
+
+**验证**：单测 7/7；重跑 mint 自检。
+
+---
+## 1.0.34 — 2026-10-03
+
+### 铸码风控修复：多页面 target 遍历 + 重启预告通知
+
+**mint 自检首跑诊断**：自动重启 ✓ / CDP 连接 ✓ / SDK 注入 ✓ / 无痕验证 ✗ unknown——
+铸码落在了 ZCode 的**第一个页面 target**（后台工具页，无用户活动痕迹），阿里云风控
+评分不过。参照 claim-bot（铸码必须在 ZCode 主渲染进程）。
+
+**修复**：
+- `pick_page_ws_urls_on`：返回全部页面 target（排除 devtools/extension，URL 含 zcode
+  的主窗口优先排序）；铸码逐 target 尝试，全部失败时报告每页原因与尝试数；
+- `failInfo` 安全序列化（undefined 时原 JSON.stringify 会抛错吞掉真实原因）；
+- **重启预告通知**：自动重启 ZCode 前先发桌面通知「ZCode 即将自动重启（登录不受影响）」
+  +3 秒缓冲——杜绝「莫名被退出」的突兀感。
+
+**验证**：重跑 mint 自检（ZCode 已带调试口，直接铸码）。
+
+---
+## 1.0.33 — 2026-10-03
+
+### 严重修复：mint 自检杀掉 ZCode 后拉不回来（安装路径解析）
+
+**事故**：验证码 mint 自检触发的自动重启把用户的 ZCode 杀掉后拉起失败——
+`zcode_launch_candidates` 只猜 C 盘两个路径，用户实际装在 `E:\Zcode国外版本\`。
+
+**修复**：
+- 新增 `query_running_zcode_path()`：从运行中进程解析真实路径（wmic ExecutablePath，
+  **GBK 解码**——中文安装目录 UTF-8 lossy 会产生替换符导致路径损坏）；
+- 新增 `resolve_zcode_exe()`：运行中进程 → claim state 持久化（zcodeExePath）→
+  env ZCODE_EXE → 常见候选；解析到即持久化（ZCode 关闭后仍可拉起）；
+- `ensure_cdp_ready`：**先解析路径，解析不到绝不杀进程**（杜绝再次发生同类事故）。
+
+**验证**：mint 自检重跑全链路（杀→带端口拉起→CDP 就绪→铸码）。
+
+---
+## 1.0.31 — 2026-10-03
+
+### 修复：自动领取从未真正抢到名额（三轮断点全修）
+
+**根因分析**（运行现场 zcode_claim_state.json 实证）：循环在跑、autoClaim 开着，但
+`accounts: {}` ——**每轮扫描都看到空名额**。三处断点叠加：
+1. **巡检间隔 30 分钟**：福利是闪购制（claim-bot 文档：名额几分钟抢完），30 分钟睁开眼时
+   名额早已没了 → 手动领才能碰上窗口；
+2. **06:00-23:00 时段限制**：drop 集中在北京 21:25-次日 01:40（claim-bot drop 历史校准），
+   我们的限制恰好把黄金窗口切掉一半；
+3. **CDP 不可用即放弃**：ZCode 运行中没开调试端口 → 自动领取直接报错，永远走不通。
+
+**修复**（节奏校准自 thelabcorner/zcode-claim-bot schedule.mjs）：
+- **热窗自适应轮询**：北京 21:25-次日 01:45 与 04:30-10:30 为热窗（**2 分钟/次**），闲时
+  30 分钟/次；可经 /api/zcode/claim/state 调 pollHotMin/pollIdleMin；启动即扫一轮；
+- **CDP 自动重启**：领取时 ZCode 运行中未开调试口 → 按 autoRestartZcode（默认开）自动重启
+  ZCode（热切换语义下登录不变，数秒恢复）并开端口——全程无人工；
+- **失败原因全量可见**：通知标题区分 成功/部分成功/失败，正文带每个账号的具体原因；
+  state["accounts"] 落盘每轮明细。
+
+**验证**：单测 7/7；二进制含循环代码；部署后观察 lastScanAt 按新节奏推进。
+
+---
+## 1.0.30 — 2026-10-03
+
+### ZCode 账号池额度状态管理重构（持久缓存 + 全局共享 + 竞态防护）
+
+**根因**（用户实测：切路由返回额度丢失/变旧）：①后端 status 不带每账号额度；②前端额度只存
+组件内存（quotaOverrides useState），ZcodePage 卸载即丢；③30s 轮询只拉状态不拉额度。
+
+**重构**
+| 层 | 改动 |
+| --- | --- |
+| 后端持久层 | 新增 `~/.wb-switch/zcode_quota_cache.json`（atomic_write）：`/api/zcode/quota` 每次查询落盘（id 或 zcode:live）；`status` 聚合回带每账号 `quota`+`quotaFetchedAt`（零网络调用）；删除账号时清缓存条目 |
+| 前端数据源 | 删内存 override，**单一数据源=后端缓存**；单行刷新/批量刷新后重拉 status；30s 轮询 + 页面聚焦/切屏 visibilitychange 重拉（廉价缓存读取，跨路由返回即见最新） |
+| 生命周期 | 获取：手动单行「额度」/「刷新全部额度」/领取后；缓存：每次查询原子落盘；刷新：聚焦+30s 回读缓存、>10 分钟标记过期（橙色+「x 分钟前」）、失败行内红字+按钮重试 |
+| UI | 账号池卡新增**额度对比条**（全账号可用额度降序、失效账号置灰）；行内额度附「刚刚/N 分钟前」时效 |
+| 竞态 | 批量刷新串行逐账号（不打爆上游）；busy key 防并发重复；缓存 last-write-wins + fetchedAt 判新旧 |
+
+**福利领取不受影响**：claim 链路未动；额度缓存独立文件，与领取状态分离。
+
+**验证**：单测 7/7；tsc 0 错误；curl quota→缓存文件生成→status 回带；切路由返回额度保持。
+
+---
+## 1.0.29 — 2026-10-03
+
+### 活动领取扫描：身份去重 + 文案澄清（回应用户困惑）
+
+**用户困惑**：扫描显示 5 行（13800138000 出现两次）且全部「今日已领 / 无套餐」——修复是不是没用？
+
+**澄清与修复**：
+- 「无可领套餐」≠ 修复失效：每日福利是**限量抢购制**（claim-bot 文档：名额几分钟内抢完），
+  preview 只反映「此刻」状态；凌晨扫描全部为空是正常现象。修复（每账号独立设备身份）在
+  名额放出时才生效——自动领取循环每 30 分钟巡检，名额一出现即自动领取；
+- 扫描展示**按身份去重**：live 与池内同身份账号只扫一行（13800138000 不再出现两次）；
+- 文案改准确：「此刻无可领名额（已领 / 未开放 / 已抢完）」+ 说明限量抢购制与自动巡检。
+
+**验证**：单测 7/7；tsc 0 错误；扫描返回去重后的账号列表。
+
+---
+## 1.0.28 — 2026-10-02
+
+### ZCode 领取限领深度排查：多设备+多环境双维度
+
+**限制定位**（JWT 解码 + claim-bot 逆向笔记 + zcode-switch issue #10 社区实证）：
+- `zcodejwttoken` JWT 内**无任何设备信息**（仅 user_id/sub/token_version）→ 服务端识别设备
+  只能靠请求头 `X-Device-Mid`（客户端自造 UUID）与 IP；
+- pjpv/zcode-switch issue #10 实锤：「第二个号开始全是这样的提示」= 同设备首号可领、后续号
+  全部失败；issue #16 证实风控有**账号维度记忆**（换设备登录仍报错）——刷身份不能太猛；
+- 1.0.27 已落地**设备维度**：领取全链路（preview/claim）改用每账号自己的 virtualDeviceMid。
+
+**本次新增（IP 维度保险）**：ZCode 池账号支持**一号一代理**——
+- 池条目新增 `proxy` 字段；`/api/zcode/accounts/update` 更新；preview/claim 请求按账号
+  代理出站（reqwest ClientBuilder 级代理，日频调用按请求构建客户端）；
+- /zcode 页池账号行新增代理显示与「编辑代理」（Globe 按钮，http/socks5）。
+
+**方案评估**：设备维度（每账号虚拟 mid，已落地）+ IP 维度（每账号可选代理，本次落地）
+双管齐下；验证码维度经 zcode-pool 实证不绑设备（其在自己 WebView 铸码、按账号 mid 提交）。
+**风险边界**：上游有账号维度风控记忆（issue #16），不要高频重试领取；4 号/1 机属正常使用形态。
+
+**验证**：单测 7/7；tsc 0 错误；明日自动领取实测 4 号齐领（如仍 1002，按报错补代理）。
+
+---
+## 1.0.27 — 2026-10-02
+
+### 修复：多账号限领（上游按设备身份限 2 号/台）
+
+**问题**：GLM-5.3-Flash 每日 1 亿 token 福利按**设备**限领（1 台设备最多 2 个号）——而领取请求
+全部携带本机 telemetry 的 deviceMid，4 个账号被上游识别为同一台设备。
+
+**修复**（方案对标 Limitinfinitude/zcode-pool 的 `account_mid`）：领取全链路（preview/claim）
+改用**每个账号自己的 virtualDeviceMid**（池内已有，缺失的自动补 UUID）——上游按 X-Device-Mid
+识别设备，4 号=4 设备，各自独立享受每日额度。live 账号兜底用 telemetry mid。
+
+**验证**：单测 7/7；池内 4 账号 mid 全部就绪；明日自动领取循环实测 4 号齐领。
+
+---
+## 1.0.26 — 2026-10-02
+
+### 修复：账号池重复入库（热切换防丢号把同一身份当成新号）
+
+**现象**：池内 4 账号变 6——`13800138000@phone.local` 出现 3 条。**根因**：热切换的「防丢号」
+捕获按 canonical 哈希去重，而切换写入的凭据注入了中继密钥（external-relay:pass_hash），
+哈希必变 → 同一身份在每次往返切换时被当成新账号入库。**修复**：capture_current 增加第二级
+**身份去重**（provider + user_id/username/email 任一相等即视为同账号，更新原条目不新增）；
+存量重复按「每身份保留最新」清理（6→4）。
+
+**验证**：单测 7/7；池文件实况 4 账号（主号/pool-account-1/13800138000/13900139000）。
+
+---
+## 1.0.25 — 2026-10-02
+
+### 修复：热切换校验基准（实测发现的真 bug）
+
+首轮热切换实测失败（「ZCode 进程回写了登录态」）——根因不是进程回写，而是校验基准写错：
+写回的凭据注入了中继密钥（`web-remote-control:external-relay:pass_hash`），canonical 哈希
+必然与库内原哈希不一致，三次重试全部假阴性。对齐 zcode-switch 的正确语义：**身份匹配优先**
+（provider + user_id/username/email 任一相等），身份无信号时才哈希兜底。修复后热切换在
+ZCode 运行中真实可用（无感换号，不关进程）。
+
+**验证**：单测 7/7；实测热切换往返（切走→切回）ZCode 进程全程未重启。
+
+---
+## 1.0.24 — 2026-10-02
+
+### ZCode 渠道升级：热切换（无感换号）+ 活动领取卡常驻（自动领取开关）
+
+| 项 | 内容 |
+| --- | --- |
+| 热切换 | ZCode 运行中默认走热切换：不关进程直接换写 credentials.json，双读校验（150ms 后复读确认进程未回写）失败退避重试 3 次；成功后独立 deviceMid 落盘 + 套餐缓存重置 + 中继密钥保活。项目/会话/设置全程不动，下一次鉴权即用新号——**不再需要每天手机号反复登录**。热切换校验失败（进程回写）时明确报错，可改用冷切换（关闭 ZCode） |
+| 活动领取卡常驻 | 不再只在有可领套餐时显示：常驻展示每账号扫描状态（今日已领/无套餐/错误明细）+ **「自动领取」开关**（持久化到 zcode_claim_state.json，定时循环实时读取） |
+| 自动领取循环 | 每 30 分钟巡检（06:00-23:00）：有可领套餐→开关开则自动领取（CDP 无痕验证码），开关关则桌面通知提醒 |
+| 领取协议 | billing/preview（免验证码）→ billing/claim（X-Aliyun-Captcha-Verify-Param 必带，CDP 驱动 ZCode 内嵌渲染进程无痕验证产出，方案参考 thelabcorner/zcode-claim-bot） |
+
+**验证**：cargo check 两包 0 error；单测 zcode 7/7；tsc 0 错误。
+
+---
 # 变更记录（wb-switch / Sylvia Switch）
 
 版本号取自 `crates/wb-switch-server/Cargo.toml`，运行时可通过

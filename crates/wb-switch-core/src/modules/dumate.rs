@@ -86,9 +86,7 @@ fn estimate_body_chars(body: &Value) -> usize {
 }
 
 /// 实测：请求体字符数 → 本机 DuMate 引擎处理耗时（2026-10-01 阶梯实验）
-/// ```
-/// 1K→1.9s  30K→4.2s  100K→16.2s  300K→45.4s  700K→61.5s  1422K→97.4s
-/// ```
+/// `1K→1.9s  30K→4.2s  100K→16.2s  300K→45.4s  700K→61.5s  1422K→97.4s`
 /// 拟合：`est_secs ≈ 27 + 0.050 × 千字符`。
 ///
 /// 🔑 **关键洞察**：这段耗时来自**请求体传输 + JSON 解析**，**不是推理** ——
@@ -156,8 +154,8 @@ fn payload_guard(body: &Value, model: &str) -> Option<DumateChatError> {
 /// - 提示词「用 Python 写一个脚本…」→ **挂住，200s / 240s / 600s 均不返回**；
 /// - 同一需求 + 「不得调用工具/不得执行，直接把代码作为回复文本输出」→ **4 秒返回**；
 /// - 「把代码写在回复正文里」→ **3 秒返回**；纯问答 → 2–3 秒。
-/// 即：引擎会把"动手类"请求当成要它**实际执行**（写文件/跑命令），从而进入内部 agent 流程并卡死；
-/// 明确声明"只要文本"即可让它退回普通问答路径。
+///   即：引擎会把"动手类"请求当成要它**实际执行**（写文件/跑命令），从而进入内部 agent 流程并卡死；
+///   明确声明"只要文本"即可让它退回普通问答路径。
 ///
 /// 本通道是纯文本补全接口（文件/命令由**客户端**自己负责，如 ZCode 自己写盘），
 /// 故该约束与语义完全一致，对普通问答无副作用。可用环境变量
@@ -1042,7 +1040,7 @@ pub(crate) fn format_points_reply(credits: &Value) -> String {
 
 fn http_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(|| reqwest::Client::new())
+    CLIENT.get_or_init(reqwest::Client::new)
 }
 
 /// prompt 组装：与 `workbuddy_proxy::flatten_messages` 同逻辑（该函数为模块
@@ -1276,14 +1274,14 @@ pub async fn chat_completions_json(model: &str, body: &Value) -> Result<Value, D
         .map_err(|e| DumateChatError::new(DumateChatErrorKind::EngineNotFound, e))?;
     let client = http_client();
     // 建会话。连接失败 = 端口漂移窗口：作废缓存重发现一次再试。
-    let session = match post_session(&client, &engine).await {
+    let session = match post_session(client, &engine).await {
         Ok(v) => v,
         Err(e) if workbuddy_proxy::is_connect_error(&e) => {
             invalidate_engine_cache();
             engine = discover_engine()
                 .await
                 .map_err(|e2| DumateChatError::new(DumateChatErrorKind::EngineNotFound, e2))?;
-            post_session(&client, &engine)
+            post_session(client, &engine)
                 .await
                 .map_err(|e2| DumateChatError::new(DumateChatErrorKind::EngineError, e2))?
         }
@@ -1311,7 +1309,7 @@ pub async fn chat_completions_json(model: &str, body: &Value) -> Result<Value, D
         payload["system"] = json!(system_text);
     }
     let reply = match post_message(
-        &client,
+        client,
         &engine,
         &session_id,
         &payload,
@@ -1321,7 +1319,7 @@ pub async fn chat_completions_json(model: &str, body: &Value) -> Result<Value, D
     {
         Ok(v) => v,
         Err(e) => {
-            cleanup_session(&client, &engine, &session_id).await;
+            cleanup_session(client, &engine, &session_id).await;
             return Err(e);
         }
     };
@@ -1342,7 +1340,7 @@ pub async fn chat_completions_json(model: &str, body: &Value) -> Result<Value, D
     let tokens = reply.pointer("/info/tokens").cloned().unwrap_or(Value::Null);
     let routing = reply.pointer("/info/routing").cloned().unwrap_or(Value::Null);
     // 成功也清理会话（不留垃圾）。
-    cleanup_session(&client, &engine, &session_id).await;
+    cleanup_session(client, &engine, &session_id).await;
     if content.trim().is_empty() {
         return Err(DumateChatError::new(
             DumateChatErrorKind::UpstreamRejected,

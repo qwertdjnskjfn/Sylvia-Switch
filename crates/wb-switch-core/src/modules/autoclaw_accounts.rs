@@ -734,6 +734,13 @@ pub fn list_for_display() -> Vec<Value> {
             "tokenPreview": account.get("tokenPreview").cloned().unwrap_or(Value::Null),
         }));
     }
+    // 1.5.0：附带账号保护层冷却状态（封禁 410004 / 限流落库后，账号管理与
+    // 渠道健康的冷却徽标都从这里取）
+    for entry in out.iter_mut() {
+        if let Some(id) = entry.get("id").and_then(Value::as_str) {
+            entry["isCooling"] = json!(crate::modules::account_protection::is_account_cooling(id));
+        }
+    }
     out
 }
 

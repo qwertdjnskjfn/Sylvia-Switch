@@ -2,8 +2,8 @@
 //!
 //! TRAE SOLO CN 的 LLM 对话端点（`POST {agent}/api/ide/v1/chat`，Cloud-IDE-JWT
 //! + 18 个设备头 + SSE）已实测打通，但服务端在请求前要求 `CreateChatSession`
-//! 建立的会话态（缺会话时 SSE 固定回 `3003 all models failed`），无法以
-//! 单发请求转发对话。因此 V1 反代交付：
+//!   建立的会话态（缺会话时 SSE 固定回 `3003 all models failed`），无法以
+//!   单发请求转发对话。因此 V1 反代交付：
 //! - 模型目录：从本地 OpenCode 形态的会话缓存
 //!   `state.vscdb`（`AI.agent.model.model_list_map`）离线读取全部场景模型
 //!   （含显示名/倍率/上下文/思考标记），该缓存由客户端服务端下发同步；

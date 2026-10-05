@@ -52,3 +52,6 @@ npm/platform/*/bin/
 
 # Windows 保留设备名残留（会阻塞 git add -A：unable to index file nul）
 nul
+
+# AI 工具会话状态（不该入库）
+.mimosa/

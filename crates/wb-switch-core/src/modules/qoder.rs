@@ -17,7 +17,7 @@
 //!    AES-256-GCM，与 AutoClaw auth.json 同构，复用现成解密原语）；
 //! 2. PKCE device flow（用户在浏览器授权后轮询拿到凭据）；
 //! 3. 手动粘贴 dt-/drt-（高级用法）。
-//! 账号池落盘 `~/.wb-switch/qoder_accounts.json`，按 uid 去重。
+//!    账号池落盘 `~/.wb-switch/qoder_accounts.json`，按 uid 去重。
 
 use base64::engine::general_purpose;
 use base64::Engine;

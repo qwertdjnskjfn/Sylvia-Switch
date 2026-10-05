@@ -244,7 +244,7 @@ async fn cdp_call_on(ws_url: &str, method: &str, params: Value) -> Result<Value,
         .await
         .map_err(|e| format!("CDP WebSocket 连接失败: {e}"))?;
     let request = json!({"id": 1, "method": method, "params": params});
-    ws.send(Message::Text(request.to_string().into()))
+    ws.send(Message::Text(request.to_string()))
         .await
         .map_err(|e| format!("CDP 发送失败: {e}"))?;
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -650,7 +650,7 @@ async fn run_sync_with(cfg: &GrokSsoConfig) -> Value {
         if attempt > 0 {
             tokio::time::sleep(Duration::from_millis(1500 * (1 << attempt))).await;
         }
-        match sync_once(&cfg).await {
+        match sync_once(cfg).await {
             Ok((written, summary)) => {
                 let mut v = json!({"attempt": attempt + 1, "written": written});
                 if let Some(obj) = v.as_object_mut() {
@@ -698,7 +698,7 @@ pub fn token_status() -> Value {
                     let logged_in = obj.get("ssoPresent").and_then(Value::as_bool).unwrap_or(false)
                         || obj.get("ssoRwPresent").and_then(Value::as_bool).unwrap_or(false);
                     obj.insert("status".to_string(), json!(if logged_in { "ok" } else { "not_logged_in" }));
-                    obj.insert("expiresInDays".to_string(), json!((remain.max(0) / 86_400_000) as i64));
+                    obj.insert("expiresInDays".to_string(), json!(remain.max(0) / 86_400_000));
                     obj.insert("sso".to_string(), json!(format!("{sso_preview}…")));
                     obj.insert("cookieString".to_string(), Value::Null);
                 }

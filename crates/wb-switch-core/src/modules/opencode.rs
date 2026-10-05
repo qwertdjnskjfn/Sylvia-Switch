@@ -178,8 +178,8 @@ fn build_attempt_chain(requested: &str, chain: &[String], free_catalog: &[String
 ///   500/503 等同理——都是服务端侧问题，换模型可能有用）；
 /// - `提交消息失败: error sending request …`：无状态码 = 连接被断 —— 实证多为上游免费池
 ///   限流 → opencode server FK bug → 断连（CHANGELOG 0.1.84），换模型确实有用。
-/// 4xx（如 400 unknown model）是请求本身的问题，换模型无意义 → 不重试。
-/// 其余（messages 为空 / 服务发现失败 / 等待回复超时 / …）同样不重试。
+///   4xx（如 400 unknown model）是请求本身的问题，换模型无意义 → 不重试。
+///   其余（messages 为空 / 服务发现失败 / 等待回复超时 / …）同样不重试。
 fn is_retryable_upstream_error(msg: &str) -> bool {
     let Some(rest) = msg.split("提交消息失败").nth(1) else {
         return false;

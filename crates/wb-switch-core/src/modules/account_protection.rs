@@ -183,10 +183,27 @@ pub struct CoolingAccountEntry {
 
 static COOLING_ACCOUNTS: Mutex<Option<HashMap<String, CoolingAccountEntry>>> = Mutex::new(None);
 
+/// 冷却表落盘路径（1.5.0）：此前纯内存，部署重启即丢——封禁 12h 冷却
+/// 会在每次发版后凭空消失（2026-10-02 实测），故持久化到 store 目录。
+fn cooling_file() -> std::path::PathBuf {
+    crate::modules::config::store_dir().join("protection_cooling.json")
+}
+
 fn with_cooling_map<R>(f: impl FnOnce(&mut HashMap<String, CoolingAccountEntry>) -> R) -> R {
     let mut lock = COOLING_ACCOUNTS.lock().unwrap();
-    let map = lock.get_or_insert_with(HashMap::new);
-    f(map)
+    if lock.is_none() {
+        // 首次访问：从磁盘恢复（重启不丢冷却）
+        let restored = std::fs::read_to_string(cooling_file())
+            .ok()
+            .and_then(|t| serde_json::from_str::<HashMap<String, CoolingAccountEntry>>(&t).ok())
+            .unwrap_or_default();
+        lock.insert(restored);
+    }
+    let map = lock.as_mut().unwrap();
+    let result = f(map);
+    // 变更后落盘（含过期条目清理后的状态）
+    let _ = std::fs::write(cooling_file(), serde_json::to_string_pretty(map).unwrap_or_default());
+    result
 }
 
 /// 检查账号是否正处于冷却保护中（已过期的条目自动清理）。

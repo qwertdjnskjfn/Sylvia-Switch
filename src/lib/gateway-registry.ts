@@ -38,6 +38,7 @@ export type GatewayNavEntry = {
 export const GATEWAY_NAV_ENTRIES: GatewayNavEntry[] = [
   { id: "glm", path: "/glm-proxy", label: "GLM 代理", icon: PlugZap },
   { id: "glmplan", path: "/glm-plan", label: "GLM Plan", icon: Layers },
+  { id: "minimax", path: "/minimax", label: "MiniMax", icon: Bot },
   { id: "qwen", path: "/qwen", label: "Qwen 通道", icon: Globe },
   { id: "qoder", path: "/qoder", label: "Qoder 网关", icon: Zap },
   { id: "kimi", path: "/kimi", label: "Kimi 网关", icon: MessagesSquare },
@@ -53,6 +54,8 @@ export const GATEWAY_NAV_ENTRIES: GatewayNavEntry[] = [
   { id: "opencode", path: "/opencode", label: "OpenCode", icon: Terminal },
   // DuMate（百度搭子）：2026-10-01 新增渠道（契约 docs/dumate-channel-contract.md §4.3）
   { id: "dumate", path: "/dumate", label: "DuMate（百度搭子）", icon: Bot },
+  // ZCode 账号池：2026-10-02 新增渠道（契约 docs/zcode-channel-contract.md §3）
+  { id: "zcode", path: "/zcode", label: "ZCode 账号", icon: Bot },
 ];
 
 /** 分组里未登记、但后端总览已返回且路由可达时的兜底图标。 */

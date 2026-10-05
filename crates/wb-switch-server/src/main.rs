@@ -196,6 +196,9 @@ async fn serve(args: &[String]) {
     wb_switch_core::modules::grok_sso::spawn_keepalive_loop();
     // v1.5.0：账号池健康体检循环（默认每 2 小时轮转 1 个账号，策略可调）。
     wb_switch_core::modules::grok_pool::spawn_health_check_loop();
+    wb_switch_core::modules::autoclaw_watch::spawn_watch_loop();
+    wb_switch_core::modules::zcode::spawn_auto_switch_loop();
+    wb_switch_core::modules::minimax::spawn_signin_loop();
     // WorkBuddy 多账号网关：余额巡检循环（启动后 60s 首轮，之后每 balance_refresh_minutes 分钟；0 = 关闭）。
     wb_switch_core::modules::workbuddy_gateway::spawn_balance_patrol_loop();
     // 模型目录自动同步循环（契约 model-sync-contract.md §3.5：启动 5 分钟后首轮，
@@ -204,6 +207,8 @@ async fn serve(args: &[String]) {
     // ChatGPT 通道托管循环（契约 chatgpt-channel-contract.md §3/§5：60s 轮询，
     // enabled+auto_start 才拉起 WebUI 服务进程；🔴 只托管服务，绝不自动启动批量注册）。
     wb_switch_core::modules::chatgpt_channel::spawn_watchdog();
+    // ZCode 活动自动领取循环（30 分钟巡检；autoClaim 开关在 ~/.wb-switch/zcode_claim_state.json）。
+    wb_switch_core::modules::zcode::spawn_claim_loop();
 
     axum::serve(listener, app).await.unwrap();
 }

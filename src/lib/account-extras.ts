@@ -1,9 +1,11 @@
 /**
- * 账号辅助功能：自定义别名/备注名持久化与隐私脱敏支持。
+ * 账号辅助功能：自定义别名/备注名持久化。
+ *
+ * 隐私脱敏机制已按 docs/unified-accounts-contract.md §3 移除：
+ * 全界面直显完整全名（备注名优先），前端不再自行加星号。
  */
 
 const NOTES_STORAGE_KEY = "wb-switch.account-notes";
-const PRIVACY_STORAGE_KEY = "wb-switch.privacy-mask";
 export const ACCOUNT_EXTRAS_CHANGE_EVENT = "wb-switch:account-extras-change";
 
 function dispatchChange() {
@@ -39,45 +41,4 @@ export function setAccountNote(id: string, note: string): void {
   } catch {
     // 静默忽略本地存储异常
   }
-}
-
-/** 读取隐私脱敏开关状态 */
-export function getPrivacyMask(): boolean {
-  try {
-    return localStorage.getItem(PRIVACY_STORAGE_KEY) === "1";
-  } catch {
-    return false;
-  }
-}
-
-/** 切换或设置隐私脱敏模式 */
-export function setPrivacyMask(enabled: boolean): void {
-  try {
-    localStorage.setItem(PRIVACY_STORAGE_KEY, enabled ? "1" : "0");
-    dispatchChange();
-  } catch {
-    // 忽略异常
-  }
-}
-
-/** 邮箱脱敏：保留首尾字符，中间以星号替代（如 zh***@qq.com） */
-export function maskEmail(email: string): string {
-  if (!email) return "";
-  const parts = email.split("@");
-  if (parts.length !== 2) {
-    if (email.length <= 4) return email;
-    return `${email.slice(0, 2)}***${email.slice(-2)}`;
-  }
-  const [local, domain] = parts;
-  if (local.length <= 2) {
-    return `${local[0] || "*"}***@${domain}`;
-  }
-  return `${local.slice(0, 2)}***${local.slice(-1)}@${domain}`;
-}
-
-/** 普通文本/UID 脱敏：保留前 3 和后 2 位 */
-export function maskIdentity(str: string): string {
-  if (!str) return "";
-  if (str.length <= 6) return `${str.slice(0, 1)}****`;
-  return `${str.slice(0, 3)}****${str.slice(-2)}`;
 }

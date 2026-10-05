@@ -4,6 +4,7 @@ import type {
   AccountRecord,
   AppStatus,
   CheckinConfig,
+  ExpiringSoonConfig,
   CheckinLog,
   CheckinResult,
   CreditExpiry,
@@ -69,6 +70,11 @@ import type {
   DumateCheckinStatus,
   DumateCheckinResult,
   DumateConfigInfo,
+  DumatePoolAccount,
+  UnifiedAccountsPayload,
+  ZcodeStatus,
+  ZcodeAccount,
+  ZcodeQuota,
 } from "./types";
 import type { ChannelDetail, ChannelHealthOverview } from "@/lib/channel-health-types";
 import type { ModelTestRequest, ModelTestResult } from "@/lib/model-test-types";
@@ -142,6 +148,16 @@ const ROUTES: Record<string, Route> = {
   get_glm_proxy_config: { method: "GET", path: "/api/glm-proxy/config" },
   get_glm_proxy_status: { method: "GET", path: "/api/glm-proxy/status" },
   get_glmplan_status: { method: "GET", path: "/api/glmplan/status" },
+  save_zcode_autoswitch_config: { method: "POST", path: "/api/zcode/auto-switch/config" },
+  tick_zcode_autoswitch: { method: "POST", path: "/api/zcode/auto-switch/tick" },
+  get_minimax_status: { method: "GET", path: "/api/minimax/status" },
+  save_minimax_config: { method: "POST", path: "/api/minimax/config" },
+  add_minimax_account: { method: "POST", path: "/api/minimax/accounts/add" },
+  remove_minimax_account: { method: "POST", path: "/api/minimax/accounts/remove" },
+  enable_minimax_account: { method: "POST", path: "/api/minimax/accounts/enable" },
+  switch_minimax_account: { method: "POST", path: "/api/minimax/accounts/switch" },
+  run_minimax_signin: { method: "POST", path: "/api/minimax/signin/run" },
+  capture_minimax_desktop: { method: "POST", path: "/api/minimax/desktop/capture" },
   save_glmplan_config: { method: "POST", path: "/api/glmplan/config" },
   add_glmplan_account: { method: "POST", path: "/api/glmplan/accounts/add" },
   remove_glmplan_account: { method: "POST", path: "/api/glmplan/accounts/remove" },
@@ -250,6 +266,27 @@ const ROUTES: Record<string, Route> = {
   save_dumate_config: { method: "POST", path: "/api/dumate/config" },
   dumate_checkin: { method: "POST", path: "/api/dumate/checkin" },
   get_dumate_checkin_status: { method: "GET", path: "/api/dumate/checkin-status" },
+  // 统一账号管理 + DuMate 多账号池（契约 docs/unified-accounts-contract.md §1.5/§2/§5；仅 webui 后端支持）；
+  // GET /api/dumate/accounts（列表）为契约 §1.5 路由组的一部分，多账号卡的数据源
+  get_unified_accounts: { method: "GET", path: "/api/accounts/unified" },
+  get_dumate_accounts: { method: "GET", path: "/api/dumate/accounts" },
+  add_dumate_account: { method: "POST", path: "/api/dumate/accounts" },
+  update_dumate_account: { method: "POST", path: "/api/dumate/accounts/update" },
+  remove_dumate_account: { method: "POST", path: "/api/dumate/accounts/remove" },
+  import_dumate_client: { method: "POST", path: "/api/dumate/accounts/import-client" },
+  dumate_account_checkin: { method: "POST", path: "/api/dumate/account/checkin" },
+  // ZCode 账号池（契约 docs/zcode-channel-contract.md §2/§3；仅 webui 后端支持）
+  get_zcode_status: { method: "GET", path: "/api/zcode/status" },
+get_zcode_claim_state: { method: "GET", path: "/api/zcode/claim/state" },
+save_zcode_claim_state: { method: "POST", path: "/api/zcode/claim/state" },
+update_zcode_account: { method: "POST", path: "/api/zcode/accounts/update" },
+      zcode_claim_scan: { method: "POST", path: "/api/zcode/claim/scan" },
+  zcode_claim_auto: { method: "POST", path: "/api/zcode/claim/auto" },
+  zcode_claim_preview: { method: "POST", path: "/api/zcode/claim/preview" },
+  capture_zcode: { method: "POST", path: "/api/zcode/capture" },
+  switch_zcode: { method: "POST", path: "/api/zcode/switch" },
+  remove_zcode: { method: "POST", path: "/api/zcode/accounts/remove" },
+  zcode_quota: { method: "POST", path: "/api/zcode/quota" },
   get_trae_proxy_status: { method: "GET", path: "/api/trae-proxy/status" },
   get_trae_proxy_models: { method: "GET", path: "/api/trae-proxy/models" },
   get_trae_proxy_config: { method: "GET", path: "/api/trae-proxy/config" },
@@ -279,6 +316,8 @@ const ROUTES: Record<string, Route> = {
   checkin_all: { method: "POST", path: "/api/checkin/all" },
   get_auto_checkin_config: { method: "GET", path: "/api/checkin/config" },
   save_auto_checkin_config: { method: "POST", path: "/api/checkin/config" },
+  get_expiring_soon_config: { method: "GET", path: "/api/config/expiring-soon" },
+  save_expiring_soon_config: { method: "POST", path: "/api/config/expiring-soon" },
   get_checkin_logs: { method: "GET", path: "/api/checkin/logs" },
   get_travel_status: { method: "GET", path: "/api/travel/status" },
   get_auto_travel_config: { method: "GET", path: "/api/travel/config" },
@@ -574,6 +613,46 @@ export async function getGlmProxyConfig(): Promise<GlmProxyConfigInfo> {
   return call("get_glm_proxy_config");
 }
 /** GLM Plan 网关（1.4.0 新通道）状态 */
+/** 保存 ZCode 自动切换配置（额度耗尽自动热切换） */
+export async function saveZcodeAutoSwitchConfig(body: { enabled: boolean; thresholdTokens: number }) {
+  return call("save_zcode_autoswitch_config", body);
+}
+/** 立即跑一轮 ZCode 自动切换检查 */
+/** MiniMax 通道（1.6.0）状态 */
+export async function getMinimaxStatus() {
+  return call("get_minimax_status");
+}
+/** 保存 MiniMax 通道配置 */
+export async function saveMinimaxConfig(body: Record<string, unknown>) {
+  return call("save_minimax_config", body);
+}
+/** 加入 MiniMax 账号池 */
+export async function addMinimaxAccount(body: Record<string, string>) {
+  return call("add_minimax_account", body);
+}
+/** 移出 MiniMax 账号池 */
+export async function removeMinimaxAccount(body: { id: string }) {
+  return call("remove_minimax_account", body);
+}
+/** 启用/停用 MiniMax 账号 */
+export async function enableMinimaxAccount(body: { id: string; enabled: boolean }) {
+  return call("enable_minimax_account", body);
+}
+
+export async function switchMinimaxAccount(body: { mode?: string; id?: string; region?: string }) {
+  return call("switch_minimax_account", body);
+}
+/** MiniMax 立即全量签到 */
+/** 从桌面端登录态导入 MiniMax 账号（只读共享） */
+export async function captureMinimaxDesktop() {
+  return call("capture_minimax_desktop");
+}
+export async function runMinimaxSignin(body: { id?: string }) {
+  return call("run_minimax_signin", body);
+}
+export async function tickZcodeAutoSwitch() {
+  return call("tick_zcode_autoswitch");
+}
 export async function getGlmplanStatus() {
   return call("get_glmplan_status");
 }
@@ -1295,6 +1374,82 @@ export async function getDumateCheckinStatus(): Promise<DumateCheckinStatus> {
   return call("get_dumate_checkin_status");
 }
 
+// ---- 统一账号管理（GET /api/accounts/unified；契约 docs/unified-accounts-contract.md §2；仅 webui 后端支持）----
+
+/** 聚合全部平台账号为统一 schema（displayName 无遮罩全名，备注优先；含 summary 统计块）。 */
+export function getUnifiedAccounts(): Promise<UnifiedAccountsPayload> {
+  return call("get_unified_accounts");
+}
+
+// ---- DuMate 多账号池（契约 §1；仅 webui 后端支持）----
+// 边界（契约 §0/§8）：多账号只用于「签到/积分」（纯 cookie 接口，一号一独立出站 IP）；
+// 模型调用引擎绑定桌面端当前登录用户，仍走本机主账号——UI 文案需如实说明。
+
+/** GET /api/dumate/accounts——账号池列表（含本机 dumate:local，isLocal 标记；不回 cookies 明文，只回 cookieCount）。 */
+export async function getDumateAccounts(): Promise<{ accounts: DumatePoolAccount[] }> {
+  const res = await call<{ accounts?: DumatePoolAccount[] } | DumatePoolAccount[]>(
+    "get_dumate_accounts",
+  );
+  // 容错：契约形状为 { accounts: [...] }，裸数组也接受
+  if (Array.isArray(res)) return { accounts: res };
+  return { accounts: res.accounts ?? [] };
+}
+
+/** 池账号/本机账号单账号签到结果（POST /api/dumate/account/checkin，契约 §1.2）。 */
+export interface DumatePoolCheckinResult {
+  /** success=本次签到成功(+500) / already=今日已领 / error=失败 */
+  result: "success" | "already" | "error" | string;
+  /** 人话说明 */
+  message?: string | null;
+  /** 本次入账积分（成功时） */
+  points?: string | number | null;
+  ok?: boolean;
+  error?: string | null;
+}
+
+/**
+ * POST /api/dumate/accounts——添加池账号（契约 §1.2 add_account）。
+ * cookies 为已解析 JSON：数组或 {cookies:[...]}，逐条需含非空 name/value；
+ * proxy 为一号一 IP 出站代理（http:// 或 socks5://），空 = 直连。
+ */
+export async function addDumateAccount(input: {
+  name: string;
+  cookies: unknown;
+  proxy?: string;
+  note?: string;
+}): Promise<{ ok?: boolean; account?: DumatePoolAccount }> {
+  return call("add_dumate_account", input as unknown as Record<string, unknown>);
+}
+
+/** POST /api/dumate/accounts/update——更新池账号（name/proxy/note 可选，缺省字段不修改；契约 §1.5）。 */
+export function updateDumateAccount(patch: {
+  id: string;
+  name?: string;
+  proxy?: string;
+  note?: string;
+}): Promise<{ ok?: boolean }> {
+  return call("update_dumate_account", patch as unknown as Record<string, unknown>);
+}
+
+/** POST /api/dumate/accounts/remove——移除池账号（仅 dumate:pool_*；契约 §1.5）。 */
+export function removeDumateAccount(id: string): Promise<{ ok?: boolean }> {
+  return call("remove_dumate_account", { id });
+}
+
+/** POST /api/dumate/accounts/import-client——导入本机客户端登录态为池账号（按 bce-user-info 去重，重复报「已是同一登录态」）。 */
+export function importDumateClient(): Promise<{
+  ok?: boolean;
+  account?: DumatePoolAccount;
+  message?: string;
+}> {
+  return call("import_dumate_client");
+}
+
+/** POST /api/dumate/account/checkin——单账号签到（id 可为 dumate:local 或 dumate:pool_*，都走此入口；幂等，契约 §1.5）。 */
+export function dumateAccountCheckin(id: string): Promise<DumatePoolCheckinResult> {
+  return call("dumate_account_checkin", { id });
+}
+
 /** 网关测试对话结果（前端 fetch 直连 /dumate/v1 的聚合返回）。 */
 export interface DumateTestChatResult {
   ok: boolean;
@@ -1730,6 +1885,18 @@ export function saveAutoCheckinConfig(config: CheckinConfig): Promise<CheckinCon
   });
 }
 
+export function getExpiringSoonConfig(): Promise<ExpiringSoonConfig> {
+  return call("get_expiring_soon_config");
+}
+
+export function saveExpiringSoonConfig(
+  config: ExpiringSoonConfig,
+): Promise<ExpiringSoonConfig> {
+  return call("save_expiring_soon_config", {
+    config: config as unknown as Record<string, unknown>,
+  });
+}
+
 export function getCheckinLogs(): Promise<{ logs: CheckinLog[] }> {
   return call("get_checkin_logs");
 }
@@ -1972,4 +2139,84 @@ export function chatGptAccounts(args?: { limit?: number; offset?: number }): Pro
 /** POST /api/chatgpt/accounts/sync——把已注册账号镜像到本地池 ~/.wb-switch/chatgpt_accounts.json。 */
 export function chatGptAccountsSync(): Promise<Record<string, unknown>> {
   return call("chatgpt_accounts_sync");
+}
+
+// ---- ZCode 账号池（契约 docs/zcode-channel-contract.md §2/§3；仅 webui 后端支持）----
+// 说明：v1 为 webui-first（桌面壳无对应 Tauri command）；切换为冷切换——ZCode 运行中
+// 默认拒绝，前端确认框说明会关闭 ZCode 后携 force=true 重试语义（契约 §3.2）。
+
+/** GET /api/zcode/status——live 登录状态 + 账号池（含每账号 identity/额度缓存摘要）。 */
+export async function getZcodeStatus(): Promise<ZcodeStatus> {
+  const res = await call<ZcodeStatus>("get_zcode_status");
+  // 容错：契约形状含 accounts[]；旧后端缺字段时兜底空池
+  return { ...res, accounts: Array.isArray(res.accounts) ? res.accounts : [] };
+}
+export function updateZcodeAccount(input: {
+  id: string;
+  name?: string;
+  proxy?: string;
+}): Promise<{ ok?: boolean; error?: string }> {
+  return call("update_zcode_account", input as unknown as Record<string, unknown>);
+}
+
+export async function saveZcodeClaimState(patch: { autoClaim?: boolean }): Promise<Record<string, unknown>> {
+  return call("save_zcode_claim_state", patch);
+}
+
+export async function getZcodeClaimState(): Promise<Record<string, unknown>> {
+  return call("get_zcode_claim_state");
+}
+
+export async function zcodeClaimScan(): Promise<Record<string, unknown>> {
+  return call("zcode_claim_scan");
+}
+
+export async function zcodeClaimAuto(id: string): Promise<Record<string, unknown>> {
+  return call("zcode_claim_auto", { id });
+}
+
+export async function zcodeClaimPreview(id?: string): Promise<Record<string, unknown>> {
+  return call("zcode_claim_preview", id ? { id } : {});
+}
+
+
+/** POST /api/zcode/capture——把当前 live 登录态捕获入池（hash 去重：同指纹更新名字）。 */
+export function captureZcode(name?: string): Promise<{
+  ok?: boolean;
+  account?: ZcodeAccount | null;
+  message?: string;
+  error?: string;
+}> {
+  return call("capture_zcode", { name: name?.trim() || undefined });
+}
+
+/**
+ * POST /api/zcode/switch——切换到池中账号（冷切换：写 credentials.json → 删套餐缓存 →
+ * ensure deviceMid → 写 telemetry-state.json）。force=true 时先 taskkill 关闭 ZCode（等 8s）。
+ */
+export function switchZcode(input: {
+  id: string;
+  force?: boolean;
+  restart?: boolean;
+  hot?: boolean;
+}): Promise<{
+  ok?: boolean;
+  message?: string;
+  error?: string;
+  hot?: boolean;
+  launched?: boolean;
+  launchedExe?: string;
+  launchError?: string;
+}> {
+  return call("switch_zcode", input as unknown as Record<string, unknown>);
+}
+
+/** POST /api/zcode/accounts/remove——从账号池移除账号（只删池记录，不动 live 文件）。 */
+export function removeZcode(id: string): Promise<{ ok?: boolean; message?: string }> {
+  return call("remove_zcode", { id });
+}
+
+/** POST /api/zcode/quota——实时额度（id 缺省 = live 当前登录态；多通道合并）。 */
+export function zcodeQuota(id?: string): Promise<ZcodeQuota> {
+  return call("zcode_quota", id ? { id } : {});
 }

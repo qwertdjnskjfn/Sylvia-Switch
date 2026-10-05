@@ -31,12 +31,17 @@ const GCM_IV_LEN: usize = 12;
 const GCM_TAG_LEN: usize = 16;
 
 /// 解密后的单条 cookie（只保留组装请求头需要的字段）。
-#[derive(Debug, Clone, PartialEq)]
+/// serde 形态与客户端 cookie 元素同构（name/value/domain/expirationDate），
+/// 供 DuMate 账号池 `dumate_accounts.json` 落盘 round-trip。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DumateCookie {
     pub name: String,
     pub value: String,
+    #[serde(default)]
     pub domain: String,
     /// Unix 秒（Chrome cookie expirationDate 语义）；None = 会话 cookie（不过滤）。
+    #[serde(default)]
     pub expiration_date: Option<f64>,
 }
 

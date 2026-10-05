@@ -1,0 +1,2051 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
+import { toast } from "sonner";
+import {
+  CalendarCheck,
+  CircleCheck,
+  Columns3,
+  AlarmClock,
+  ChevronDown,
+  Download,
+  ExternalLink,
+  FileDown,
+  FileUp,
+  Globe,
+  Layers,
+  Loader2,
+  Pencil,
+  Plus,
+  QrCode,
+  RefreshCw,
+  Rows3,
+  Search,
+  ShieldCheck,
+  Trash2,
+  Users,
+  X,
+} from "lucide-react";
+
+import { AccountCard } from "@/components/account-card";
+import { DemoAction } from "@/components/demo-action";
+import { WorkBuddyMark } from "@/components/product-marks";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Separator } from "@/components/ui/separator";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Switch } from "@/components/ui/switch";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import {
+  ACCOUNT_EXTRAS_CHANGE_EVENT,
+  getAccountNotes,
+  setAccountNote,
+} from "@/lib/account-extras";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { ExportAccountsDialog } from "@/components/export-accounts-dialog";
+import { ImportAccountsDialog } from "@/components/import-accounts-dialog";
+import { OAuthLoginDialog } from "@/components/oauth-login-dialog";
+import { QoderCnImportDialog } from "@/components/qoder-cn-import-dialog";
+import { SwitchAccountDialog } from "@/components/switch-account-dialog";
+import * as api from "@/lib/api";
+import type {
+  AccountMeta,
+  AppStatus,
+  CheckinConfig,
+  CreditExpiry,
+  PlatformCheckinItem,
+  TravelConfig,
+  TravelStatus,
+  UnifiedAccount,
+  UnifiedAccountsPayload,
+} from "@/lib/types";
+import { cn } from "@/lib/utils";
+import { useAccountsStore } from "@/stores/accounts";
+
+function expiringSoonAmount(credit?: CreditExpiry): number {
+  return credit?.ok ? credit.expiringSoonRemaining ?? 0 : 0;
+}
+
+function hasExpiringSoonCredits(credit?: CreditExpiry): boolean {
+  return credit?.ok === true && expiringSoonAmount(credit) > 0;
+}
+
+function soonestRelevantExpiry(credit?: CreditExpiry): number {
+  const soonestExpiringCredit = (credit?.resources ?? [])
+    .filter((resource) => resource.remaining > 0 && resource.expiringSoon && resource.expireAt != null)
+    .map((resource) => resource.expireAt as number)
+    .reduce((soonest, expireAt) => Math.min(soonest, expireAt), Number.POSITIVE_INFINITY);
+  return Number.isFinite(soonestExpiringCredit)
+    ? soonestExpiringCredit
+    : credit?.soonestExpireAt ?? Number.POSITIVE_INFINITY;
+}
+
+function creditPriorityRank(credit?: CreditExpiry): number {
+  if (!credit?.ok) return 3;
+  if (hasExpiringSoonCredits(credit)) return 0;
+  if (credit.expired) return 1;
+  return 2;
+}
+
+function isWorkbuddyCurrent(account: AccountMeta, current: AppStatus["current"] | undefined): boolean {
+  if (!current) return false;
+  return Boolean(
+    (current.uid && (account.uid === current.uid || account.id === current.uid)) ||
+      (current.email && account.email === current.email),
+  );
+}
+
+/** 并行查询今日签到；失败的账号不写入，由调用方保留原值。 */
+async function fetchTodayCheckinMap(
+  accountIds: string[],
+  isStale?: () => boolean,
+): Promise<Record<string, boolean>> {
+  const entries = await Promise.all(
+    accountIds.map(async (id) => {
+      try {
+        const res = await api.getCheckinStatus(id);
+        if (isStale?.() || !res.ok) return null;
+        return [id, res.todayCheckedIn] as const;
+      } catch {
+        return null;
+      }
+    }),
+  );
+  const next: Record<string, boolean> = {};
+  for (const entry of entries) {
+    if (entry) next[entry[0]] = entry[1];
+  }
+  return next;
+}
+
+/** 并行查询各账号今日旅行状态；失败的账号不写入，由调用方保留原值。 */
+async function fetchTravelMap(
+  accountIds: string[],
+  isStale?: () => boolean,
+): Promise<Record<string, TravelStatus>> {
+  const entries = await Promise.all(
+    accountIds.map(async (id) => {
+      try {
+        const res = await api.getTravelStatus(id);
+        if (isStale?.()) return null;
+        return [id, res] as const;
+      } catch {
+        return null;
+      }
+    }),
+  );
+  const next: Record<string, TravelStatus> = {};
+  for (const entry of entries) {
+    if (entry) next[entry[0]] = entry[1];
+  }
+  return next;
+}
+
+// ---------------------------------------------------------------------------
+// 统一账号管理（契约 docs/unified-accounts-contract.md §2/§4）
+// ---------------------------------------------------------------------------
+
+/** 平台显示名（契约 §2 platform 枚举的超集；未知平台回退原始字符串）。 */
+const PLATFORM_LABELS: Record<string, string> = {
+  workbuddy: "WorkBuddy",
+  autoclaw: "AutoClaw",
+  trae_work_cn: "TRAE Work CN",
+  dumate: "DuMate",
+  grok: "Grok",
+  chatglm: "ChatGLM",
+  glmweb: "ChatGLM Web",
+  loomy: "Loomy",
+  miaoshou: "妙手",
+  qoder: "Qoder",
+  kimi: "Kimi",
+  qwen: "Qwen",
+  chatgpt: "ChatGPT",
+};
+
+const PLATFORM_TONES = [
+  "bg-emerald-500/15 text-emerald-700 dark:text-emerald-400",
+  "bg-violet-500/15 text-violet-700 dark:text-violet-400",
+  "bg-sky-500/15 text-sky-700 dark:text-sky-400",
+  "bg-amber-500/15 text-amber-700 dark:text-amber-400",
+  "bg-rose-500/15 text-rose-700 dark:text-rose-400",
+  "bg-teal-500/15 text-teal-700 dark:text-teal-400",
+] as const;
+
+function platformLabel(platform: string): string {
+  return PLATFORM_LABELS[platform] || platform;
+}
+
+function platformTone(platform: string): string {
+  let hash = 0;
+  for (let i = 0; i < platform.length; i += 1) hash = (hash * 31 + platform.charCodeAt(i)) >>> 0;
+  return PLATFORM_TONES[hash % PLATFORM_TONES.length];
+}
+
+/** 统一账号积分显示（上游多为字符串数值，容错 number / 非法值）。 */
+function fmtUnifiedCredits(value: string | number | null | undefined): string {
+  if (value == null || value === "") return "—";
+  const num = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(num)
+    ? new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(num)
+    : String(value);
+}
+
+/** 秒级 epoch → 「M/D」短日期（如 10/31）；无到期时间返回 null。 */
+function fmtExpireShort(expireAt: number | null | undefined): string | null {
+  if (expireAt == null || !Number.isFinite(expireAt)) return null;
+  const d = new Date(expireAt * 1000);
+  return `${d.getMonth() + 1}/${d.getDate()}`;
+}
+
+/** 秒级 epoch → 「10/31 到期」/「10/31 已过期」/「无到期时间」。 */
+function fmtExpireLabel(expireAt: number | null | undefined): string {
+  const short = fmtExpireShort(expireAt);
+  if (!short) return "无到期时间";
+  return (expireAt as number) * 1000 < Date.now() ? `${short} 已过期` : `${short} 到期`;
+}
+
+/** 账号是否有 7 天内到期（含已过期）的积分包。 */
+function hasExpiringPackages(account: UnifiedAccount): boolean {
+  const pkgs = account.credits?.packages ?? [];
+  return pkgs.some((p) => p.expiringSoon);
+}
+
+/** 解析并校验 DuMate cookies JSON（数组或 {cookies:[...]}，逐条 name/value 非空）。 */
+function parseDumateCookies(text: string): { ok: true; parsed: unknown } | { ok: false; error: string } {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { ok: false, error: 'cookies JSON 解析失败：请粘贴完整的 JSON 数组或 {"cookies":[...]}' };
+  }
+  const list = Array.isArray(parsed)
+    ? parsed
+    : parsed && typeof parsed === "object" && Array.isArray((parsed as { cookies?: unknown }).cookies)
+      ? (parsed as { cookies: unknown[] }).cookies
+      : null;
+  if (!list || list.length === 0) {
+    return { ok: false, error: '未识别到 cookie 列表：支持 JSON 数组或 {"cookies":[...]}' };
+  }
+  const bad = list.findIndex((c) => {
+    if (!c || typeof c !== "object") return true;
+    const o = c as { name?: unknown; value?: unknown };
+    return typeof o.name !== "string" || !o.name || typeof o.value !== "string" || !o.value;
+  });
+  if (bad >= 0) {
+    return { ok: false, error: `第 ${bad + 1} 条 cookie 缺少非空的 name / value 字段` };
+  }
+  return { ok: true, parsed };
+}
+
+export default function AccountsPage() {
+  const navigate = useNavigate();
+  const {
+    accounts,
+    status,
+    loading,
+    error,
+    fetchAll,
+    deleteAccount,
+    importLocal,
+    creditMap,
+    creditLoadingMap,
+    creditUpdatedAtMap,
+    refreshingCredits,
+    ensureCredits,
+    refreshCredits,
+  } = useAccountsStore();
+  const [oauthOpen, setOauthOpen] = useState(false);
+  const [exportOpen, setExportOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
+  const [qoderCnOpen, setQoderCnOpen] = useState(false);
+  const [switchAccount, setSwitchAccount] = useState<AccountMeta | null>(null);
+  const [importing, setImporting] = useState(false);
+  const [autoCheckinConfig, setAutoCheckinConfig] = useState<CheckinConfig | null>(null);
+  const [autoCheckinSaving, setAutoCheckinSaving] = useState(false);
+  /** 账号 id -> 今日是否已签到（undefined=查询中/未知） */
+  const [checkinMap, setCheckinMap] = useState<Record<string, boolean>>({});
+  /** 本机平台账号（AutoClaw / TRAE Work CN）签到状态 + 积分 */
+  const [platformCheckins, setPlatformCheckins] = useState<PlatformCheckinItem[]>([]);
+  const [platformCheckinBusyId, setPlatformCheckinBusyId] = useState<string | null>(null);
+  /** 平台卡片积分刷新中 */
+  const [platformCreditLoadingId, setPlatformCreditLoadingId] = useState<string | null>(null);
+  const [autoTravelConfig, setAutoTravelConfig] = useState<TravelConfig | null>(null);
+  const [autoTravelSaving, setAutoTravelSaving] = useState(false);
+  /** 账号 id -> 今日旅行状态（undefined=查询中/未知） */
+  const [travelMap, setTravelMap] = useState<Record<string, TravelStatus>>({});
+  /** 刷新按钮触发的批量签到进行中 */
+  const [checkinAllRunning, setCheckinAllRunning] = useState(false);
+  /** 删除账号确认目标（null=关闭） */
+  const [deleteTarget, setDeleteTarget] = useState<AccountMeta | null>(null);
+  /** 紧凑模式：卡片更小、同屏更多列；默认开启，持久化到 localStorage */
+  const [compact, setCompact] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("wb-switch.compact") !== "0";
+    } catch {
+      return true;
+    }
+  });
+
+  // 搜索、过滤、排序与辅助功能状态
+  const [searchQuery, setSearchQuery] = useState("");
+  const [filterType, setFilterType] = useState<"all" | "unchecked" | "expiring" | "active">("all");
+  const [sortType, setSortType] = useState<"default" | "credits-desc" | "credits-asc" | "recent-expiry">("default");
+  const [accountNotes, setAccountNotes] = useState<Record<string, string>>(getAccountNotes);
+  /** 备注编辑目标（统一账号与本地账号共用；null=关闭） */
+  const [editingNoteTarget, setEditingNoteTarget] = useState<{ id: string; name: string } | null>(null);
+  const [noteInput, setNoteInput] = useState("");
+
+  // ---- 统一账号聚合（契约 §2/§4；仅 webui 后端支持，旧后端加载失败时相关区块整体隐藏）----
+  const [unified, setUnified] = useState<UnifiedAccountsPayload | null>(null);
+  const [unifiedLoading, setUnifiedLoading] = useState(false);
+  const [unifiedFilter, setUnifiedFilter] = useState<string>("all");
+  /** 统一表行内操作进行中（签到为账号 id，代理编辑为 `proxy:${id}`） */
+  const [unifiedBusyId, setUnifiedBusyId] = useState<string | null>(null);
+  /** 统一表行内代理编辑（仅 dumate 池账号） */
+  const [unifiedProxyEdit, setUnifiedProxyEdit] = useState<{ id: string; value: string } | null>(null);
+  /** 统一表积分包展开（账号 id 集合，点击积分包徽标切换） */
+  const [unifiedPkgOpen, setUnifiedPkgOpen] = useState<Set<string>>(() => new Set());
+
+  // ---- DuMate 多账号池（契约 §1/§4.3；多账号仅用于签到/积分，模型调用走本机主账号）----
+  const [dumateError, setDumateError] = useState<string | null>(null);
+  const [dumateBusy, setDumateBusy] = useState<string | null>(null);
+  const [dumateAddOpen, setDumateAddOpen] = useState(false);
+  const [dumateAddName, setDumateAddName] = useState("");
+  const [dumateAddCookies, setDumateAddCookies] = useState("");
+  const [dumateAddProxy, setDumateAddProxy] = useState("");
+  const [dumateAdding, setDumateAdding] = useState(false);
+
+  useEffect(() => {
+    const onExtrasChange = () => {
+      setAccountNotes(getAccountNotes());
+    };
+    window.addEventListener(ACCOUNT_EXTRAS_CHANGE_EVENT, onExtrasChange);
+    return () => window.removeEventListener(ACCOUNT_EXTRAS_CHANGE_EVENT, onExtrasChange);
+  }, []);
+
+  function openEditNote(account: AccountMeta) {
+    setEditingNoteTarget({ id: account.id, name: account.nickname || account.email || account.id });
+    setNoteInput(accountNotes[account.id] || "");
+  }
+
+  function openUnifiedNote(account: UnifiedAccount) {
+    setEditingNoteTarget({ id: account.id, name: unifiedDisplayName(account) });
+    setNoteInput(accountNotes[account.id] || "");
+  }
+
+  function saveNote() {
+    if (!editingNoteTarget) return;
+    setAccountNote(editingNoteTarget.id, noteInput);
+    setEditingNoteTarget(null);
+    toast.success("备注已保存");
+  }
+
+  function clearNote() {
+    if (!editingNoteTarget) return;
+    setAccountNote(editingNoteTarget.id, "");
+    setEditingNoteTarget(null);
+    toast.success("备注已清除");
+  }
+
+  function toggleCompact() {
+    setCompact((value) => {
+      const next = !value;
+      try {
+        localStorage.setItem("wb-switch.compact", next ? "1" : "0");
+      } catch {
+        /* 存储不可用时静默 */
+      }
+      return next;
+    });
+  }
+
+  useEffect(() => {
+    void fetchAll();
+  }, [fetchAll]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void api
+      .getAutoCheckinConfig()
+      .then((config) => {
+        if (!cancelled) setAutoCheckinConfig(config);
+      })
+      .catch((e) => {
+        if (!cancelled) {
+          toast.error("自动签到配置加载失败", { description: api.asError(e) });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void api
+      .getAutoTravelConfig()
+      .then((config) => {
+        if (!cancelled) setAutoTravelConfig(config);
+      })
+      .catch((e) => {
+        if (!cancelled) {
+          toast.error("自动旅行配置加载失败", { description: api.asError(e) });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /** 首次启动自动导入本机账号（本会话只尝试一次，无本机账号时静默） */
+  const autoImportTried = useRef(false);
+  useEffect(() => {
+    if (autoImportTried.current || loading || accounts.length > 0) return;
+    autoImportTried.current = true;
+    void importLocal()
+      .then(() => void fetchAll())
+      .catch(() => {
+        /* 本机无 WorkBuddy 登录态时静默，不打扰用户 */
+      });
+  }, [accounts.length, loading, importLocal, fetchAll]);
+
+  // ---------------------------------------------------------------------------
+  // 统一账号聚合 + DuMate 账号池：加载（30s 静默轮询 + 切屏刷新）
+  // ---------------------------------------------------------------------------
+
+  /** 拉取统一账号聚合（契约 §2）。失败保留旧数据；从未成功过则相关区块不渲染。 */
+  async function loadUnified(showLoading = false) {
+    if (showLoading) setUnifiedLoading(true);
+    try {
+      setUnified(await api.getUnifiedAccounts());
+    } catch {
+      /* 静默：保留旧数据或维持未加载态（旧后端无此接口） */
+    } finally {
+      if (showLoading) setUnifiedLoading(false);
+    }
+  }
+
+  /** DuMate 账号池列表（失败落 dumateError，卡内展示，不打断其他区块）。 */
+  /** 账号池可加载性探测（账号列表已在「统一账号」表展示，此处只记加载错误）。 */
+  async function loadDumatePool() {
+    try {
+      await api.getDumateAccounts();
+      setDumateError(null);
+    } catch (e) {
+      setDumateError(api.asError(e));
+    }
+  }
+
+  useEffect(() => {
+    void loadUnified(true);
+    void loadDumatePool();
+    const interval = window.setInterval(() => {
+      void loadUnified();
+      void loadDumatePool();
+    }, 30_000);
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        void loadUnified();
+        void loadDumatePool();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, []);
+
+  /** 手动刷新：统一聚合 + DuMate 账号池一起重拉。 */
+  async function refreshUnifiedAll() {
+    await Promise.all([loadUnified(true), loadDumatePool()]);
+  }
+
+  // ---------------------------------------------------------------------------
+  // 统一账号表：名称 / 签到 / 代理 / 备注 / 跳转
+  // ---------------------------------------------------------------------------
+
+  /** 名称显示统一规则（任务 #3）：备注（accountNotes）→ 账号自身 displayName → 平台默认名。全程无星号。 */
+  function unifiedDisplayName(account: UnifiedAccount): string {
+    const note = accountNotes[account.id]?.trim();
+    if (note) return note;
+    const own = account.displayName?.trim();
+    if (own) return own;
+    return platformLabel(account.platform);
+  }
+
+  async function onUnifiedCheckin(account: UnifiedAccount) {
+    if (unifiedBusyId !== null) return;
+    setUnifiedBusyId(account.id);
+    try {
+      const res = await api.checkin(account.id);
+      const label =
+        res.result === "success"
+          ? "签到成功"
+          : res.result === "already"
+            ? "今天已签到"
+            : "签到失败";
+      const description = `${unifiedDisplayName(account)}${res.error ? `：${res.error}` : ""}`;
+      if (res.result === "error") toast.error(label, { description });
+      else toast.success(label, { description });
+      void loadUnified();
+    } catch (e) {
+      toast.error("签到失败", { description: api.asError(e) });
+    } finally {
+      setUnifiedBusyId(null);
+    }
+  }
+
+  /** 保存统一表行内编辑的出站代理（空串 = 直连；仅 dumate 池账号）。 */
+  async function saveUnifiedProxy(account: UnifiedAccount) {
+    const proxy = (unifiedProxyEdit?.id === account.id ? unifiedProxyEdit.value : account.proxy ?? "").trim();
+    setUnifiedBusyId(`proxy:${account.id}`);
+    try {
+      await api.updateDumateAccount({ id: account.id, proxy });
+      toast.success(proxy ? `「${unifiedDisplayName(account)}」代理已更新` : `「${unifiedDisplayName(account)}」已改为直连`);
+      setUnifiedProxyEdit(null);
+      await Promise.all([loadUnified(), loadDumatePool()]);
+    } catch (e) {
+      toast.error(api.asError(e));
+    } finally {
+      setUnifiedBusyId(null);
+    }
+  }
+
+  /** 删除统一表中的 DuMate 池账号（非 dumate 平台按钮不渲染）。 */
+  async function onUnifiedRemoveDumate(account: UnifiedAccount) {
+    if (!window.confirm(`确定删除账号「${unifiedDisplayName(account)}」？删除后不可恢复。`)) return;
+    setUnifiedBusyId(`remove:${account.id}`);
+    try {
+      await api.removeDumateAccount(account.id);
+      toast.success(`已删除「${unifiedDisplayName(account)}」`);
+      await Promise.all([loadUnified(), loadDumatePool()]);
+    } catch (e) {
+      toast.error(api.asError(e));
+    } finally {
+      setUnifiedBusyId(null);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // DuMate 多账号池：导入 / 添加 / 签到 / 代理 / 删除
+  // ---------------------------------------------------------------------------
+
+  /** 导入本机客户端登录态为池账号（后端按 bce-user-info 去重，重复直接报错）。 */
+  async function onDumateImportClient() {
+    setDumateBusy("import");
+    try {
+      const res = await api.importDumateClient();
+      toast.success(res.message || "已导入本机登录态");
+      await Promise.all([loadDumatePool(), loadUnified()]);
+    } catch (e) {
+      toast.error(api.asError(e));
+    } finally {
+      setDumateBusy(null);
+    }
+  }
+
+  /** 添加池账号：客户端先校验 cookies JSON（数组或 {cookies:[...]}，逐条 name/value 非空）。 */
+  async function onDumateAdd() {
+    const name = dumateAddName.trim();
+    if (!name) {
+      toast.error("请填写账号名称");
+      return;
+    }
+    const text = dumateAddCookies.trim();
+    if (!text) {
+      toast.error("请粘贴 cookies JSON");
+      return;
+    }
+    const parsed = parseDumateCookies(text);
+    if (!parsed.ok) {
+      toast.error(parsed.error);
+      return;
+    }
+    setDumateAdding(true);
+    try {
+      await api.addDumateAccount({
+        name,
+        cookies: parsed.parsed,
+        proxy: dumateAddProxy.trim(),
+        note: "",
+      });
+      toast.success(`已添加账号「${name}」`);
+      setDumateAddName("");
+      setDumateAddCookies("");
+      setDumateAddProxy("");
+      setDumateAddOpen(false);
+      await Promise.all([loadDumatePool(), loadUnified()]);
+    } catch (e) {
+      toast.error(api.asError(e));
+    } finally {
+      setDumateAdding(false);
+    }
+  }
+
+
+
+
+  async function loadPlatformCheckins() {
+    try {
+      setPlatformCheckins(await api.getPlatformCheckinItems());
+    } catch {
+      setPlatformCheckins([]);
+    }
+  }
+
+  // 账号列表变化后并行查询各账号今日签到状态，并开启 30 秒静默轮询与切屏/唤醒激活更新
+  useEffect(() => {
+    if (!accounts.length) return;
+    let cancelled = false;
+    const updateCheckin = () => {
+      void fetchTodayCheckinMap(
+        accounts.map((account) => account.id),
+        () => cancelled,
+      ).then((next) => {
+        if (!cancelled && Object.keys(next).length > 0) {
+          setCheckinMap((prev) => ({ ...prev, ...next }));
+        }
+      });
+      void loadPlatformCheckins();
+    };
+
+    updateCheckin();
+    const interval = window.setInterval(updateCheckin, 30_000);
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        updateCheckin();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    window.addEventListener("focus", updateCheckin);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.removeEventListener("focus", updateCheckin);
+    };
+  }, [accounts]);
+
+  async function onPlatformCheckin(item: PlatformCheckinItem) {
+    if (platformCheckinBusyId !== null) return;
+    setPlatformCheckinBusyId(item.accountId);
+    try {
+      const res = await api.checkin(item.accountId);
+      const label =
+        res.result === "success"
+          ? "签到成功"
+          : res.result === "already"
+            ? "今天已签到"
+            : "签到失败";
+      const description = `${item.email}${res.error ? `：${res.error}` : ""}`;
+      if (res.result === "error") toast.error(label, { description });
+      else toast.success(label, { description });
+      void loadPlatformCheckins();
+    } catch (e) {
+      toast.error("签到失败", { description: api.asError(e) });
+    } finally {
+      setPlatformCheckinBusyId(null);
+    }
+  }
+
+  /** AccountCard 回调适配：按 id 找回平台账号条目 */
+  async function onPlatformCardCheckin(a: AccountMeta) {
+    const item = platformCheckins.find((p) => p.accountId === a.id);
+    if (item) await onPlatformCheckin(item);
+  }
+
+  /** 某平台的全部账号（供一键切换列出目标）。 */
+  function platformAccountsOf(platform: string): AccountMeta[] {
+    return platformCheckins
+      .filter((p) => p.platform === platform)
+      .map((p) => ({
+        id: p.accountId,
+        uid: null,
+        email: p.email,
+        nickname: p.email,
+        enterpriseName: null,
+        expiresAt: null,
+        refreshExpiresAt: null,
+        refreshedAt: null,
+        createdAt: null,
+        needsRelogin: false,
+        needsReloginReason: null,
+      }));
+  }
+
+  function onPlatformCardRefresh(a: AccountMeta) {
+    if (platformCreditLoadingId !== null) return;
+    setPlatformCreditLoadingId(a.id);
+    void loadPlatformCheckins()
+      .then(() => toast.success("平台积分已刷新", { description: a.nickname || a.id }))
+      .catch(() => toast.error("平台积分刷新失败"))
+      .finally(() => setPlatformCreditLoadingId(null));
+  }
+
+  async function loadTravelMap(accountIds: string[], isStale?: () => boolean) {
+    const next = await fetchTravelMap(accountIds, isStale);
+    if (!isStale?.() && Object.keys(next).length > 0) {
+      setTravelMap((prev) => ({ ...prev, ...next }));
+    }
+  }
+
+  // 账号列表变化后并行查询旅行状态；后台领取后每 60 秒再拉一次，避免卡片停在「旅行中」。
+  useEffect(() => {
+    if (!accounts.length) return;
+    let cancelled = false;
+    const ids = accounts.map((account) => account.id);
+    void loadTravelMap(ids, () => cancelled);
+    const timer = window.setInterval(() => {
+      void loadTravelMap(ids, () => cancelled);
+    }, 60_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [accounts]);
+
+  // 只给尚未缓存的账号拉积分；切回首页不重复请求。点「刷新积分」才强制更新。
+  useEffect(() => {
+    if (!accounts.length) return;
+    void ensureCredits(accounts.map((account) => account.id));
+  }, [accounts, ensureCredits]);
+
+  async function onImport() {
+    setImporting(true);
+    try {
+      const acc = await importLocal();
+      toast.success("账号已导入", { description: acc.nickname || acc.email || acc.id });
+    } catch (e) {
+      toast.error("导入失败", { description: api.asError(e) });
+    } finally {
+      setImporting(false);
+    }
+  }
+
+  async function onAutoCheckinChange(enabled: boolean) {
+    if (!autoCheckinConfig || autoCheckinSaving) return;
+    const previous = autoCheckinConfig;
+    const next = { ...previous, enabled };
+    setAutoCheckinConfig(next);
+    setAutoCheckinSaving(true);
+    try {
+      setAutoCheckinConfig(await api.saveAutoCheckinConfig(next));
+    } catch (e) {
+      setAutoCheckinConfig(previous);
+      toast.error("自动签到设置保存失败", { description: api.asError(e) });
+    } finally {
+      setAutoCheckinSaving(false);
+    }
+  }
+
+  async function onAutoTravelChange(enabled: boolean) {
+    if (!autoTravelConfig || autoTravelSaving) return;
+    const previous = autoTravelConfig;
+    const next = { ...previous, enabled };
+    setAutoTravelConfig(next);
+    setAutoTravelSaving(true);
+    try {
+      setAutoTravelConfig(await api.saveAutoTravelConfig(next));
+      if (enabled) {
+        toast.success("自动旅行已开启", { description: "正在按官方状态派发或领取" });
+        window.setTimeout(() => {
+          void loadTravelMap(accounts.map((account) => account.id));
+        }, 2500);
+      }
+    } catch (e) {
+      setAutoTravelConfig(previous);
+      toast.error("自动旅行设置保存失败", { description: api.asError(e) });
+    } finally {
+      setAutoTravelSaving(false);
+    }
+  }
+
+  /** 导出完成提示（含安全提醒）。 */
+  function onExported(count: number) {
+    const text = `已导出 ${count} 个账号。文件含登录 token，等同密码，请勿上传网盘或发送给他人。`;
+    toast.success("导出成功", { description: text });
+  }
+
+  /** 导入完成提示：计数 + token 可能过期提醒，并刷新列表。 */
+  function onImported(result: { imported: number; skipped: number; overwritten: number }) {
+    void fetchAll();
+    const overwriteText = result.overwritten > 0 ? `（覆盖 ${result.overwritten} 个）` : "";
+    const text = `已导入 ${result.imported} 个${overwriteText}，跳过 ${result.skipped} 个。token 可能已过期，切换后可能需要重新登录。`;
+    toast.success("导入成功", { description: text });
+  }
+
+  async function onDelete(a: AccountMeta) {
+    // 桌面 App（Tauri WebView）不支持 window.confirm，改用 Dialog 确认
+    setDeleteTarget(a);
+  }
+
+  async function confirmDelete() {
+    if (!deleteTarget) return;
+    const a = deleteTarget;
+    setDeleteTarget(null);
+    try {
+      await deleteAccount(a.id);
+      toast.success("账号已删除");
+    } catch (e) {
+      toast.error("删除失败", { description: api.asError(e) });
+    }
+  }
+
+  async function onCheckin(a: AccountMeta) {
+    try {
+      const res = await api.checkin(a.id);
+      const label =
+        res.result === "success"
+          ? "签到成功"
+          : res.result === "already"
+            ? "今天已签到"
+            : "签到失败";
+      const description = `${a.nickname || a.email || a.id}${res.error ? `：${res.error}` : ""}`;
+      if (res.result === "error") toast.error(label, { description });
+      else toast.success(label, { description });
+      // 刷新该账号的今日签到状态
+      try {
+        const st = await api.getCheckinStatus(a.id);
+        if (st.ok) setCheckinMap((prev) => ({ ...prev, [a.id]: st.todayCheckedIn }));
+      } catch {
+        /* ignore */
+      }
+      void fetchAll();
+      // 签到成功/已签到会带来积分变动，force 刷新该账号积分
+      if (res.result !== "error") void refreshCredits([a.id]);
+    } catch (e) {
+      toast.error("签到失败", { description: api.asError(e) });
+    }
+  }
+
+  async function onRefresh(a: AccountMeta) {
+    try {
+      const res = await api.refreshAccountToken(a.id);
+      const label = a.nickname || a.email || a.id;
+      if (res.needsRelogin) {
+        toast.error("Token 刷新失败", { description: `${label}：需重新登录${res.needsReloginReason ? `（${res.needsReloginReason}）` : ""}` });
+      } else {
+        toast.success("Token 已刷新", { description: label });
+      }
+      void fetchAll();
+    } catch (e) {
+      toast.error("Token 刷新失败", { description: api.asError(e) });
+    }
+  }
+
+  /** 刷新按钮：先跑一轮批量签到并重查今日签到状态，再强制刷新全部积分。 */
+  async function onRefreshCredits() {
+    if (!accounts.length || refreshingCredits || checkinAllRunning) return;
+    setCheckinAllRunning(true);
+    try {
+      try {
+        const res = await api.checkinAll();
+        const entries = res.accounts ?? [];
+        const success = entries.filter((e) => e.result === "success").length;
+        const already = entries.filter((e) => e.result === "already").length;
+        const failed = entries.filter((e) => e.result === "error").length;
+        const parts: string[] = [];
+        if (success > 0) parts.push(`${success} 个签到成功`);
+        if (already > 0) parts.push(`${already} 个已签到`);
+        if (failed > 0) parts.push(`${failed} 个失败`);
+        const summary = parts.length > 0 ? parts.join("，") : "无账号需要签到";
+        if (entries.length > 0 && failed === entries.length) {
+          toast.error("签到失败", { description: summary });
+        } else {
+          toast.success("签到完成", { description: summary });
+        }
+        // 批量签到后重查全部账号的今日签到状态，无需切换页面即反映最新结果
+        const next = await fetchTodayCheckinMap(accounts.map((account) => account.id));
+        if (Object.keys(next).length > 0) {
+          setCheckinMap((prev) => ({ ...prev, ...next }));
+        }
+        void loadPlatformCheckins();
+      } catch (e) {
+        toast.error("批量签到失败", { description: api.asError(e) });
+      }
+      await refreshCredits(accounts.map((account) => account.id));
+      await loadTravelMap(accounts.map((account) => account.id));
+      toast.success("积分到期情况已刷新");
+    } finally {
+      setCheckinAllRunning(false);
+    }
+  }
+
+  const current = status?.current;
+  const creditOrderingReady =
+    accounts.length > 0 &&
+    accounts.every((account) => Boolean(creditMap[account.id]) && !creditLoadingMap[account.id]);
+  const orderedAccounts = creditOrderingReady
+    ? accounts
+        .map((account, index) => ({ account, index }))
+        .sort((left, right) => {
+          const leftCredit = creditMap[left.account.id];
+          const rightCredit = creditMap[right.account.id];
+          const rankDifference = creditPriorityRank(leftCredit) - creditPriorityRank(rightCredit);
+          if (rankDifference !== 0) return rankDifference;
+
+          const leftExpiry = soonestRelevantExpiry(leftCredit);
+          const rightExpiry = soonestRelevantExpiry(rightCredit);
+          if (leftExpiry !== rightExpiry) return leftExpiry - rightExpiry;
+
+          const amountDifference = expiringSoonAmount(rightCredit) - expiringSoonAmount(leftCredit);
+          if (amountDifference !== 0) return amountDifference;
+          return left.index - right.index;
+        })
+        .map(({ account }) => account)
+    : accounts;
+
+  // 统计各标签数量
+  const uncheckedCount = useMemo(
+    () => accounts.filter((a) => checkinMap[a.id] === false).length,
+    [accounts, checkinMap],
+  );
+  const expiringCount = useMemo(
+    () => accounts.filter((a) => hasExpiringSoonCredits(creditMap[a.id])).length,
+    [accounts, creditMap],
+  );
+  const activeCount = useMemo(
+    () => accounts.filter((a) => isWorkbuddyCurrent(a, current)).length,
+    [accounts, current],
+  );
+
+  // 综合搜索、过滤与排序
+  const filteredAndSortedAccounts = useMemo(() => {
+    let list = accounts;
+
+    // 1. 关键字模糊搜索
+    const query = searchQuery.trim().toLowerCase();
+    if (query) {
+      list = list.filter((a) => {
+        const note = (accountNotes[a.id] || "").toLowerCase();
+        const nickname = (a.nickname || "").toLowerCase();
+        const email = (a.email || "").toLowerCase();
+        const uid = (a.uid || "").toLowerCase();
+        const id = (a.id || "").toLowerCase();
+        return (
+          note.includes(query) ||
+          nickname.includes(query) ||
+          email.includes(query) ||
+          uid.includes(query) ||
+          id.includes(query)
+        );
+      });
+    }
+
+    // 2. 状态标签过滤
+    if (filterType === "unchecked") {
+      list = list.filter((a) => checkinMap[a.id] === false);
+    } else if (filterType === "expiring") {
+      list = list.filter((a) => hasExpiringSoonCredits(creditMap[a.id]));
+    } else if (filterType === "active") {
+      list = list.filter((a) => isWorkbuddyCurrent(a, current));
+    }
+
+    // 3. 排序
+    const sorted = [...list];
+    if (sortType === "credits-desc") {
+      sorted.sort((a, b) => {
+        const crA = creditMap[a.id]?.totalRemaining ?? 0;
+        const crB = creditMap[b.id]?.totalRemaining ?? 0;
+        return crB - crA;
+      });
+    } else if (sortType === "credits-asc") {
+      sorted.sort((a, b) => {
+        const crA = creditMap[a.id]?.totalRemaining ?? 0;
+        const crB = creditMap[b.id]?.totalRemaining ?? 0;
+        return crA - crB;
+      });
+    } else if (sortType === "recent-expiry") {
+      sorted.sort((a, b) => {
+        const expA = soonestRelevantExpiry(creditMap[a.id]);
+        const expB = soonestRelevantExpiry(creditMap[b.id]);
+        return expA - expB;
+      });
+    } else {
+      // 默认排序：即将过期优先
+      if (creditOrderingReady) {
+        sorted.sort((left, right) => {
+          const leftCredit = creditMap[left.id];
+          const rightCredit = creditMap[right.id];
+          const rankDiff = creditPriorityRank(leftCredit) - creditPriorityRank(rightCredit);
+          if (rankDiff !== 0) return rankDiff;
+          const leftExpiry = soonestRelevantExpiry(leftCredit);
+          const rightExpiry = soonestRelevantExpiry(rightCredit);
+          if (leftExpiry !== rightExpiry) return leftExpiry - rightExpiry;
+          return expiringSoonAmount(rightCredit) - expiringSoonAmount(leftCredit);
+        });
+      }
+    }
+
+    return sorted;
+  }, [
+    accounts,
+    accountNotes,
+    searchQuery,
+    filterType,
+    sortType,
+    creditMap,
+    checkinMap,
+    creditOrderingReady,
+    current,
+  ]);
+  const priorityAccountId =
+    creditOrderingReady
+      ? orderedAccounts.find((account) => hasExpiringSoonCredits(creditMap[account.id]))?.id
+      : undefined;
+  // 展示字段防御：客户端新版本可能把 nickname/email 写成加密信封对象
+  // （$wbEncrypted），对象作为 React child 会触发 error #31 白屏，只接受字符串。
+  const pickStatusText = (v: unknown): string | null =>
+    typeof v === "string" && v.trim() !== "" ? v : null;
+  const workbuddyCurrentName = current
+    ? pickStatusText(current.nickname) ||
+      pickStatusText(current.email) ||
+      pickStatusText(current.uid) ||
+      "未知账号"
+    : "未登录";
+
+  // ---- 统一账号表：平台 chips 与过滤 ----
+  const unifiedAccounts = unified?.accounts ?? [];
+
+  /** 同源锚点 id → 展示名（「同源」徽标的 title 用） */
+  const sameSourceName = (id: string | null | undefined): string =>
+    id ? (unifiedAccounts.find((a) => a.id === id)?.displayName ?? id) : "";
+  const unifiedSummary = unified?.summary ?? null;
+  /** 存在 7 天内到期（含已过期）积分包的账号数（总览「积分临近到期」瓦片）。 */
+  const unifiedExpiringCount = useMemo(
+    () => unifiedAccounts.filter(hasExpiringPackages).length,
+    [unifiedAccounts],
+  );
+  const unifiedPlatforms = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const acc of unifiedAccounts) {
+      counts.set(acc.platform, (counts.get(acc.platform) ?? 0) + 1);
+    }
+    return [...counts.entries()];
+  }, [unifiedAccounts]);
+  const filteredUnified = useMemo(
+    () =>
+      unifiedFilter === "all"
+        ? unifiedAccounts
+        : unifiedAccounts.filter((acc) => acc.platform === unifiedFilter),
+    [unifiedAccounts, unifiedFilter],
+  );
+
+  /** 统一账号是否为 DuMate 池账号（契约 §2：仅池账号有 proxy 字段）。 */
+  const isDumatePool = (acc: UnifiedAccount): boolean => acc.id.startsWith("dumate:pool_");
+
+  return (
+    <div className="mx-auto w-full max-w-[1180px] px-6 py-8 sm:px-8 sm:py-9">
+      <header className="mb-6">
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <h1 className="text-[28px] font-semibold tracking-tight">账号管理</h1>
+            <p className="mt-2 text-sm leading-6 text-muted-foreground">
+              统一管理全部平台账号：签到、积分、登录态与 DuMate 一号一 IP 出站代理，全名直显无遮罩。
+            </p>
+          </div>
+          <div className="flex shrink-0 items-center gap-4 pt-1">
+            <div className="flex items-center gap-2.5">
+              <span className="group relative inline-flex cursor-default">
+                <span
+                  className={
+                    status?.running
+                      ? "inline-flex rounded-[22%] bg-primary p-[2px] shadow-sm shadow-primary/40"
+                      : "inline-flex rounded-[22%] bg-muted-foreground/30 p-[2px]"
+                  }
+                >
+                  <WorkBuddyMark size={28} />
+                </span>
+                <span className="pointer-events-none absolute right-0 top-full z-50 mt-2 hidden whitespace-nowrap rounded-md bg-popover px-2.5 py-1.5 text-xs text-popover-foreground shadow-lg ring-1 ring-black/5 group-hover:block">
+                  WorkBuddy：{status?.running ? "运行中" : "未运行"} · 当前账号：{workbuddyCurrentName}
+                </span>
+              </span>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      {error && (
+        <Alert variant="destructive" className="mb-4">
+          <AlertTitle>加载失败</AlertTitle>
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      )}
+
+      {/* 总览条（契约 §4.1）：平台数 / 账号总数 / 健康数 / 今日已签，来源 /api/accounts/unified summary */}
+      {unifiedSummary && (
+        <section className="mb-6" aria-label="全平台账号总览">
+          <Card className="min-w-0 gap-0 overflow-hidden rounded-xl py-0 shadow-none">
+            <div className="flex min-w-0 flex-wrap items-center justify-between gap-2 px-4 pt-3 sm:px-5">
+              <CardTitle className="flex items-center gap-2 text-sm font-medium">
+                <Layers className="size-4 text-muted-foreground" />
+                全平台总览
+              </CardTitle>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-7 gap-1 px-2 text-xs"
+                onClick={() => void refreshUnifiedAll()}
+                disabled={unifiedLoading}
+              >
+                <RefreshCw className={cn("size-3.5", unifiedLoading && "animate-spin")} />
+                刷新
+              </Button>
+            </div>
+            <CardContent className="p-4 pt-3 sm:p-5 sm:pt-3">
+              <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-5">
+                {[
+                  { label: "平台数", value: unifiedSummary.platforms, icon: Layers },
+                  { label: "账号总数", value: unifiedSummary.accounts, icon: Users },
+                  { label: "登录态健康", value: unifiedSummary.healthy, icon: ShieldCheck },
+                  {
+                    label: `今日已签 ${unifiedSummary.checkedInToday ?? 0}/${unifiedSummary.accounts ?? 0}`,
+                    value: unifiedSummary.checkedInToday,
+                    icon: CircleCheck,
+                  },
+                  {
+                    label: "积分临近到期",
+                    value: unifiedExpiringCount,
+                    icon: AlarmClock,
+                  },
+                ].map((stat) => (
+                  <div key={stat.label} className="rounded-lg border border-border/60 bg-muted/30 px-3 py-2.5">
+                    <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                      <stat.icon className="size-3.5" />
+                      <span className="min-w-0 truncate">{stat.label}</span>
+                    </div>
+                    <div className="mt-1 text-xl font-semibold tabular-nums tracking-tight">
+                      {typeof stat.value === "number" ? stat.value : "—"}
+                    </div>
+                  </div>
+                ))}
+              </div>
+              {unifiedExpiringCount > 0 ? (
+                <p className="mt-2.5 flex items-center gap-1.5 rounded-md bg-warning/10 px-2.5 py-1.5 text-[11px] text-warning">
+                  <AlarmClock className="size-3.5 shrink-0" />
+                  有 {unifiedExpiringCount} 个账号存在 7 天内到期（含已过期）的积分包，展开账号行查看明细，尽快使用。
+                </p>
+              ) : null}
+            </CardContent>
+          </Card>
+        </section>
+      )}
+
+      {/* 统一账号表（契约 §4.2）：平台 chips 筛选 + 行式布局（平台徽标|名称|登录态|积分|今日签到|代理|操作） */}
+      {unified && (
+        <section className="mb-8" aria-labelledby="unified-accounts-title">
+          <Card className="min-w-0 gap-0 overflow-hidden rounded-xl py-0 shadow-none">
+            <div className="flex min-w-0 flex-wrap items-center justify-between gap-2 px-4 py-3 sm:px-5">
+              <div className="flex min-w-0 items-center gap-2">
+                <Users className="size-4 shrink-0 text-muted-foreground" />
+                <h2 id="unified-accounts-title" className="text-sm font-medium">统一账号</h2>
+                <Badge variant="secondary" className="text-[10px] tabular-nums">
+                  {unifiedAccounts.length}
+                </Badge>
+              </div>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-7 gap-1 px-2 text-xs"
+                onClick={() => void loadUnified(true)}
+                disabled={unifiedLoading}
+              >
+                <RefreshCw className={cn("size-3.5", unifiedLoading && "animate-spin")} />
+                刷新
+              </Button>
+            </div>
+
+            {/* 平台筛选 chips */}
+            {unifiedPlatforms.length > 0 && (
+              <div className="flex flex-wrap items-center gap-1.5 px-4 pb-3 sm:px-5">
+                <button
+                  type="button"
+                  onClick={() => setUnifiedFilter("all")}
+                  className={cn(
+                    "rounded-md border px-2 py-0.5 text-[11px] transition-colors",
+                    unifiedFilter === "all"
+                      ? "border-primary/30 bg-primary/10 font-medium text-primary"
+                      : "border-border/60 text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  全部 <span className="tabular-nums">({unifiedAccounts.length})</span>
+                </button>
+                {unifiedPlatforms.map(([platform, count]) => (
+                  <button
+                    key={platform}
+                    type="button"
+                    onClick={() => setUnifiedFilter(platform)}
+                    className={cn(
+                      "rounded-md border px-2 py-0.5 text-[11px] transition-colors",
+                      unifiedFilter === platform
+                        ? "border-primary/30 bg-primary/10 font-medium text-primary"
+                        : "border-border/60 text-muted-foreground hover:text-foreground",
+                    )}
+                  >
+                    {platformLabel(platform)} <span className="tabular-nums">({count})</span>
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {/* 账号行 */}
+            <div className="divide-y divide-border/50 border-t border-border/50">
+              {filteredUnified.length === 0 ? (
+                <p className="px-4 py-6 text-center text-sm text-muted-foreground sm:px-5">
+                  {unifiedAccounts.length === 0
+                    ? "暂无统一账号数据。请确认各平台已接入后再试。"
+                    : "该平台暂无账号。"}
+                </p>
+              ) : (
+                filteredUnified.map((acc) => {
+                  const displayName = unifiedDisplayName(acc);
+                  const isPool = isDumatePool(acc);
+                  const checkingIn = unifiedBusyId === acc.id;
+                  const savingProxy = unifiedBusyId === `proxy:${acc.id}`;
+                  const regionMark =
+                    acc.region === "intl" ? " 🌐" : acc.region === "cn" ? " 🇨🇳" : "";
+                  return (
+                    <div
+                      key={acc.id}
+                      className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-2 px-4 py-2.5 sm:px-5"
+                    >
+                      {/* 平台徽标 + 名称（全名，备注优先，无星号） */}
+                      <div className="flex w-[210px] min-w-0 shrink-0 items-center gap-2">
+                        <span
+                          className={cn(
+                            "inline-flex h-5 shrink-0 items-center rounded px-1.5 text-[10px] font-medium",
+                            platformTone(acc.platform),
+                          )}
+                        >
+                          {platformLabel(acc.platform)}
+                        </span>
+                        <span className="min-w-0 truncate text-xs font-medium" title={displayName}>
+                          {displayName}
+                          {regionMark}
+                        </span>
+                        {acc.note?.trim() ? (
+                          <Badge variant="secondary" className="h-4 shrink-0 px-1 text-[10px] font-normal text-muted-foreground">
+                            备注
+                          </Badge>
+                        ) : null}
+                        {acc.sameSourceOf ? (
+                          <Badge
+                            variant="outline"
+                            className="h-4 shrink-0 px-1 text-[10px] font-normal text-muted-foreground"
+                            title={`与「${sameSourceName(acc.sameSourceOf)}」是同一账号的不同入口（本机 / 池）。两条都展示，不隐藏。`}
+                          >
+                            同源
+                          </Badge>
+                        ) : null}
+                      </div>
+
+                      {/* 状态字段：登录态 | 积分 | 今日签到 | 代理 */}
+                      <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
+                        {acc.loginState === "ok" ? (
+                          <Badge variant="success" className="text-[10px]">登录正常</Badge>
+                        ) : acc.loginState === "expired" ? (
+                          <Badge variant="destructive" className="text-[10px]">登录失效</Badge>
+                        ) : (
+                          <Badge variant="secondary" className="text-[10px] text-muted-foreground">登录未知</Badge>
+                        )}
+                        <span className="shrink-0 tabular-nums">
+                          积分 <span className="font-medium text-foreground">{fmtUnifiedCredits(acc.credits?.available)}</span>
+                        </span>
+                        {/* 积分包：徽标（数量 + 最近到期）→ 点击展开明细（名称/剩余/到期/临期） */}
+                        {(acc.credits?.packages?.length ?? 0) > 0 ? (
+                          <span className="flex min-w-0 flex-col gap-1">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setUnifiedPkgOpen((prev) => {
+                                  const next = new Set(prev);
+                                  if (next.has(acc.id)) next.delete(acc.id);
+                                  else next.add(acc.id);
+                                  return next;
+                                })
+                              }
+                              className={cn(
+                                "flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] transition-colors",
+                                unifiedPkgOpen.has(acc.id)
+                                  ? "border-primary/30 bg-primary/10 text-primary"
+                                  : hasExpiringPackages(acc)
+                                    ? "border-warning/40 bg-warning/10 text-warning hover:bg-warning/20"
+                                    : "border-border/60 text-muted-foreground hover:text-foreground",
+                              )}
+                              title="展开/收起积分包明细"
+                            >
+                              <ChevronDown
+                                className={cn(
+                                  "size-3 shrink-0 transition-transform",
+                                  unifiedPkgOpen.has(acc.id) ? "rotate-180" : "",
+                                )}
+                              />
+                              {acc.credits?.packages?.length ?? 0} 个积分包
+                              {fmtExpireShort(acc.credits?.soonestExpireAt)
+                                ? ` · 最近 ${fmtExpireShort(acc.credits?.soonestExpireAt)} 到期`
+                                : ""}
+                              {/* 临期数量直接上徽标：不点开也能看见有没有包快到期 */}
+                              {hasExpiringPackages(acc)
+                                ? ` · 近期到期 ${
+                                    (acc.credits?.packages ?? []).filter((p) => p.expiringSoon).length
+                                  }`
+                                : ""}
+                            </button>
+                            {unifiedPkgOpen.has(acc.id)
+                              ? (acc.credits?.packages ?? []).map((pkg, idx) => (
+                                  <span
+                                    key={`${pkg.name}-${pkg.expireAt ?? idx}`}
+                                    className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px]"
+                                  >
+                                    <span className="max-w-[160px] truncate font-medium text-foreground" title={pkg.name}>
+                                      {pkg.name}
+                                    </span>
+                                    <span className="tabular-nums">剩余 {fmtUnifiedCredits(pkg.remaining)}</span>
+                                    <span className={pkg.expiringSoon ? "text-warning" : ""}>
+                                      {fmtExpireLabel(pkg.expireAt)}
+                                    </span>
+                                    {pkg.expiringSoon ? (
+                                      <Badge variant="warning" className="h-4 px-1 text-[9px]">
+                                        {pkg.expireAt != null && pkg.expireAt * 1000 < Date.now() ? "已过期" : "近期到期"}
+                                      </Badge>
+                                    ) : null}
+                                  </span>
+                                ))
+                              : null}
+                          </span>
+                        ) : null}
+                        {acc.todayCheckedIn === true ? (
+                          <Badge variant="success" className="text-[10px]">今日已签</Badge>
+                        ) : acc.todayCheckedIn === false ? (
+                          <Badge variant="warning" className="text-[10px]">今日未签</Badge>
+                        ) : (
+                          <span>今日签到 —</span>
+                        )}
+                        {isPool && (
+                          <span className="max-w-[220px] truncate">
+                            {acc.proxy ? `代理 ${acc.proxy}` : "直连"}
+                          </span>
+                        )}
+                      </div>
+
+                      {/* 操作：签到 / 刷新 / 备注 / 代理 / 跳转 */}
+                      <div className="ml-auto flex shrink-0 items-center gap-1">
+                        {unifiedProxyEdit?.id === acc.id ? (
+                          <>
+                            <Input
+                              className="h-7 w-44 text-xs"
+                              placeholder="http:// 或 socks5://，留空直连"
+                              value={unifiedProxyEdit.value}
+                              onChange={(e) => setUnifiedProxyEdit({ id: acc.id, value: e.target.value })}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter" && !e.nativeEvent.isComposing)
+                                  void saveUnifiedProxy(acc);
+                              }}
+                            />
+                            <Button
+                              size="sm"
+                              className="h-7 px-2 text-xs"
+                              onClick={() => void saveUnifiedProxy(acc)}
+                              disabled={savingProxy}
+                            >
+                              {savingProxy ? <Loader2 className="animate-spin" /> : null}保存
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              className="h-7 px-2 text-xs"
+                              onClick={() => setUnifiedProxyEdit(null)}
+                            >
+                              取消
+                            </Button>
+                          </>
+                        ) : (
+                          <>
+                            {acc.todayCheckedIn != null && (
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <Button
+                                    size="sm"
+                                    variant="outline"
+                                    className="h-7 px-2 text-xs"
+                                    onClick={() => void onUnifiedCheckin(acc)}
+                                    disabled={checkingIn || unifiedBusyId !== null}
+                                  >
+                                    {checkingIn ? <Loader2 className="animate-spin" /> : <CalendarCheck />}
+                                    签到
+                                  </Button>
+                                </TooltipTrigger>
+                                <TooltipContent side="top">为该账号签到（幂等）</TooltipContent>
+                              </Tooltip>
+                            )}
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  className="h-7 px-1.5 text-xs"
+                                  onClick={() => void loadUnified(true)}
+                                  disabled={unifiedLoading}
+                                  aria-label={`刷新 ${displayName}`}
+                                >
+                                  <RefreshCw className={cn("size-3.5", unifiedLoading && "animate-spin")} />
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent side="top">刷新状态与积分</TooltipContent>
+                            </Tooltip>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  className="h-7 px-1.5 text-xs"
+                                  onClick={() => openUnifiedNote(acc)}
+                                  aria-label={`编辑 ${displayName} 备注`}
+                                >
+                                  <Pencil className="size-3.5" />
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent side="top">编辑备注</TooltipContent>
+                            </Tooltip>
+                            {isPool && (
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <Button
+                                    size="sm"
+                                    variant="ghost"
+                                    className="h-7 px-1.5 text-xs"
+                                    onClick={() => setUnifiedProxyEdit({ id: acc.id, value: acc.proxy ?? "" })}
+                                    aria-label={`编辑 ${displayName} 代理`}
+                                  >
+                                    <Globe className="size-3.5" />
+                                  </Button>
+                                </TooltipTrigger>
+                                <TooltipContent side="top">编辑出站代理（一号一 IP）</TooltipContent>
+                              </Tooltip>
+                            )}
+                            {isPool && (
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <Button
+                                    size="sm"
+                                    variant="ghost"
+                                    className="h-7 px-1.5 text-xs text-destructive hover:text-destructive"
+                                    onClick={() => void onUnifiedRemoveDumate(acc)}
+                                    disabled={unifiedBusyId !== null}
+                                    aria-label={`删除 ${displayName}`}
+                                  >
+                                    <Trash2 className="size-3.5" />
+                                  </Button>
+                                </TooltipTrigger>
+                                <TooltipContent side="top">删除该 DuMate 池账号</TooltipContent>
+                              </Tooltip>
+                            )}
+                            {acc.gatewayPage && (
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <Button
+                                    size="sm"
+                                    variant="ghost"
+                                    className="h-7 px-1.5 text-xs"
+                                    onClick={() => navigate(acc.gatewayPage as string)}
+                                    aria-label={`打开 ${platformLabel(acc.platform)} 渠道页`}
+                                  >
+                                    <ExternalLink className="size-3.5" />
+                                  </Button>
+                                </TooltipTrigger>
+                                <TooltipContent side="top">打开 {platformLabel(acc.platform)} 渠道页</TooltipContent>
+                              </Tooltip>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </Card>
+        </section>
+      )}
+
+      {/* DuMate 多账号卡（契约 §4.3）：多账号仅用于签到/积分（一号一 IP），模型调用走本机主账号 */}
+      <section className="mb-8 min-w-0" aria-labelledby="dumate-pool-title">
+        <Card className="min-w-0 gap-0 overflow-hidden rounded-xl py-0 shadow-none">
+          {/* 工具条：导入本机登录态 / 添加账号 */}
+          <div className="flex min-w-0 flex-wrap items-center justify-between gap-2 px-4 py-3 sm:px-5">
+            <div className="flex min-w-0 items-center gap-2">
+              <Users className="size-4 shrink-0 text-muted-foreground" />
+              <h2 id="dumate-pool-title" className="text-sm font-medium">
+                DuMate 多账号管理
+              </h2>
+              {dumateError ? (
+                <Badge variant="destructive" className="text-[10px]">加载失败</Badge>
+              ) : null}
+            </div>
+            <div className="flex shrink-0 items-center gap-2">
+              <DemoAction>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => void onDumateImportClient()}
+                  disabled={dumateBusy === "import"}
+                  title="把本机 DuMate 客户端当前登录的百度账号导入账号池（与既有账号同一登录态时会提示）"
+                >
+                  {dumateBusy === "import" ? <Loader2 className="animate-spin" /> : <Download />}
+                  导入本机登录态
+                </Button>
+              </DemoAction>
+              <Button
+                size="sm"
+                variant={dumateAddOpen ? "secondary" : "outline"}
+                onClick={() => setDumateAddOpen((v) => !v)}
+              >
+                <Plus />
+                {dumateAddOpen ? "收起" : "添加账号"}
+              </Button>
+            </div>
+          </div>
+
+          {/* 添加账号（折叠表单：名称 / cookies JSON / 代理 URL） */}
+          {dumateAddOpen ? (
+            <div className="space-y-3 border-t border-border/50 bg-muted/30 px-4 py-4 sm:px-5">
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div>
+                  <label className="text-xs font-medium text-muted-foreground">账号名称</label>
+                  <Input
+                    className="mt-1"
+                    placeholder="如：二号机"
+                    value={dumateAddName}
+                    onChange={(e) => setDumateAddName(e.target.value)}
+                  />
+                </div>
+                <div>
+                  <label className="text-xs font-medium text-muted-foreground">
+                    出站代理 URL（一号一 IP，可选）
+                  </label>
+                  <Input
+                    className="mt-1"
+                    placeholder="http:// 或 socks5://，留空 = 直连"
+                    value={dumateAddProxy}
+                    onChange={(e) => setDumateAddProxy(e.target.value)}
+                  />
+                </div>
+              </div>
+              <div>
+                <label className="text-xs font-medium text-muted-foreground">
+                  Cookies JSON（浏览器 DevTools 导出的百度登录 cookie）
+                </label>
+                <textarea
+                  rows={4}
+                  placeholder='[{"name":"...","value":"...","domain":"..."},...] 或 {"cookies":[...]}'
+                  value={dumateAddCookies}
+                  onChange={(e) => setDumateAddCookies(e.target.value)}
+                  className="mt-1 block w-full rounded-md border border-input bg-background p-2.5 font-mono text-xs shadow-sm focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+                />
+              </div>
+              <div className="flex items-center gap-2">
+                <Button size="sm" onClick={() => void onDumateAdd()} disabled={dumateAdding}>
+                  {dumateAdding ? <Loader2 className="animate-spin" /> : <Plus />}保存账号
+                </Button>
+                <Button size="sm" variant="ghost" onClick={() => setDumateAddOpen(false)}>
+                  取消
+                </Button>
+              </div>
+            </div>
+          ) : null}
+
+          <p className="px-4 pb-3 text-[11px] leading-5 text-muted-foreground sm:px-5">
+            多账号仅用于签到与积分查询（每个账号可配独立出站代理，实现一号一 IP，降低同 IP 关联风控）；
+            模型调用仍走本机主账号。账号已在「统一账号」表展示并参与统一签到，此处不再重复列出。
+          </p>
+        </Card>
+      </section>
+
+      <div className="relative mb-6 overflow-visible rounded-2xl border border-border bg-muted/30 px-5 py-5 shadow-[0_6px_20px_rgba(15,23,42,.025)]">
+        <div className="pointer-events-none absolute inset-0 overflow-hidden rounded-2xl">
+          <div className="absolute -right-12 -top-20 size-44 rounded-full border-[28px] border-slate-400/[0.035]" />
+        </div>
+        <div className="relative flex flex-wrap items-center gap-x-5 gap-y-4">
+          <div className="min-w-[190px] flex-1">
+            <h2 className="text-sm font-semibold text-foreground">添加与迁移账号</h2>
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">
+              快速接入新账号，或从已有环境恢复。AutoClaw / TRAE Work CN 无需导入：
+              登录本机客户端后自动出现在下方「平台账号」。
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2.5">
+            <DemoAction>
+              <Button
+                className="h-10 bg-primary px-4 text-primary-foreground shadow-sm hover:bg-primary/90"
+                onClick={() => setOauthOpen(true)}
+              >
+                <QrCode />OAuth 扫码添加
+              </Button>
+            </DemoAction>
+            <DemoAction>
+              <Button className="h-10 px-4" onClick={onImport} disabled={importing} variant="outline">
+                {importing ? <Loader2 className="animate-spin" /> : <Download />}导入本机账号
+              </Button>
+            </DemoAction>
+            <DemoAction>
+              <Button className="h-10 px-4" onClick={() => setQoderCnOpen(true)} variant="outline" title="导入 Qoder CN（中国版）账号：本机登录态 / 手动凭证 / 设备码授权">
+                <Globe />导入 Qoder CN 账号
+              </Button>
+            </DemoAction>
+          </div>
+          <div className="flex items-center gap-1">
+            <DemoAction>
+              <Button variant="ghost" size="sm" className="h-9 px-2.5" onClick={() => setImportOpen(true)} title="从备份文件导入账号">
+                <FileUp />导入备份
+              </Button>
+            </DemoAction>
+            <DemoAction>
+              <Button variant="ghost" size="sm" className="h-9 px-2.5" onClick={() => setExportOpen(true)} disabled={accounts.length === 0} title="导出账号备份">
+                <FileDown />导出
+              </Button>
+            </DemoAction>
+          </div>
+        </div>
+      </div>
+
+      <section className="mt-7 min-w-0" aria-labelledby="accounts-list-title">
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <h2 id="accounts-list-title" className="text-base font-semibold tracking-tight">WorkBuddy 账号</h2>
+            <Badge
+              variant="secondary"
+              className="h-6 min-w-6 rounded-full border-0 px-1.5 text-[11px] tabular-nums text-muted-foreground shadow-none"
+              aria-label={`${accounts.length} 个账号`}
+            >
+              {accounts.length}
+            </Badge>
+          </div>
+          <TooltipProvider delayDuration={400}>
+            <div className="ml-auto flex items-center gap-1">
+              <div className="mr-1 flex items-center gap-2.5">
+                <label htmlFor="accounts-auto-checkin" className="cursor-pointer text-xs font-medium text-muted-foreground">
+                  自动签到
+                </label>
+                <DemoAction>
+                  <Switch
+                    id="accounts-auto-checkin"
+                    checked={autoCheckinConfig?.enabled ?? false}
+                    disabled={!autoCheckinConfig || autoCheckinSaving}
+                    onCheckedChange={(enabled) => void onAutoCheckinChange(enabled)}
+                    aria-label="自动签到"
+                  />
+                </DemoAction>
+                {autoCheckinSaving && <Loader2 className="size-3.5 animate-spin text-muted-foreground" aria-label="正在保存自动签到设置" />}
+              </div>
+              <div className="mr-1 flex items-center gap-2.5">
+                <label htmlFor="accounts-auto-travel" className="cursor-pointer text-xs font-medium text-muted-foreground">
+                  自动旅行
+                </label>
+                <DemoAction>
+                  <Switch
+                    id="accounts-auto-travel"
+                    checked={autoTravelConfig?.enabled ?? false}
+                    disabled={!autoTravelConfig || autoTravelSaving}
+                    onCheckedChange={(enabled) => void onAutoTravelChange(enabled)}
+                    aria-label="自动旅行"
+                  />
+                </DemoAction>
+                {autoTravelSaving && <Loader2 className="size-3.5 animate-spin text-muted-foreground" aria-label="正在保存自动旅行设置" />}
+              </div>
+              <Separator orientation="vertical" className="mx-2 h-5" />
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className={cn("size-9 rounded-lg", compact && "bg-accent text-accent-foreground")}
+                    onClick={toggleCompact}
+                    aria-label={compact ? "切换为宽松模式" : "切换为紧凑模式"}
+                  >
+                    {compact ? <Rows3 /> : <Columns3 />}
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="top">{compact ? "切换为宽松模式" : "切换为紧凑模式"}</TooltipContent>
+              </Tooltip>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span>
+                    <DemoAction>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="size-9 rounded-lg"
+                        disabled={refreshingCredits || checkinAllRunning || accounts.length === 0}
+                        onClick={() => void onRefreshCredits()}
+                        aria-label="签到并刷新全部账号积分"
+                      >
+                        <RefreshCw className={refreshingCredits || checkinAllRunning ? "animate-spin" : undefined} />
+                      </Button>
+                    </DemoAction>
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent side="top">{api.isDemoMode() ? "演示模式下不可操作" : "签到并刷新全部账号积分"}</TooltipContent>
+              </Tooltip>
+            </div>
+          </TooltipProvider>
+        </div>
+
+        {/* 搜索与多维过滤工具栏 */}
+        {accounts.length > 0 && (
+          <div className="mb-5 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            {/* 左侧：搜索输入框 */}
+            <div className="relative flex-1 max-w-sm">
+              <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="搜索账号昵称、邮箱、UID、备注…"
+                className="h-9 pl-9 pr-8 text-xs bg-background/60"
+              />
+              {searchQuery && (
+                <button
+                  type="button"
+                  onClick={() => setSearchQuery("")}
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                  aria-label="清空搜索"
+                >
+                  <X className="size-3.5" />
+                </button>
+              )}
+            </div>
+
+            {/* 中间/右侧：过滤标签组 + 排序 */}
+            <div className="flex flex-wrap items-center gap-2">
+              {/* 过滤 Pills */}
+              <div className="flex items-center rounded-lg border border-border/60 bg-muted/30 p-0.5 text-xs">
+                <button
+                  type="button"
+                  onClick={() => setFilterType("all")}
+                  className={cn(
+                    "rounded-md px-2.5 py-1 transition-all",
+                    filterType === "all"
+                      ? "bg-background font-medium text-foreground shadow-xs"
+                      : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  全部
+                  <span className="ml-1 text-[10px] text-muted-foreground">({accounts.length})</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setFilterType("unchecked")}
+                  className={cn(
+                    "rounded-md px-2.5 py-1 transition-all",
+                    filterType === "unchecked"
+                      ? "bg-background font-medium text-foreground shadow-xs"
+                      : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  未签到
+                  {uncheckedCount > 0 && (
+                    <span className="ml-1 rounded-full bg-amber-500/15 px-1 py-0.2 text-[10px] font-semibold text-amber-600 dark:text-amber-400">
+                      {uncheckedCount}
+                    </span>
+                  )}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setFilterType("expiring")}
+                  className={cn(
+                    "rounded-md px-2.5 py-1 transition-all",
+                    filterType === "expiring"
+                      ? "bg-background font-medium text-foreground shadow-xs"
+                      : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  即将到期
+                  {expiringCount > 0 && (
+                    <span className="ml-1 rounded-full bg-orange-500/15 px-1 py-0.2 text-[10px] font-semibold text-orange-600 dark:text-orange-400">
+                      {expiringCount}
+                    </span>
+                  )}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setFilterType("active")}
+                  className={cn(
+                    "rounded-md px-2.5 py-1 transition-all",
+                    filterType === "active"
+                      ? "bg-background font-medium text-foreground shadow-xs"
+                      : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  当前活跃
+                  {activeCount > 0 && (
+                    <span className="ml-1 text-[10px] text-muted-foreground">({activeCount})</span>
+                  )}
+                </button>
+              </div>
+
+              {/* 排序下拉 */}
+              <Select value={sortType} onValueChange={(v: any) => setSortType(v)}>
+                <SelectTrigger size="sm" className="h-9 w-[130px] text-xs bg-background/60">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="default">默认优先级</SelectItem>
+                  <SelectItem value="credits-desc">积分最多</SelectItem>
+                  <SelectItem value="credits-asc">积分最少</SelectItem>
+                  <SelectItem value="recent-expiry">到期最近</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+        )}
+
+        {loading && accounts.length === 0 ? (
+          /* 高保真骨架屏 */
+          <div
+            className={cn(
+              "grid min-w-0 items-start gap-5",
+              compact
+                ? "grid-cols-[repeat(auto-fit,minmax(min(100%,300px),1fr))]"
+                : "grid-cols-[repeat(auto-fit,minmax(min(100%,340px),1fr))]",
+            )}
+          >
+            {[1, 2, 3, 4].map((i) => (
+              <div
+                key={i}
+                className="flex flex-col rounded-2xl border border-border bg-card p-4 shadow-xs"
+              >
+                <div className="flex items-center gap-3 border-b border-border/50 pb-3">
+                  {!compact && <Skeleton className="size-12 rounded-full" />}
+                  <div className="flex-1 space-y-2">
+                    <Skeleton className="h-4 w-3/4 rounded" />
+                    <Skeleton className="h-3 w-1/2 rounded" />
+                  </div>
+                </div>
+                <div className="space-y-2 pt-3">
+                  <Skeleton className="h-6 w-1/3 rounded" />
+                  <Skeleton className="h-3.5 w-full rounded" />
+                  <Skeleton className="h-3.5 w-4/5 rounded" />
+                </div>
+                <div className="mt-4 flex justify-between gap-2 border-t border-border/50 pt-3">
+                  <Skeleton className="h-8 w-20 rounded-lg" />
+                  <Skeleton className="h-8 w-20 rounded-lg" />
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : accounts.length === 0 ? (
+          <div className="rounded-xl border border-dashed px-4 py-16 text-center text-sm text-muted-foreground">
+            暂无账号。点击上方按钮导入本机账号或扫码登录。
+          </div>
+        ) : filteredAndSortedAccounts.length === 0 ? (
+          <div className="rounded-xl border border-dashed px-4 py-16 text-center text-sm text-muted-foreground">
+            <p>未找到符合条件的账号</p>
+            <Button
+              variant="outline"
+              size="sm"
+              className="mt-3 text-xs"
+              onClick={() => {
+                setSearchQuery("");
+                setFilterType("all");
+              }}
+            >
+              清空搜索与筛选
+            </Button>
+          </div>
+        ) : (
+          <div className={cn("grid min-w-0 items-start gap-5", compact ? "grid-cols-[repeat(auto-fit,minmax(min(100%,300px),1fr))]" : "grid-cols-[repeat(auto-fit,minmax(min(100%,340px),1fr))]")}>
+            {filteredAndSortedAccounts.map((a) => (
+              <AccountCard
+                key={a.id}
+                account={a}
+                compact={compact}
+                note={accountNotes[a.id]}
+                onEditNote={openEditNote}
+                onDelete={onDelete}
+                onSwitch={setSwitchAccount}
+                onCheckin={onCheckin}
+                onRefresh={onRefresh}
+                todayCheckedIn={checkinMap[a.id]}
+                travelStatus={travelMap[a.id]}
+                credit={creditMap[a.id]}
+                creditLoading={creditLoadingMap[a.id]}
+                creditUpdatedAt={creditUpdatedAtMap[a.id]}
+                creditPriority={a.id === priorityAccountId}
+                workbuddyActive={isWorkbuddyCurrent(a, current)}
+                onQuickSwitch={{
+                  accounts,
+                  current,
+                  // 切换会重启 WorkBuddy：稍等片刻再拉状态，避免读到切换前的旧账号
+                  done: () => {
+                    window.setTimeout(() => void fetchAll(), 2500);
+                  },
+                }}
+                featuresDisabled={false}
+              />
+            ))}
+          </div>
+        )}
+      </section>
+
+      {platformCheckins.length > 0 ? (
+        <section className="mt-2 space-y-4" aria-labelledby="platform-checkin-title">
+          <div>
+            <h2 id="platform-checkin-title" className="text-lg font-semibold">
+              平台账号
+            </h2>
+            <p className="text-sm text-muted-foreground">
+              本机登录的 AutoClaw / TRAE Work CN，与 WorkBuddy 账号一起自动签到；AutoClaw 账号按 🌐 国际 / 🇨🇳 国内分网关隔离签到
+            </p>
+          </div>
+          <div className={cn("grid min-w-0 items-start gap-5", compact ? "grid-cols-[repeat(auto-fit,minmax(min(100%,300px),1fr))]" : "grid-cols-[repeat(auto-fit,minmax(min(100%,340px),1fr))]")}>
+            {platformCheckins.map((item) => {
+              // AutoClaw 平台账号展示区域标签（🌐 国际 / 🇨🇳 国内）。
+              const regionMark =
+                item.platform === "autoclaw" && item.region
+                  ? item.region === "international"
+                    ? " 🌐国际版"
+                    : " 🇨🇳国内版"
+                  : "";
+              const displayName = item.email + regionMark;
+              const meta: AccountMeta = {
+                id: item.accountId,
+                uid: null,
+                email: displayName,
+                nickname: displayName,
+                enterpriseName: null,
+                expiresAt: null,
+                refreshExpiresAt: null,
+                refreshedAt: null,
+                createdAt: null,
+                needsRelogin: false,
+                needsReloginReason: null,
+              };
+              return (
+                <AccountCard
+                  key={item.accountId}
+                  account={meta}
+                  platform={item.platform}
+                  compact={compact}
+                  todayCheckedIn={item.ok ? item.todayCheckedIn : undefined}
+                  credit={item.credit}
+                  creditUpdatedAt={item.credit?.updatedAt}
+                  creditLoading={platformCreditLoadingId === item.accountId}
+                  onCheckin={onPlatformCardCheckin}
+                  onRefresh={onPlatformCardRefresh}
+                  onDelete={() => {}}
+                  onQuickSwitchPlatform={{
+                    platform: item.platform,
+                    accounts: platformAccountsOf(item.platform),
+                    // 本机客户端当前登录的账号（用于标注「当前」与排除重复切换）
+                    currentId: platformCheckins.find(
+                      (p) => p.platform === item.platform && p.localLogin,
+                    )?.accountId,
+                    done: () => {
+                      // 切换会重启客户端：稍等再刷新，避免读到切换前的旧登录态
+                      window.setTimeout(() => void loadPlatformCheckins(), 3000);
+                    },
+                  }}
+                  featuresDisabled={false}
+                />
+              );
+            })}
+          </div>
+        </section>
+      ) : null}
+
+      {/* 修改账号备注弹窗（统一账号与本地账号共用） */}
+      <Dialog open={editingNoteTarget !== null} onOpenChange={(open) => !open && setEditingNoteTarget(null)}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>编辑账号备注</DialogTitle>
+            <DialogDescription>
+              为账号 {editingNoteTarget?.name || "…"} 设置一个易记的别名。备注将作为显示名优先展示。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="py-2">
+            <Input
+              value={noteInput}
+              onChange={(e) => setNoteInput(e.target.value)}
+              placeholder="例如：主力工作号、备用小号…"
+              maxLength={20}
+              autoFocus
+              onKeyDown={(e) => {
+                if (e.key === "Enter") saveNote();
+              }}
+            />
+          </div>
+          <DialogFooter className="flex gap-2 sm:justify-between">
+            <Button variant="ghost" size="sm" onClick={clearNote} disabled={!accountNotes[editingNoteTarget?.id || ""]}>
+              清除备注
+            </Button>
+            <div className="flex gap-2">
+              <Button variant="outline" size="sm" onClick={() => setEditingNoteTarget(null)}>
+                取消
+              </Button>
+              <Button size="sm" onClick={saveNote}>
+                保存
+              </Button>
+            </div>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <OAuthLoginDialog open={oauthOpen} onOpenChange={setOauthOpen} />
+      <QoderCnImportDialog open={qoderCnOpen} onOpenChange={setQoderCnOpen} />
+      <ExportAccountsDialog
+        open={exportOpen}
+        onOpenChange={setExportOpen}
+        accounts={accounts}
+        onExported={onExported}
+      />
+      <ImportAccountsDialog
+        open={importOpen}
+        onOpenChange={setImportOpen}
+        onImported={onImported}
+      />
+      <SwitchAccountDialog
+        open={switchAccount !== null}
+        onOpenChange={(o) => {
+          if (!o) setSwitchAccount(null);
+        }}
+        account={switchAccount}
+        onDone={() => {
+          void fetchAll();
+        }}
+      />
+
+      {/* 删除账号确认 */}
+      <Dialog open={deleteTarget !== null} onOpenChange={(o) => !o && setDeleteTarget(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>删除账号</DialogTitle>
+            <DialogDescription>
+              确定删除账号「{deleteTarget?.nickname || deleteTarget?.email || deleteTarget?.id}」？
+              此操作不可撤销。
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDeleteTarget(null)}>
+              取消
+            </Button>
+            <Button variant="destructive" onClick={() => void confirmDelete()}>
+              删除
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}

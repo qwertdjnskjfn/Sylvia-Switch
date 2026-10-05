@@ -30,7 +30,7 @@ const OFFICIAL_USAGE_PAYLOAD_VERSION: i64 = 2;
 /// - 超过该时长 → 视为过期，读缓存时自动重采；
 /// - `rangeEnd` 不是今天 → 无论多新都必须重采（否则「今日消耗」会停留在
 ///   采集当天，表现为长期不随实际使用更新）。
-/// 10 分钟是「不打扰官方接口」与「及时同步」之间的折中。
+///   10 分钟是「不打扰官方接口」与「及时同步」之间的折中。
 const OFFICIAL_USAGE_TTL_MS: i64 = 10 * 60 * 1000;
 /// 后台同步周期：与 TTL 对齐，保证没有页面请求时投影也会滚动刷新。
 pub const OFFICIAL_USAGE_SYNC_INTERVAL: StdDuration = StdDuration::from_secs(10 * 60);

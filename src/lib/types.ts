@@ -116,6 +116,12 @@ export interface CheckinConfig {
   lazy_refresh_hours: number;
 }
 
+/** 「近期到期」窗口配置（GET/POST /api/config/expiring-soon；后端夹取 1–365）。 */
+export interface ExpiringSoonConfig {
+  /** 距到期还剩多少天内算「近期到期」；默认 30 */
+  days: number;
+}
+
 export interface CheckinLog {
   ts: number;
   accountId: string | null;
@@ -1377,4 +1383,205 @@ export interface DumateConfigInfo {
   opencodeUrl?: string | null;
   /** 引擎 inapp key 预览（additive 容错） */
   inappKeyPreview?: string | null;
+}
+
+// ---- 统一账号管理 + DuMate 多账号池（契约 docs/unified-accounts-contract.md §1/§2/§5）----
+// 说明：camelCase、可空键容错（后端 additive/缺省字段一律 optional）。
+
+/** 统一账号积分摘要（§2 credits 三键 + 积分包明细；上游数值多为字符串，容错 number）。 */
+export interface UnifiedAccountCredits {
+  available?: string | number | null;
+  total?: string | number | null;
+  used?: string | number | null;
+}
+
+/** 统一账号积分包明细：名称/剩余/到期/临期标志（后端 unified_accounts 提取）。 */
+export interface UnifiedCreditPackage {
+  /** 包名（上游 packageName/source/packageType 映射的中文名） */
+  name: string;
+  /** 剩余积分（展示串，如 "9932.57"） */
+  remaining: string;
+  /** 总量 */
+  total: string;
+  /** 已用 */
+  used: string;
+  /** 到期时间（秒级 epoch，null=无到期信息） */
+  expireAt: number | null;
+  /** 是否 7 天内到期（含已过期） */
+  expiringSoon: boolean;
+  /** 来源类型：resource（CreditExpiry.resources）/ subscription / incremental */
+  kind?: string | null;
+}
+
+/** 统一账号 credits 扩展字段（§「近期到期」：包明细 + 最近到期 + 临期余额）。 */
+export interface UnifiedAccountCreditsDetail extends UnifiedAccountCredits {
+  packages?: UnifiedCreditPackage[] | null;
+  /** 7 天内到期（含已过期）的余额合计（展示串），无则 null */
+  expiringSoonRemaining?: string | null;
+  /** 最近一个包的到期时间（秒级 epoch），无则 null */
+  soonestExpireAt?: number | null;
+}
+
+/**
+ * 统一账号（GET /api/accounts/unified 单行，契约 §2）：聚合全部平台账号。
+ * displayName 为**完整全名无遮罩**（备注优先，无备注用账号自身名称字段，契约 §0/§3）。
+ */
+export interface UnifiedAccount {
+  id: string;
+  /** autoclaw | trae_work_cn | dumate | grok | chatglm | loomy | miaoshou | workbuddy | ... */
+  platform: string;
+  /** 完整全名（无星号；备注名优先） */
+  displayName: string;
+  /** cn | intl；平台无区域概念为 null */
+  region?: "cn" | "intl" | null;
+  /** 本机客户端登录态存在 */
+  localLogin?: boolean | null;
+  /** ok | expired | unknown */
+  loginState?: string;
+  /** 今日已签；平台无签到概念为 null */
+  todayCheckedIn?: boolean | null;
+  /** 积分摘要 + 积分包明细（含近期到期） */
+  credits?: UnifiedAccountCreditsDetail | null;
+  /** 仅 dumate 池账号有（一号一 IP 出站代理），其余 "" */
+  proxy?: string;
+  /** account-extras 备注 */
+  note?: string;
+  /** 自动签到开关现状 */
+  checkinEnabled?: boolean;
+  /** 跳转对应渠道页（platform→路由映射），未知为 null */
+  gatewayPage?: string | null;
+  /**
+   * 同源账号：与 `sameSourceOf` 指向的 id 是同一账号的不同入口
+   * （实测 DuMate 本机账号 `dumate:local` 与池主号 `dumate:pool_1`
+   *   可用积分与积分包逐项相同）。**仅标注不隐藏**，两条都展示。
+   */
+  sameSourceOf?: string | null;
+}
+
+/** GET /api/accounts/unified 的 summary 统计块（契约 §2）。 */
+export interface UnifiedAccountsSummary {
+  platforms?: number;
+  accounts?: number;
+  healthy?: number;
+  checkedInToday?: number;
+}
+
+/** GET /api/accounts/unified 响应（契约 §2）。 */
+export interface UnifiedAccountsPayload {
+  accounts: UnifiedAccount[];
+  summary?: UnifiedAccountsSummary | null;
+}
+
+/**
+ * DuMate 账号池条目（GET /api/dumate/accounts 行，契约 §1.1/§1.5）。
+ * **不含 cookies 明文**——list 只回 cookieCount（契约 §1.5）；本机主账号以
+ * isLocal 标记（id=dumate:local），池账号 id 前缀 dumate:pool_。
+ */
+export interface DumatePoolAccount {
+  /** 池账号 id 前缀 dumate:pool_；本机账号为 dumate:local */
+  id: string;
+  /** 用户起名（显示用，可改） */
+  name: string;
+  /** 一号一 IP：http:// 或 socks5:// 出站代理，空 = 直连 */
+  proxy?: string;
+  note?: string;
+  /** ok | expired | unknown */
+  status?: string;
+  /** 添加时刻（ms epoch） */
+  addedAt?: number | null;
+  /** 最近签到日（YYYY-MM-DD），未签过为 "" */
+  lastCheckinDay?: string;
+  /** cookie 条数（不回传明文，契约 §1.5） */
+  cookieCount?: number | null;
+  /** true = 本机主账号（dumate:local，走客户端登录态） */
+  isLocal?: boolean;
+  /** 最新缓存积分快照（未查询/查询失败为 null；dumate::get_credits 同构） */
+  credits?: DumateCredits | null;
+}
+
+// ---- ZCode 账号池（契约 docs/zcode-channel-contract.md §3；camelCase、可空容错）----
+// 说明：v1 为 webui-first（仅 webui 后端有 /api/zcode/* 路由组，契约 §2）；
+// 后端 W1 按 §1/§2 同步实现，前端按契约 API 形状先行——缺省/新增字段一律 optional。
+
+/** ZCode 登录身份（后端 zcode::ZcodeIdentity 的 camelCase 投影；解析失败各字段可为 null）。 */
+export interface ZcodeIdentity {
+  /** OAuth provider（如 bigmodel）；未知为 null */
+  provider: string | null;
+  username: string | null;
+  /** 展示名优先级：displayName > username > email > userId */
+  displayName: string | null;
+  email: string | null;
+  /** JWT user_id / sub 兜底 */
+  userId: string | null;
+  /** access_token JWT exp 判定；true = 已过期（缺省兼容旧后端） */
+  jwtExpired?: boolean | null;
+}
+
+/** 额度通道单条（后端 quota_for() 的 channels[] 元素：{name, available, ...}）。 */
+export interface ZcodeQuotaChannel {
+  /** 通道名（monitor / zai_billing 等，未知值原样展示） */
+  name: string;
+  available?: string | number | null;
+  total?: string | number | null;
+  used?: string | number | null;
+  ok?: boolean | null;
+  error?: string | null;
+  /** 上游附加字段透传（additive 容错） */
+  [key: string]: unknown;
+}
+
+/** 实时额度（POST /api/zcode/quota 响应；多通道合并，契约 §0「额度三通道」v1 做两条）。 */
+export interface ZcodeQuota {
+  ok: boolean;
+  channels?: ZcodeQuotaChannel[] | null;
+  error?: string | null;
+}
+
+/** 账号池条目（~/.wb-switch/zcode_accounts.json 行；不回 credentials 明文，契约 §1）。 */
+export interface ZcodeAccount {
+  /** zcode:<hash8>（canonical JSON 去重指纹前 8 位） */
+  id: string;
+  name: string;
+  /** 完整去重指纹（SHA256 hex，剔除 device* 前缀键后 canonical JSON） */
+  hash?: string | null;
+  /** 每账号独立设备遥测身份（UUID v4，防关联）；未生成为 null */
+  virtualDeviceMid?: string | null;
+  /** 账号出站代理（一号一 IP，覆盖 IP 维度限领/风控；空=直连） */
+  proxy?: string | null;
+  addedAt?: number | string | null;
+  updatedAt?: number | string | null;
+  /** 与 live 登录态同指纹（= 当前生效账号，显示「使用中」徽标，契约 §3.2） */
+  isActive?: boolean;
+  identity?: ZcodeIdentity | null;
+  /** 额度缓存摘要（status 附带；未查询/查询失败为 null） */
+  quota?: ZcodeQuota | null;
+  /** 额度缓存落盘时间（ms）；null=未查询过 */
+  quotaFetchedAt?: number | string | null;
+  error?: string | null;
+}
+
+/** GET /api/zcode/status 响应：live 登录状态 + 账号池（含每账号 identity/额度缓存摘要）。 */
+export interface ZcodeAutoSwitchState {
+  config?: { enabled: boolean; thresholdTokens: number };
+  lastTickAt?: number | null;
+  lastState?: string | null;
+  lastSwitchAt?: number | null;
+  lastSwitchTo?: string | null;
+  lastMessage?: string | null;
+  events?: { ts: number; message: string }[];
+}
+
+export interface ZcodeStatus {
+  /** credentials.json 文件存在 */
+  liveExists: boolean;
+  /** 能解析出登录身份（= 已登录） */
+  loggedIn: boolean;
+  /** 1.5.2 多账号自动管理（额度耗尽自动切换） */
+  autoSwitch?: ZcodeAutoSwitchState;
+  identity: ZcodeIdentity | null;
+  /** ZCode.exe 进程检测（tasklist，契约 §0） */
+  desktopRunning: boolean;
+  accounts?: ZcodeAccount[];
+  error?: string | null;
+  message?: string | null;
 }

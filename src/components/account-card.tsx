@@ -17,7 +17,6 @@ import { WorkBuddyMark } from "@/components/product-marks";
 import { QuickSwitchMenu } from "@/components/quick-switch-menu";
 import { cn } from "@/lib/utils";
 import { demoModeEnabled } from "@/lib/demo-mode";
-import { maskEmail, maskIdentity } from "@/lib/account-extras";
 import type { AccountMeta, CreditExpiry, CreditResource, TravelStatus } from "@/lib/types";
 
 const AVATAR_TONES = [
@@ -80,11 +79,8 @@ function creditResources(credit?: CreditExpiry): CreditResource[] {
 }
 
 function accountIdentity(account: AccountMeta): string {
-  if (account.email) {
-    const [local, domain] = account.email.split("@");
-    if (!domain) return account.email;
-    return `${local.slice(0, 1)}${"*".repeat(Math.max(3, local.length - 1))}@${domain}`;
-  }
+  // 全名直显（契约 docs/unified-accounts-contract.md §3）：完整邮箱 / UID，不再加星号
+  if (account.email) return account.email;
   return account.uid ? `UID · ${account.uid}` : `ID · ${account.id}`;
 }
 
@@ -181,8 +177,6 @@ interface Props {
   compact?: boolean;
   /** 自定义别名/备注名 */
   note?: string;
-  /** 是否开启隐私脱敏 */
-  privacyMask?: boolean;
   /** 点击修改备注回调 */
   onEditNote?: (a: AccountMeta) => void;
   /** 本地 WorkBuddy 账号的一键切换（切换后重启 WorkBuddy） */
@@ -237,7 +231,6 @@ export function AccountCard({
   featuresDisabled = true,
   compact = false,
   note,
-  privacyMask = false,
   onEditNote,
   onQuickSwitch,
   onQuickSwitchPlatform,
@@ -249,10 +242,13 @@ export function AccountCard({
   const onQuickSwitchDone = onQuickSwitch?.done;
   const platformName = platform === "autoclaw" ? "AutoClaw" : platform === "trae_work_cn" ? "TRAE Work CN" : platform === "loomy" ? "Loomy" : platform === "chatglm" ? "ChatGLM" : platform;
   const rawName = account.nickname || account.uid || "未命名账号";
-  const name = note ? note : privacyMask ? maskIdentity(rawName) : rawName;
+  // 全名直显（契约 §3）：备注名优先，不加星号
+  const name = note || rawName;
   const secondaryIdentity = note
-    ? (privacyMask ? maskEmail(account.email || "") || maskIdentity(account.uid || "") : (account.email || account.uid ? `${account.nickname ? `${account.nickname} · ` : ""}${account.email || account.uid}` : ""))
-    : (privacyMask ? maskEmail(account.email || "") || maskIdentity(account.uid || "") : accountIdentity(account));
+    ? (account.email || account.uid
+        ? `${account.nickname ? `${account.nickname} · ` : ""}${account.email || account.uid}`
+        : "")
+    : accountIdentity(account);
   const expired = typeof account.expiresAt === "number" && account.expiresAt < Date.now();
   const avatarClass = avatarTone(rawName);
   const resources = creditResources(credit);
@@ -510,7 +506,6 @@ export function AccountCard({
                 current={{ id: onQuickSwitchPlatform.currentId }}
                 onDone={onQuickSwitchPlatform.done}
                 disabled={featuresDisabled}
-                privacyMask={privacyMask}
                 compact={compact}
               />
               <span className="min-w-0 flex-1 truncate">
@@ -547,7 +542,6 @@ export function AccountCard({
               onDone={onQuickSwitchDone}
               onAdvanced={onSwitch}
               disabled={featuresDisabled}
-              privacyMask={privacyMask}
             />
           ) : null}
         </footer>

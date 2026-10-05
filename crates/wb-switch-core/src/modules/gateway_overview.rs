@@ -131,27 +131,27 @@ fn model_capabilities(model: &Value) -> Vec<&'static str> {
     }
 
     // 退化到模型名关键字
-    if !caps.iter().any(|c| *c == "image") && (id.contains("image") || id.contains("imagine")) {
+    if !caps.contains(&"image") && (id.contains("image") || id.contains("imagine")) {
         caps.push("image");
     }
-    if !caps.iter().any(|c| *c == "video") && id.contains("video") {
+    if !caps.contains(&"video") && id.contains("video") {
         caps.push("video");
     }
-    if !caps.iter().any(|c| *c == "voice")
+    if !caps.contains(&"voice")
         && (id.contains("voice") || id.contains("tts") || id.contains("stt"))
     {
         caps.push("voice");
     }
-    if !caps.iter().any(|c| *c == "search") && id.contains("search") {
+    if !caps.contains(&"search") && id.contains("search") {
         caps.push("search");
     }
-    if !caps.iter().any(|c| *c == "reasoning") && (id.contains("thinking") || id.contains("reasoning")) {
+    if !caps.contains(&"reasoning") && (id.contains("thinking") || id.contains("reasoning")) {
         caps.push("reasoning");
     }
 
     if caps.is_empty() {
         caps.push("text");
-    } else if !caps.iter().any(|c| *c == "text") {
+    } else if !caps.contains(&"text") {
         // 多模态模型同时也具备文本能力
         caps.insert(0, "text");
     }

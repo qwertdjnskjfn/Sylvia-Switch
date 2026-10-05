@@ -17,9 +17,9 @@ use rust_embed::RustEmbed;
 use serde_json::{json, Value};
 
 use wb_switch_core::modules::{
-    account, account_protection, auth_file, channel_health, chatgpt_channel, checkin, config, credit_usage, credits, export_import,
-    autoclaw_accounts, glm_proxy, glmplan, loomy, loomy_proxy, model_probe, model_usage, oauth, platform_checkin, platform_switch, process, refresh,
-    gateway_admin, gateway_overview, glm_web, grok, grok_pool, grok_register, kimi, qoder, qwen, qwen_mcp, qwen_web, grok2api_manager, grok_sso, miaoshou, model_sync, session, switch, token_stats, toolcall_monitor, travel, update, trae_acp, trae_accounts, trae_proxy, trae_proxy_config, workbuddy_proxy, workbuddy_errors, workbuddy_gateway, workbuddy_protocols, workbuddy_upstream, opencode, dumate, dumate_accounts, unified_accounts,
+    account, account_protection, autoclaw_watch, auth_file, channel_health, chatgpt_channel, checkin, config, credit_usage, credits, export_import,
+    autoclaw_accounts, glm_proxy, glmplan, loomy, minimax, loomy_proxy, model_probe, model_usage, oauth, platform_checkin, platform_switch, process, refresh,
+    gateway_admin, gateway_overview, glm_web, grok, grok_pool, grok_register, kimi, laya_shadow, qoder, qwen, qwen_mcp, qwen_web, grok2api_manager, grok_sso, miaoshou, model_sync, session, switch, token_stats, toolcall_monitor, travel, update, trae_acp, trae_accounts, trae_proxy, trae_proxy_config, workbuddy_proxy, workbuddy_errors, workbuddy_gateway, workbuddy_protocols, workbuddy_upstream, opencode, dumate, dumate_accounts, unified_accounts, zcode,
 };
 
 /// 服务实际绑定端口（main.rs serve 启动时写入），供端点展示使用。
@@ -118,6 +118,22 @@ pub fn router() -> Router {
         )
         .route("/api/glm-proxy/status", get(api_glm_proxy_status))
         // ── GLM Plan 网关（1.4.0 新通道：GLM Coding Plan 账号池）──
+        .route("/api/minimax/status", get(api_minimax_status))
+        .route("/api/minimax/config", post(api_minimax_config_save))
+        .route("/api/minimax/accounts/add", post(api_minimax_accounts_add))
+        .route("/api/minimax/accounts/remove", post(api_minimax_accounts_remove))
+        .route("/api/minimax/accounts/enable", post(api_minimax_accounts_enable))
+        .route("/api/minimax/accounts/switch", post(api_minimax_accounts_switch))
+        .route("/api/minimax/signin/run", post(api_minimax_signin_run))
+        .route("/api/minimax/test", post(api_minimax_test))
+        .route("/api/minimax/desktop/discover", get(api_minimax_desktop_discover))
+        .route("/api/minimax/desktop/details", get(api_minimax_desktop_details))
+        .route("/api/minimax/desktop/capture", post(api_minimax_desktop_capture))
+        .route("/api/minimax/probe", post(api_minimax_probe))
+        .route("/minimax/v1/models", get(api_minimax_models))
+        .route("/minimax/v1/chat/completions", post(api_minimax_chat))
+        .route("/api/autoclaw/watch", get(api_autoclaw_watch_state))
+        .route("/api/autoclaw/watch/probe", post(api_autoclaw_watch_probe))
         .route("/api/glmplan/status", get(api_glmplan_status))
         .route("/api/glmplan/test", post(api_glmplan_test))
         .route("/api/glmplan/config", post(api_glmplan_config_save))
@@ -307,6 +323,23 @@ pub fn router() -> Router {
             post(api_dumate_accounts_import_client),
         )
         .route("/api/dumate/account/checkin", post(api_dumate_account_checkin))
+        // ── ZCode 账号池（契约 zcode-channel-contract.md §2）：
+        //    捕获/切换 ZCode 登录身份（enc:v1 凭据 + 设备身份隔离）+ 额度三通道。
+        .route("/api/zcode/status", get(api_zcode_status))
+        .route("/api/zcode/capture", post(api_zcode_capture))
+        .route("/api/zcode/switch", post(api_zcode_switch))
+        .route("/api/zcode/accounts/remove", post(api_zcode_remove))
+        .route("/api/zcode/accounts/update", post(api_zcode_accounts_update))
+        .route("/api/zcode/quota", post(api_zcode_quota))
+        .route("/api/zcode/claim/preview", post(api_zcode_claim_preview))
+        .route("/api/zcode/claim/submit", post(api_zcode_claim_submit))
+        .route("/api/zcode/claim/captcha-config", get(api_zcode_claim_captcha_config))
+        .route("/api/zcode/claim/captcha-mint", post(api_zcode_claim_captcha_mint))
+        .route("/api/zcode/claim/scan", post(api_zcode_claim_scan))
+        .route("/api/zcode/claim/auto", post(api_zcode_claim_auto))
+        .route("/api/zcode/claim/state", get(api_zcode_claim_state).post(api_zcode_claim_state_save))
+        .route("/api/zcode/auto-switch/config", post(api_zcode_autoswitch_config))
+        .route("/api/zcode/auto-switch/tick", post(api_zcode_autoswitch_tick))
         .route("/api/loomy-proxy/config", get(api_loomy_proxy_config_get).post(api_loomy_proxy_config_save))
         .route("/api/loomy-proxy/status", get(api_loomy_proxy_status))
         .route("/api/loomy/protection/status", get(api_loomy_protection_status))
@@ -431,6 +464,9 @@ pub fn router() -> Router {
         .fallback(static_handler)
         // 代理端点常带长上下文 / base64 图片，必须放宽请求体上限（默认 2 MiB）。
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        // Laya 影子打标（调研 P1，2026-10-05）：chat 入口旁路 System 1 标签，只落 JSONL 不路由。
+        // 开关 ~/.wb-switch/laya_shadow.json（enabled:true 才生效）；任何失败静默跳过，主链路零阻塞。
+        .layer(axum::middleware::from_fn(laya_shadow_middleware))
         // 观测性兜底（2026-09-18 ZCode -32603 事故：请求没到 handler 就失败，无任何日志可查）：
         // ① access_log：记录所有非静态资源请求的 method/path/status/耗时 —— body 被前置层
         //    拒绝（413/422）、未知路径落 SPA 兜底等情况从此可见；
@@ -456,6 +492,75 @@ fn is_logged_path(path: &str) -> bool {
 /// 前置访问日志：所有网关/管理 API 请求的 method、path、状态码、耗时。
 /// 处理器内部已有业务日志的请求会出现两条（一条 http 一条业务），属预期 ——
 /// 这条的价值在于「请求根本没走到 handler」的场景（413/422/未知路径/连接层失败前的最后状态）。
+/// Laya 影子打标中间件（调研 P1）：对 chat 入口（/v1/chat/completions、/v1/messages）的请求体
+/// 旁路提取最后一条 user 消息，spawn 给 core::laya_shadow::fire 打 System 1 标签。
+/// body 用与 DefaultBodyLimit 相同的上限整读后原样重建，handler 无感知；失败时放行 400（与
+/// 无中间件时 handler 读 body 失败的结局等价）。
+///
+/// 路径形态两类：
+/// - 根网关 `/v1/chat/completions`（未加渠道前缀，即 glm）→ `glm`
+/// - 渠道网关 `/kimi/v1/chat/completions`、`/grok/v1/messages` → `kimi` / `grok`
+async fn laya_shadow_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = req.uri().path().to_string();
+    let is_chat = req.method() == "POST"
+        && (path.ends_with("/v1/chat/completions") || path.ends_with("/v1/messages"));
+    if !is_chat {
+        return next.run(req).await;
+    }
+    let channel = channel_of_path(&path);
+    let (parts, body) = req.into_parts();
+    let bytes = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "request body could not be buffered",
+            )
+                .into_response();
+        }
+    };
+    if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+        let model = v.get("model").and_then(Value::as_str).map(str::to_string);
+        if let Some(text) = laya_shadow::extract_last_user_text(&v) {
+            tokio::spawn(laya_shadow::fire(channel, model, text));
+        }
+    }
+    next.run(axum::extract::Request::from_parts(parts, Body::from(bytes)))
+        .await
+}
+
+/// 从 chat 路径解析渠道名：`/v1/chat/completions`→glm（根网关即 glm）；
+/// `/<channel>/v1/...`→第一段。`/qwen-flash/v1/chat/completions` 这类连字符渠道原样返回。
+fn channel_of_path(path: &str) -> String {
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    match segs.first() {
+        Some(seg) if *seg == "v1" => "glm".to_string(),
+        Some(seg) => (*seg).to_string(),
+        None => "glm".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod laya_shadow_tests {
+    use super::channel_of_path;
+
+    #[test]
+    fn channel_of_root_gateway_paths_is_glm() {
+        assert_eq!(channel_of_path("/v1/chat/completions"), "glm");
+        assert_eq!(channel_of_path("/v1/messages"), "glm");
+    }
+
+    #[test]
+    fn channel_of_prefixed_paths_returns_first_segment() {
+        assert_eq!(channel_of_path("/kimi/v1/chat/completions"), "kimi");
+        assert_eq!(channel_of_path("/grok/v1/messages"), "grok");
+        assert_eq!(channel_of_path("/qwen-flash/v1/chat/completions"), "qwen-flash");
+    }
+}
+
 async fn access_log_middleware(
     req: axum::extract::Request,
     next: axum::middleware::Next,
@@ -5471,7 +5576,7 @@ fn workbuddy_pool_sticky_key(body: &Value) -> String {
 ///   重传 N 遍（参考实现 forward.go:211-233 的结论）；契约 §4 要求立即 400。
 /// - `SessionDead`：账号 OAuth 会话已失效（12153），继续换号重发会让客户端以为
 ///   是请求本身的问题；回 401 提示重新登录该账号。
-/// 其余 kind 返回 None = 记账后继续换号。
+///   其余 kind 返回 None = 记账后继续换号。
 fn workbuddy_pool_fatal_status(kind: workbuddy_errors::ErrKind) -> Option<StatusCode> {
     use workbuddy_errors::ErrKind;
     match kind {
@@ -5724,7 +5829,7 @@ async fn workbuddy_pool_dispatch(
         }
 
         let out_body =
-            workbuddy_upstream::prepare_body(&payload, &acc.region, cfg.sanitize_enabled);
+            workbuddy_upstream::prepare_body(payload, &acc.region, cfg.sanitize_enabled);
         match workbuddy_upstream::chat_stream(&acc, &out_body).await {
             // 上游 >=400：body 已按 ErrKind 分类
             Ok(workbuddy_upstream::ChatOutcome::Error { status, body }) => {
@@ -7406,6 +7511,218 @@ async fn api_dumate_credits() -> Response {
     json_ok(dumate::get_credits().await)
 }
 
+// ── ZCode 账号池（契约 zcode-channel-contract.md §2）───────────────────────
+
+/// POST /api/zcode/accounts/update：更新池账号（body {id, name?, proxy?}；代理=一号一 IP）。
+async fn api_zcode_accounts_update(Json(body): Json<Value>) -> Response {
+    let Some(id) = body.get("id").and_then(Value::as_str).map(str::to_string) else {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let name = body.get("name").and_then(Value::as_str).map(str::to_string);
+    let proxy = body.get("proxy").and_then(Value::as_str).map(str::to_string);
+    match zcode::update_account(
+        &id,
+        name.as_deref(),
+        proxy.as_deref(),
+    ) {
+        Ok(()) => json_ok(json!({"ok": true})),
+        Err(e) => json_err(e, StatusCode::NOT_FOUND),
+    }
+}
+
+/// GET /api/zcode/status：live 登录态 + 账号池聚合。
+async fn api_zcode_status() -> Response {
+    json_ok(zcode::status())
+}
+
+/// POST /api/zcode/capture：当前登录态捕获入池（同指纹更新不重复）。
+async fn api_zcode_capture(Json(body): Json<Value>) -> Response {
+    let name = body.get("name").and_then(Value::as_str).map(str::to_string);
+    match zcode::capture_current(name.as_deref()) {
+        Ok(v) => json_ok(v),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/zcode/switch：切换登录身份（运行中默认拒绝，force 杀进程）。
+/// POST /api/zcode/auto-switch/config：启用/关闭自动切换与阈值。
+async fn api_zcode_autoswitch_config(Json(body): Json<Value>) -> Response {
+    let enabled = body.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+    let threshold = body.get("thresholdTokens").and_then(Value::as_f64).unwrap_or(0.0);
+    match zcode::save_auto_switch_config(enabled, threshold) {
+        Ok(()) => json_ok(json!({ "ok": true, "enabled": enabled, "thresholdTokens": threshold.max(0.0) })),
+        Err(e) => json_err(e, StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/zcode/auto-switch/tick：立即跑一轮自动切换检查（后台每 5 分钟自动跑）。
+async fn api_zcode_autoswitch_tick() -> Response {
+    json_ok(zcode::auto_switch_tick().await)
+}
+
+async fn api_zcode_switch(Json(body): Json<Value>) -> Response {
+    let Some(id) = body.get("id").and_then(Value::as_str).map(str::to_string) else {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let force = body.get("force").and_then(Value::as_bool).unwrap_or(false);
+    let restart = body.get("restart").and_then(Value::as_bool).unwrap_or(false);
+    let hot = body.get("hot").and_then(Value::as_bool).unwrap_or(false);
+    match zcode::switch_account(&id, force, restart, hot) {
+        Ok(v) => json_ok(v),
+        Err(e) => json_err(e, StatusCode::CONFLICT),
+    }
+}
+
+/// POST /api/zcode/accounts/remove：删除池账号。
+async fn api_zcode_remove(Json(body): Json<Value>) -> Response {
+    let Some(id) = body.get("id").and_then(Value::as_str).map(str::to_string) else {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    };
+    match zcode::remove_account(&id) {
+        Ok(()) => json_ok(json!({"ok": true})),
+        Err(e) => json_err(e, StatusCode::NOT_FOUND),
+    }
+}
+
+/// POST /api/zcode/claim/preview：可领套餐（id 缺省 = 当前 live）。
+async fn api_zcode_claim_preview(Json(body): Json<Value>) -> Response {
+    let (creds, acc_id) = match claim_creds_for(&body) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let mid = zcode::account_mid(&acc_id).or_else(zcode::telemetry_device_mid);
+    let px = zcode::account_proxy(&acc_id);
+    match zcode::claim_preview_for(&creds, mid, px.as_deref()).await {
+        Ok(plans) => json_ok(json!({"ok": true, "plans": plans})),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/zcode/claim/submit：提交领取（body {id?, planId, captchaParam, captchaRegion?}）。
+async fn api_zcode_claim_submit(Json(body): Json<Value>) -> Response {
+    let Some(plan_id) = body.get("planId").and_then(Value::as_str).map(str::to_string) else {
+        return json_err("缺少 planId".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let captcha_param = body
+        .get("captchaParam")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let captcha_region = body.get("captchaRegion").and_then(Value::as_str).map(str::to_string);
+    let (creds, acc_id) = match claim_creds_for(&body) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let mid = zcode::account_mid(&acc_id).or_else(zcode::telemetry_device_mid);
+    let px = zcode::account_proxy(&acc_id);
+    match zcode::claim_submit_for(&creds, &plan_id, &captcha_param, captcha_region.as_deref(), mid, px.as_deref()).await {
+        Ok(v) => json_ok(json!({"ok": true, "result": v})),
+        Err((code, msg)) => json_err(format!("[code {code}] {msg}"), StatusCode::BAD_REQUEST),
+    }
+}
+
+/// GET /api/zcode/claim/captcha-config：阿里云验证码配置（前端无痕/滑块初始化）。
+async fn api_zcode_claim_captcha_config() -> Response {
+    match zcode::claim_captcha_config().await {
+        Ok(v) => json_ok(v),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/zcode/claim/auto：单账号全自动领取（CDP 无痕验证码；body {id}）。
+async fn api_zcode_claim_auto(Json(body): Json<Value>) -> Response {
+    let Some(id) = body.get("id").and_then(Value::as_str).map(str::to_string) else {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    };
+    // 手动一键领取同样尊重 autoRestartZcode 开关（默认 true）。
+    let auto_restart = zcode::load_claim_state()
+        .get("autoRestartZcode")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    match zcode::auto_claim_account(&id, auto_restart).await {
+        Ok(v) => json_ok(v),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/zcode/claim/state：更新领取设置（body {autoClaim}）。
+async fn api_zcode_claim_state_save(Json(body): Json<Value>) -> Response {
+    let mut state = zcode::load_claim_state();
+    if let Some(v) = body.get("autoClaim").and_then(Value::as_bool) {
+        state["autoClaim"] = json!(v);
+    }
+    if let Some(v) = body.get("pollIdleMin").and_then(Value::as_u64) {
+        state["pollIdleMin"] = json!(v.max(2));
+    }
+    if let Some(v) = body.get("pollHotMin").and_then(Value::as_u64) {
+        state["pollHotMin"] = json!(v.max(1));
+    }
+    if let Some(v) = body.get("autoRestartZcode").and_then(Value::as_bool) {
+        state["autoRestartZcode"] = json!(v);
+    }
+    match zcode::save_claim_state(&state) {
+        Ok(()) => json_ok(state),
+        Err(e) => json_err(e, StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// GET /api/zcode/claim/state：领取状态（上次扫描/领取/autoClaim 开关）。
+async fn api_zcode_claim_state() -> Response {
+    json_ok(zcode::load_claim_state())
+}
+
+/// POST /api/zcode/claim/captcha-mint：验证码铸造自检（CDP 全链路，不消耗资格）。
+async fn api_zcode_claim_captcha_mint() -> Response {
+    match zcode::captcha_mint_selftest().await {
+        Ok(v) => json_ok(v),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/zcode/claim/scan：全量扫描（live+池账号逐一 preview，返回可领清单）。
+async fn api_zcode_claim_scan() -> Response {
+    json_ok(zcode::claim_scan_all().await)
+}
+
+/// quota/claim 共用：按 body.id 取凭据（缺省 = live）。同时返回账号 id 供取虚拟设备 mid。
+fn claim_creds_for(body: &Value) -> Result<(Value, String), Response> {
+    match body.get("id").and_then(Value::as_str) {
+        Some(id) => match zcode::pool_credentials(id) {
+            Some(c) => Ok((c, id.to_string())),
+            None => Err(json_err(format!("账号不存在: {id}"), StatusCode::NOT_FOUND)),
+        },
+        None => match zcode::live_credentials() {
+            Some(c) => Ok((c, "zcode:live".to_string())),
+            None => Err(json_err(
+                "未找到 ZCode 登录态".to_string(),
+                StatusCode::NOT_FOUND,
+            )),
+        },
+    }
+}
+
+/// POST /api/zcode/quota：实时额度（id 缺省 = 当前 live）。
+async fn api_zcode_quota(Json(body): Json<Value>) -> Response {
+    let id = body.get("id").and_then(Value::as_str).map(str::to_string);
+    let (creds, cache_key) = match id {
+        Some(id) => {
+            // 池账号凭据从池文件直读（list 只回摘要）。
+            match zcode::pool_credentials(&id) {
+                Some(c) => (c, id),
+                None => return json_err(format!("账号不存在或凭据缺失: {id}"), StatusCode::NOT_FOUND),
+            }
+        }
+        None => match zcode::live_credentials() {
+            Some(c) => (c, "zcode:live".to_string()),
+            None => return json_err("未找到 ZCode 登录态".to_string(), StatusCode::NOT_FOUND),
+        },
+    };
+    let quota = zcode::quota_for(&creds).await;
+    // 查询结果落缓存：status 聚合时回带，前端跨路由/重进组件不丢。
+    zcode::save_quota_cache_entry(&cache_key, &quota);
+    json_ok(quota)
+}
+
 /// GET /api/dumate/config：接入信息（Base URL / 密钥掩码 / 启用态），只读不触发发现。
 async fn api_dumate_config_get() -> Response {
     json_ok(dumate::config_info())
@@ -7643,6 +7960,413 @@ fn glmplan_key_ok(headers: &HeaderMap) -> bool {
         .and_then(|s| s.strip_prefix("Bearer "))
         .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()));
     matches!(got, Some(k) if k == cfg.api_key)
+}
+
+// ---------------------------------------------------------------------------
+// MiniMax 通道（1.6.0：Agent 网页端反代 + 账号池 + 每日签到）
+// ---------------------------------------------------------------------------
+
+fn minimax_mask(key: &str) -> String {
+    if key.len() <= 12 {
+        "*".repeat(key.len())
+    } else {
+        format!("{}...{}", &key[..8], &key[key.len() - 4..])
+    }
+}
+
+fn minimax_key_ok(headers: &HeaderMap) -> bool {
+    let cfg = minimax::load_config();
+    let got = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()));
+    matches!(got, Some(k) if k == cfg.api_key)
+}
+
+async fn api_minimax_status() -> Response {
+    let cfg = minimax::load_config();
+    let cfg_pin = cfg.pinned_account_id.clone();
+    let accounts: Vec<Value> = cfg
+        .accounts
+        .iter()
+        .map(|a| {
+            json!({
+                "id": a.id, "label": a.label, "region": a.region,
+                "regionLabel": minimax::provider_label(&a.region),
+                "tokenMasked": minimax_mask(&a.token),
+                "source": a.source,
+                "uuid": a.uuid, "deviceId": a.device_id, "userId": a.user_id,
+                "agentId": a.agent_id, "baseUrl": a.base_url,
+                "enabled": a.enabled, "lastError": a.last_error,
+                "cooldown": a.cooldown_until_ms > minimax::now_ms(),
+                "signinLastDate": a.signin_last_date, "signinPointsTotal": a.signin_points_total,
+                "balance": a.balance, "creditConsumed": a.credit_consumed, "balanceAt": a.balance_at,
+                // 2026-10-05：前端据此渲染“当前账号 / 可用性”
+                "usable": minimax::account_usable(a, minimax::now_ms()),
+                "isLocal": a.source == "desktop",
+                "pinned": cfg_pin == a.id,
+            })
+        })
+        .collect();
+    let port = BOUND_PORT.get().copied().unwrap_or(57890);
+    json_ok(json!({
+        "enabled": cfg.enabled,
+        "apiKey": cfg.api_key,
+        // 2026-10-05：多账号选号模式（前端据此渲染策略按钮）
+        "accountMode": cfg.account_mode,
+        "pinnedAccountId": cfg.pinned_account_id,
+        "defaultModel": "MiniMax-M3.1-Flash-Preview",
+        "models": minimax::desktop_models().as_array().cloned().unwrap_or_default().iter().filter_map(Value::as_str).map(String::from).collect::<Vec<_>>(),
+        "accounts": accounts,
+        "chatExperimental": true,
+        "endpoint": format!("http://127.0.0.1:{port}/minimax/v1"),
+        "payloadTemplate": cfg.chat_payload_template,
+    }))
+}
+
+async fn api_minimax_config_save(Json(body): Json<Value>) -> Response {
+    let mut cfg = minimax::load_config();
+    if let Some(b) = body.get("enabled").and_then(Value::as_bool) {
+        cfg.enabled = b;
+    }
+    if body.get("regenerateKey").and_then(Value::as_bool).unwrap_or(false) {
+        cfg.api_key = minimax::gen_api_key();
+    }
+    if let Some(t) = body.get("chatPayloadTemplate").and_then(Value::as_str) {
+        if !t.is_empty() {
+            cfg.chat_payload_template = t.to_string();
+        }
+    }
+    // 2026-10-05：账号选择模式与固定账号（对齐 glm_proxy 范式）
+    if let Some(m) = body.get("accountMode").and_then(Value::as_str) {
+        cfg.account_mode = minimax::normalize_account_mode(m);
+    }
+    if let Some(id) = body.get("pinnedAccountId").and_then(Value::as_str) {
+        cfg.pinned_account_id = id.to_string();
+    }
+    minimax::save_config(&cfg);
+    json_ok(json!({
+        "ok": true,
+        "accountMode": cfg.account_mode,
+        "pinnedAccountId": cfg.pinned_account_id,
+    }))
+}
+
+/// POST /api/minimax/accounts/switch：切换号策略 / 指定当前账号（2026-10-05）。
+///
+/// body: { mode?: round_robin|local_first|local_only|pinned, id?: <accountId> }
+/// - 给 `id` 时自动切到 pinned 并把该账号设为当前（一步完成“切账号”）
+/// - 只给 `mode` 时只改策略
+/// 切换后返回**当前生效账号**与候选列表，方便前端直显。
+async fn api_minimax_accounts_switch(Json(body): Json<Value>) -> Response {
+    let mut cfg = minimax::load_config();
+    if let Some(m) = body.get("mode").and_then(Value::as_str) {
+        cfg.account_mode = minimax::normalize_account_mode(m);
+    }
+    if let Some(id) = body.get("id").and_then(Value::as_str) {
+        let id = id.trim();
+        if !id.is_empty() {
+            if !cfg.accounts.iter().any(|a| a.id == id) {
+                return json_err("账号不存在（可能已删除）".to_string(), StatusCode::NOT_FOUND);
+            }
+            cfg.pinned_account_id = id.to_string();
+            cfg.account_mode = minimax::MM_MODE_PINNED.to_string();
+        }
+    }
+    minimax::save_config(&cfg);
+    let region = body.get("region").and_then(Value::as_str);
+    let pool = minimax::ordered_pool(&cfg, region);
+    let (candidates, err) = match &pool {
+        Ok(list) => (
+            list.iter().map(|a| json!({"id": a.id, "label": a.label, "region": a.region, "source": a.source})).collect::<Vec<_>>(),
+            Value::Null,
+        ),
+        Err(e) => (Vec::new(), json!(e)),
+    };
+    let active = pool.as_ref().ok().and_then(|l| l.first()).cloned();
+    json_ok(json!({
+        "ok": true,
+        "accountMode": cfg.account_mode,
+        "pinnedAccountId": cfg.pinned_account_id,
+        "activeAccount": active.as_ref().map(|a| json!({"id": a.id, "label": a.label, "region": a.region, "source": a.source})),
+        "candidates": candidates,
+        "error": err,
+    }))
+}
+
+async fn api_minimax_accounts_add(Json(body): Json<Value>) -> Response {
+    let region = body.get("region").and_then(Value::as_str).unwrap_or("domestic").to_string();
+    if !matches!(region.as_str(), "domestic" | "international") {
+        return json_err("region 必须为 domestic（国内版）或 international（国际版）".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let token = body.get("token").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    if token.is_empty() {
+        return json_err("缺少 token（网页端 JWT，localStorage._token）".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let mut cfg = minimax::load_config();
+    let id = minimax::gen_id();
+    cfg.accounts.push(minimax::MmAccount {
+        id: id.clone(),
+        label: body.get("label").and_then(Value::as_str).unwrap_or("未命名").trim().to_string(),
+        region,
+        token,
+        uuid: body.get("uuid").and_then(Value::as_str).unwrap_or("").to_string(),
+        device_id: body.get("deviceId").and_then(Value::as_str).unwrap_or("").to_string(),
+        user_id: body.get("userId").and_then(Value::as_str).unwrap_or("").to_string(),
+        agent_id: body.get("agentId").and_then(Value::as_str).unwrap_or("").to_string(),
+        screen_w: body.get("screenW").and_then(Value::as_str).unwrap_or("1707").to_string(),
+        screen_h: body.get("screenH").and_then(Value::as_str).unwrap_or("1067").to_string(),
+        base_url: body.get("baseUrl").and_then(Value::as_str).unwrap_or("").to_string(),
+        enabled: true,
+        added_at: minimax::now_ms(),
+        last_error: None,
+        cooldown_until_ms: 0,
+        signin_last_date: String::new(),
+        signin_points_total: 0,
+        source: String::new(),
+        auth_path: String::new(),
+        auth_key: String::new(),
+        balance: None,
+        credit_consumed: None,
+        balance_at: 0,
+    });
+    if !cfg.enabled {
+        cfg.enabled = true;
+    }
+    minimax::save_config(&cfg);
+    json_ok(json!({ "ok": true, "id": id }))
+}
+
+async fn api_minimax_accounts_remove(Json(body): Json<Value>) -> Response {
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("");
+    let mut cfg = minimax::load_config();
+    let before = cfg.accounts.len();
+    cfg.accounts.retain(|a| a.id != id);
+    if cfg.accounts.len() == before {
+        return json_err("账号不存在".to_string(), StatusCode::NOT_FOUND);
+    }
+    minimax::save_config(&cfg);
+    json_ok(json!({ "ok": true }))
+}
+
+async fn api_minimax_accounts_enable(Json(body): Json<Value>) -> Response {
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("");
+    let enabled = body.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+    let mut cfg = minimax::load_config();
+    match cfg.accounts.iter_mut().find(|a| a.id == id) {
+        Some(a) => {
+            a.enabled = enabled;
+            a.cooldown_until_ms = 0;
+            minimax::save_config(&cfg);
+            json_ok(json!({ "ok": true }))
+        }
+        None => json_err("账号不存在".to_string(), StatusCode::NOT_FOUND),
+    }
+}
+
+async fn api_minimax_test(Json(body): Json<Value>) -> Response {
+    // 本地管理端点（与 /api/glm-proxy/test 同口径）：不走网关密钥
+    let prompt = body.get("prompt").and_then(Value::as_str).unwrap_or("只回复 OK").to_string();
+    let model = body.get("model").and_then(Value::as_str).map(str::trim)
+        .filter(|s| !s.is_empty()).map(String::from);
+    let started = std::time::Instant::now();
+    match minimax::chat_once(&prompt, None, model.as_deref()).await {
+        Ok(v) => {
+            let content = v
+                .pointer("/choices/0/message/content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            json_ok(json!({ "ok": true, "content": content, "latencyMs": started.elapsed().as_millis() as u64 }))
+        }
+        Err((s, e)) => json_ok(json!({ "ok": false, "error": e, "status": s })),
+    }
+}
+
+async fn api_minimax_desktop_details() -> Response {
+    json_ok(minimax::desktop_details())
+}
+
+async fn api_minimax_desktop_discover() -> Response {
+    json_ok(minimax::discover_desktop())
+}
+
+async fn api_minimax_desktop_capture() -> Response {
+    json_ok(minimax::capture_from_desktop())
+}
+
+async fn api_minimax_signin_run(Json(body): Json<Value>) -> Response {
+    let only_id = body.get("id").and_then(Value::as_str).map(String::from);
+    let cfg = minimax::load_config();
+    if !cfg.enabled {
+        return json_err("MiniMax 网关未启用".to_string(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let mut results = Vec::new();
+    for acc in &cfg.accounts {
+        if !acc.enabled {
+            continue;
+        }
+        if let Some(id) = &only_id {
+            if &acc.id != id {
+                continue;
+            }
+        }
+        let res = minimax::signin_account(acc).await;
+        results.push(res);
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    // 签到结果回写签到日期 + 实时积分快照（按 id 匹配；成功/幂等都记当天，防重复触发）
+    // 2026-10-04 修复：签到后积分不刷新——原代码只回写签到日期/累计分，而 status
+    // 接口只读 balance 快照字段，导致「已签到但积分不变」。对齐 probe 范式：
+    // 签成功后逐账号查 credit/details（desktop）或 membership_balance（web）写回
+    // 三字段，UI 立即可见最新积分。
+    let mut cfg = minimax::load_config();
+    let today = minimax::today_str();
+    let mut credit_updated: Vec<String> = Vec::new();
+    for res in &results {
+        if res.get("ok").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        let Some(id) = res.get("id").and_then(Value::as_str).map(String::from) else {
+            continue;
+        };
+        let Some(acc) = cfg.accounts.iter().find(|a| a.id == id).cloned() else {
+            continue;
+        };
+        if let Some(a) = cfg.accounts.iter_mut().find(|a| a.id == id) {
+            a.signin_last_date = today.clone();
+            // 新领取（非幂等已领）时累加积分
+            if res.get("action").and_then(Value::as_str) == Some("claimed") {
+                let p = res
+                    .get("points")
+                    .and_then(Value::as_u64)
+                    .or_else(|| {
+                        res.get("points")
+                            .and_then(Value::as_str)
+                            .and_then(|s| s.parse::<u64>().ok())
+                    })
+                    .unwrap_or(0);
+                a.signin_points_total += p;
+            }
+        }
+        // 实时积分快照（2026-10-05：收敛到公共函数，与自动签到同一口径）
+        let (bal, consumed) = minimax::refresh_credit_snapshot(&acc).await;
+        if let Some(a) = cfg.accounts.iter_mut().find(|a| a.id == id) {
+            a.balance = bal;
+            a.credit_consumed = consumed;
+            a.balance_at = minimax::now_ms();
+        }
+        credit_updated.push(id);
+    }
+    minimax::save_config(&cfg);
+    json_ok(json!({ "ok": true, "results": results, "creditUpdated": credit_updated }))
+}
+
+async fn api_minimax_probe(Json(body): Json<Value>) -> Response {
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+    let cfg = minimax::load_config();
+    let Some(acc) = cfg.accounts.iter().find(|a| a.id == id).cloned() else {
+        return json_err("账号不存在".to_string(), StatusCode::NOT_FOUND);
+    };
+    let started = std::time::Instant::now();
+    let (status, detail) = minimax::probe_account(&acc).await;
+    let mut balance = None;
+    let mut consumed_out = None;
+    if status == 200 {
+        if acc.source == "desktop" {
+            // desktop：credit/details 明细（剩余+已消耗），写回账号供页面直显
+            if let Some((remaining, consumed, _expire)) = minimax::credit_summary(&acc).await {
+                balance = Some(remaining);
+                consumed_out = Some(consumed);
+                let mut cfg2 = minimax::load_config();
+                if let Some(a) = cfg2.accounts.iter_mut().find(|x| x.id == acc.id) {
+                    a.balance = Some(remaining);
+                    a.credit_consumed = Some(consumed);
+                    a.balance_at = minimax::now_ms();
+                }
+                minimax::save_config(&cfg2);
+            }
+        } else {
+            balance = minimax::membership_balance(&acc).await.ok();
+        }
+    }
+    json_ok(json!({
+        "ok": status == 200, "account": acc.label, "status": status,
+        "detail": detail, "balance": balance, "consumed": consumed_out,
+        "latencyMs": started.elapsed().as_millis() as u64,
+    }))
+}
+
+async fn api_minimax_models(headers: HeaderMap, RawQuery(raw_query): RawQuery) -> Response {
+    if !minimax_key_ok(&headers) {
+        return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+    }
+    let cfg = minimax::load_config();
+    let region = raw_query.as_deref().and_then(|q| {
+        q.split('&')
+            .find_map(|kv| kv.strip_prefix("region=").map(|v| v.to_string()))
+    });
+    json_ok(minimax::models_payload_filtered(&cfg, region.as_deref()))
+}
+
+/// 取 messages 末条的文本，**兼容两种 content 形状**：
+/// - OpenAI：`"content": "文本"`
+/// - Anthropic：`"content": [{"type":"text","text":"文本"}, …]`
+///
+/// 🔴 2026-10-05 修复：此前只认字符串（`as_str` 失败即 `""`），
+/// 导致 Anthropic 协议调用方（ZCode 等）的 prompt **恒为空串** ——
+/// 上游收到空输入后返回固定问候语，表现为「模型不工作」。
+fn minimax_last_message_text(body: &Value) -> String {
+    let Some(content) = body.pointer("/messages/-1/content") else {
+        return String::new();
+    };
+    if let Some(s) = content.as_str() {
+        return s.to_string();
+    }
+    if let Some(arr) = content.as_array() {
+        return arr
+            .iter()
+            .filter(|b| {
+                // 只取 text 块（缺 type 字段时按 text 处理，容错）
+                b.get("type")
+                    .and_then(Value::as_str)
+                    .map(|t| t == "text")
+                    .unwrap_or(true)
+            })
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("");
+    }
+    String::new()
+}
+
+async fn api_minimax_chat(headers: HeaderMap, Json(mut body): Json<Value>) -> Response {
+    if !minimax_key_ok(&headers) {
+        return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+    }
+    let region = body.get("region").and_then(Value::as_str).map(String::from);
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let prompt = minimax_last_message_text(&body);
+    body["prompt"] = json!(prompt);
+    match minimax::chat_once(&prompt, region.as_deref(), model.as_deref()).await {
+        Ok(v) => json_ok(v),
+        Err((s, e)) => glm_proxy_error(e, StatusCode::from_u16(s).unwrap_or(StatusCode::BAD_GATEWAY)),
+    }
+}
+
+async fn api_autoclaw_watch_state() -> Response {
+    // 只读存储的监控状态（不触发网络探测；探测走 POST /probe）
+    json_ok(autoclaw_watch::watch_state())
+}
+
+async fn api_autoclaw_watch_probe() -> Response {
+    json_ok(autoclaw_watch::probe_now().await)
 }
 
 async fn api_glmplan_status() -> Response {

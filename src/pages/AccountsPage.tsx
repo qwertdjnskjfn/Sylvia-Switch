@@ -1,18 +1,27 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import {
+  CalendarCheck,
+  CircleCheck,
   Columns3,
+  AlarmClock,
+  ChevronDown,
   Download,
-  Eye,
-  EyeOff,
+  ExternalLink,
   FileDown,
   FileUp,
   Globe,
+  Layers,
   Loader2,
+  Pencil,
   QrCode,
   RefreshCw,
   Rows3,
   Search,
+  ShieldCheck,
+  Trash2,
+  Users,
   X,
 } from "lucide-react";
 
@@ -22,6 +31,7 @@ import { WorkBuddyMark } from "@/components/product-marks";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
@@ -31,9 +41,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import {
   ACCOUNT_EXTRAS_CHANGE_EVENT,
   getAccountNotes,
-  getPrivacyMask,
   setAccountNote,
-  setPrivacyMask,
 } from "@/lib/account-extras";
 import {
   Dialog,
@@ -49,7 +57,17 @@ import { OAuthLoginDialog } from "@/components/oauth-login-dialog";
 import { QoderCnImportDialog } from "@/components/qoder-cn-import-dialog";
 import { SwitchAccountDialog } from "@/components/switch-account-dialog";
 import * as api from "@/lib/api";
-import type { AccountMeta, AppStatus, CheckinConfig, CreditExpiry, PlatformCheckinItem, TravelConfig, TravelStatus } from "@/lib/types";
+import type {
+  AccountMeta,
+  AppStatus,
+  CheckinConfig,
+  CreditExpiry,
+  PlatformCheckinItem,
+  TravelConfig,
+  TravelStatus,
+  UnifiedAccount,
+  UnifiedAccountsPayload,
+} from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useAccountsStore } from "@/stores/accounts";
 
@@ -132,7 +150,77 @@ async function fetchTravelMap(
   return next;
 }
 
+// ---------------------------------------------------------------------------
+// 统一账号管理（契约 docs/unified-accounts-contract.md §2/§4）
+// ---------------------------------------------------------------------------
+
+/** 平台显示名（契约 §2 platform 枚举的超集；未知平台回退原始字符串）。 */
+const PLATFORM_LABELS: Record<string, string> = {
+  workbuddy: "WorkBuddy",
+  autoclaw: "AutoClaw",
+  trae_work_cn: "TRAE Work CN",
+  dumate: "DuMate",
+  grok: "Grok",
+  chatglm: "ChatGLM",
+  glmweb: "ChatGLM Web",
+  loomy: "Loomy",
+  miaoshou: "妙手",
+  qoder: "Qoder",
+  kimi: "Kimi",
+  qwen: "Qwen",
+  chatgpt: "ChatGPT",
+};
+
+const PLATFORM_TONES = [
+  "bg-emerald-500/15 text-emerald-700 dark:text-emerald-400",
+  "bg-violet-500/15 text-violet-700 dark:text-violet-400",
+  "bg-sky-500/15 text-sky-700 dark:text-sky-400",
+  "bg-amber-500/15 text-amber-700 dark:text-amber-400",
+  "bg-rose-500/15 text-rose-700 dark:text-rose-400",
+  "bg-teal-500/15 text-teal-700 dark:text-teal-400",
+] as const;
+
+function platformLabel(platform: string): string {
+  return PLATFORM_LABELS[platform] || platform;
+}
+
+function platformTone(platform: string): string {
+  let hash = 0;
+  for (let i = 0; i < platform.length; i += 1) hash = (hash * 31 + platform.charCodeAt(i)) >>> 0;
+  return PLATFORM_TONES[hash % PLATFORM_TONES.length];
+}
+
+/** 统一账号积分显示（上游多为字符串数值，容错 number / 非法值）。 */
+function fmtUnifiedCredits(value: string | number | null | undefined): string {
+  if (value == null || value === "") return "—";
+  const num = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(num)
+    ? new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(num)
+    : String(value);
+}
+
+/** 秒级 epoch → 「M/D」短日期（如 10/31）；无到期时间返回 null。 */
+function fmtExpireShort(expireAt: number | null | undefined): string | null {
+  if (expireAt == null || !Number.isFinite(expireAt)) return null;
+  const d = new Date(expireAt * 1000);
+  return `${d.getMonth() + 1}/${d.getDate()}`;
+}
+
+/** 秒级 epoch → 「10/31 到期」/「10/31 已过期」/「无到期时间」。 */
+function fmtExpireLabel(expireAt: number | null | undefined): string {
+  const short = fmtExpireShort(expireAt);
+  if (!short) return "无到期时间";
+  return (expireAt as number) * 1000 < Date.now() ? `${short} 已过期` : `${short} 到期`;
+}
+
+/** 账号是否有 7 天内到期（含已过期）的积分包。 */
+function hasExpiringPackages(account: UnifiedAccount): boolean {
+  const pkgs = account.credits?.packages ?? [];
+  return pkgs.some((p) => p.expiringSoon);
+}
+
 export default function AccountsPage() {
+  const navigate = useNavigate();
   const {
     accounts,
     status,
@@ -184,40 +272,51 @@ export default function AccountsPage() {
   const [searchQuery, setSearchQuery] = useState("");
   const [filterType, setFilterType] = useState<"all" | "unchecked" | "expiring" | "active">("all");
   const [sortType, setSortType] = useState<"default" | "credits-desc" | "credits-asc" | "recent-expiry">("default");
-  const [privacyMask, setPrivacyMaskState] = useState<boolean>(getPrivacyMask);
   const [accountNotes, setAccountNotes] = useState<Record<string, string>>(getAccountNotes);
-  const [editingNoteAccount, setEditingNoteAccount] = useState<AccountMeta | null>(null);
+  /** 备注编辑目标（统一账号与本地账号共用；null=关闭） */
+  const [editingNoteTarget, setEditingNoteTarget] = useState<{ id: string; name: string } | null>(null);
   const [noteInput, setNoteInput] = useState("");
+
+  // ---- 统一账号聚合（契约 §2/§4；仅 webui 后端支持，旧后端加载失败时相关区块整体隐藏）----
+  const [unified, setUnified] = useState<UnifiedAccountsPayload | null>(null);
+  const [unifiedLoading, setUnifiedLoading] = useState(false);
+  const [unifiedFilter, setUnifiedFilter] = useState<string>("all");
+  /** 统一表行内操作进行中（签到为账号 id，代理编辑为 `proxy:${id}`） */
+  const [unifiedBusyId, setUnifiedBusyId] = useState<string | null>(null);
+  /** 统一表行内代理编辑（仅 dumate 池账号） */
+  const [unifiedProxyEdit, setUnifiedProxyEdit] = useState<{ id: string; value: string } | null>(null);
+  /** 统一表积分包展开（账号 id 集合，点击积分包徽标切换） */
+  const [unifiedPkgOpen, setUnifiedPkgOpen] = useState<Set<string>>(() => new Set());
 
   useEffect(() => {
     const onExtrasChange = () => {
       setAccountNotes(getAccountNotes());
-      setPrivacyMaskState(getPrivacyMask());
     };
     window.addEventListener(ACCOUNT_EXTRAS_CHANGE_EVENT, onExtrasChange);
     return () => window.removeEventListener(ACCOUNT_EXTRAS_CHANGE_EVENT, onExtrasChange);
   }, []);
 
-  function togglePrivacyMask() {
-    setPrivacyMask(!privacyMask);
+  function openEditNote(account: AccountMeta) {
+    setEditingNoteTarget({ id: account.id, name: account.nickname || account.email || account.id });
+    setNoteInput(accountNotes[account.id] || "");
   }
 
-  function openEditNote(account: AccountMeta) {
-    setEditingNoteAccount(account);
+  function openUnifiedNote(account: UnifiedAccount) {
+    setEditingNoteTarget({ id: account.id, name: unifiedDisplayName(account) });
     setNoteInput(accountNotes[account.id] || "");
   }
 
   function saveNote() {
-    if (!editingNoteAccount) return;
-    setAccountNote(editingNoteAccount.id, noteInput);
-    setEditingNoteAccount(null);
+    if (!editingNoteTarget) return;
+    setAccountNote(editingNoteTarget.id, noteInput);
+    setEditingNoteTarget(null);
     toast.success("备注已保存");
   }
 
   function clearNote() {
-    if (!editingNoteAccount) return;
-    setAccountNote(editingNoteAccount.id, "");
-    setEditingNoteAccount(null);
+    if (!editingNoteTarget) return;
+    setAccountNote(editingNoteTarget.id, "");
+    setEditingNoteTarget(null);
     toast.success("备注已清除");
   }
 
@@ -282,6 +381,110 @@ export default function AccountsPage() {
         /* 本机无 WorkBuddy 登录态时静默，不打扰用户 */
       });
   }, [accounts.length, loading, importLocal, fetchAll]);
+
+  // ---------------------------------------------------------------------------
+  // 统一账号聚合 + DuMate 账号池：加载（30s 静默轮询 + 切屏刷新）
+  // ---------------------------------------------------------------------------
+
+  /** 拉取统一账号聚合（契约 §2）。失败保留旧数据；从未成功过则相关区块不渲染。 */
+  async function loadUnified(showLoading = false) {
+    if (showLoading) setUnifiedLoading(true);
+    try {
+      setUnified(await api.getUnifiedAccounts());
+    } catch {
+      /* 静默：保留旧数据或维持未加载态（旧后端无此接口） */
+    } finally {
+      if (showLoading) setUnifiedLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void loadUnified(true);
+    const interval = window.setInterval(() => {
+      void loadUnified();
+    }, 30_000);
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        void loadUnified();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, []);
+
+  /** 手动刷新：统一聚合。 */
+  async function refreshUnifiedAll() {
+    await loadUnified(true);
+  }
+
+  // ---------------------------------------------------------------------------
+  // 统一账号表：名称 / 签到 / 代理 / 备注 / 跳转
+  // ---------------------------------------------------------------------------
+
+  /** 名称显示统一规则（任务 #3）：备注（accountNotes）→ 账号自身 displayName → 平台默认名。全程无星号。 */
+  function unifiedDisplayName(account: UnifiedAccount): string {
+    const note = accountNotes[account.id]?.trim();
+    if (note) return note;
+    const own = account.displayName?.trim();
+    if (own) return own;
+    return platformLabel(account.platform);
+  }
+
+  async function onUnifiedCheckin(account: UnifiedAccount) {
+    if (unifiedBusyId !== null) return;
+    setUnifiedBusyId(account.id);
+    try {
+      const res = await api.checkin(account.id);
+      const label =
+        res.result === "success"
+          ? "签到成功"
+          : res.result === "already"
+            ? "今天已签到"
+            : "签到失败";
+      const description = `${unifiedDisplayName(account)}${res.error ? `：${res.error}` : ""}`;
+      if (res.result === "error") toast.error(label, { description });
+      else toast.success(label, { description });
+      void loadUnified();
+    } catch (e) {
+      toast.error("签到失败", { description: api.asError(e) });
+    } finally {
+      setUnifiedBusyId(null);
+    }
+  }
+
+  /** 保存统一表行内编辑的出站代理（空串 = 直连；仅 dumate 池账号）。 */
+  async function saveUnifiedProxy(account: UnifiedAccount) {
+    const proxy = (unifiedProxyEdit?.id === account.id ? unifiedProxyEdit.value : account.proxy ?? "").trim();
+    setUnifiedBusyId(`proxy:${account.id}`);
+    try {
+      await api.updateDumateAccount({ id: account.id, proxy });
+      toast.success(proxy ? `「${unifiedDisplayName(account)}」代理已更新` : `「${unifiedDisplayName(account)}」已改为直连`);
+      setUnifiedProxyEdit(null);
+      await loadUnified();
+    } catch (e) {
+      toast.error(api.asError(e));
+    } finally {
+      setUnifiedBusyId(null);
+    }
+  }
+
+  /** 删除统一表中的 DuMate 池账号（非 dumate 平台按钮不渲染）。 */
+  async function onUnifiedRemoveDumate(account: UnifiedAccount) {
+    if (!window.confirm(`确定删除账号「${unifiedDisplayName(account)}」？删除后不可恢复。`)) return;
+    setUnifiedBusyId(`remove:${account.id}`);
+    try {
+      await api.removeDumateAccount(account.id);
+      toast.success(`已删除「${unifiedDisplayName(account)}」`);
+      await loadUnified();
+    } catch (e) {
+      toast.error(api.asError(e));
+    } finally {
+      setUnifiedBusyId(null);
+    }
+  }
 
   async function loadPlatformCheckins() {
     try {
@@ -703,6 +906,37 @@ export default function AccountsPage() {
       pickStatusText(current.uid) ||
       "未知账号"
     : "未登录";
+
+  // ---- 统一账号表：平台 chips 与过滤 ----
+  const unifiedAccounts = unified?.accounts ?? [];
+
+  /** 同源锚点 id → 展示名（「同源」徽标的 title 用） */
+  const sameSourceName = (id: string | null | undefined): string =>
+    id ? (unifiedAccounts.find((a) => a.id === id)?.displayName ?? id) : "";
+  const unifiedSummary = unified?.summary ?? null;
+  /** 存在 7 天内到期（含已过期）积分包的账号数（总览「积分临近到期」瓦片）。 */
+  const unifiedExpiringCount = useMemo(
+    () => unifiedAccounts.filter(hasExpiringPackages).length,
+    [unifiedAccounts],
+  );
+  const unifiedPlatforms = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const acc of unifiedAccounts) {
+      counts.set(acc.platform, (counts.get(acc.platform) ?? 0) + 1);
+    }
+    return [...counts.entries()];
+  }, [unifiedAccounts]);
+  const filteredUnified = useMemo(
+    () =>
+      unifiedFilter === "all"
+        ? unifiedAccounts
+        : unifiedAccounts.filter((acc) => acc.platform === unifiedFilter),
+    [unifiedAccounts, unifiedFilter],
+  );
+
+  /** 统一账号是否为 DuMate 池账号（契约 §2：仅池账号有 proxy 字段）。 */
+  const isDumatePool = (acc: UnifiedAccount): boolean => acc.id.startsWith("dumate:pool_");
+
   return (
     <div className="mx-auto w-full max-w-[1180px] px-6 py-8 sm:px-8 sm:py-9">
       <header className="mb-6">
@@ -710,7 +944,7 @@ export default function AccountsPage() {
           <div className="min-w-0">
             <h1 className="text-[28px] font-semibold tracking-tight">账号管理</h1>
             <p className="mt-2 text-sm leading-6 text-muted-foreground">
-              统一管理 WorkBuddy、AutoClaw 与 TRAE Work CN 账号、积分和签到状态。
+              统一管理全部平台账号：签到、积分、登录态与 DuMate 一号一 IP 出站代理，全名直显无遮罩。
             </p>
           </div>
           <div className="flex shrink-0 items-center gap-4 pt-1">
@@ -733,6 +967,409 @@ export default function AccountsPage() {
           </div>
         </div>
       </header>
+
+      {error && (
+        <Alert variant="destructive" className="mb-4">
+          <AlertTitle>加载失败</AlertTitle>
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      )}
+
+      {/* 总览条（契约 §4.1）：平台数 / 账号总数 / 健康数 / 今日已签，来源 /api/accounts/unified summary */}
+      {unifiedSummary && (
+        <section className="mb-6" aria-label="全平台账号总览">
+          <Card className="min-w-0 gap-0 overflow-hidden rounded-xl py-0 shadow-none">
+            <div className="flex min-w-0 flex-wrap items-center justify-between gap-2 px-4 pt-3 sm:px-5">
+              <CardTitle className="flex items-center gap-2 text-sm font-medium">
+                <Layers className="size-4 text-muted-foreground" />
+                全平台总览
+              </CardTitle>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-7 gap-1 px-2 text-xs"
+                onClick={() => void refreshUnifiedAll()}
+                disabled={unifiedLoading}
+              >
+                <RefreshCw className={cn("size-3.5", unifiedLoading && "animate-spin")} />
+                刷新
+              </Button>
+            </div>
+            <CardContent className="p-4 pt-3 sm:p-5 sm:pt-3">
+              <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-5">
+                {[
+                  { label: "平台数", value: unifiedSummary.platforms, icon: Layers },
+                  { label: "账号总数", value: unifiedSummary.accounts, icon: Users },
+                  { label: "登录态健康", value: unifiedSummary.healthy, icon: ShieldCheck },
+                  {
+                    label: `今日已签 ${unifiedSummary.checkedInToday ?? 0}/${unifiedSummary.accounts ?? 0}`,
+                    value: unifiedSummary.checkedInToday,
+                    icon: CircleCheck,
+                  },
+                  {
+                    label: "积分临近到期",
+                    value: unifiedExpiringCount,
+                    icon: AlarmClock,
+                  },
+                ].map((stat) => (
+                  <div key={stat.label} className="rounded-lg border border-border/60 bg-muted/30 px-3 py-2.5">
+                    <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                      <stat.icon className="size-3.5" />
+                      <span className="min-w-0 truncate">{stat.label}</span>
+                    </div>
+                    <div className="mt-1 text-xl font-semibold tabular-nums tracking-tight">
+                      {typeof stat.value === "number" ? stat.value : "—"}
+                    </div>
+                  </div>
+                ))}
+              </div>
+              {unifiedExpiringCount > 0 ? (
+                <p className="mt-2.5 flex items-center gap-1.5 rounded-md bg-warning/10 px-2.5 py-1.5 text-[11px] text-warning">
+                  <AlarmClock className="size-3.5 shrink-0" />
+                  有 {unifiedExpiringCount} 个账号存在 7 天内到期（含已过期）的积分包，展开账号行查看明细，尽快使用。
+                </p>
+              ) : null}
+            </CardContent>
+          </Card>
+        </section>
+      )}
+
+      {/* 统一账号表（契约 §4.2）：平台 chips 筛选 + 行式布局（平台徽标|名称|登录态|积分|今日签到|代理|操作） */}
+      {unified && (
+        <section className="mb-8" aria-labelledby="unified-accounts-title">
+          <Card className="min-w-0 gap-0 overflow-hidden rounded-xl py-0 shadow-none">
+            <div className="flex min-w-0 flex-wrap items-center justify-between gap-2 px-4 py-3 sm:px-5">
+              <div className="flex min-w-0 items-center gap-2">
+                <Users className="size-4 shrink-0 text-muted-foreground" />
+                <h2 id="unified-accounts-title" className="text-sm font-medium">统一账号</h2>
+                <Badge variant="secondary" className="text-[10px] tabular-nums">
+                  {unifiedAccounts.length}
+                </Badge>
+              </div>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-7 gap-1 px-2 text-xs"
+                onClick={() => void loadUnified(true)}
+                disabled={unifiedLoading}
+              >
+                <RefreshCw className={cn("size-3.5", unifiedLoading && "animate-spin")} />
+                刷新
+              </Button>
+            </div>
+
+            {/* 平台筛选 chips */}
+            {unifiedPlatforms.length > 0 && (
+              <div className="flex flex-wrap items-center gap-1.5 px-4 pb-3 sm:px-5">
+                <button
+                  type="button"
+                  onClick={() => setUnifiedFilter("all")}
+                  className={cn(
+                    "rounded-md border px-2 py-0.5 text-[11px] transition-colors",
+                    unifiedFilter === "all"
+                      ? "border-primary/30 bg-primary/10 font-medium text-primary"
+                      : "border-border/60 text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  全部 <span className="tabular-nums">({unifiedAccounts.length})</span>
+                </button>
+                {unifiedPlatforms.map(([platform, count]) => (
+                  <button
+                    key={platform}
+                    type="button"
+                    onClick={() => setUnifiedFilter(platform)}
+                    className={cn(
+                      "rounded-md border px-2 py-0.5 text-[11px] transition-colors",
+                      unifiedFilter === platform
+                        ? "border-primary/30 bg-primary/10 font-medium text-primary"
+                        : "border-border/60 text-muted-foreground hover:text-foreground",
+                    )}
+                  >
+                    {platformLabel(platform)} <span className="tabular-nums">({count})</span>
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {/* 账号行 */}
+            <div className="divide-y divide-border/50 border-t border-border/50">
+              {filteredUnified.length === 0 ? (
+                <p className="px-4 py-6 text-center text-sm text-muted-foreground sm:px-5">
+                  {unifiedAccounts.length === 0
+                    ? "暂无统一账号数据。请确认各平台已接入后再试。"
+                    : "该平台暂无账号。"}
+                </p>
+              ) : (
+                filteredUnified.map((acc) => {
+                  const displayName = unifiedDisplayName(acc);
+                  const isPool = isDumatePool(acc);
+                  const checkingIn = unifiedBusyId === acc.id;
+                  const savingProxy = unifiedBusyId === `proxy:${acc.id}`;
+                  const regionMark =
+                    acc.region === "intl" ? " 🌐" : acc.region === "cn" ? " 🇨🇳" : "";
+                  return (
+                    <div
+                      key={acc.id}
+                      className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-2 px-4 py-2.5 sm:px-5"
+                    >
+                      {/* 平台徽标 + 名称（全名，备注优先，无星号） */}
+                      <div className="flex w-[210px] min-w-0 shrink-0 items-center gap-2">
+                        <span
+                          className={cn(
+                            "inline-flex h-5 shrink-0 items-center rounded px-1.5 text-[10px] font-medium",
+                            platformTone(acc.platform),
+                          )}
+                        >
+                          {platformLabel(acc.platform)}
+                        </span>
+                        <span className="min-w-0 truncate text-xs font-medium" title={displayName}>
+                          {displayName}
+                          {regionMark}
+                        </span>
+                        {acc.note?.trim() ? (
+                          <Badge variant="secondary" className="h-4 shrink-0 px-1 text-[10px] font-normal text-muted-foreground">
+                            备注
+                          </Badge>
+                        ) : null}
+                        {acc.sameSourceOf ? (
+                          <Badge
+                            variant="outline"
+                            className="h-4 shrink-0 px-1 text-[10px] font-normal text-muted-foreground"
+                            title={`与「${sameSourceName(acc.sameSourceOf)}」是同一账号的不同入口（本机 / 池）。两条都展示，不隐藏。`}
+                          >
+                            同源
+                          </Badge>
+                        ) : null}
+                      </div>
+
+                      {/* 状态字段：登录态 | 积分 | 今日签到 | 代理 */}
+                      <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
+                        {acc.loginState === "ok" ? (
+                          <Badge variant="success" className="text-[10px]">登录正常</Badge>
+                        ) : acc.loginState === "expired" ? (
+                          <Badge variant="destructive" className="text-[10px]">登录失效</Badge>
+                        ) : (
+                          <Badge variant="secondary" className="text-[10px] text-muted-foreground">登录未知</Badge>
+                        )}
+                        <span className="shrink-0 tabular-nums">
+                          积分 <span className="font-medium text-foreground">{fmtUnifiedCredits(acc.credits?.available)}</span>
+                        </span>
+                        {/* 积分包：徽标（数量 + 最近到期）→ 点击展开明细（名称/剩余/到期/临期） */}
+                        {(acc.credits?.packages?.length ?? 0) > 0 ? (
+                          <span className="flex min-w-0 flex-col gap-1">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setUnifiedPkgOpen((prev) => {
+                                  const next = new Set(prev);
+                                  if (next.has(acc.id)) next.delete(acc.id);
+                                  else next.add(acc.id);
+                                  return next;
+                                })
+                              }
+                              className={cn(
+                                "flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] transition-colors",
+                                unifiedPkgOpen.has(acc.id)
+                                  ? "border-primary/30 bg-primary/10 text-primary"
+                                  : hasExpiringPackages(acc)
+                                    ? "border-warning/40 bg-warning/10 text-warning hover:bg-warning/20"
+                                    : "border-border/60 text-muted-foreground hover:text-foreground",
+                              )}
+                              title="展开/收起积分包明细"
+                            >
+                              <ChevronDown
+                                className={cn(
+                                  "size-3 shrink-0 transition-transform",
+                                  unifiedPkgOpen.has(acc.id) ? "rotate-180" : "",
+                                )}
+                              />
+                              {acc.credits?.packages?.length ?? 0} 个积分包
+                              {fmtExpireShort(acc.credits?.soonestExpireAt)
+                                ? ` · 最近 ${fmtExpireShort(acc.credits?.soonestExpireAt)} 到期`
+                                : ""}
+                              {/* 临期数量直接上徽标：不点开也能看见有没有包快到期 */}
+                              {hasExpiringPackages(acc)
+                                ? ` · 近期到期 ${
+                                    (acc.credits?.packages ?? []).filter((p) => p.expiringSoon).length
+                                  }`
+                                : ""}
+                            </button>
+                            {unifiedPkgOpen.has(acc.id)
+                              ? (acc.credits?.packages ?? []).map((pkg, idx) => (
+                                  <span
+                                    key={`${pkg.name}-${pkg.expireAt ?? idx}`}
+                                    className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px]"
+                                  >
+                                    <span className="max-w-[160px] truncate font-medium text-foreground" title={pkg.name}>
+                                      {pkg.name}
+                                    </span>
+                                    <span className="tabular-nums">剩余 {fmtUnifiedCredits(pkg.remaining)}</span>
+                                    <span className={pkg.expiringSoon ? "text-warning" : ""}>
+                                      {fmtExpireLabel(pkg.expireAt)}
+                                    </span>
+                                    {pkg.expiringSoon ? (
+                                      <Badge variant="warning" className="h-4 px-1 text-[9px]">
+                                        {pkg.expireAt != null && pkg.expireAt * 1000 < Date.now() ? "已过期" : "近期到期"}
+                                      </Badge>
+                                    ) : null}
+                                  </span>
+                                ))
+                              : null}
+                          </span>
+                        ) : null}
+                        {acc.todayCheckedIn === true ? (
+                          <Badge variant="success" className="text-[10px]">今日已签</Badge>
+                        ) : acc.todayCheckedIn === false ? (
+                          <Badge variant="warning" className="text-[10px]">今日未签</Badge>
+                        ) : (
+                          <span>今日签到 —</span>
+                        )}
+                        {isPool && (
+                          <span className="max-w-[220px] truncate">
+                            {acc.proxy ? `代理 ${acc.proxy}` : "直连"}
+                          </span>
+                        )}
+                      </div>
+
+                      {/* 操作：签到 / 刷新 / 备注 / 代理 / 跳转 */}
+                      <div className="ml-auto flex shrink-0 items-center gap-1">
+                        {unifiedProxyEdit?.id === acc.id ? (
+                          <>
+                            <Input
+                              className="h-7 w-44 text-xs"
+                              placeholder="http:// 或 socks5://，留空直连"
+                              value={unifiedProxyEdit.value}
+                              onChange={(e) => setUnifiedProxyEdit({ id: acc.id, value: e.target.value })}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter" && !e.nativeEvent.isComposing)
+                                  void saveUnifiedProxy(acc);
+                              }}
+                            />
+                            <Button
+                              size="sm"
+                              className="h-7 px-2 text-xs"
+                              onClick={() => void saveUnifiedProxy(acc)}
+                              disabled={savingProxy}
+                            >
+                              {savingProxy ? <Loader2 className="animate-spin" /> : null}保存
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              className="h-7 px-2 text-xs"
+                              onClick={() => setUnifiedProxyEdit(null)}
+                            >
+                              取消
+                            </Button>
+                          </>
+                        ) : (
+                          <>
+                            {acc.todayCheckedIn != null && (
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <Button
+                                    size="sm"
+                                    variant="outline"
+                                    className="h-7 px-2 text-xs"
+                                    onClick={() => void onUnifiedCheckin(acc)}
+                                    disabled={checkingIn || unifiedBusyId !== null}
+                                  >
+                                    {checkingIn ? <Loader2 className="animate-spin" /> : <CalendarCheck />}
+                                    签到
+                                  </Button>
+                                </TooltipTrigger>
+                                <TooltipContent side="top">为该账号签到（幂等）</TooltipContent>
+                              </Tooltip>
+                            )}
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  className="h-7 px-1.5 text-xs"
+                                  onClick={() => void loadUnified(true)}
+                                  disabled={unifiedLoading}
+                                  aria-label={`刷新 ${displayName}`}
+                                >
+                                  <RefreshCw className={cn("size-3.5", unifiedLoading && "animate-spin")} />
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent side="top">刷新状态与积分</TooltipContent>
+                            </Tooltip>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  className="h-7 px-1.5 text-xs"
+                                  onClick={() => openUnifiedNote(acc)}
+                                  aria-label={`编辑 ${displayName} 备注`}
+                                >
+                                  <Pencil className="size-3.5" />
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent side="top">编辑备注</TooltipContent>
+                            </Tooltip>
+                            {isPool && (
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <Button
+                                    size="sm"
+                                    variant="ghost"
+                                    className="h-7 px-1.5 text-xs"
+                                    onClick={() => setUnifiedProxyEdit({ id: acc.id, value: acc.proxy ?? "" })}
+                                    aria-label={`编辑 ${displayName} 代理`}
+                                  >
+                                    <Globe className="size-3.5" />
+                                  </Button>
+                                </TooltipTrigger>
+                                <TooltipContent side="top">编辑出站代理（一号一 IP）</TooltipContent>
+                              </Tooltip>
+                            )}
+                            {isPool && (
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <Button
+                                    size="sm"
+                                    variant="ghost"
+                                    className="h-7 px-1.5 text-xs text-destructive hover:text-destructive"
+                                    onClick={() => void onUnifiedRemoveDumate(acc)}
+                                    disabled={unifiedBusyId !== null}
+                                    aria-label={`删除 ${displayName}`}
+                                  >
+                                    <Trash2 className="size-3.5" />
+                                  </Button>
+                                </TooltipTrigger>
+                                <TooltipContent side="top">删除该 DuMate 池账号</TooltipContent>
+                              </Tooltip>
+                            )}
+                            {acc.gatewayPage && (
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <Button
+                                    size="sm"
+                                    variant="ghost"
+                                    className="h-7 px-1.5 text-xs"
+                                    onClick={() => navigate(acc.gatewayPage as string)}
+                                    aria-label={`打开 ${platformLabel(acc.platform)} 渠道页`}
+                                  >
+                                    <ExternalLink className="size-3.5" />
+                                  </Button>
+                                </TooltipTrigger>
+                                <TooltipContent side="top">打开 {platformLabel(acc.platform)} 渠道页</TooltipContent>
+                              </Tooltip>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </Card>
+        </section>
+      )}
 
       <div className="relative mb-6 overflow-visible rounded-2xl border border-border bg-muted/30 px-5 py-5 shadow-[0_6px_20px_rgba(15,23,42,.025)]">
         <div className="pointer-events-none absolute inset-0 overflow-hidden rounded-2xl">
@@ -781,17 +1418,10 @@ export default function AccountsPage() {
         </div>
       </div>
 
-      {error && (
-        <Alert variant="destructive" className="mb-4">
-          <AlertTitle>加载失败</AlertTitle>
-          <AlertDescription>{error}</AlertDescription>
-        </Alert>
-      )}
-
       <section className="mt-7 min-w-0" aria-labelledby="accounts-list-title">
         <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-2">
-            <h2 id="accounts-list-title" className="text-base font-semibold tracking-tight">账号</h2>
+            <h2 id="accounts-list-title" className="text-base font-semibold tracking-tight">WorkBuddy 账号</h2>
             <Badge
               variant="secondary"
               className="h-6 min-w-6 rounded-full border-0 px-1.5 text-[11px] tabular-nums text-muted-foreground shadow-none"
@@ -894,7 +1524,7 @@ export default function AccountsPage() {
               )}
             </div>
 
-            {/* 中间/右侧：过滤标签组 + 排序 + 隐私脱敏 */}
+            {/* 中间/右侧：过滤标签组 + 排序 */}
             <div className="flex flex-wrap items-center gap-2">
               {/* 过滤 Pills */}
               <div className="flex items-center rounded-lg border border-border/60 bg-muted/30 p-0.5 text-xs">
@@ -974,23 +1604,6 @@ export default function AccountsPage() {
                   <SelectItem value="recent-expiry">到期最近</SelectItem>
                 </SelectContent>
               </Select>
-
-              {/* 隐私脱敏开关 */}
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="icon"
-                    className={cn("size-9 rounded-lg transition-colors", privacyMask && "bg-primary/10 text-primary border-primary/30")}
-                    onClick={togglePrivacyMask}
-                    aria-label={privacyMask ? "关闭隐私脱敏" : "开启隐私脱敏"}
-                  >
-                    {privacyMask ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent side="top">{privacyMask ? "已开启隐私脱敏（点击关闭）" : "开启隐私脱敏模式"}</TooltipContent>
-              </Tooltip>
             </div>
           </div>
         )}
@@ -1056,7 +1669,6 @@ export default function AccountsPage() {
                 account={a}
                 compact={compact}
                 note={accountNotes[a.id]}
-                privacyMask={privacyMask}
                 onEditNote={openEditNote}
                 onDelete={onDelete}
                 onSwitch={setSwitchAccount}
@@ -1123,7 +1735,6 @@ export default function AccountsPage() {
                   account={meta}
                   platform={item.platform}
                   compact={compact}
-                  privacyMask={privacyMask}
                   todayCheckedIn={item.ok ? item.todayCheckedIn : undefined}
                   credit={item.credit}
                   creditUpdatedAt={item.credit?.updatedAt}
@@ -1151,13 +1762,13 @@ export default function AccountsPage() {
         </section>
       ) : null}
 
-      {/* 修改账号备注弹窗 */}
-      <Dialog open={editingNoteAccount !== null} onOpenChange={(open) => !open && setEditingNoteAccount(null)}>
+      {/* 修改账号备注弹窗（统一账号与本地账号共用） */}
+      <Dialog open={editingNoteTarget !== null} onOpenChange={(open) => !open && setEditingNoteTarget(null)}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle>编辑账号备注</DialogTitle>
             <DialogDescription>
-              为账号 {editingNoteAccount?.nickname || editingNoteAccount?.email || editingNoteAccount?.id} 设置一个易记的别名。
+              为账号 {editingNoteTarget?.name || "…"} 设置一个易记的别名。备注将作为显示名优先展示。
             </DialogDescription>
           </DialogHeader>
           <div className="py-2">
@@ -1173,11 +1784,11 @@ export default function AccountsPage() {
             />
           </div>
           <DialogFooter className="flex gap-2 sm:justify-between">
-            <Button variant="ghost" size="sm" onClick={clearNote} disabled={!accountNotes[editingNoteAccount?.id || ""]}>
+            <Button variant="ghost" size="sm" onClick={clearNote} disabled={!accountNotes[editingNoteTarget?.id || ""]}>
               清除备注
             </Button>
             <div className="flex gap-2">
-              <Button variant="outline" size="sm" onClick={() => setEditingNoteAccount(null)}>
+              <Button variant="outline" size="sm" onClick={() => setEditingNoteTarget(null)}>
                 取消
               </Button>
               <Button size="sm" onClick={saveNote}>

@@ -17,17 +17,17 @@
 //! - Codex CLI 0.146 起移除了 `wire_api = "chat"`，只讲 Responses 协议；
 //! - Claude Code / CC Switch 只讲 Anthropic Messages 协议；
 //! - 上游（copilot.tencent.com / www.workbuddy.ai）只认 OpenAI Chat Completions。
-//! 因此三边必须互译：请求侧把客户端私有协议翻成内部 chat payload（出站前再过
-//! `workbuddy_upstream::prepare_body`），响应侧把聚合结果还原成客户端协议的对象与
-//! SSE 帧序列。
+//!   因此三边必须互译：请求侧把客户端私有协议翻成内部 chat payload（出站前再过
+//!   `workbuddy_upstream::prepare_body`），响应侧把聚合结果还原成客户端协议的对象与
+//!   SSE 帧序列。
 //!
 //! # 帧格式两协议不同（调用方勿混用）
 //!
 //! - **Responses**：契约 §1 钉定「每帧一个 `data: {json}\n\n`」，`data: [DONE]\n\n` 收尾；
 //! - **Anthropic**：真实客户端规范要求 `event:` 名（Claude Code 按事件名分派），
 //!   故每帧 `event: <name>\ndata: {json}\n\n`，**无 `[DONE]` 哨兵**（`message_stop` 即结束）。
-//! 口径分别对齐参考实现 `_workbuddy-gateway-ref/.../responses_stream.go:43` 与本仓
-//! `glm_anthropic.rs:427 sse_event`。
+//!   口径分别对齐参考实现 `_workbuddy-gateway-ref/.../responses_stream.go:43` 与本仓
+//!   `glm_anthropic.rs:427 sse_event`。
 //!
 //! # 口径来源（逐条对应，防漂移）
 //!

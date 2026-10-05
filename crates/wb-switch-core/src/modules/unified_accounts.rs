@@ -22,6 +22,7 @@ use crate::modules::checkin;
 use crate::modules::config;
 use crate::modules::grok;
 use crate::modules::platform_checkin;
+use crate::modules::zcode;
 
 /// 统一账号聚合（GET /api/accounts/unified 的数据层）。
 /// 返回 `{accounts: [...], summary: {platforms, accounts, healthy, checkedInToday}}`。
@@ -41,7 +42,7 @@ pub async fn unified_accounts() -> Value {
         let Some(id) = acc.get("id").and_then(Value::as_str).map(String::from) else {
             continue;
         };
-        if !seen.insert(id) {
+        if !seen.insert(id.clone()) {
             continue;
         }
         checkin_accounts.push(acc);
@@ -66,6 +67,64 @@ pub async fn unified_accounts() -> Value {
             continue;
         }
         items.push(grok_account_item(&acc));
+    }
+
+    // ②' ZCode 账号池：无签到概念，仅登录身份与额度聚合（契约 zcode-channel-contract §2）。
+    //    live 登录态也产出一行（isLive），池内同指纹账号另列 isActive。
+    for acc in zcode::list_accounts() {
+        let Some(id) = acc.get("id").and_then(Value::as_str).map(String::from) else {
+            continue;
+        };
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        let identity = acc.get("identity").cloned().unwrap_or(json!({}));
+        let label = identity
+            .get("label")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| "ZCode 账号".to_string());
+        let jwt_expired = identity.get("jwtExpired").and_then(Value::as_bool).unwrap_or(false);
+        items.push(json!({
+            "id": id.clone(),
+            "platform": "zcode",
+            "displayName": label,
+            "region": Value::Null,
+            "localLogin": false,
+            "loginState": if jwt_expired { "expired" } else { "ok" },
+            "todayCheckedIn": Value::Null,
+            "credits": Value::Null,
+            "proxy": "",
+            "note": "",
+            "checkinEnabled": false,
+            "gatewayPage": "/zcode",
+        }));
+    }
+    if let Some(live) = zcode::live_credentials() {
+        if zcode::is_logged_in(&live) {
+            let live_hash = zcode::canonical_hash(&live);
+            let covered = zcode::list_accounts()
+                .iter()
+                .any(|acc| acc.get("id").and_then(Value::as_str) == Some(format!("zcode:{live_hash}").as_str()));
+            if !covered {
+                let identity = zcode::identity_of(&live);
+                items.push(json!({
+                    "id": "zcode:live",
+                    "platform": "zcode",
+                    "displayName": identity.label().unwrap_or_else(|| "ZCode 当前登录".to_string()),
+                    "region": Value::Null,
+                    "localLogin": true,
+                    "loginState": if identity.jwt_expired { "expired" } else { "ok" },
+                    "todayCheckedIn": Value::Null,
+                    "credits": Value::Null,
+                    "proxy": "",
+                    "note": "",
+                    "checkinEnabled": false,
+                    "gatewayPage": "/zcode",
+                }));
+            }
+        }
     }
 
     // ③ 同源标注：同一账号的多个入口（本机 / 池）打上 sameSourceOf，仅标注不隐藏。

@@ -1012,7 +1012,7 @@ fn rpc_http_client() -> &'static reqwest::Client {
 /// 约束、流中空闲由 [`read_stream_chunk`] 约束（参考 client.rs:29-30 同口径）。
 fn chat_http_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(|| reqwest::Client::new())
+    CLIENT.get_or_init(reqwest::Client::new)
 }
 
 /// 出站脱敏开关：取网关配置 `sanitize_enabled`（契约 §5，默认开、可关；

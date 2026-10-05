@@ -1110,12 +1110,20 @@ mod tests {
                 }),
                 now,
             ),
+            // 1.0.19 起窗口默认 30 天：窗外（45 天）资源不计入
+            resource_summary(
+                &json!({
+                    "CycleCapacityRemainPrecise": 500,
+                    "DeductionEndTime": now + 45 * 24 * 3600 * 1000,
+                }),
+                now,
+            ),
         ];
         let expiring: f64 = resources
             .iter()
             .filter(|resource| resource["expiringSoon"] == true)
             .map(|resource| resource["remaining"].as_f64().unwrap())
             .sum();
-        assert_eq!(expiring, 80.0);
+        assert_eq!(expiring, 100.0);
     }
 }
