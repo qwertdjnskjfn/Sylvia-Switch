@@ -175,6 +175,8 @@ pub struct MmConfig {
     pub yy_absolute_chat: bool,
     /// 账号选择模式（2026-10-05 新增，对齐 glm_proxy 的 ACCOUNT_MODE_* 范式）
     pub account_mode: String,
+    /// 单次请求换号上限：**0 = 不限制**（默认；按候选池顺序试完为止）。2026-10-05
+    pub max_failover: u32,
     /// 熔断冷却基数（秒），默认 60；风控(429/403) 自动 ×2。2026-10-05 可配置
     pub cooldown_base_secs: u64,
     /// 熔断冷却上限（秒），默认 1800（30 分钟）
@@ -199,8 +201,24 @@ pub const MM_MODE_LOCAL_ONLY: &str = "local_only";
 /// 固定账号：只用**固定集合** `pinned_account_ids`（有序、可同时多个；集合内换号，绝不换出集合）。
 pub const MM_MODE_PINNED: &str = "pinned";
 
-/// 单次请求最多尝试的候选账号数（换号重试上限，防止把延迟放大成倍）。
-pub const MAX_FAILOVER: usize = 3;
+/// 换号次数默认值：**0 = 不限制**（把候选池里所有可用账号依次试完）。
+/// 2026-10-05 调整：此前硬编码为 3，导致固定集合超过 3 个时**排在后面的账号当次请求轮不到**。
+/// 需要限制延迟时可把 `max_failover` 配成正整数。
+pub const DEFAULT_MAX_FAILOVER: u32 = 0;
+
+/// 安全硬上限：即使配置成很大的值，也不会让单次请求无节制重试（防延迟爆炸）。
+pub const MAX_FAILOVER_HARD_CAP: usize = 64;
+
+/// 计算本次请求最多尝试几个候选（**纯函数**，便于单测）。
+/// `configured = 0` 表示不限制 → 试完整个候选池（仍受硬上限约束）。
+pub fn failover_attempts(pool_len: usize, configured: u32) -> usize {
+    let want = if configured == 0 {
+        pool_len
+    } else {
+        (configured as usize).min(pool_len)
+    };
+    want.min(MAX_FAILOVER_HARD_CAP)
+}
 
 /// 归一化账号模式：未知值一律回落到 round_robin（防配置手改写坏）。
 pub fn normalize_account_mode(value: &str) -> String {
@@ -231,6 +249,7 @@ pub fn load_config() -> MmConfig {
         cache_enabled: false,
         chat_payload_template: r#"{"message":{"content":"{{message}}"}}"#.to_string(),
         yy_absolute_chat: true,
+        max_failover: DEFAULT_MAX_FAILOVER,
         cooldown_base_secs: 60,
         cooldown_max_secs: 1800,
         account_mode: MM_MODE_ROUND_ROBIN.to_string(),
@@ -271,6 +290,11 @@ pub fn load_config() -> MmConfig {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    cfg.max_failover = v
+        .get("max_failover")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_MAX_FAILOVER as u64)
+        .min(MAX_FAILOVER_HARD_CAP as u64) as u32;
     cfg.cooldown_base_secs = v
         .get("cooldown_base_secs")
         .and_then(Value::as_u64)
@@ -350,6 +374,7 @@ pub fn save_config(cfg: &MmConfig) {
         "enabled": cfg.enabled, "api_key": cfg.api_key,
         "chat_payload_template": cfg.chat_payload_template,
         "yy_absolute_chat": cfg.yy_absolute_chat,
+        "max_failover": cfg.max_failover,
         "cooldown_base_secs": cfg.cooldown_base_secs,
         "cooldown_max_secs": cfg.cooldown_max_secs,
         "account_mode": cfg.account_mode,
@@ -1341,9 +1366,10 @@ async fn chat_with_account(
 /// 对话入口（2026-10-05 增强）：**按 ordered_pool 候选顺序换号重试 + 失败熔断**。
 ///
 /// - 候选顺序由选号模式决定（轮询 / 本机优先 / 仅本机 / 固定账号）；
-/// - 单个账号失败且属于「可换号错误」时，自动取下一个账号（最多 `MAX_FAILOVER` 个），
+/// - 单个账号失败且属于「可换号错误」时，自动取下一个账号（默认**试完整个候选池**，
 ///   失败账号写入 `last_error` + 指数退避冷却（`cooldown_after_failure`），连续失败计数 `fail_streak`；
 /// - 成功则清零计数；`pinned` 模式：候选 = 固定集合 ∩ 可用，**集合内换号、绝不换出集合**（仅剩 1 个候选时严格不换）；
+///   可用 `max_failover` 配置上限，0 = 不限制；硬上限 `MAX_FAILOVER_HARD_CAP`）。
 /// - 返回体带 `failover`（第几个候选成功）与 `minimax.account`（实际账号），便于排障。
 pub async fn chat_once(
     prompt: &str,
@@ -1366,7 +1392,7 @@ pub async fn chat_once(
         return Err((503, "MiniMax 账号池无可用账号：请先添加账号（网页端 JWT + 指纹三件套）".to_string()));
     }
     let start = CHAT_CURSOR.fetch_add(1, Ordering::Relaxed) % pool.len();
-    let attempts = pool.len().min(MAX_FAILOVER);
+    let attempts = failover_attempts(pool.len(), cfg.max_failover);
     let mut last: Option<(u16, String)> = None;
     for k in 0..attempts {
         let acc = &pool[(start + k) % pool.len()];
@@ -1915,6 +1941,7 @@ mod tests {
             cache_enabled: false,
             chat_payload_template: String::new(),
             yy_absolute_chat: true,
+            max_failover: 0,
             cooldown_base_secs: 60,
             cooldown_max_secs: 1800,
             account_mode: mode.to_string(),
@@ -2169,9 +2196,19 @@ mod tests {
     }
 
     #[test]
-    fn failover_attempts_are_bounded() {
-        assert_eq!(MAX_FAILOVER, 3);
-        assert!(MAX_FAILOVER >= 1, "至少要能试一个候选");
+    fn failover_attempts_defaults_to_unlimited() {
+        // 0 = 不限制 → 试完整个候选池（不再硬编码 3）
+        assert_eq!(failover_attempts(1, 0), 1);
+        assert_eq!(failover_attempts(2, 0), 2);
+        assert_eq!(failover_attempts(5, 0), 5, "固定 5 个账号时 5 个都能轮到");
+        assert_eq!(failover_attempts(20, 0), 20);
+        // 配成正整数 → 取该值与池子大小的较小者
+        assert_eq!(failover_attempts(5, 2), 2);
+        assert_eq!(failover_attempts(1, 9), 1);
+        // 硬上限兜底（防延迟爆炸）
+        assert_eq!(failover_attempts(1000, 0), MAX_FAILOVER_HARD_CAP);
+        assert_eq!(failover_attempts(1000, 999), MAX_FAILOVER_HARD_CAP);
+        assert_eq!(failover_attempts(0, 0), 0);
     }
 
     #[test]

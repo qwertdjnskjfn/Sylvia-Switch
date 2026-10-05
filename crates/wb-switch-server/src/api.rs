@@ -8022,6 +8022,8 @@ async fn api_minimax_status() -> Response {
         "accountMode": cfg.account_mode,
         "pinnedAccountIds": cfg.pinned_account_ids,
         "pinnedAccountId": cfg.pinned_account_id,
+        // 2026-10-05：换号上限（0 = 不限制）
+        "maxFailover": cfg.max_failover,
         // 2026-10-05：熔断冷却可配置（秒）
         "cooldownBaseSecs": cfg.cooldown_base_secs,
         "cooldownMaxSecs": cfg.cooldown_max_secs,
@@ -8055,6 +8057,10 @@ async fn api_minimax_config_save(Json(body): Json<Value>) -> Response {
         let id = id.trim().to_string();
         cfg.pinned_account_ids = if id.is_empty() { Vec::new() } else { vec![id.clone()] };
         cfg.pinned_account_id = id;
+    }
+    // 单次请求换号上限（0 = 不限制，默认；上限受 MAX_FAILOVER_HARD_CAP 约束）
+    if let Some(v) = body.get("maxFailover").and_then(Value::as_u64) {
+        cfg.max_failover = v.min(minimax::MAX_FAILOVER_HARD_CAP as u64) as u32;
     }
     // 熔断冷却参数（5s~1h 基数 / 1min~1day 上限）
     if let Some(v) = body.get("cooldownBaseSecs").and_then(Value::as_u64) {

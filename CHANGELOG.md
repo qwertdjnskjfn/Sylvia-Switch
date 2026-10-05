@@ -1,3 +1,22 @@
+## 1.0.50 — 2026-10-05
+
+### 调整：MiniMax **换号次数默认不限**（不再硬编码 3 个账号上限）
+
+**问题**：`MAX_FAILOVER = 3` 硬编码 + `attempts = pool.len().min(3)` →
+固定集合里有 4 个以上账号时，**排在后面的账号当次请求根本轮不到**（哪怕前面 3 个全挂了）。
+
+**改动**
+- 新增 `max_failover: u32`（**0 = 不限制**，默认 0），可配置；`MAX_FAILOVER_HARD_CAP = 64` 作安全硬上限（防延迟爆炸）
+- 纯函数 `failover_attempts(pool_len, configured)` 统一计算尝试次数（**单测覆盖**）
+- `chat_once` 改用该函数 → 默认**按候选池顺序试完所有可用账号**
+- `status` 暴露 `maxFailover`；`config` 接口接收
+- 前端新增「换号上限：[__] 个（0 = 不限制，全部候选都会轮到）[保存]」输入
+
+**测试**：`cargo test -p wb-switch-core minimax` → **18 passed**（新增 `failover_attempts_defaults_to_unlimited`：池 5 → 试 5；池 20 → 试 20；配置正整数则取小者；1000 → 受硬上限 64 兜底）。
+**端到端**：真号 + 4 个坏号同时固定 → 单次请求依次试完全部候选，最终成功且 `failover = 4`（旧版最多 2，会直接失败）。
+
+---
+
 ## 1.0.47 — 2026-10-05
 
 ### MiniMax 对话：停止无效排查，标记「当前不可用」+ 回滚两处无效改动

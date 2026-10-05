@@ -56,6 +56,8 @@ type MmStatus = {
   // 2026-10-05：熔断冷却参数（秒，可配）
   cooldownBaseSecs?: number;
   cooldownMaxSecs?: number;
+  // 2026-10-05：单次请求换号上限（0 = 不限制）
+  maxFailover?: number;
   chatExperimental: boolean;
   endpoint: string;
   payloadTemplate: string;
@@ -94,6 +96,7 @@ export default function MiniMaxPage() {
   const [fScreenH, setFScreenH] = useState("1067");
   // 试一试
   // 熔断参数输入（空串=未改，显示服务端值）
+  const [mf, setMf] = useState("");
   const [cdBase, setCdBase] = useState("");
   const [cdMax, setCdMax] = useState("");
   const [testPrompt, setTestPrompt] = useState("只回复 OK");
@@ -545,6 +548,34 @@ export default function MiniMaxPage() {
             >
               {busy === "capture" ? <Loader2 className="animate-spin" /> : <Download />}从桌面端导入
             </Button>
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="text-xs text-muted-foreground">换号上限：</span>
+              <input
+                className="h-7 w-14 rounded-md border border-border bg-transparent px-2 text-xs"
+                value={mf || String(status.maxFailover ?? 0)}
+                onChange={(e) => setMf(e.target.value)}
+                inputMode="numeric"
+                title="单次请求最多尝试几个候选账号；0 = 不限制（默认，按候选池顺序试完为止）"
+              />
+              <span className="text-[11px] text-muted-foreground">
+                {(mf || String(status.maxFailover ?? 0)) === "0" ? "个（0 = 不限制，全部候选都会轮到）" : "个"}
+              </span>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 px-2 text-xs"
+                disabled={busy === "saveMinimaxConfig"}
+                onClick={() =>
+                  void act(
+                    "saveMinimaxConfig",
+                    { maxFailover: Number(mf || status.maxFailover || 0) },
+                    "换号上限已保存",
+                  ).then(() => setMf(""))
+                }
+              >
+                保存
+              </Button>
+            </div>
             <div className="flex flex-wrap items-center gap-1.5">
               <span className="text-xs text-muted-foreground">熔断冷却：</span>
               <input

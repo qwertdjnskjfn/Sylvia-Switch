@@ -5722,7 +5722,7 @@ dependencies = [
 
 [[package]]
 name = "wb-switch-core"
-version = "1.0.49"
+version = "1.0.50"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -5774,7 +5774,7 @@ dependencies = [
 
 [[package]]
 name = "wb-switch-server"
-version = "1.0.49"
+version = "1.0.50"
 dependencies = [
  "axum",
  "futures-util",
