@@ -53,6 +53,9 @@ type MmStatus = {
   pinnedAccountId?: string;
   // 固定集合（有序，可同时多个）
   pinnedAccountIds?: string[];
+  // 2026-10-05：熔断冷却参数（秒，可配）
+  cooldownBaseSecs?: number;
+  cooldownMaxSecs?: number;
   chatExperimental: boolean;
   endpoint: string;
   payloadTemplate: string;
@@ -90,6 +93,9 @@ export default function MiniMaxPage() {
   const [fScreenW, setFScreenW] = useState("1707");
   const [fScreenH, setFScreenH] = useState("1067");
   // 试一试
+  // 熔断参数输入（空串=未改，显示服务端值）
+  const [cdBase, setCdBase] = useState("");
+  const [cdMax, setCdMax] = useState("");
   const [testPrompt, setTestPrompt] = useState("只回复 OK");
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<{ ok: boolean; text: string } | null>(null);
@@ -285,7 +291,19 @@ export default function MiniMaxPage() {
 
       {status.chatExperimental ? (
         <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-600">
-          ⚠ 对话功能为实验性：网页端消息 payload 的真实形状未被完整逆向，上游 400 时请抓 HAR（浏览器 network 面板 → agent/session/message 请求体）更新「payload 模板」。签到与余额为多仓库交叉验证的可靠部分。
+          <p className="font-medium">⚠ 对话功能当前不可用（2026-10-05 排查结论）</p>
+          <p className="mt-1.5 leading-relaxed">
+            经排查，上游 <code className="mx-0.5">/mavis/api/v1/llm/v1/messages</code> 端点对本渠道的桌面端 OAuth
+            请求返回固定输入（<code className="mx-0.5">usage.input_tokens</code> 恒为 21，与 prompt 长度无关），
+            导致回复答非所问。已逐一排除：端点 / payload 形状 / max_tokens / header / User-Agent /
+            content 格式 / HTTP 版本 / TLS 后端（rustls 与 native-tls）/ 报文细节 / 连接池 /
+            HTTP 客户端（curl 子进程同样复现）—— 均非原因。
+          </p>
+          <p className="mt-1.5">
+            同参数用 Python urllib 直连则每次正常（<code className="mx-0.5">in=41</code>），
+            故判断为<strong>上游侧对该 OAuth 账号/会话的限制或状态异常</strong>，非本项目代码问题。
+            签到与余额为多仓库交叉验证的可靠部分，不受影响。
+          </p>
         </div>
       ) : null}
 
@@ -422,6 +440,41 @@ export default function MiniMaxPage() {
                     签到 {a.signinLastDate ? a.signinLastDate : "未签"} · 累计签到 {a.signinPointsTotal} 分
                   </Badge>
                   {a.lastError ? <span className="min-w-0 flex-1 truncate text-[11px] text-destructive">{a.lastError}</span> : <span className="flex-1" />}
+                  {a.pinned ? (() => {
+                    const ids = status.pinnedAccountIds || [];
+                    const i = ids.indexOf(a.id);
+                    const move = (dir: -1 | 1) => {
+                      const next = [...ids];
+                      const j = i + dir;
+                      if (i < 0 || j < 0 || j >= next.length) return;
+                      [next[i], next[j]] = [next[j], next[i]];
+                      void act("switchAccount", { ids: next }, `已调整固定顺序：${a.label} ${dir < 0 ? "上移" : "下移"}`);
+                    };
+                    return (
+                      <span className="flex items-center gap-0.5">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-6 w-6 p-0 text-[10px]"
+                          disabled={busy === "switchAccount" || i <= 0}
+                          onClick={() => move(-1)}
+                          title="在固定集合内上移（= 提高优先顺序）"
+                        >
+                          ↑
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-6 w-6 p-0 text-[10px]"
+                          disabled={busy === "switchAccount" || i < 0 || i >= ids.length - 1}
+                          onClick={() => move(1)}
+                          title="在固定集合内下移"
+                        >
+                          ↓
+                        </Button>
+                      </span>
+                    );
+                  })() : null}
                   {a.cooldown ? (
                     <Button
                       variant="outline"
@@ -492,6 +545,46 @@ export default function MiniMaxPage() {
             >
               {busy === "capture" ? <Loader2 className="animate-spin" /> : <Download />}从桌面端导入
             </Button>
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="text-xs text-muted-foreground">熔断冷却：</span>
+              <input
+                className="h-7 w-16 rounded-md border border-border bg-transparent px-2 text-xs"
+                value={cdBase || String(status.cooldownBaseSecs ?? 60)}
+                onChange={(e) => setCdBase(e.target.value)}
+                inputMode="numeric"
+                title="冷却基数（秒）：首次失败后的冷却时长；风控(429/403) 自动 ×2"
+              />
+              <span className="text-[11px] text-muted-foreground">秒起 · 上限</span>
+              <input
+                className="h-7 w-20 rounded-md border border-border bg-transparent px-2 text-xs"
+                value={cdMax || String(status.cooldownMaxSecs ?? 1800)}
+                onChange={(e) => setCdMax(e.target.value)}
+                inputMode="numeric"
+                title="冷却上限（秒）：指数退避的封顶值"
+              />
+              <span className="text-[11px] text-muted-foreground">秒</span>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 px-2 text-xs"
+                disabled={busy === "saveMinimaxConfig"}
+                onClick={() =>
+                  void act(
+                    "saveMinimaxConfig",
+                    {
+                      cooldownBaseSecs: Number(cdBase || status.cooldownBaseSecs || 60),
+                      cooldownMaxSecs: Number(cdMax || status.cooldownMaxSecs || 1800),
+                    },
+                    "熔断参数已保存",
+                  ).then(() => {
+                    setCdBase("");
+                    setCdMax("");
+                  })
+                }
+              >
+                保存
+              </Button>
+            </div>
             <div className="flex flex-wrap items-center gap-1.5">
               <span className="text-xs text-muted-foreground">选号策略：</span>
               {([

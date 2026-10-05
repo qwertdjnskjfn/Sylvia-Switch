@@ -175,6 +175,10 @@ pub struct MmConfig {
     pub yy_absolute_chat: bool,
     /// 账号选择模式（2026-10-05 新增，对齐 glm_proxy 的 ACCOUNT_MODE_* 范式）
     pub account_mode: String,
+    /// 熔断冷却基数（秒），默认 60；风控(429/403) 自动 ×2。2026-10-05 可配置
+    pub cooldown_base_secs: u64,
+    /// 熔断冷却上限（秒），默认 1800（30 分钟）
+    pub cooldown_max_secs: u64,
     /// account_mode=pinned 时生效：**固定集合**（有序、可同时多个）。
     /// 单账号固定是它的特例；`pinned_account_id` 保留为兼容字段（= 集合首元素）。
     pub pinned_account_ids: Vec<String>,
@@ -227,6 +231,8 @@ pub fn load_config() -> MmConfig {
         cache_enabled: false,
         chat_payload_template: r#"{"message":{"content":"{{message}}"}}"#.to_string(),
         yy_absolute_chat: true,
+        cooldown_base_secs: 60,
+        cooldown_max_secs: 1800,
         account_mode: MM_MODE_ROUND_ROBIN.to_string(),
         pinned_account_ids: Vec::new(),
         pinned_account_id: String::new(),
@@ -265,6 +271,16 @@ pub fn load_config() -> MmConfig {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    cfg.cooldown_base_secs = v
+        .get("cooldown_base_secs")
+        .and_then(Value::as_u64)
+        .unwrap_or(60)
+        .clamp(5, 3600);
+    cfg.cooldown_max_secs = v
+        .get("cooldown_max_secs")
+        .and_then(Value::as_u64)
+        .unwrap_or(1800)
+        .clamp(60, 86_400);
     // 固定集合（2026-10-05）：新字段优先，缺失时用旧单值迁移（逻辑见 parse_pin_set）
     cfg.pinned_account_ids = parse_pin_set(v.get("pinned_account_ids"), &cfg.pinned_account_id);
     if let Some(list) = v.get("accounts").and_then(Value::as_array) {
@@ -334,6 +350,8 @@ pub fn save_config(cfg: &MmConfig) {
         "enabled": cfg.enabled, "api_key": cfg.api_key,
         "chat_payload_template": cfg.chat_payload_template,
         "yy_absolute_chat": cfg.yy_absolute_chat,
+        "cooldown_base_secs": cfg.cooldown_base_secs,
+        "cooldown_max_secs": cfg.cooldown_max_secs,
         "account_mode": cfg.account_mode,
         "pinned_account_ids": cfg.pinned_account_ids,
         "pinned_account_id": legacy_pin,
@@ -1010,6 +1028,29 @@ fn pool_empty_msg(cooling: usize, region_hint: &str) -> String {
     }
 }
 
+/// 账号池错误是否属于**瞬时**（稍后重试有意义）：
+/// 目前唯一判定依据是「全部候选都在冷却保护期」——冷却会自动过期，故可重试。
+/// 其余（固定集合为空 / 账号被删除·禁用 / 凭据为空 / 池里没号）属**配置类**，重试无用。
+pub fn is_transient_pool_error(msg: &str) -> bool {
+    msg.contains("冷却")
+}
+
+/// 供 chat_once 使用：把账号池错误映射为语义正确的状态码（2026-10-05）。
+/// - 瞬时（全在冷却）→ **503** Service Unavailable（客户端稍后可重试）
+/// - 配置类 → **409** Conflict（需用户去页面改配置，重试无用）
+pub fn ordered_pool_for_chat(
+    cfg: &MmConfig,
+    region: Option<&str>,
+) -> Result<Vec<MmAccount>, (u16, String)> {
+    match ordered_pool(cfg, region) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            let code = if is_transient_pool_error(&e) { 503 } else { 409 };
+            Err((code, e))
+        }
+    }
+}
+
 /// 取一个账号：候选集合与顺序由 `ordered_pool`（即选号模式）决定，轮询用全局游标。
 fn pick_account(cfg: &MmConfig, region: Option<&str>) -> Option<MmAccount> {
     let pool = ordered_pool(cfg, region).ok()?;
@@ -1320,7 +1361,7 @@ pub async fn chat_once(
         .unwrap_or(DEFAULT_CHAT_MODEL)
         .to_string();
     let region = normalize_region(region_hint);
-    let pool = ordered_pool(&cfg, region).map_err(|e| (503, e))?;
+    let pool = ordered_pool_for_chat(&cfg, region)?;
     if pool.is_empty() {
         return Err((503, "MiniMax 账号池无可用账号：请先添加账号（网页端 JWT + 指纹三件套）".to_string()));
     }
@@ -1371,11 +1412,27 @@ pub fn is_retryable_status(status: u16) -> bool {
         || status >= 500
 }
 
-/// 失败后的**指数退避**冷却（毫秒）：限流/风控（429/403）起步更高；连续失败按 2^n 放大，上限 30 分钟。
-pub fn cooldown_after_failure(streak: u32, status: u16) -> u64 {
-    let base_ms: u64 = if status == 429 || status == 403 { 120_000 } else { 60_000 };
+/// 失败后的**指数退避**冷却（毫秒，**纯函数**）：限流/风控（429/403）起步 ×2；
+/// 连续失败按 2^n 放大（n 截到 5），整体受 `max_ms` 封顶。
+pub fn cooldown_after_failure_with(streak: u32, status: u16, base_ms: u64, max_ms: u64) -> u64 {
+    let base = if status == 429 || status == 403 {
+        base_ms.saturating_mul(2)
+    } else {
+        base_ms
+    };
     let shift = streak.saturating_sub(1).min(5);
-    (base_ms << shift).min(30 * 60_000)
+    (base << shift).min(max_ms)
+}
+
+/// 读配置的冷却计算（基数/上限可配，见 config 的 cooldown_base_secs / cooldown_max_secs）。
+pub fn cooldown_after_failure(streak: u32, status: u16) -> u64 {
+    let cfg = load_config();
+    cooldown_after_failure_with(
+        streak,
+        status,
+        cfg.cooldown_base_secs.saturating_mul(1000),
+        cfg.cooldown_max_secs.saturating_mul(1000),
+    )
 }
 
 /// 记一次失败：累加 `fail_streak`、写 `last_error`、置冷却（熔断）。
@@ -1858,6 +1915,8 @@ mod tests {
             cache_enabled: false,
             chat_payload_template: String::new(),
             yy_absolute_chat: true,
+            cooldown_base_secs: 60,
+            cooldown_max_secs: 1800,
             account_mode: mode.to_string(),
             pinned_account_ids: if pin.is_empty() { Vec::new() } else { vec![pin.to_string()] },
             pinned_account_id: pin.to_string(),
@@ -2071,16 +2130,42 @@ mod tests {
 
     #[test]
     fn cooldown_uses_exponential_backoff_with_cap() {
-        // 普通错误：60s 起，按 2^n 放大
-        assert_eq!(cooldown_after_failure(1, 500), 60_000);
-        assert_eq!(cooldown_after_failure(2, 500), 120_000);
-        assert_eq!(cooldown_after_failure(3, 500), 240_000);
-        // 限流/风控：起步 120s
-        assert_eq!(cooldown_after_failure(1, 429), 120_000);
-        assert_eq!(cooldown_after_failure(2, 403), 240_000);
-        // 上限 30 分钟（shift 截到 5、并整体封顶）
-        assert_eq!(cooldown_after_failure(99, 429), 30 * 60_000);
-        assert_eq!(cooldown_after_failure(99, 500), 30 * 60_000);
+        let (base, max) = (60_000u64, 30 * 60_000u64);
+        // 普通错误：基数起，按 2^n 放大
+        assert_eq!(cooldown_after_failure_with(1, 500, base, max), 60_000);
+        assert_eq!(cooldown_after_failure_with(2, 500, base, max), 120_000);
+        assert_eq!(cooldown_after_failure_with(3, 500, base, max), 240_000);
+        // 限流/风控：起步 ×2
+        assert_eq!(cooldown_after_failure_with(1, 429, base, max), 120_000);
+        assert_eq!(cooldown_after_failure_with(2, 403, base, max), 240_000);
+        // 上限封顶（shift 截到 5、并受 max 限制）
+        assert_eq!(cooldown_after_failure_with(99, 429, base, max), max);
+        assert_eq!(cooldown_after_failure_with(99, 500, base, max), max);
+    }
+
+    #[test]
+    fn cooldown_respects_custom_config() {
+        // 自定义基数 5s / 上限 60s（可在页面上配）
+        let (base, max) = (5_000u64, 60_000u64);
+        assert_eq!(cooldown_after_failure_with(1, 500, base, max), 5_000);
+        assert_eq!(cooldown_after_failure_with(2, 500, base, max), 10_000);
+        assert_eq!(cooldown_after_failure_with(1, 429, base, max), 10_000);
+        assert_eq!(cooldown_after_failure_with(9, 500, base, max), 60_000, "受上限封顶");
+    }
+
+    #[test]
+    fn transient_error_classification() {
+        // 全在冷却 → 瞬时（503，可重试）
+        assert!(is_transient_pool_error(
+            "1 个候选账号均处于冷却保护期（近期触发限流）：待冷却结束自动恢复，或在账号卡片上手动解除"
+        ));
+        // 配置类 → 409（重试无用）
+        assert!(!is_transient_pool_error(
+            "已选择「固定账号」，但固定集合为空：请在 MiniMax 页把账号设为「固定」（可同时固定多个）"
+        ));
+        assert!(!is_transient_pool_error(
+            "MiniMax 账号池无可用账号：请先添加账号（网页端 JWT + 指纹三件套）或从桌面端导入登录态"
+        ));
     }
 
     #[test]

@@ -8022,6 +8022,9 @@ async fn api_minimax_status() -> Response {
         "accountMode": cfg.account_mode,
         "pinnedAccountIds": cfg.pinned_account_ids,
         "pinnedAccountId": cfg.pinned_account_id,
+        // 2026-10-05：熔断冷却可配置（秒）
+        "cooldownBaseSecs": cfg.cooldown_base_secs,
+        "cooldownMaxSecs": cfg.cooldown_max_secs,
         "defaultModel": "MiniMax-M3.1-Flash-Preview",
         "models": minimax::desktop_models().as_array().cloned().unwrap_or_default().iter().filter_map(Value::as_str).map(String::from).collect::<Vec<_>>(),
         "accounts": accounts,
@@ -8052,6 +8055,13 @@ async fn api_minimax_config_save(Json(body): Json<Value>) -> Response {
         let id = id.trim().to_string();
         cfg.pinned_account_ids = if id.is_empty() { Vec::new() } else { vec![id.clone()] };
         cfg.pinned_account_id = id;
+    }
+    // 熔断冷却参数（5s~1h 基数 / 1min~1day 上限）
+    if let Some(v) = body.get("cooldownBaseSecs").and_then(Value::as_u64) {
+        cfg.cooldown_base_secs = v.clamp(5, 3600);
+    }
+    if let Some(v) = body.get("cooldownMaxSecs").and_then(Value::as_u64) {
+        cfg.cooldown_max_secs = v.clamp(60, 86_400);
     }
     if let Some(arr) = body.get("pinnedAccountIds").and_then(Value::as_array) {
         let ids: Vec<String> = arr

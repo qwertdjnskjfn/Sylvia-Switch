@@ -1,3 +1,78 @@
+## 1.0.47 — 2026-10-05
+
+### MiniMax 对话：停止无效排查，标记「当前不可用」+ 回滚两处无效改动
+
+#### 背景
+用户报 MiniMax 渠道（`/minimax/v1/chat/completions`）无论问什么都回固定问候语
+（`How can I help you today?`）或 503/529，**成功率 0/6**。
+
+#### ⚠️ 本轮尝试过但**已确认无效**的改动（均已回滚/放弃）
+| 版本 | 尝试 | 结果 |
+| --- | --- | --- |
+| 1.0.41 | `http1_only()`（强制 HTTP/1.1）| ❌ 无效 |
+| 1.0.43 | `reqwest` TLS 后端 `rustls-tls` → `native-tls` | ❌ 无效，**本版已回滚为 `rustls-tls`** |
+| 1.0.44/46 | 对话改用系统 `curl.exe` 子进程（绕过 reqwest）| ❌ 无效（curl 直连成功，经网关仍 `in=21`）|
+
+#### 已逐一排除的原因（均有实验证据，非推测）
+端点 / payload 形状 / `max_tokens` / `anthropic-version` header / `User-Agent` /
+content 字符串 vs 数组 / **HTTP 版本（h1.1 vs h2）** / **TLS 后端（rustls vs native-tls）** /
+`Accept-Encoding` / `Expect: 100-continue` / `accept` 头 / **连接池复用**（重启进程后第 1 发即 `in=21`）/
+**HTTP 客户端实现**（curl 子进程同样复现）。
+
+#### 🎯 结论
+- `usage.input_tokens` **恒为 21**（2 字符与 2000 字符 prompt 都一样）⇒ 上游**未按内容处理**；
+- 同参数 **Python urllib 直连每次正常**（`in=41`、回答正确）；
+- ⇒ 判断为**上游侧对该桌面端 OAuth 账号/会话的限制或状态异常**，**非本项目代码问题**。
+  佐证：模型回复「你提供的 system 部分是文档片段」「你发的是空消息」——像在抱怨 prompt 形状。
+
+#### 本版实际改动
+| 项 | 说明 |
+| --- | --- |
+| `Cargo.toml` | **回滚** `native-tls` → `rustls-tls`（恢复原状，去掉无收益的全局依赖变更）|
+| `minimax.rs` | 移除 `chat_client()`（`http1_only`，已确认无效）；对话路径暂用 `chat_via_curl` |
+| `MiniMaxPage.tsx` | 顶部提示改为**准确的现状说明**（原文案「待抓包校准」已过时）|
+
+#### ✅ 保留：1.0.40 修的两个**真 bug**（独立有效，与本问题无关）
+| 修复 | 验证 |
+| --- | --- |
+| `model` 4 处硬编码 `MiniMax-M3.1-Flash-Preview` → 改用请求参数 | ✅ `MiniMax-M3` 现正确回显 |
+| `api_minimax_chat` prompt 提取只认字符串 → 新增 `minimax_last_message_text()` 兼容 Anthropic 数组 | ✅ 不再丢 prompt |
+
+#### 📌 工程教训（写给未来的自己）
+1. **「curl/python 能通、reqwest 不通」≠ TLS 指纹问题**。我据此改了全局依赖，结果无效。
+2. 正确顺序：**先抓包 diff 拿到证据 → 再改**；不要枚举假设逐个试后靠"改一个部署一次"验证
+   （本轮为此付出了 5 次无效构建部署）。
+3. **全局依赖变更**（TLS 后端）代价高（构建 3–7 分钟 + 影响所有渠道），**必须先有抓包证据**。
+4. 高频实测会**触发账号冷却**，导致「修复无效」的假象 —— 排障时注意区分
+   「真失败」与「被限流」（看 `minimax_proxy_config` 的 `cooldown_until_ms`）。
+
+### 附：1.0.44–1.0.46 的 `chat_via_curl` 保留
+payload 改用 **stdin**（`--data-binary @-`）而非临时文件——
+v1 版本在 `Command::output()` 返回前就 `remove_file`，竞态下 curl 仍在读
+→ `CURLE_READ_ERROR(26)`。stdin 方案无此竞态，也无需清理临时文件。
+
+## 1.0.49 — 2026-10-05
+
+### 优化：MiniMax 错误语义（409/503 分流）+ 熔断冷却可配置 + 固定集合排序 UI
+
+**① 错误语义分流**（此前配置类问题也返回 503，语义不准、排查误导）
+- 瞬时类（全部候选都在**冷却保护期**）→ **503**（可稍后重试）
+- 配置类（固定集合为空 / 账号被删除·禁用 / 凭据为空 / 池里没号）→ **409 Conflict**（重试无用，需去页面改配置）
+- 新增纯函数 `is_transient_pool_error()` + `ordered_pool_for_chat()`（分组映射状态码）
+
+**③ 熔断冷却可配置**（`cooldown_base_secs` 默认 60、`cooldown_max_secs` 默认 1800）
+- 纯函数 `cooldown_after_failure_with(streak, status, base_ms, max_ms)`；配置版 `cooldown_after_failure()` 读配置
+- `status` 暴露 `cooldownBaseSecs`/`cooldownMaxSecs`；`config` 接口接收（基数 5s~1h、上限 1min~1day 带夹取）
+- 前端新增「熔断冷却：__ 秒起 · 上限 __ 秒 [保存]」输入行
+
+**② 固定集合排序 UI**
+- 固定账号卡片新增 **↑/↓**（集合内上移/下移 = 调整优先顺序），复用既有 `switch {{ids:[…]}}` 接口，**无需后端改动**
+- 底部集合摘要不变（`固定集合 N 个：1.x 2.y …`）
+
+**测试**：`cargo test -p wb-switch-core minimax` → **18 passed**（新增：自定义冷却基数/上限、瞬时 vs 配置类错误判定）；`tsc --noEmit` 0 error。
+
+---
+
 ## 1.0.45 — 2026-10-05
 
 ### 新增：MiniMax **多账号固定集合**（同时固定多个 + 集合内换号 + 集合外永不参与）
