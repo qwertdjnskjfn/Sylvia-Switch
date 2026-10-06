@@ -29,6 +29,22 @@ auth_path 现读 auth.json，身份由 auth_key 精确命中（键含账号特�
 **验证**：部署后 `/minimax/v1/chat/completions` 短/长两个 prompt 的 `usage.input_tokens`
 必须随内容变化且回答正确；`/api/minimax/probe` 余额照常。
 
+### 修复（版本号双源不同步）：桌面窗口显示旧版本 1.0.59 —— core/server 双 Cargo.toml 只 bump 了一个
+
+**现象**：部署 1.0.60 后，桌面应用窗口标题/侧栏徽标仍显示 `1.0.59`（`/api/version` 却已是 1.0.60）。
+
+**根因**：版本号有**两个编译期来源**——UI 读 `/api/status` 的 `version` = core 包 `update.rs::APP_VERSION`
+（`env!("CARGO_PKG_VERSION")` 取 **wb-switch-core 自己的版本**）；deploy.py 断言用 `/api/version` =
+server 包版本。本次只 bump 了 server，core 停在 1.0.59 ⇒ 两端点分叉（历史上两者一直同步 bump，
+HEAD~3 双双 1.0.53，本次漏改属流程失误非新问题）。
+
+**修复与防线**：core 同步 bump 至 1.0.60，重构建重部署，实测 `/api/version` 与 `/api/status`
+双双 1.0.60；`gate.ps1` 新增**第 1 步「版本号同步」检查**（core/server 两 Cargo.toml 必须相等，
+不等即 FAIL），AGENTS.md 环境坑 #8 补「双 bump」规则。deploy.py 断言读 server 文件的结构保持不变
+（故不做 workspace 继承，避免削弱部署断言）。
+
+**验证**：`/minimax/v1/chat/completions` 复测 in=45 →「2」；`/api/status.version` = `/api/version` = 1.0.60。
+
 ---
 
 ## 1.0.59 — 2026-10-06
