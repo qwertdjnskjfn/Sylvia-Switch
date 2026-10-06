@@ -316,19 +316,14 @@ export default function MiniMaxPage() {
       </div>
 
       {status.chatExperimental ? (
-        <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-600">
-          <p className="font-medium">⚠ 对话功能当前不可用（2026-10-05 排查结论）</p>
+        <div className="rounded-lg border border-sky-500/40 bg-sky-500/10 px-3 py-2 text-xs text-sky-600">
+          <p className="font-medium">✅ 对话功能已恢复（2026-10-07 根因修复）</p>
           <p className="mt-1.5 leading-relaxed">
-            经排查，上游 <code className="mx-0.5">/mavis/api/v1/llm/v1/messages</code> 端点对本渠道的桌面端 OAuth
-            请求返回固定输入（<code className="mx-0.5">usage.input_tokens</code> 恒为 21，与 prompt 长度无关），
-            导致回复答非所问。已逐一排除：端点 / payload 形状 / max_tokens / header / User-Agent /
-            content 格式 / HTTP 版本 / TLS 后端（rustls 与 native-tls）/ 报文细节 / 连接池 /
-            HTTP 客户端（curl 子进程同样复现）—— 均非原因。
-          </p>
-          <p className="mt-1.5">
-            同参数用 Python urllib 直连则每次正常（<code className="mx-0.5">in=41</code>），
-            故判断为<strong>上游侧对该 OAuth 账号/会话的限制或状态异常</strong>，非本项目代码问题。
-            签到与余额为多仓库交叉验证的可靠部分，不受影响。
+            10-05 的「回复答非所问 / 401」已实锤：桌面端会在同一条 auth.json 记录内
+            <strong>原地轮换 accessToken</strong>，账号导入时的冻结快照随之失效打上游 401
+            （签到与余额因现读 auth.json 一直正常，对话路径因快照优先而断线）。
+            现已改为 auth_key 身份校验现读、记录不匹配（真切号）才回落快照，轮换自动跟上；
+            实测 <code className="mx-0.5">usage.input_tokens</code> 随 prompt 变化、回复正确。
           </p>
         </div>
       ) : null}

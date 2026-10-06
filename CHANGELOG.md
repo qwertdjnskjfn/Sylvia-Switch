@@ -1,3 +1,36 @@
+## 1.0.60 — 2026-10-07
+
+### 修复：MiniMax 对话断线根因实锤 —— 桌面端**原地轮换 accessToken**，冻结快照失效打上游 401；token 改「现读优先、快照兜底」
+
+**推翻 10-05「上游侧限制」结论（决定性对照实验，同 token / 同 payload / 同 header / 同传输）**：
+
+| 实验 | 结果 |
+| --- | --- |
+| 网关冻结快照 token（mmoat_-8…）直连 + 网关本体 | 双双 **401 invalid access token** |
+| auth.json 现读 token（mmoat_MI…，同 auth_key 记录内已轮换）直连 | **in=45，回答正确** |
+| 现读 token + **完全复刻网关传输**（System32 curl + stdin 管道 + 默认 HTTP） | **in=45，回答正确** |
+
+⇒ 10-05 的「input_tokens 恒 21」传输层悬案（TLS 指纹/HTTP 版本假设）不成立：同一传输方式在
+新鲜 token 下完全正常。真实链条：**桌面端在 auth.json 同一条记录内原地轮换 accessToken
+（auth_key 不变、token 已换）→ 2026-10-04 引入的冻结快照成死信 → 上游 401**。
+签到/余额路径因每次现读 auth.json 一直正常——与「部分链路好部分坏」完全吻合。
+
+**改动（`minimax.rs`）**：`effective_token` 取用顺序改为 **现读优先**：desktop 条目先按
+auth_path 现读 auth.json，身份由 auth_key 精确命中（键含账号特异后缀）或 userID 防漂移核对
+保证；记录消失/漂移（真切号）才回落冻结快照，由既有 401 换号/自动禁用逻辑接管。
+核心抽为纯函数 `fresh_desktop_token_from(text, auth_key, cur_uid, user_id)`。
+签到/余额/对话/会话 9 处调用点统一收口此函数，一处修复全路径生效。
+
+**测试**：新增 6 个单测（原地轮换跟上 / 漂移拒绝 / 同用户回落 / 空 token 跳过 / 非法输入 /
+现读优先于快照+文件缺失回落），`cargo test -p wb-switch-core minimax` → **25 passed**。
+
+**前端**：`MiniMaxPage` 顶部「⚠ 对话功能当前不可用」横幅替换为「✅ 已恢复（2026-10-07 根因修复）」。
+
+**验证**：部署后 `/minimax/v1/chat/completions` 短/长两个 prompt 的 `usage.input_tokens`
+必须随内容变化且回答正确；`/api/minimax/probe` 余额照常。
+
+---
+
 ## 1.0.59 — 2026-10-06
 
 ### 优化：Loomy 中转「思考节制」—— 上游不认档位参数，改为 prompt 层约束
