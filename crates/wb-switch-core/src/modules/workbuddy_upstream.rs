@@ -91,7 +91,12 @@ const REFRESH_TOKEN_PATH: &str = "/v2/plugin/auth/token/refresh";
 /// 短 RPC（refresh/models/user_resource）总时长上限（参考 client.rs:24 HTTP_TOTAL_TIMEOUT）。
 const RPC_TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
 /// chat SSE 首字节（响应头）超时（对应 Go Transport.ResponseHeaderTimeout）。
-pub const CHAT_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
+// 2026-10-06 实测：该上游（www.workbuddy.ai）首字节延迟常在 **14–19s** 区间，
+// 原 15s 卡在临界点上 → 稍慢即 `transport: response header timeout after 15s` 失败，
+// 账号被连带判为不健康而进冷却 → 后续「无可用账号」→ 形自噬循环
+// （实测池 30 分钟成功率仅 26/49=53%，失败原因 top1 就是这条）。
+// 放宽到 45s：只影响"首字节耐心"，流中仍有 CHAT_IDLE_TIMEOUT(60s) 兜底，不会挂死。
+pub const CHAT_HEADER_TIMEOUT: Duration = Duration::from_secs(45);
 /// chat SSE 流中空闲超时：超过即断流返回 Err，调用方据此释放账号租约
 /// （参考 sse.rs/idle.go 的「读块套 timeout」等价实现）。
 pub const CHAT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -256,7 +261,7 @@ pub enum ChatOutcome {
 ///
 /// - 出站体经 [`prepare_body`] 预处理（脱敏开关取网关配置 `sanitize_enabled`，
 ///   契约 §5：默认开、可关）；
-/// - 首字节（响应头）超时 [`CHAT_HEADER_TIMEOUT`]（15s）；chat client 不设总超时
+/// - 首字节（响应头）超时 [`CHAT_HEADER_TIMEOUT`]（**45s**，2026-10-06 由 15s 放宽）；chat client 不设总超时
 ///   （流式响应可能很长），流中空闲由 [`read_stream_chunk`] 约束；
 /// - >=400：读体（上限 1MB）并走 `workbuddy_errors::classify`，返回
 ///   [`ChatOutcome::Error`]；只有传输层失败才返回 Err（`transport: ...`）。

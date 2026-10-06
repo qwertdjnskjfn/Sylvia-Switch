@@ -8119,7 +8119,7 @@ async fn api_minimax_accounts_clear_cooldown(Json(body): Json<Value>) -> Respons
 /// body: `{ id: <accountId>, pinned: true|false }`
 /// - `pinned=true`  → 追加到固定集合末尾（已存在则保持原位置，幂等）；不改选号模式
 /// - `pinned=false` → 从固定集合移出（幂等）
-/// 返回更新后的集合与顺序；集合为空时**不会**自动切模式（由调用方决定）。
+///   返回更新后的集合与顺序；集合为空时**不会**自动切模式（由调用方决定）。
 async fn api_minimax_accounts_pin(Json(body): Json<Value>) -> Response {
     let want = body.get("pinned").and_then(Value::as_bool).unwrap_or(true);
     // 一键全固定 / 一键清空（2026-10-05）：{all:true, pinned:true|false}
@@ -8191,7 +8191,7 @@ async fn api_minimax_accounts_pin(Json(body): Json<Value>) -> Response {
 /// body: { mode?: round_robin|local_first|local_only|pinned, id?: <accountId> }
 /// - 给 `id` 时自动切到 pinned 并把该账号设为当前（一步完成“切账号”）
 /// - 只给 `mode` 时只改策略
-/// 切换后返回**当前生效账号**与候选列表，方便前端直显。
+///   切换后返回**当前生效账号**与候选列表，方便前端直显。
 async fn api_minimax_accounts_switch(Json(body): Json<Value>) -> Response {
     let mut cfg = minimax::load_config();
     if let Some(m) = body.get("mode").and_then(Value::as_str) {
@@ -8276,6 +8276,13 @@ async fn api_minimax_accounts_add(Json(body): Json<Value>) -> Response {
         agent_id: body.get("agentId").and_then(Value::as_str).unwrap_or("").to_string(),
         screen_w: body.get("screenW").and_then(Value::as_str).unwrap_or("1707").to_string(),
         screen_h: body.get("screenH").and_then(Value::as_str).unwrap_or("1067").to_string(),
+        // 手动添加走 token 为主凭据；快照同值（desktop 漂移回落逻辑不适用 web 号）
+        token_snapshot: body
+            .get("token")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string(),
         base_url: body.get("baseUrl").and_then(Value::as_str).unwrap_or("").to_string(),
         enabled: true,
         added_at: minimax::now_ms(),
@@ -8431,6 +8438,17 @@ async fn api_minimax_probe(Json(body): Json<Value>) -> Response {
     };
     let started = std::time::Instant::now();
     let (status, detail) = minimax::probe_account(&acc).await;
+    let (status, detail) = if status == 401 && minimax::desktop_token_expired(&acc) {
+        (
+            401,
+            format!(
+                "{}（桌面端 token 已过期：请在 MiniMax Code 桌面端内做一次操作以自动续期，或重新登录）",
+                detail
+            ),
+        )
+    } else {
+        (status, detail)
+    };
     let mut balance = None;
     let mut consumed_out = None;
     if status == 200 {
@@ -8478,7 +8496,13 @@ async fn api_minimax_models(headers: HeaderMap, RawQuery(raw_query): RawQuery) -
 /// 导致 Anthropic 协议调用方（ZCode 等）的 prompt **恒为空串** ——
 /// 上游收到空输入后返回固定问候语，表现为「模型不工作」。
 fn minimax_last_message_text(body: &Value) -> String {
-    let Some(content) = body.pointer("/messages/-1/content") else {
+    // 🔴 2026-10-05 修复：不能用 pointer("/messages/-1/...")——serde_json 的
+    // immutable pointer 对数组段 "-1" 解析 usize 失败，恒返回 None（=空 prompt，
+    // 上游 in 恒 7~21、答非所问的根因）。数组取末元素必须显式 last()。
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+        return String::new();
+    };
+    let Some(content) = messages.last().and_then(|m| m.get("content")) else {
         return String::new();
     };
     if let Some(s) = content.as_str() {

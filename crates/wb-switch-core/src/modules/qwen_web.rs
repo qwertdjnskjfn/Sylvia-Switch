@@ -379,7 +379,7 @@ fn profile_dir() -> PathBuf {
 
 async fn cdp_alive(port: u16) -> bool {
     match cdp_http_client()
-        .get(&format!("http://127.0.0.1:{port}/json/version"))
+        .get(format!("http://127.0.0.1:{port}/json/version"))
         .send()
         .await
     {

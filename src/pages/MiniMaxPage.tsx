@@ -447,33 +447,50 @@ export default function MiniMaxPage() {
                 {g.models.length === 0 ? <span className="text-[11px] text-muted-foreground">暂无账号</span> : null}
               </div>
               {g.models.map((a) => (
-                <div key={a.id} className="flex flex-wrap items-center gap-2 border-b border-border/40 px-4 py-2 sm:px-5">
-                  <span className="text-xs font-medium">{a.label}</span>
-                  <code className="text-[11px] text-muted-foreground">{a.tokenMasked}</code>
-                  {a.pinned ? <Badge className="h-5 px-1.5 text-[10px]">当前账号</Badge> : null}
-                  {a.cooldown ? (
-                    <Badge variant="warning" className="h-5 px-1.5 text-[10px]">
-                      {(() => {
-                        const elapsed = Math.floor((Date.now() - statusAtRef.current) / 1000);
-                        const remain = Math.max(0, (a.cooldownRemainSecs ?? 0) - elapsed);
-                        return remain > 0 ? `冷却中 还剩 ${remain}s` : "冷却中 即将恢复";
-                      })()}
-                    </Badge>
-                  ) : null}
-                  {a.usable === false && !a.cooldown ? <Badge variant="warning" className="h-5 px-1.5 text-[10px]">不可用</Badge> : null}
-                  {a.isLocal ? <Badge variant="outline" className="h-5 px-1.5 text-[10px]">本机</Badge> : null}
-                  {(a as { source?: string }).source === "desktop" ? (
-                    <Badge variant="outline" className="h-5 px-1.5 text-[10px]">桌面端共享</Badge>
-                  ) : null}
-                  {a.balance != null ? (
-                    <Badge variant="secondary" className="h-5 px-1.5 text-[10px]" title={`已消耗 ${a.creditConsumed ?? 0} 分（credit/details 明细）`}>
-                      积分 {a.balance} · 已用 {a.creditConsumed ?? 0}
-                    </Badge>
-                  ) : null}
-                  <Badge variant="secondary" className="h-5 px-1.5 text-[10px]">
-                    签到 {a.signinLastDate ? a.signinLastDate : "未签"} · 累计签到 {a.signinPointsTotal} 分
-                  </Badge>
-                  {a.lastError ? <span className="min-w-0 flex-1 truncate text-[11px] text-destructive">{a.lastError}</span> : <span className="flex-1" />}
+                <div
+                  key={a.id}
+                  className="flex min-w-0 flex-wrap items-center justify-between gap-2 border-b border-border/50 px-4 py-3 last:border-0 sm:px-5"
+                >
+                  {/* 左：名称 + 徽标堆叠（AutoClaw 池行式），灰色 ID/错误在下 */}
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-sm font-medium">{a.label}</span>
+                      <code className="text-[11px] text-muted-foreground">{a.tokenMasked}</code>
+                      {a.pinned ? <Badge className="h-5 px-1.5 text-[10px]">当前账号</Badge> : null}
+                      {a.cooldown ? (
+                        <Badge variant="warning" className="h-5 px-1.5 text-[10px]">
+                          {(() => {
+                            const elapsed = Math.floor((Date.now() - statusAtRef.current) / 1000);
+                            const remain = Math.max(0, (a.cooldownRemainSecs ?? 0) - elapsed);
+                            return remain > 0 ? `冷却中 还剩 ${remain}s` : "冷却中 即将恢复";
+                          })()}
+                        </Badge>
+                      ) : null}
+                      {a.usable === false && !a.cooldown ? <Badge variant="warning" className="h-5 px-1.5 text-[10px]">不可用</Badge> : null}
+                      {a.isLocal ? <Badge variant="outline" className="h-5 px-1.5 text-[10px]">本机</Badge> : null}
+                      {(a as { source?: string }).source === "desktop" ? (
+                        <Badge variant="outline" className="h-5 px-1.5 text-[10px]">桌面端共享</Badge>
+                      ) : null}
+                      {a.balance != null ? (
+                        <Badge variant="secondary" className="h-5 px-1.5 text-[10px]" title={`已消耗 ${a.creditConsumed ?? 0} 分（credit/details 明细）`}>
+                          积分 {a.balance} · 已用 {a.creditConsumed ?? 0}
+                        </Badge>
+                      ) : null}
+                      <Badge variant="secondary" className="h-5 px-1.5 text-[10px]">
+                        签到 {a.signinLastDate ? a.signinLastDate : "未签"} · 累计 {a.signinPointsTotal} 分
+                      </Badge>
+                    </div>
+                    <p
+                      className="mt-0.5 truncate text-[11px] text-muted-foreground"
+                      title={a.lastError || a.id}
+                    >
+                      {a.id}
+                      {a.lastError ? ` · ${a.lastError}` : ""}
+                    </p>
+                  </div>
+
+                  {/* 右：操作按钮组（shrink-0 右对齐） */}
+                  <div className="flex shrink-0 flex-wrap items-center gap-1.5">
                   {a.pinned ? (() => {
                     const ids = status.pinnedAccountIds || [];
                     const i = ids.indexOf(a.id);
@@ -561,6 +578,7 @@ export default function MiniMaxPage() {
                   >
                     <Trash2 />移除
                   </Button>
+                  </div>
                 </div>
               ))}
             </div>

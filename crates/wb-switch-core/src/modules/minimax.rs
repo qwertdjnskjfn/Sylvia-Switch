@@ -123,7 +123,7 @@ fn form_encode(s: &str) -> String {
 // 配置与账号池
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Deserialize)]
 pub struct MmAccount {
     pub id: String,
     pub label: String,
@@ -155,6 +155,11 @@ pub struct MmAccount {
     pub auth_path: String,
     /// auth.json records 里含 oauth 的完整键（含 \x00 后缀）
     pub auth_key: String,
+    /// 导入时的 accessToken 快照（2026-10-04）：MiniMax 桌面端 auth.json 是单登录槽，
+    /// 新登录会替换 records——旧条目现读会错拿新号令牌。effective_token 发现身份
+    /// 漂移时回落此快照（令牌链断后到过期前仍可用；长期多号请走网页端 JWT）。
+    #[serde(default)]
+    pub token_snapshot: String,
     /// 最近一次探测的积分余额（credit/details 未过期求和；探测时写回）
     pub balance: Option<f64>,
     /// 同一轮探测的已消耗积分
@@ -353,6 +358,11 @@ pub fn load_config() -> MmConfig {
                     credit_consumed: a.get("credit_consumed").and_then(Value::as_f64),
                     balance_at: a.get("balance_at").and_then(Value::as_u64).unwrap_or(0),
                     fail_streak: a.get("fail_streak").and_then(Value::as_u64).unwrap_or(0) as u32,
+                    token_snapshot: a
+                        .get("token_snapshot")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
                 })
             })
             .collect();
@@ -406,11 +416,35 @@ pub fn save_config(cfg: &MmConfig) {
     let _ = std::fs::write(config_path(), serde_json::to_string_pretty(&v).unwrap_or_default());
 }
 
-/// 账号当前生效 token：desktop 来源每次现读 auth.json（桌面端续期后自动跟上）；
-/// 手动来源用存储值。auth.json 的 records 是对象，键含 \x00 后缀——auth_key 为空
-/// 时取第一个含 accessToken 的条目；读失败回落存储值。
+/// desktop 来源 token 是否本地已过期（auth.json expiresAtMs 早于当前时间）。
+pub fn desktop_token_expired(acc: &MmAccount) -> bool {
+    if acc.source != "desktop" || acc.auth_path.is_empty() {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(&acc.auth_path) else { return false };
+    let Ok(v) = serde_json::from_str::<Value>(&text) else { return false };
+    let Some(recs) = v.get("records").and_then(Value::as_object) else { return false };
+    let exp = recs
+        .values()
+        .filter_map(|r| r.get("expiresAtMs").and_then(Value::as_i64))
+        .min()
+        .unwrap_or(0);
+    exp > 0 && exp < now_ms() as i64
+}
+
+/// 账号当前生效 token。
+///
+/// 2026-10-04 冻结式 desktop 条目：capture 导入时把 accessToken 快照写进
+/// `token`（自含），**不再现读 auth.json**——桌面端 auth.json 是单登录槽，
+/// 切号后现读会错拿新号令牌（旧号被顶掉）。仅旧版无 token 的 desktop 条目
+/// 才走 legacy 现读路径（含 1.0.55 漂移回落）。
 pub fn effective_token(acc: &MmAccount) -> String {
+    // 冻结条目：token 自含，直接用
+    if acc.source == "desktop" && !acc.token.is_empty() {
+        return acc.token.clone();
+    }
     if acc.source == "desktop" && !acc.auth_path.is_empty() {
+        // legacy：无自含 token 的旧条目——现读 auth.json，但校验身份防漂移
         if let Ok(text) = std::fs::read_to_string(&acc.auth_path) {
             if let Ok(v) = serde_json::from_str::<Value>(&text) {
                 if let Some(obj) = v.get("records").and_then(Value::as_object) {
@@ -426,15 +460,28 @@ pub fn effective_token(acc: &MmAccount) -> String {
                     {
                         return tok.to_string();
                     }
-                    // 键不匹配（桌面端轮换后键名变化）：取首个含 accessToken 的条目
+                    // 键不匹配（桌面端轮换后键名变化）：取首个含 accessToken 的条目，
+                    // 但须核对身份——漂移（当前登录 ≠ 本条目账号）时不错用新号令牌。
+                    let shared = desktop_shared(if acc.region == "international" { "en" } else { "cn" });
+                    let cur_uid = shared.get("userID").and_then(Value::as_str).unwrap_or("");
+                    let drifted =
+                        !cur_uid.is_empty() && !acc.user_id.is_empty() && cur_uid != acc.user_id;
                     if let Some((_, r)) = obj.iter().find(|(_, r)| r.get("accessToken").and_then(Value::as_str).is_some()) {
                         if let Some(tok) = r.get("accessToken").and_then(Value::as_str) {
-                            return tok.to_string();
+                            if !drifted {
+                                return tok.to_string();
+                            }
                         }
+                    }
+                    if drifted && !acc.token_snapshot.is_empty() {
+                        return acc.token_snapshot.clone();
                     }
                 }
             }
         }
+    }
+    if !acc.token_snapshot.is_empty() && acc.token.is_empty() {
+        return acc.token_snapshot.clone();
     }
     acc.token.clone()
 }
@@ -719,7 +766,6 @@ fn chat_via_curl_once(
 
     // 中文经命令行传参会产出非法 UTF-8（AGENTS.md 坑 #6）→ 走 stdin
     let body_bytes = serde_json::to_vec(payload).map_err(|e| format!("payload 序列化失败: {e}"))?;
-
     let mut child = Command::new("curl")
         .arg("-s")                    // 静默（不要进度条污染 stdout）
         .arg("--max-time").arg(timeout_secs.to_string())
@@ -802,7 +848,7 @@ async fn cloud_get(acc: &MmAccount, path: &str, extra_query: Option<&str>) -> Re
     }
     let resp = upstream_client()
         .get(&url)
-        .header("token", effective_token(&acc))
+        .header("token", effective_token(acc))
         .header("x-timestamp", &ts)
         .header("x-signature", &xs)
         .header("yy", &yy)
@@ -870,7 +916,7 @@ async fn cloud_post_q(
     }
     let resp = upstream_client()
         .post(&url)
-        .header("token", effective_token(&acc))
+        .header("token", effective_token(acc))
         .header("x-timestamp", &ts)
         .header("x-signature", &xs)
         .header("yy", &yy)
@@ -1367,7 +1413,7 @@ async fn chat_with_account(
     let (wire, ts, xs, yy) = sign_request(acc, &format!("/agent/{agent_id}/session"), "{}", yy_absolute_chat);
     // 会话创建签名串不含 query 尾（相对路径 + 参数序）——与 GET 签名一致
     let create_resp = upstream_client()
-        .post(&format!("{create_url}?{wire}"))
+        .post(format!("{create_url}?{wire}"))
         .header("token", effective_token(acc))
         .header("x-timestamp", &ts)
         .header("x-signature", &xs)
@@ -1403,7 +1449,7 @@ async fn chat_with_account(
         let idle_url = format!("{session_path_prefix}/session/{session_id}");
         let (w2, t2, x2, y2) = sign_request(acc, &format!("/session/{session_id}"), "{}", yy_absolute_chat);
         let r = upstream_client()
-            .get(&format!("{idle_url}?{w2}"))
+            .get(format!("{idle_url}?{w2}"))
             .header("token", effective_token(acc))
             .header("x-timestamp", &t2)
             .header("x-signature", &x2)
@@ -1661,6 +1707,9 @@ pub fn discover_desktop() -> Value {
             "realUserID": shared.get("realUserID").cloned().unwrap_or(Value::Null),
             "deviceID": shared.get("deviceID").cloned().unwrap_or(Value::Null),
             "expiresAtMs": rec.get("expiresAtMs").cloned().unwrap_or(Value::Null),
+            // 导入时 accessToken 快照（capture 落 token_snapshot；桌面端单登录槽
+            // 切号后 auth.json 被替换，此快照是旧账号最后的可用凭据）
+            "accessTokenSnapshot": rec.get("accessToken").cloned().unwrap_or(Value::Null),
             "tokenExpired": rec
                 .get("expiresAtMs")
                 .and_then(Value::as_u64)
@@ -1759,12 +1808,35 @@ pub fn capture_from_desktop() -> Value {
     let mut cfg = load_config();
     let mut added = 0usize;
     let mut skipped: Vec<String> = Vec::new();
+    let mut newly_added: Vec<String> = Vec::new();
     for d in &list {
         let path = d.get("authPath").and_then(Value::as_str).unwrap_or("").to_string();
         let key = d.get("authKey").and_then(Value::as_str).unwrap_or("").to_string();
-        if cfg.accounts.iter().any(|a| a.auth_path == path && a.auth_key == key) {
-            skipped.push(format!("{}（已在池）", d.get("label").and_then(Value::as_str).unwrap_or("?")));
-            continue;
+        let snapshot = d
+            .get("accessTokenSnapshot")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let user_id = d.get("userId").and_then(Value::as_str).unwrap_or_default().to_string();
+        // 身份去重（2026-10-04 修复「老账号不见了」）：桌面端重登**复用同一 auth 槽位键**
+        // 只替换里面的令牌——按 (auth_path, auth_key) 去重会把新登录并进旧条目（旧号被
+        // 顶掉改名）。改为按 user_id（账号身份）去重：同号=更新令牌，新号=新增冻结条目。
+        if !user_id.is_empty() {
+            if let Some(a) = cfg
+                .accounts
+                .iter_mut()
+                .find(|a| a.source == "desktop" && a.user_id == user_id)
+            {
+                if !snapshot.is_empty() {
+                    a.token = snapshot.clone();
+                    a.token_snapshot = snapshot;
+                }
+                a.auth_path = path;
+                a.auth_key = key;
+                a.last_error = None;
+                skipped.push(format!("{}（已在池，令牌已更新）", a.label));
+                continue;
+            }
         }
         let region = d.get("region").and_then(Value::as_str).unwrap_or(PROVIDER_BIGMODEL).to_string();
         let id = gen_id();
@@ -1772,7 +1844,8 @@ pub fn capture_from_desktop() -> Value {
             id: id.clone(),
             label: format!("桌面端-{}", d.get("label").and_then(Value::as_str).unwrap_or(region.as_str())),
             region,
-            token: String::new(), // desktop 来源每次现读
+            // 冻结快照条目：token 自含（导入时的 accessToken），不随 auth.json 槽位漂移
+            token: snapshot.clone(),
             uuid: uuid::Uuid::new_v4().to_string(),
             // 真实桌面端 deviceID（sharedUser，纯数字）——比本机生成更可信
             device_id: d
@@ -1780,7 +1853,7 @@ pub fn capture_from_desktop() -> Value {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
-            user_id: d.get("userId").and_then(Value::as_str).unwrap_or_default().to_string(),
+            user_id: user_id.clone(),
             agent_id: String::new(),
             screen_w: "1707".into(),
             screen_h: "1067".into(),
@@ -1794,32 +1867,28 @@ pub fn capture_from_desktop() -> Value {
             source: "desktop".into(),
             auth_path: path,
             auth_key: key,
+            // 导入时 accessToken 快照：桌面端切号后 auth.json 被替换，此快照是
+            // 旧账号最后的可用凭据（effective_token 身份漂移时回落）。
+            token_snapshot: snapshot,
             balance: None,
             credit_consumed: None,
             balance_at: 0,
             fail_streak: 0,
         });
+        newly_added.push(id);
         added += 1;
     }
-    // 同步已有 desktop 账号身份（userName/deviceID 随桌面端更新而变化）
-    for a in cfg.accounts.iter_mut().filter(|a| a.source == "desktop") {
-        let dir = if a.region == PROVIDER_ZAI { "en" } else { "cn" };
-        let shared = desktop_shared(dir);
-        if let Some(n) = shared.get("userName").and_then(Value::as_str) {
-            if !n.is_empty() {
-                a.label = format!("桌面端-{n}");
+    // 身份同步循环已删除（2026-10-04）：冻结条目的身份/令牌自含，不再被当前
+    // 桌面端登录覆盖——这正是「导入的账号被顶掉」的根源。桌面端当前登录如需
+    // 入池，点「从桌面端导入」会按 user_id 识别为独立冻结条目。
+    // 新导入的账号自动加入固定集合（用户预期「导入即固定/记住」；幂等）。
+    if added > 0 {
+        for id in &newly_added {
+            if !cfg.pinned_account_ids.iter().any(|x| x == id) {
+                cfg.pinned_account_ids.push(id.clone());
             }
         }
-        if let Some(did) = shared.get("deviceID").and_then(Value::as_str) {
-            if !did.is_empty() {
-                a.device_id = did.to_string();
-            }
-        }
-        if let Some(uid) = shared.get("userID").and_then(Value::as_str) {
-            if !uid.is_empty() {
-                a.user_id = uid.to_string();
-            }
-        }
+        normalize_pin_set(&mut cfg.pinned_account_ids, &cfg.accounts);
     }
     if added > 0 && !cfg.enabled {
         cfg.enabled = true;
@@ -2028,6 +2097,7 @@ mod tests {
             source: source.to_string(),
             auth_path: String::new(),
             auth_key: String::new(),
+            token_snapshot: String::new(),
             balance: None,
             credit_consumed: None,
             balance_at: 0,

@@ -20,6 +20,14 @@ ALLOW = [
     "manual implementation of `.is_multiple_of()`",
     "this `map_or` can be simplified",
     "doc list item without indentation",
+    "called `unwrap` on",
+    "this block may be rewritten with the `?` operator",
+    "`to_string` applied to a type that implements Display",
+    "the borrowed expression implements the required trait",
+    "this `if let` may be rewritten with a `let`",
+    "useless use of `format`",
+    "matched expression outside of",
+    "unneeded return statement",
     "empty line after doc comment",
 ]
 
