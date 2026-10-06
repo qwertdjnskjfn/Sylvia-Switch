@@ -47,6 +47,7 @@ pub const PLATFORM_LOOMY: &str = "loomy";
 pub const PLATFORM_CHATGLM: &str = "chatglm";
 pub const PLATFORM_MIAOSHOU: &str = "miaoshou";
 pub const PLATFORM_DUMATE: &str = "dumate";
+pub const PLATFORM_MINIMAX: &str = "minimax";
 
 // ---------------------------------------------------------------------------
 // AutoClaw（澳龙）客户端常量（自 resources/app.asar 逆向确认）
@@ -129,6 +130,7 @@ pub fn account_platform(account: &Value) -> &'static str {
         Some(PLATFORM_CHATGLM) => PLATFORM_CHATGLM,
         Some(PLATFORM_MIAOSHOU) => PLATFORM_MIAOSHOU,
         Some(PLATFORM_DUMATE) => PLATFORM_DUMATE,
+        Some(PLATFORM_MINIMAX) => PLATFORM_MINIMAX,
         _ => PLATFORM_WORKBUDDY,
     }
 }
@@ -152,6 +154,7 @@ pub fn platform_display_name(platform: &str) -> &'static str {
         PLATFORM_CHATGLM => "ChatGLM",
         PLATFORM_MIAOSHOU => "妙手",
         PLATFORM_DUMATE => "DuMate（百度搭子）",
+        PLATFORM_MINIMAX => "MiniMax",
         _ => "WorkBuddy",
     }
 }
@@ -304,6 +307,26 @@ pub fn all_checkin_accounts() -> Vec<Value> {
             .to_string();
         if !id.is_empty() && seen.insert(id) {
             accounts.push(acct);
+        }
+    }
+    // MiniMax 账号池（2026-10-07 接入统一全量签到）：此前渠道签到只挂在
+    // 渠道内独立循环/按钮，「立即全量签到」从没碰过 MiniMax（签到日志
+    // 500 条 0 条 minimax 实锤）。启用账号**始终入列**（与其他平台一致）：
+    // 已签的由上游面板幂等返回 already，单账号重试不会「账号不存在」；
+    // 禁用号排除（token 已失效，签了也必败）。
+    for acct in crate::modules::minimax::load_config().accounts {
+        if !acct.enabled {
+            continue;
+        }
+        let id = format!("minimax:{}", acct.id);
+        if seen.insert(id.clone()) {
+            let label = acct.label.clone();
+            accounts.push(json!({
+                "id": id,
+                "email": format!("MiniMax · {label}"),
+                "nickname": format!("MiniMax · {label}"),
+                "platform": PLATFORM_MINIMAX,
+            }));
         }
     }
     accounts
@@ -477,6 +500,13 @@ pub async fn get_platform_status(account: &Value) -> Value {
             Some(pool_id) => crate::modules::dumate_accounts::account_status(pool_id).await,
             None => get_dumate_status().await,
         },
+        PLATFORM_MINIMAX => {
+            // 统一状态页：查上游签到面板（is_today.status==3 = 今日已领）。
+            match crate::modules::minimax::find_account(minimax_id_suffix(account)) {
+                Some(acc) => crate::modules::minimax::signin_panel_status(&acc).await,
+                None => json!({"ok": false, "error": "MiniMax 账号不存在（可能已被删除）"}),
+            }
+        }
         _ => json!({"ok": false, "error": "未知签到平台"}),
     }
 }
@@ -535,10 +565,46 @@ async fn get_autoclaw_pool_status(store_id: &str) -> Value {
     status
 }
 
+/// 统一签到条目 id（"minimax:<账号id>"）→ 渠道配置内账号 id。
+fn minimax_id_suffix(account: &Value) -> &str {
+    account
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .strip_prefix("minimax:")
+        .unwrap_or("")
+}
+
 /// 平台账号统一签到：查状态 → 未签到时提交。返回 `{result, error}`，
 /// result 取值与 WorkBuddy 一致（success / already / error）。
 pub async fn checkin_platform_account(account: &Value) -> Value {
     let platform = account_platform(account);
+    // MiniMax：渠道签到自带幂等（面板 today_status==3 / claim_result==2），
+    // 直接走渠道签到一步到位（内部含本地记账 + 积分快照刷新），不走
+    // 统一 status 预查——省一次上游往返，幂等性由渠道自己保证。
+    if platform == PLATFORM_MINIMAX {
+        let Some(acc) = crate::modules::minimax::find_account(minimax_id_suffix(account)) else {
+            return json!({"result": "error", "error": "MiniMax 账号不存在（可能已被删除）"});
+        };
+        if !acc.enabled {
+            return json!({"result": "error", "error": "账号已禁用（token 随桌面端切号失效后自动禁用；把 MiniMax 桌面端切回该账号后，到 MiniMax 页点启用即可自动拿到新 token）"});
+        }
+        let res = crate::modules::minimax::signin_and_record(&acc).await;
+        if res.get("ok").and_then(Value::as_bool) == Some(true) {
+            let already = res.get("action").and_then(Value::as_str) == Some("already-claimed");
+            return json!({
+                "result": if already { "already" } else { "success" },
+                "points": res.get("points").cloned().unwrap_or(Value::Null),
+            });
+        }
+        return json!({
+            "result": "error",
+            "error": res
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("签到失败"),
+        });
+    }
     let status = get_platform_status(account).await;
     if status.get("ok").and_then(Value::as_bool) != Some(true) {
         return json!({
@@ -3969,5 +4035,18 @@ mod autoclaw_probe_candidate_tests {
         assert!(got.iter().all(|t| !t.starts_with("Bearer ")));
         // 非 JSON / 空输入 → 空列表
         assert!(pool_probe_candidates_from_json("not json", now_ms).is_empty());
+    }
+
+    #[test]
+    fn minimax_platform_routes_through_unified_checkin() {
+        // 2026-10-07 接入统一全量签到：platform=minimax 必须被识别与分发
+        let account = json!({"id": "minimax:abc123", "platform": "minimax", "email": "MiniMax · x"});
+        assert_eq!(account_platform(&account), PLATFORM_MINIMAX);
+        assert_eq!(minimax_id_suffix(&account), "abc123");
+        assert_eq!(platform_display_name(PLATFORM_MINIMAX), "MiniMax");
+        // 无 platform 字段的历史条目仍归 WorkBuddy（新平台不得改变缺省路由）
+        assert_eq!(account_platform(&json!({"id": "wb1"})), PLATFORM_WORKBUDDY);
+        // 非 minimax 前缀的 id 走空后缀（find_account 找不到 → 可操作报错）
+        assert_eq!(minimax_id_suffix(&json!({"id": "other:1"})), "");
     }
 }

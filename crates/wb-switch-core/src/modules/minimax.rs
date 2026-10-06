@@ -2044,26 +2044,7 @@ pub fn spawn_signin_loop() {
                         .cloned()
                         .collect();
                     for acc in due {
-                        let res = signin_account(&acc).await;
-                        let signed = res.get("ok").and_then(Value::as_bool) == Some(true);
-                        let mut cfg2 = load_config();
-                        if let Some(a) = cfg2.accounts.iter_mut().find(|x| x.id == acc.id) {
-                            if signed {
-                                a.signin_last_date = today.clone();
-                                if let Some(p) = res.get("points").and_then(Value::as_u64) {
-                                    a.signin_points_total += p;
-                                }
-                            } else {
-                                a.last_error = res.get("error").and_then(Value::as_str).map(String::from);
-                            }
-                        }
-                        save_config(&cfg2);
-                        // 2026-10-05 修复：自动签到后**必须刷新积分快照**。
-                        // 原缺陷：此处只回写签到日期/累计分，而 `/api/minimax/status` 只读
-                        // balance 快照字段 → “已签到但积分不变”。与手动签到路由同一口径。
-                        if signed {
-                            let _ = refresh_and_save_credit(&acc).await;
-                        }
+                        let res = signin_and_record(&acc).await;
                         crate::modules::notify::notify(
                             "minimax-signin",
                             "MiniMax 每日签到",
@@ -2076,6 +2057,60 @@ pub fn spawn_signin_loop() {
             tokio::time::sleep(Duration::from_secs(30 * 60)).await;
         }
     });
+}
+
+/// 按配置内账号 id 取账号（统一签到分发用）。
+pub fn find_account(id: &str) -> Option<MmAccount> {
+    load_config().accounts.into_iter().find(|a| a.id == id)
+}
+
+/// 签到 + 本地记账（日期 / 累计分 / last_error）+ 积分快照刷新——**统一口径**。
+///
+/// 自动签到循环与统一全量签到（platform_checkin）共用：2026-10-06 的教训是
+/// 「签到后积分不变」源于循环与手动路由两份实现漂移，这里收敛为唯一实现。
+/// ok=true 即记当日已签（含上游 already-claimed：桌面端自己签过时把当日
+/// 已发分同步进累计值，日期标记后当日不会重复入账）。
+pub async fn signin_and_record(acc: &MmAccount) -> Value {
+    let res = signin_account(acc).await;
+    let signed = res.get("ok").and_then(Value::as_bool) == Some(true);
+    let mut cfg2 = load_config();
+    if let Some(a) = cfg2.accounts.iter_mut().find(|x| x.id == acc.id) {
+        if signed {
+            a.signin_last_date = today_str();
+            if let Some(p) = res.get("points").and_then(Value::as_u64) {
+                a.signin_points_total += p;
+            }
+        } else {
+            a.last_error = res.get("error").and_then(Value::as_str).map(String::from);
+        }
+    }
+    save_config(&cfg2);
+    if signed {
+        // 签到后必须刷新积分快照，否则 /api/minimax/status 的 balance 不动
+        let _ = refresh_and_save_credit(acc).await;
+    }
+    res
+}
+
+/// 统一签到状态页用：查上游签到面板，is_today.status==3 视为今日已领。
+pub async fn signin_panel_status(acc: &MmAccount) -> Value {
+    let tz = "timezone_id=Asia/Shanghai";
+    match cloud_get(acc, "/minimax-cloud/api/v1/signin/status", Some(tz)).await {
+        Ok(v) => {
+            let today_status = v
+                .pointer("/data/panel/days")
+                .and_then(Value::as_array)
+                .and_then(|arr| {
+                    arr.iter()
+                        .find(|d| d.get("is_today").and_then(Value::as_bool) == Some(true))
+                })
+                .and_then(|d| d.get("status"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            json!({"ok": true, "todayCheckedIn": today_status == 3})
+        }
+        Err(e) => json!({"ok": false, "error": e}),
+    }
 }
 
 /// 健康探测：余额查询（区分封禁/额度/登录态由 HTTP 码与业务码判断）。

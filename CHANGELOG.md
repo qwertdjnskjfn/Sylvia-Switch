@@ -1,3 +1,49 @@
+## 1.0.62 — 2026-10-07
+
+### 修复：「立即全量签到」从没包含 MiniMax —— 接入统一签到清单（用户实测 3 账号 0 积分暴露）
+
+**现象**：用户点「立即全量签到」，3 个 MiniMax 账号无一获得签到积分。排查实锤：
+`auto_checkin_logs.json` **500 条里 0 条 minimax**——统一签到（`run_checkin_all`）覆盖
+WorkBuddy/AutoClaw/TRAE/Loomy/ChatGLM/妙手/DuMate 七平台，**MiniMax 渠道（10-04 才建）的
+签到一直挂在渠道内独立循环（spawn_signin_loop，仅 7-10 点窗口）+ 渠道页按钮，从未接入统一清单**。
+（另一层：账号 2/3 已随桌面端切号自动禁用，任何签到路径都跳过它们——这部分是预期行为。）
+
+**改动**（对齐七平台既有范式）：
+- `platform_checkin.rs`：`PLATFORM_MINIMAX` 常量 + `account_platform` 归一化 + 平台显示名 +
+  `all_checkin_accounts()` 收编 MiniMax **启用**账号（id `minimax:<id>`；禁用号排除，已签号
+  始终入列由上游幂等返回 already——首版曾加「今日已签排除」过滤导致单账号重试报「账号不存在」，
+  已改为与其他平台一致的始终入列口径）+ `checkin_platform_account` 分发分支（不走统一 status
+  预查，渠道签到自带面板/claim_result 双重幂等）+ `get_platform_status` 分支（签到状态页可显示
+  MiniMax 行的 `todayCheckedIn`）。
+- `minimax.rs`：抽出 `signin_and_record()`（签到 + 本地记账 + 积分快照刷新**统一口径**，
+  自动循环与统一签到共用——消除 2026-10-06「两份实现漂移」类隐患）+ `find_account()` +
+  `signin_panel_status()`；`spawn_signin_loop` 重构为调用统一函数（行为不变）。
+
+**测试**：新增 `minimax_platform_routes_through_unified_checkin`（平台识别/前缀解析/显示名/
+缺省路由回归），checkin 41 + platform_checkin 18 + minimax 26 全过。
+
+**验证（全部实测，1.0.62 部署后）**：
+- 统一单签 `POST /api/checkin {accountId:"minimax:…"}` → **success，+800 分入账**（累计 800→1600，
+  余额快照刷新 2386.47，签到日期 2026-10-07）；
+- 已签后重试 → **already**（幂等，不再误报「账号不存在」）；
+- **`POST /api/checkin/all` → 15 条结果含 1 条 minimax**（已签 → already）；签到日志 minimax
+  0 → 3 条；
+- 状态页 `/api/checkin/status` 出现 MiniMax 行（`ok:true, todayCheckedIn` 实时查上游面板）。
+- 已知小口径：上游签到面板在零点后至当日首次渲染前 `days=[]`，此窗口状态页可能显示「未签到」
+  （实际 claim 幂等兜底，不会重复发分）；自动循环 7-10 点窗口不受影响。
+
+---
+
+## 1.0.61 — 2026-10-07
+
+### 接入（中间版本）：MiniMax 统一签到首版（单测+构建+部署验收通过）
+
+含 1.0.62 的全部主体改动（见下）；与 1.0.62 的差异仅在 `all_checkin_accounts()` 的
+MiniMax 收编口径：首版过滤了「今日已签」账号，导致已签后单账号重试报「账号不存在」，
+1.0.62 修正为启用账号始终入列。部署后已实测单签 success +800 分入账。
+
+---
+
 ## 1.0.60 — 2026-10-07
 
 ### 修复：MiniMax 对话断线根因实锤 —— 桌面端**原地轮换 accessToken**，冻结快照失效打上游 401；token 改「现读优先、快照兜底」
