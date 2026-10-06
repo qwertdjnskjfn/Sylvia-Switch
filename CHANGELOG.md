@@ -1,3 +1,24 @@
+## 1.0.59 — 2026-10-06
+
+### 优化：Loomy 中转「思考节制」—— 上游不认档位参数，改为 prompt 层约束
+
+**判据（实测）**：`/loomy/v1` 下发 `glm-5.3-flash` 时，思考 **1194 字 / 答案 51 字**（≈23×），总耗时 10.9s。
+
+**先排除档位方案（关键否定证据）**：向 Loomy 上游注入五种 effort/thinking 参数各测一次 ——
+`reasoning_effort=low`(1085字) / `thinking:{type:disabled}`(1067字) / `enable_thinking=false`(969字) /
+`reasoning:{effort:low}`(1211字) / `reasoning_budget_tokens=128`(1185字) —— **全部与基线同级** ⇒
+**该上游不认任何档位参数**，档位映射此路不通（此前方案 L-A 作废）。
+
+**改动**：`loomy_proxy.rs` 新增 `BRIEF_THINKING_DIRECTIVE` 与 `inject_brief_thinking()`：
+在**流式与非流式两个入口**、`sanitize_loomy_payload` 之后注入「回答前只做最必要的内部推理（1–3 步），直接给结论」；
+已有 `system` 则追加，否则在消息最前插一条 system。可用 **`LOOMY_BRIEF_THINKING=off`** 关闭（复杂推理任务建议关）。
+
+**测试**：新增 3 个单测（无 system 时插入 / 有 system 时追加 / 环境变量关闭），`cargo test -p wb-switch-core loomy` → 9 passed。
+
+**验证**：部署后同 prompt 复测思考字数与总耗时，与基线（1194 字 / 10.9s）对照。
+
+---
+
 ## 1.0.58 — 2026-10-06
 
 ### 修复：WorkBuddy 池上游**首字节超时 15s → 45s**（消除"慢即失败"自噬循环）

@@ -247,6 +247,51 @@ pub async fn proxy_status() -> Value {
 /// 1. 模型名统一归一化（不区分大小写匹配真实 ID，如 `glm-5.3-flash` -> `GLM-5.3-Flash`）；
 /// 2. `max_tokens` 安全钳位：上游硬上限为 131072（128K），超限上游直接报 400，此处自动安全钳位；
 /// 3. 空 content 与无效属性修正。
+/// 思考节制指令（2026-10-06 实测驱动）。
+///
+/// 背景：Loomy 上游**不认任何 effort/thinking 参数** —— 实测注入
+/// `reasoning_effort=low` / `thinking:{type:disabled}` / `enable_thinking=false` /
+/// `reasoning:{effort:low}` / `reasoning_budget_tokens=128` 五种形态后，
+/// 思考字数仍稳定在 **970–1210 字**（差异只是噪声），故**档位映射此路不通**。
+/// 唯一可控手段是 **prompt 层约束**：要求模型只做最必要的内部推理。
+/// 可用环境变量 `LOOMY_BRIEF_THINKING=off` 关闭（复杂推理任务建议关掉）。
+pub const BRIEF_THINKING_DIRECTIVE: &str =
+    "【思考方式】回答前只在内部做最必要的推理（1–3 步），不要展开长篇分析；直接给出结论。";
+
+/// 是否启用思考节制（默认开；`LOOMY_BRIEF_THINKING=off` 关闭）。
+pub fn brief_thinking_enabled() -> bool {
+    match std::env::var("LOOMY_BRIEF_THINKING") {
+        Ok(v) => !v.eq_ignore_ascii_case("off"),
+        Err(_) => true,
+    }
+}
+
+/// 把思考节制指令注入 payload：优先追加到已有 `system`，否则在消息最前插一条 system。
+fn inject_brief_thinking(body: &mut Value) {
+    if !brief_thinking_enabled() {
+        return;
+    }
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    match obj.get("system").and_then(Value::as_str) {
+        Some(cur) if !cur.trim().is_empty() => {
+            let merged = format!("{cur}\n\n{}", BRIEF_THINKING_DIRECTIVE);
+            obj.insert("system".to_string(), json!(merged));
+        }
+        _ => {
+            if let Some(msgs) = obj.get_mut("messages").and_then(Value::as_array_mut) {
+                if !msgs.is_empty() {
+                    msgs.insert(
+                        0,
+                        json!({"role": "system", "content": BRIEF_THINKING_DIRECTIVE}),
+                    );
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn sanitize_loomy_payload(body: &mut Value) {
     let Some(obj) = body.as_object_mut() else {
         return;
@@ -299,6 +344,7 @@ pub(crate) fn sanitize_loomy_payload(body: &mut Value) {
 /// 非流式对话补全：透传上游 OpenAI 格式响应。
 pub async fn chat_completions_json(mut body: Value) -> Result<Value, String> {
     sanitize_loomy_payload(&mut body);
+    inject_brief_thinking(&mut body);
     let pool = ordered_pool();
     if pool.is_empty() {
         return Err("Loomy 可用账号池为空（无有效账号或全部账号处于安全冷却保护中）".to_string());
@@ -467,6 +513,7 @@ fn record_usage(value: &Value, model: &str, account_id: &str, started: i64) {
 /// 流式对话补全：透传上游 SSE（Loomy 网关本身支持 stream）。
 pub async fn chat_completions_stream(mut body: Value) -> Result<LoomyUpstreamStream, String> {
     sanitize_loomy_payload(&mut body);
+    inject_brief_thinking(&mut body);
     let pool = ordered_pool();
     if pool.is_empty() {
         return Err("Loomy 可用账号池为空（无有效账号或全部账号处于安全冷却保护中）".to_string());
@@ -709,6 +756,43 @@ pub async fn chat_completions(body: Value) -> Result<LoomyChatCompletion, String
 /// Anthropic Messages 协议兼容转发。
 pub async fn anthropic_messages(body: Value) -> Result<LoomyChatCompletion, String> {
     super::loomy_anthropic::messages(body).await
+}
+
+#[cfg(test)]
+mod brief_thinking_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn injects_system_message_when_absent() {
+        std::env::remove_var("LOOMY_BRIEF_THINKING");
+        let mut body = json!({"model":"GLM-5.3-Flash","messages":[{"role":"user","content":"hi"}]});
+        inject_brief_thinking(&mut body);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["role"], "system");
+        assert!(msgs[0]["content"].as_str().unwrap().contains("思考方式"));
+    }
+
+    #[test]
+    fn appends_to_existing_system() {
+        std::env::remove_var("LOOMY_BRIEF_THINKING");
+        let mut body = json!({"system":"你是助手","messages":[{"role":"user","content":"hi"}]});
+        inject_brief_thinking(&mut body);
+        let sys = body["system"].as_str().unwrap();
+        assert!(sys.starts_with("你是助手"));
+        assert!(sys.contains("思考方式"));
+        assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn disabled_by_env() {
+        std::env::set_var("LOOMY_BRIEF_THINKING", "off");
+        let mut body = json!({"messages":[{"role":"user","content":"hi"}]});
+        inject_brief_thinking(&mut body);
+        assert_eq!(body["messages"].as_array().unwrap().len(), 1, "关闭时不应注入");
+        std::env::remove_var("LOOMY_BRIEF_THINKING");
+    }
 }
 
 #[cfg(test)]
