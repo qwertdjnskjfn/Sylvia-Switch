@@ -451,7 +451,8 @@ export default function MiniMaxPage() {
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="text-sm font-medium">{a.label}</span>
                       <code className="text-[11px] text-muted-foreground">{a.tokenMasked}</code>
-                      {a.pinned ? <Badge className="h-5 px-1.5 text-[10px]">当前账号</Badge> : null}
+                      {/* 「当前账号」= 固定集合首位（签到/对话的首选号）；其余固定号由下方按钮标「已固定 #n」 */}
+                      {a.pinned && a.pinOrder === 0 ? <Badge className="h-5 px-1.5 text-[10px]">当前账号</Badge> : null}
                       {a.cooldown ? (
                         <Badge variant="warning" className="h-5 px-1.5 text-[10px]">
                           {(() => {
@@ -468,7 +469,7 @@ export default function MiniMaxPage() {
                       ) : null}
                       {a.balance != null ? (
                         <Badge variant="secondary" className="h-5 px-1.5 text-[10px]" title={`已消耗 ${a.creditConsumed ?? 0} 分（credit/details 明细）`}>
-                          积分 {a.balance} · 已用 {a.creditConsumed ?? 0}
+                          积分 {a.balance.toFixed(2)} · 已用 {(a.creditConsumed ?? 0).toFixed(2)}
                         </Badge>
                       ) : null}
                       <Badge variant="secondary" className="h-5 px-1.5 text-[10px]">

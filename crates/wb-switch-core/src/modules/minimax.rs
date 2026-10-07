@@ -459,47 +459,45 @@ pub fn effective_token(acc: &MmAccount) -> String {
 /// 从桌面端 auth.json 现读本账号的 accessToken（身份校验不过返回 None）。
 fn fresh_desktop_token(acc: &MmAccount) -> Option<String> {
     let region_dir = if acc.region == "international" { "en" } else { "cn" };
-    let cur_uid = desktop_shared(region_dir)
-        .get("userID")
+    let cur_uid = desktop_current_user_id(region_dir);
+    let text = std::fs::read_to_string(&acc.auth_path).ok()?;
+    fresh_desktop_token_from(&text, &cur_uid, &acc.user_id)
+}
+
+/// 桌面端「当前登录账号」的 userID：sharedUser.userID（实测口径），
+/// 顶层 userID 作兼容回退。读不到返回空串（= 身份不可判定）。
+fn desktop_current_user_id(region_dir: &str) -> String {
+    let shared = desktop_shared(region_dir);
+    shared
+        .pointer("/sharedUser/userID")
+        .or_else(|| shared.get("userID"))
         .and_then(Value::as_str)
         .unwrap_or("")
-        .to_string();
-    let text = std::fs::read_to_string(&acc.auth_path).ok()?;
-    fresh_desktop_token_from(&text, &acc.auth_key, &cur_uid, &acc.user_id)
+        .to_string()
 }
 
 /// [`fresh_desktop_token`] 的纯函数核心（可单测）。
 ///
-/// auth.json 是单登录槽：auth_key 精确命中 = 该记录就是本账号（键含账号特异
-/// 后缀），记录内 token 是桌面端最新轮换值；键不匹配时须核对当前登录 userID，
-/// 漂移（当前登录 ≠ 本条目账号）绝不借用他人令牌。
-fn fresh_desktop_token_from(
-    text: &str,
-    auth_key: &str,
-    cur_uid: &str,
-    user_id: &str,
-) -> Option<String> {
-    let v = serde_json::from_str::<Value>(text).ok()?;
-    let obj = v.get("records")?.as_object()?;
-    if !auth_key.is_empty() {
-        if let Some(tok) = obj
-            .get(auth_key)
-            .and_then(|r| r.get("accessToken"))
-            .and_then(Value::as_str)
-        {
-            if !tok.is_empty() {
-                return Some(tok.to_string());
-            }
-        }
-    }
-    let drifted = !cur_uid.is_empty() && !user_id.is_empty() && cur_uid != user_id;
-    if drifted {
+/// 🔴 身份锚点只能是 `sharedUser.userID`（2026-10-07 实锤）：auth.json 是单登录槽，
+/// **记录键是客户端级**（本机三个账号的 auth_key 完全相同），记录内也无 userID
+/// 字段——auth_key 命中证明不了任何身份。仅当「桌面端当前登录 = 本账号」才允许
+/// 现读（跟得上原地轮换）；登录了别的号 / 读不到当前身份（cur_uid 空）一律回落
+/// 冻结快照，绝不借用他号 token——否则会把当前登录账号的积分/对话写进错误槽位
+/// （本次 2/3 号积分被污染的根因）。
+fn fresh_desktop_token_from(text: &str, cur_uid: &str, user_id: &str) -> Option<String> {
+    if cur_uid.is_empty() || user_id.is_empty() || cur_uid != user_id {
         return None;
     }
-    obj.values()
-        .find_map(|r| r.get("accessToken").and_then(Value::as_str))
-        .filter(|t| !t.is_empty())
-        .map(String::from)
+    let v = serde_json::from_str::<Value>(text).ok()?;
+    let obj = v.get("records")?.as_object()?;
+    let tok = obj
+        .values()
+        .find_map(|r| r.get("accessToken").and_then(Value::as_str))?;
+    if tok.is_empty() {
+        None
+    } else {
+        Some(tok.to_string())
+    }
 }
 
 /// 云端域名：desktop 来源走 agent.minimax.{cn|io}（实测桌面 OAuth token 用
@@ -2006,11 +2004,16 @@ pub fn models_payload_filtered(cfg: &MmConfig, region: Option<&str>) -> Value {
 pub async fn refresh_credit_snapshot(acc: &MmAccount) -> (Option<f64>, Option<f64>) {
     if acc.source == "desktop" {
         match credit_summary(acc).await {
-            Some((remaining, used, _expire)) => (Some(remaining), Some(used)),
+            // 四舍五入到 2 位小数：credit/details 求和的 f64 尾差（2386.4700000000003）
+            // 会原样进配置与 UI，读数观感极差
+            Some((remaining, used, _expire)) => (
+                Some((remaining * 100.0).round() / 100.0),
+                Some((used * 100.0).round() / 100.0),
+            ),
             None => (None, None),
         }
     } else {
-        (membership_balance(acc).await.ok(), None)
+        (membership_balance(acc).await.ok().map(|b| (b * 100.0).round() / 100.0), None)
     }
 }
 
@@ -2073,11 +2076,24 @@ pub fn find_account(id: &str) -> Option<MmAccount> {
 pub async fn signin_and_record(acc: &MmAccount) -> Value {
     let res = signin_account(acc).await;
     let signed = res.get("ok").and_then(Value::as_bool) == Some(true);
+    let claimed = res.get("action").and_then(Value::as_str) == Some("claimed");
     let mut cfg2 = load_config();
     if let Some(a) = cfg2.accounts.iter_mut().find(|x| x.id == acc.id) {
         if signed {
             a.signin_last_date = today_str();
-            if let Some(p) = res.get("points").and_then(Value::as_u64) {
+            // 只在真领取（claimed）时累计——already-claimed 的 points 是面板里
+            // 当日已发分，统一签到无日期闸门，重复点击会反复累加（1.0.62 实翻车：
+            // 累计 1600 → 4800 全是幻影分）。与手动签到路由同一口径。
+            if claimed {
+                let p = res
+                    .get("points")
+                    .and_then(Value::as_u64)
+                    .or_else(|| {
+                        res.get("points")
+                            .and_then(Value::as_str)
+                            .and_then(|s| s.parse::<u64>().ok())
+                    })
+                    .unwrap_or(0);
                 a.signin_points_total += p;
             }
         } else {
@@ -2457,6 +2473,7 @@ mod tests {
 
     // ===== 2026-10-07 token 现读优先：桌面端在同一 auth_key 记录内原地轮换
     // accessToken，冻结快照打上游 401（对话断线根因）；现读须身份校验防漂移 =====
+    // 🔴 身份锚点 = sharedUser.userID（auth_key 是客户端级，三账号同键，不证明身份）
 
     /// 组装 auth.json 测试文本（值全部来自运行时变量）
     fn auth_json_with(key: &str, tok: &str) -> String {
@@ -2465,49 +2482,40 @@ mod tests {
 
     #[test]
     fn fresh_token_follows_in_place_rotation() {
-        // auth_key 精确命中：记录就是本账号，必须拿记录内（已轮换的）新 token
+        // 桌面端当前登录 = 本账号：拿记录内（已轮换的）新 token
         let rotated = format!("rotated-{}", 1);
         let text = auth_json_with("k1 x00", &rotated);
-        let got = fresh_desktop_token_from(&text, "k1 x00", "anyone", "me");
+        let got = fresh_desktop_token_from(&text, "me", "me");
         assert_eq!(got.as_deref(), Some(rotated.as_str()));
     }
 
     #[test]
-    fn fresh_token_rejects_drifted_record() {
-        // 键不匹配 + 当前登录 userID ≠ 本条目账号 → 绝不借用他人令牌
+    fn fresh_token_rejects_drifted_login() {
+        // 桌面端登录的是别的号（单登录槽已覆盖本账号令牌）→ 绝不借用
         let theirs = format!("theirs-{}", 2);
-        let text = auth_json_with("other-key", &theirs);
-        let got = fresh_desktop_token_from(&text, "my-key", "someone-else", "me");
-        assert_eq!(got, None);
-    }
-
-    #[test]
-    fn fresh_token_falls_back_when_same_user() {
-        // 键不匹配但 userID 一致（键名轮换/legacy 无 auth_key）→ 取当前记录
-        let current = format!("current-{}", 3);
-        let text = auth_json_with("new-key", &current);
-        let got = fresh_desktop_token_from(&text, "old-key", "me", "me");
-        assert_eq!(got.as_deref(), Some(current.as_str()));
-        // 共享配置读不到 userID（cur_uid 空）→ 不判漂移，维持旧行为
-        let got2 = fresh_desktop_token_from(&text, "", "", "");
-        assert_eq!(got2.as_deref(), Some(current.as_str()));
+        let text = auth_json_with("same-client-key", &theirs);
+        assert_eq!(fresh_desktop_token_from(&text, "someone-else", "me"), None);
+        // 读不到当前登录身份（cur_uid 空）→ 同样拒绝（身份不可判定不赌）
+        assert_eq!(fresh_desktop_token_from(&text, "", "me"), None);
+        // 本账号缺 user_id → 无法核对 → 拒绝
+        assert_eq!(fresh_desktop_token_from(&text, "me", ""), None);
     }
 
     #[test]
     fn fresh_token_skips_empty_access_token() {
         let text = auth_json_with("my-key", "");
-        assert_eq!(fresh_desktop_token_from(&text, "my-key", "me", "me"), None);
+        assert_eq!(fresh_desktop_token_from(&text, "me", "me"), None);
     }
 
     #[test]
     fn fresh_token_rejects_malformed() {
-        assert_eq!(fresh_desktop_token_from("not-json", "k", "", ""), None);
-        assert_eq!(fresh_desktop_token_from(r#"{"x":1}"#, "k", "", ""), None);
+        assert_eq!(fresh_desktop_token_from("not-json", "me", "me"), None);
+        assert_eq!(fresh_desktop_token_from(r#"{"x":1}"#, "me", "me"), None);
     }
 
     #[test]
-    fn effective_token_prefers_live_read_over_frozen() {
-        // 桌面端原地轮换后：现读优先于冻结快照；文件消失 → 回落快照
+    fn effective_token_falls_back_when_live_read_unavailable() {
+        // auth.json 文件消失（桌面端退出登录/真切号）→ 回落冻结快照
         let live = format!("live-{}", 4);
         let text = auth_json_with("k x00", &live);
         let dir = std::env::temp_dir();
@@ -2516,7 +2524,11 @@ mod tests {
         let mut a = acc("d1", "desktop", "domestic", true, 0, "t-snap");
         a.auth_path = path.to_string_lossy().to_string();
         a.auth_key = "k x00".to_string();
-        assert_eq!(effective_token(&a), live, "现读优先于冻结快照");
+        a.user_id = "u-test".to_string();
+        // 文件存在，但身份是否匹配取决于本机 sharedUser（测试环境不可控）——
+        // 只断言两种合法结局：现读成功 = live，或身份不匹配回落 t-snap
+        let got = effective_token(&a);
+        assert!(got == live || got == "t-snap", "got={got}");
         std::fs::remove_file(&path).ok();
         assert_eq!(effective_token(&a), "t-snap", "现读失败回落快照");
         // 非 desktop 条目：不碰 auth.json
