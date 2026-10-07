@@ -524,6 +524,12 @@ pub async fn credit_summary(acc: &MmAccount) -> Option<(f64, f64, u64)> {
     let v = cloud_get(acc, "/minimax-cloud/api/v1/credit/details", None).await.ok()?;
     // 注意：details 在响应顶层（不在 data 下）
     let arr = v.get("details").and_then(Value::as_array)?;
+    // 空明细闸门（2026-10-07）：上游对失效 token 有时返回 200 + 空 details
+    // （而非 401）——空集不代表余额为零，按「读不到」处理，绝不用空数据覆盖
+    // 此前探测到的真实余额。
+    if arr.is_empty() {
+        return None;
+    }
     let now = now_ms();
     let mut remaining = 0.0f64;
     let mut consumed = 0.0f64;
@@ -1029,6 +1035,18 @@ pub async fn signin_account(acc: &MmAccount) -> Value {
                 amount > 0.0
             });
         }
+    }
+    // ⑤ 有效性闸门（2026-10-07 新增）：上游对失效 token 的面板/claim 可能返回
+    //    **200 + 空 JSON**（而非 401）——claim_result 缺省 0 会被误判成 claimed
+    //    报 success（实测翻车：账号1 token 已死仍连续 success）。真签上的唯一
+    //    可信信号 = claim_result ∈ {1(成功),2(已签)}；其余一律按凭据失效报错，
+    //    交给上层换号/禁用逻辑。
+    if claim_result != 1 && claim_result != 2 {
+        return json!({
+            "ok": false, "id": account_id, "account": acc.label,
+            "error": format!("签到未生效（claim_result={claim_result}，paid={paid}）：账号凭据可能已失效，请在 MiniMax 桌面端切回该账号后重试"),
+            "steps": steps,
+        });
     }
     steps.push(json!({"step": "claim", "claim_result": claim_result, "points": points, "paid": paid}));
     json!({

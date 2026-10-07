@@ -1,3 +1,33 @@
+## 1.0.65 — 2026-10-07
+
+### 修复：MiniMax 死 token 被「假签到成功」——上游对失效凭据返 200 空 JSON，claim_result=0 误判 claimed；补有效性闸门
+
+**全渠道刷新时发现（用户要求刷新全部账号）**：账号1 的冻结 token 已被桌面端轮换作废（curl 直测
+signin/status 与 credit/details 均 **401 invalid access token**），但统一签到却连续返回
+`success`（23:11/23:16/23:17 三次）且 `points=0`、累计分不变——**假成功**。
+
+**根因**：上游对失效 token 的行为**按端点分裂**：部分端点正常 401，但签到面板/claim 等对死
+token 返回 **HTTP 200 + 空 JSON**（`days=[]`、claim 无 `claim_result` 字段）。`signin_account`
+里 `claim_result` 缺省值 0 ≠ 2（already）→ 走进 "claimed" 分支报 ok=true。上游先前对 reqwest
+vs curl 响应不一致（同 token curl 401 / 网关 200 空壳）再次实锤「同端点不同客户端不同响应」。
+
+**修复**：
+- `signin_account` 加**有效性闸门**：真签上的唯一可信信号 = `claim_result ∈ {1(成功), 2(已签)}`；
+  其余一律报可操作错误「签到未生效（claim_result=N）…请在桌面端切回该账号后重试」，交给上层
+  换号/禁用逻辑——绝不再把空响应当成功。
+- `credit_summary` 加**空明细闸门**：credit/details 返回 200 + 空 details（死 token 的另一种
+  200 空壳形态）时按「读不到」处理（返回 None），绝不用空数据覆盖此前探测到的真实余额
+  （probe/签到快照两处写回同时受保护）。
+
+**测试**：`cargo test -p wb-switch-core minimax` → 25 passed；构建部署 1.0.65（OUTAGE 1.3s）。
+
+**数据口径（本次全量刷新后）**：账号1 冻结 token 已死——在桌面端切回账号1 之前，它的签到/余额
+将诚实显示「未生效/不可用」而非假 success；账号2（当前桌面端登录）数据实时有效（余额 2381.29）；
+账号3 余额 2386.47 为其 token 有效期内最后真实值。此前 10-07 上午记到账号1 名下的「+800」实为
+死 token 空响应误判，不确认为真实发放。
+
+---
+
 ## 1.0.64 — 2026-10-07
 
 ### 修复：AutoClaw 客户端更新后「auth.json 缺少 refreshToken」无法导入账号 —— 新版凭据布局兼容
