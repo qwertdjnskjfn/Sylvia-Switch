@@ -1,3 +1,54 @@
+## 1.0.64 — 2026-10-07
+
+### 修复：AutoClaw 客户端更新后「auth.json 缺少 refreshToken」无法导入账号 —— 新版凭据布局兼容
+
+**现象与根因**：用户报导入账号报「auth.json 缺少 refreshToken」。实测：新版 AutoClaw 客户端
+（`E:\AutoClaw国内版本\AutoClaw2`，2026-09 官方版）把登录态从旧 `%APPDATA%\autoclaw\auth.json`
+（顶层 token/refreshToken 加密串）**迁到** `%APPDATA%\AutoClaw-official\accounts\<sha256>\
+account-credentials.enc`——旧 auth.json 只剩 `deviceId + updatedAt` 空壳（10-06 被新版改写），
+网关 `import_local` 硬取旧字段必然报错。**确属 AutoClaw 版本更新导致，非网关凭据损坏。**
+
+**新版布局逆向（实测打通）**：`account-credentials.enc` = `v10` 前缀 + AES-256-GCM（nonce 12B
+前置，与 Electron os_crypt 同构）；密钥 = `AutoClaw-official\Local State` 的
+`os_crypt.encrypted_key`（base64 → DPAPI），复用既有 `autoclaw_encryption_key` +
+`decrypt_windows_gcm_v10`；明文 JSON = `{schemaVersion, revision, accessToken, refreshToken,
+updatedAt}`，token 均带 `Bearer ` 前缀；当前登录账号由 `device\active-product-account.json` 的
+`accountKey` 指向（本机实测指向 145f…，refreshToken 真实存在且可换发）。
+
+**改动**：
+- `platform_checkin.rs`：新增 `autoclaw_official_credentials()`（枚举 accounts 目录 →
+  active-product-account 优先、缺省取 mtime 最新 → 解密返回 access/refresh 对）；
+  `read_autoclaw_token()` ② 号新版布局（旧 auth.json 无 token 时）。
+- `autoclaw_accounts.rs::import_local`：旧 auth.json 有 refreshToken → 原路径解密；无（新版
+  空壳）→ 从 enc 明文取 refresh（`Bearer ` 前缀剥离）；两者都无 → 可操作报错。deviceId 沿用
+  旧文件（设备指纹未变）。
+
+**测试**：`cargo test -p wb-switch-core autoclaw` → **38 passed**；platform_checkin 18 passed。
+
+**行为断言（部署 1.0.64 后实测）**：`POST /api/autoclaw/accounts/import-local` →
+`ok=true`，新账号 `autoclaw:826119`（uid 从 access JWT 解出）入池，access/refresh 均非空；
+`POST /api/autoclaw/accounts/refresh {id}` → `{"ok":true}`（refreshToken 真实换发成功）；
+统一签到清单出现该账号且 `todayCheckedIn: true`（上游真实状态）。
+
+### 新增：AutoClaw **国际号轮换池**（轮换状态机 + 网关国际 lane lease 化 + 9 管理端点 + TokenKeeper + `/autoclaw-intl` 独立页）
+
+**背景**：AutoClaw 国际版 OAuth 全自动注册管线已打通、首号已入池（region=international），国际号需要独立于国内号的轮换/健康/限速/替换机制。契约：`docs/autoclaw-intl-pool-contract.md`（唯一事实来源），四阶段 M1–M4 本次全部落地。
+
+**改动（按层）**：
+- **M1 状态机与存储**（core 新模块 `autoclaw_intl_pool.rs`）：六状态轮换状态机（active / quota-out / cooldown / invalid / banned / disabled）+ 内存单例（`OnceLock` + Mutex，**锁内决策锁外 IO**，MutexGuard 不跨 await）+ 新存储文件 `autoclaw_intl_pool.json`（与凭据文件分离，事件驱动 debounce 2s atomic_write）+ events 环形 100 条。
+  - 选号 `acquire(lane)`：六重过滤（enabled ∧ active ∧ 冷却到期 ∧ token 剩余 >300s ∧ 今日预算未满 ∧ 单号/整池并发上限内）→ 策略选号（round-robin **默认** / random / least-used / sticky）→ 锁内记账返回 Lease。
+  - 回写 `release(lease, outcome)`：2xx 计数清连续失败；429/繁忙 → 指数退避冷却（60s×1.5^n，帽 15min）；810001 → quota-out（quotaResetHour 后自动复活）；410004 → banned 摘出轮换 + 水位不足 toast 告警。
+  - 入池对接：`add_account_v2` intl 分支解析 JWT exp/jti 写 `intlMeta` 附加字段（sourceEmail 幂等去重键），重复入池=更新令牌；国内条目零改动。
+- **M2 网关接入**：`glm_proxy` / `glm_anthropic` **国际 lane** 选号从「pool_accounts 顺序过滤」改为 `PoolManager.acquire()/release()` **lease 模式**；非流式 body 读完 / SSE 流结束才 release；池空 → **503 + 池水位原因文案**（对齐 glmplan 空池语义）；401 → release(AuthExpired) 触发 TokenKeeper 续期，仍 401 才 failover。国内 lane 行为不变。
+- **M3 API + 续期 + watch 订阅**：9 个管理端点（`GET list/summary/events` + `POST policy/toggle/remove/probe/refresh/rotate`，本机免鉴权现状惯例）；**TokenKeeper** 续期 worker（15min 扫描 token 到期 <2h 者提前续 + 401 即时触发，续期回调按 region 路由国际网关 refresh 端点，**连续 3 次失败 → invalid 摘出**，复活=重新入池）；**watch 订阅**（60s 轮询 `autoclaw_watch` 探测结果，banned/invalid/quota **单向映射**进状态机——watch 不感知池存在，零侵入）。
+- **M4 前端**：新独立页 `/autoclaw-intl`（侧边栏「AutoClaw 国际池」+ 路由注册），五卡布局：池总览（健康度/策略/游标/今日用量预算条）、账号列表（徽标堆叠 + token 到期倒计时 <2h 橙色 + 探测/续期/停用/移除操作组）、轮换事件流、策略设置（热更新即时生效）、接入信息（base_url/模型清单/调用示例，`/access` 未上线时回落 glm-proxy 配置端点）；10s 轮询 + focus 重拉。
+
+**测试**：`cargo test -p wb-switch-core autoclaw_intl` → **26 passed, 0 failed**（覆盖：四策略选号/六重过滤/整池并发上限/冷却退避帽 15min/quota 复活/banned 摘除与水位通知/token 过滤与续期扫描/3 次失败转 invalid 且成功复活/lease 记账与双释放/跨零点计数重置/策略热更新校验/幂等入池更新令牌/HTTP 错误族映射/落盘 inFlight 清零/debounce 合并写/401 触发续期回调/watch 三类映射与 ok 复活）。
+
+**遗留与待实测**：intl refresh 端点海外行为是否与国内同构、新号虚拟 device_id 全链路等契约 §7 假设清单**沿用文档**，按「不得臆测」原则留待首号实测后回写契约。
+
+---
+
 ## 1.0.63 — 2026-10-07
 
 ### 修复：MiniMax 跨账号数据污染 —— auth_key 是**客户端级**标识（三账号同键），现读借到当前登录号的 token；签到累计分重复累加虚涨

@@ -400,25 +400,50 @@ fn hidden_by_local_login_with(account: &Value, local_discovery: Option<String>) 
 /// 已存在同 uid 账号时返回该账号（幂等），并补记 localDiscoveryId。
 pub async fn import_local() -> Result<Value, String> {
     let token = read_autoclaw_token().map_err(|e| format!("本机 AutoClaw 登录态不可用: {e}"))?;
-    let auth_path = crate::modules::platform_checkin::autoclaw_data_dir()
+    let legacy = crate::modules::platform_checkin::autoclaw_data_dir()
         .ok_or_else(|| "无法定位 AutoClaw 数据目录".to_string())?
         .join("auth.json");
-    let text = std::fs::read_to_string(auth_path)
-        .and_then(|t| {
-            serde_json::from_str::<Value>(&t)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    // 旧布局解析（可能只剩 deviceId 空壳——新版 AutoClaw 清掉了 token 字段）：
+    // deviceId 仍有效（设备指纹没变），refresh 则按有无分别处理。
+    let (legacy_refresh, legacy_device_id) = std::fs::read_to_string(&legacy)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .map(|v| {
+            (
+                v.get("refreshToken")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from),
+                v.get("deviceId")
+                    .and_then(Value::as_str)
+                    .map(String::from),
+            )
         })
-        .map_err(|e| format!("读取 auth.json 失败: {e}"))?;
-    let refresh_enc = text
-        .get("refreshToken")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "auth.json 缺少 refreshToken".to_string())?;
-    let refresh_token = autoclaw_decrypt_token(refresh_enc)?;
-    let device_id = text
-        .get("deviceId")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
+        .unwrap_or((None, None));
+    // 旧布局：auth.json 的 enc refreshToken → 解密；新版布局：旧文件只剩
+    // deviceId 空壳（AutoClaw 更新后登录态迁到 account-credentials.enc），
+    // refresh 从 enc 明文 JSON 取——「auth.json 缺少 refreshToken」由此修复。
+    let refresh_token = match legacy_refresh {
+        Some(enc) if !enc.is_empty() => autoclaw_decrypt_token(&enc)?,
+        _ => {
+            #[cfg(target_os = "windows")]
+            {
+                let (_, refresh, _) =
+                    crate::modules::platform_checkin::autoclaw_official_credentials()
+                        .map_err(|e| format!("auth.json 缺少 refreshToken 且新版凭据不可用: {e}"))?;
+                if refresh.is_empty() {
+                    return Err("新版 AutoClaw 凭据里没有 refreshToken：请打开 AutoClaw 客户端确认登录后重试".to_string());
+                }
+                refresh
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                return Err("auth.json 缺少 refreshToken".to_string());
+            }
+        }
+    };
+    let refresh_token = refresh_token.trim_start_matches("Bearer ").to_string();
+    let device_id = legacy_device_id.unwrap_or_default();
 
     let (uid, phone) = profile_info_region(&token, &device_id, local_autoclaw_region())
         .await
@@ -488,6 +513,46 @@ pub async fn add_account(
     add_account_v2(label, access_token, refresh_token, device_id, None, AccountSource::ManualImport).await
 }
 
+/// 构造 intl 条目的 intlMeta 附加字段（契约 docs/autoclaw-intl-pool-contract.md §2.1）：
+/// - sourceEmail：JWT jti（注册邮箱，幂等去重键）；
+/// - tokenExpireAt：accessToken JWT exp（秒级）；
+/// - registeredVia：入池来源标记（OAuth 管线 = "oauth-pipeline"）；
+/// - deviceIsolated：该号是否独立虚拟 deviceId。默认 false（当前首号绑真
+///   设备 = 契约 §4 已知风险；是否虚拟化由注册管线掌握，M3 接入时补传）。
+///
+/// 国内条目不构造该对象（调用方按 region 判定），国内路径零改动。
+fn build_intl_meta(access_token: &str, source: AccountSource) -> Value {
+    json!({
+        "sourceEmail": jti_from_access_token(access_token).unwrap_or_default(),
+        "registeredVia": if source == AccountSource::OAuth { "oauth-pipeline" } else { source.as_str() },
+        "tokenExpireAt": jwt_exp_from_access_token(access_token),
+        "deviceIsolated": false,
+    })
+}
+
+/// intl 号入库成功后同步初始化轮换池状态（契约 §3.1：PoolState.accounts
+/// 初始化 state=active → events「join」）。国内条目直接跳过，零改动。
+fn join_intl_pool(account: &Value) {
+    let Some(id) = account.get("id").and_then(Value::as_str) else {
+        return;
+    };
+    if account.get("region").and_then(Value::as_str) != Some("international") {
+        return;
+    }
+    let source_email = account
+        .pointer("/intlMeta/sourceEmail")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let token_expire_at = account.pointer("/intlMeta/tokenExpireAt").and_then(Value::as_i64);
+    let device_isolated = account
+        .pointer("/intlMeta/deviceIsolated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    crate::modules::autoclaw_intl_pool::pool_manager()
+        .join(id, &source_email, token_expire_at, device_isolated);
+}
+
 /// 带区域和来源元数据的账号导入（region 传 None 时按身份自动归类）。
 pub async fn add_account_v2(
     label: Option<String>,
@@ -521,6 +586,10 @@ pub async fn add_account_v2(
         .or(phone)
         .unwrap_or_else(|| "导入账号".to_string());
 
+    // 契约 §2.1：intl 条目补 intlMeta；国内条目不写（零改动）。
+    let intl_meta = (region == AccountRegion::International)
+        .then(|| build_intl_meta(&access_token, source));
+
     let account = json!({
         "id": id,
         "label": display,
@@ -538,6 +607,17 @@ pub async fn add_account_v2(
     let _guard = WRITE_LOCK.lock().unwrap();
     let mut accounts = load_accounts();
     if let Some(existing) = find_account_mut(&mut accounts, &id) {
+        // intlMeta 字段级合并：重复入池=更新令牌（契约 §3.1），既有
+        // deviceIsolated/welcomePoints 等保留，其余键以本次为准。
+        if let Some(meta) = &intl_meta {
+            let mut merged = existing.get("intlMeta").cloned().unwrap_or(json!({}));
+            if let (Some(dst), Some(src)) = (merged.as_object_mut(), meta.as_object()) {
+                for (k, v) in src {
+                    dst.insert(k.clone(), v.clone());
+                }
+            }
+            existing["intlMeta"] = merged;
+        }
         for (key, value) in account.as_object().unwrap() {
             if key == "addedAt" {
                 continue;
@@ -546,10 +626,16 @@ pub async fn add_account_v2(
         }
         let snapshot = existing.clone();
         save_accounts(&accounts)?;
+        join_intl_pool(&snapshot);
         return Ok(snapshot);
+    }
+    let mut account = account;
+    if let Some(meta) = &intl_meta {
+        account["intlMeta"] = meta.clone();
     }
     accounts.push(account.clone());
     save_accounts(&accounts)?;
+    join_intl_pool(&account);
     Ok(account)
 }
 
@@ -579,6 +665,13 @@ fn update_stored_tokens(id: &str, access_token: &str, refresh_token: &str) -> Re
     account["updatedAt"] = json!(now_ms());
     account["status"] = json!("ok");
     account["lastError"] = Value::Null;
+    // intl 条目同步刷新 intlMeta.tokenExpireAt（契约 §2.1：随 accessToken
+    // JWT exp 更新，供轮换池的 token 到期过滤/续期扫描使用）。
+    if account.get("intlMeta").is_some() {
+        if let Some(exp) = jwt_exp_from_access_token(access_token) {
+            account["intlMeta"]["tokenExpireAt"] = json!(exp);
+        }
+    }
     save_accounts(&accounts)
 }
 

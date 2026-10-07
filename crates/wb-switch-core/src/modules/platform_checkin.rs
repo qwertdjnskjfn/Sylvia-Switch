@@ -917,6 +917,79 @@ fn imported_autoclaw_token(now: i64) -> Option<String> {
     (!token.is_empty()).then_some(token)
 }
 
+/// 新版 AutoClaw（2026-09 官方版）的凭据布局：
+/// `%APPDATA%\AutoClaw-official\accounts\<sha256>\account-credentials.enc`
+/// = `v10` + AES-256-GCM（nonce 12B 前置），明文 JSON 含 accessToken /
+/// refreshToken（均带 `Bearer ` 前缀）；密钥 = 同目录 `Local State` 的
+/// `os_crypt.encrypted_key`（DPAPI）。当前登录账号由
+/// `device\active-product-account.json` 的 `accountKey` 指向。
+///
+/// 旧布局（`autoclaw\auth.json` 顶层 token/refreshToken）自新版起被清空
+/// （只剩 deviceId/updatedAt）——这正是「auth.json 缺少 refreshToken」报错的来源。
+#[cfg(target_os = "windows")]
+pub(crate) fn autoclaw_official_credentials() -> Result<(String, String, String), String> {
+    let base = dirs::config_dir().ok_or_else(|| "无法定位 %APPDATA%".to_string())?;
+    let dir = base.join("AutoClaw-official");
+    // 当前活跃账号 key（缺省时取修改时间最新的账号目录——单账号安装等价）
+    let active_key = std::fs::read_to_string(dir.join("device").join("active-product-account.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| v.get("accountKey").and_then(Value::as_str).map(String::from));
+    let accounts_dir = dir.join("accounts");
+    let mut candidates: Vec<(String, std::time::SystemTime)> = std::fs::read_dir(&accounts_dir)
+        .map_err(|e| format!("读取 AutoClaw-official/accounts 失败: {e}"))?
+        .filter_map(|e| {
+            let Ok(entry) = e else { return None };
+            let p = entry.path();
+            if p.is_dir() {
+                let key = p.file_name()?.to_string_lossy().to_string();
+                let mtime = entry.metadata().ok()?.modified().ok()?;
+                Some((key, mtime))
+            } else {
+                None
+            }
+        })
+        .collect();
+    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+    if candidates.is_empty() {
+        return Err("AutoClaw-official/accounts 下没有账号目录（新版客户端尚未登录过）".to_string());
+    }
+    let chosen = match &active_key {
+        Some(k) if candidates.iter().any(|(key, _)| key == k) => k.clone(),
+        _ => candidates[0].0.clone(),
+    };
+    let enc = std::fs::read(accounts_dir.join(&chosen).join("account-credentials.enc"))
+        .map_err(|e| format!("读取 account-credentials.enc 失败: {e}"))?;
+    let key = autoclaw_encryption_key(&dir)?;
+    let plain = decrypt_windows_gcm_v10(&key, &enc)?;
+    let v: Value = serde_json::from_slice(&plain)
+        .map_err(|e| format!("account-credentials.enc 明文不是 JSON: {e}"))?;
+    let access = v
+        .get("accessToken")
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| "account-credentials.enc 缺少 accessToken".to_string())?;
+    let refresh = v
+        .get("refreshToken")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    Ok((access.to_string(), refresh.to_string(), chosen))
+}
+
+/// 新版凭据里 refresh 为空时的可操作报错（refresh 链路必需）。
+#[cfg(target_os = "windows")]
+fn autoclaw_official_import_pair() -> Result<(String, String), String> {
+    let (access, refresh, _key) = autoclaw_official_credentials()?;
+    if refresh.is_empty() {
+        return Err(
+            "新版 AutoClaw 的 account-credentials.enc 里没有 refreshToken（可能登录态由 \
+             访问令牌单发）——请打开 AutoClaw 客户端确认已登录，再重试导入"
+                .to_string(),
+        );
+    }
+    Ok((access, refresh))
+}
+
 pub(crate) fn read_autoclaw_token() -> Result<String, String> {
     // ① 旧位置优先（便宜）：`%APPDATA%\autoclaw\auth.json` 顶层的加密 token。
     if let Some(dir) = autoclaw_data_dir() {
@@ -934,15 +1007,20 @@ pub(crate) fn read_autoclaw_token() -> Result<String, String> {
             }
         }
     }
-    // ② 新位置：WorkBuddy 5.5.6+ 把登录态改成 `$wbEncrypted` 信封（密钥内置在
-    //    定制 Electron 原生模块里，静态不可提取），旧位置只剩 deviceId/updatedAt
-    //    空壳 → 复用 `auth_file` 的导入路径（内存提取），带缓存。
+    // ② 新版官方布局（2026-10 实测）：AutoClaw 更新后把登录态迁到
+    //    `AutoClaw-official\accounts\<hash>\account-credentials.enc`（AES-GCM），
+    //    旧 auth.json 只剩 deviceId/updatedAt 空壳。
+    #[cfg(target_os = "windows")]
+    if let Ok((access, _refresh, _)) = autoclaw_official_credentials() {
+        return Ok(access);
+    }
+    // ③ 兜底：WorkBuddy 5.5.6+ 的 $wbEncrypted 信封路径（内存提取，带缓存）。
     if let Some(token) = imported_autoclaw_token(crate::modules::config::now_ms()) {
         return Ok(token);
     }
-    Err("AutoClaw 登录态不可用：旧位置 %APPDATA%\\autoclaw\\auth.json 无 token\
-         （WorkBuddy 5.5.6+ 已改加密信封存储），从桌面端提取亦失败 —— \
-         请确认 WorkBuddy 已登录且正在运行"
+    Err("AutoClaw 登录态不可用：旧 auth.json 无 token 且新版 \
+         AutoClaw-official\\accounts\\*\\account-credentials.enc 读取失败 —— \
+         请确认 AutoClaw 客户端已登录"
         .to_string())
 }
 
