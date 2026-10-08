@@ -1,3 +1,26 @@
+## 1.0.69 — 2026-10-08
+
+### 修复：MiniMax（含**桌面端账号**）无法签到 —— 统一签到分发漏了 MiniMax 分支
+
+**现象**：页面显示 `MiniMax · 桌面端-小螺帽3968 / 未签到`，平台标注为 **`minimax` + 「未知签到平台」**。
+
+**根因**：`platform_checkin` 的三处平台分发中，`get_platform_status`（状态查询）**有** MiniMax 分支，
+但 **`checkin_platform_account`（执行签到）与 `get_platform_credits`（积分）都漏了** ⇒
+统一签到时 MiniMax 账号落到 `_ => 未知签到平台`；而 MiniMax 自己的 `spawn_signin_loop` 只在
+07:00–10:00 窗口跑、且不参与手动"一键签到" ⇒ **桌面端账号实际上从未被签到过**。
+
+**修复**
+- `checkin_platform_account` 补 `PLATFORM_MINIMAX` 分支 → `minimax::find_account(minimax_id_suffix)`
+  取池内 `MmAccount` → `minimax::signin_account`（该实现已处理桌面端 `source=desktop` **现读 auth.json**
+  取 token、以及幂等 `already`）；池内找不到时给出可操作报错
+- `get_platform_credits` 同步补 MiniMax 分支（`credits_remaining` → credit/details 余额）
+- 新增回归测试 `minimax_is_wired_into_checkin_and_credits_dispatch`：
+  源码级断言两处 dispatch 都必须包含 `PLATFORM_MINIMAX`，防再次漏接
+
+**测试**：`cargo test -p wb-switch-core minimax` → 26 passed
+
+---
+
 ## 1.0.68 — 2026-10-08
 
 ### 新增：签到「轮次汇总」落盘到签到日志（stdout 不可见 → 有据可查）

@@ -647,6 +647,19 @@ pub async fn checkin_platform_account(account: &Value) -> Value {
         }
         PLATFORM_CHATGLM => perform_chatglm_checkin(account).await,
         PLATFORM_MIAOSHOU => perform_miaoshou_checkin().await,
+        // MiniMax（含桌面端共享账号 source=desktop）：统一走 minimax 模块自身的签到实现——
+        // 它已处理「桌面端账号现读 auth.json 取 token」与幂等（already）。
+        // 2026-10-08 修复：此前**漏了这个分支**，MiniMax 账号落到 `_` ⇒ 报「未知签到平台」。
+        PLATFORM_MINIMAX => match crate::modules::minimax::find_account(minimax_id_suffix(account)) {
+            Some(acc) => crate::modules::minimax::signin_account(&acc).await,
+            None => json!({
+                "result": "error",
+                "error": format!(
+                    "MiniMax 账号池中找不到 {}，请重新从桌面端导入该账号",
+                    minimax_id_suffix(account)
+                ),
+            }),
+        },
         // DuMate：池账号走 dumate_accounts::account_checkin（幂等/判定/日志
         // 同款）；本机账号维持原路径。
         PLATFORM_DUMATE => match account.get("dumatePoolId").and_then(Value::as_str) {
@@ -3318,6 +3331,16 @@ pub async fn get_platform_credits(account: &Value) -> Value {
         }
         PLATFORM_CHATGLM => get_chatglm_credits(account).await,
         PLATFORM_MIAOSHOU => get_miaoshou_credits(account).await,
+        // MiniMax：与签到同一套账号定位（池内 MmAccount → credit/details 余额）
+        PLATFORM_MINIMAX => {
+            match crate::modules::minimax::find_account(minimax_id_suffix(account)) {
+                Some(acc) => match crate::modules::minimax::credits_remaining(&acc).await {
+                    Some(v) => json!({"ok": true, "balance": v}),
+                    None => json!({"ok": false, "error": "查询 MiniMax 积分失败"}),
+                },
+                None => json!({"ok": false, "error": "MiniMax 账号池中找不到该账号"}),
+            }
+        }
         // WorkBuddy：积分到期链路（新资源接口 + 旧接口回退），resources[]
         // 即积分包明细（unified 账号管理的「近期到期」展示来源）。
         PLATFORM_WORKBUDDY => crate::modules::credits::get_credit_expiry(account).await,
@@ -4126,5 +4149,35 @@ mod autoclaw_probe_candidate_tests {
         assert_eq!(account_platform(&json!({"id": "wb1"})), PLATFORM_WORKBUDDY);
         // 非 minimax 前缀的 id 走空后缀（find_account 找不到 → 可操作报错）
         assert_eq!(minimax_id_suffix(&json!({"id": "other:1"})), "");
+    }
+
+    #[test]
+    fn minimax_is_wired_into_checkin_and_credits_dispatch() {
+        // 回归防护：2026-10-08 之前 `checkin_platform_account` **漏了 MiniMax 分支**
+        // ⇒ MiniMax（含桌面端共享账号）统一签到直接返回「未知签到平台」。
+        let src = include_str!("platform_checkin.rs");
+        let checkin_arm = src
+            .split("async fn checkin_platform_account")
+            .nth(1)
+            .and_then(|seg| seg.split("未知签到平台").next())
+            .unwrap_or("");
+        assert!(
+            checkin_arm.contains("PLATFORM_MINIMAX"),
+            "checkin_platform_account 缺少 PLATFORM_MINIMAX 分支"
+        );
+        let credits_arm = src
+            .split("fn get_platform_credits")
+            .nth(1)
+            .and_then(|seg| seg.split("未知签到平台").next())
+            .unwrap_or("");
+        assert!(
+            credits_arm.contains("PLATFORM_MINIMAX"),
+            "get_platform_credits 缺少 PLATFORM_MINIMAX 分支"
+        );
+        assert_eq!(PLATFORM_MINIMAX, "minimax");
+        assert_eq!(
+            minimax_id_suffix(&json!({"id": "minimax:15b560248455"})),
+            "15b560248455"
+        );
     }
 }
