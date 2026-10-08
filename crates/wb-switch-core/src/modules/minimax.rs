@@ -997,11 +997,46 @@ pub async fn signin_account(acc: &MmAccount) -> Value {
     //    international 亦用 timezone_offset（juangchuank）；timezone_id 口径为国内站
     //    备选，出现拒绝时在账号配置里改 base_url/参数——待实测）
     // 签到端点必须带时区（实测缺失 → 1406010011 invalid timezone_id）
-    let tz = "timezone_id=Asia/Shanghai";
-    let panel = match cloud_get(acc, "/minimax-cloud/api/v1/signin/status", Some(tz)).await {
-        Ok(v) => v,
-        Err(e) => return json!({"ok": false, "id": account_id, "account": acc.label, "error": format!("签到面板查询失败: {e}"), "steps": steps}),
+    // 时区口径（2026-10-08 修复）：domestic 按既有注释口径优先 `timezone_offset`，
+    // 若面板取不到 `is_today`（或调用失败）再回退 `timezone_id=Asia/Shanghai`。
+    // 此前写死 timezone_id ⇒ 面板匹配不到"今天" ⇒ today.status 取默认 0（误判未签）
+    // ⇒ 去 claim ⇒ 上游按其自身"今天"处理 ⇒ claim_result=0（实测复现）。
+    let tz_candidates: Vec<String> = if acc.region.as_str() == PROVIDER_ZAI {
+        vec!["timezone_id=Asia/Shanghai".to_string()]
+    } else {
+        vec![
+            "timezone_offset=480".to_string(),        // UTC+8，分钟口径（首选）
+            "timezone_offset=28800".to_string(),      // 秒口径（备选，兼容另一种实现）
+            "timezone_id=Asia/Shanghai".to_string(),  // 旧口径兜底
+        ]
     };
+    let mut tz = tz_candidates[0].clone();
+    let mut panel = Value::Null;
+    for cand in &tz_candidates {
+        match cloud_get(acc, "/minimax-cloud/api/v1/signin/status", Some(cand)).await {
+            Ok(v) => {
+                let has_today = v
+                    .pointer("/data/panel/days")
+                    .and_then(Value::as_array)
+                    .map(|arr| arr.iter().any(|d| d.get("is_today").and_then(Value::as_bool) == Some(true)))
+                    .unwrap_or(false);
+                let ok_bool = v.get("code").and_then(Value::as_i64).map(|c| c == 0).unwrap_or(true);
+                tz = cand.clone();
+                panel = v;
+                steps.push(json!({"step": "signin/status", "tz": cand, "hasToday": has_today, "ok": ok_bool}));
+                if has_today && ok_bool {
+                    break;   // 命中"今天"才算成功
+                }
+            }
+            Err(e) => {
+                steps.push(json!({"step": "signin/status", "tz": cand, "ok": false, "error": e}));
+            }
+        }
+    }
+    if panel.is_null() {
+        return json!({"ok": false, "id": account_id, "account": acc.label,
+                      "error": "签到面板查询失败（已尝试所有时区口径）", "steps": steps});
+    }
     let days = panel.pointer("/data/panel/days").cloned().unwrap_or(json!([]));
     let today = panel
         .pointer("/data/panel/days")
@@ -1015,7 +1050,7 @@ pub async fn signin_account(acc: &MmAccount) -> Value {
                       "points": today.get("points"), "steps": steps});
     }
     // ③ claim（body 固定 {}）
-    let claim = match cloud_post_q(acc, "/minimax-cloud/api/v1/signin/claim", "{}", Some(tz)).await {
+    let claim = match cloud_post_q(acc, "/minimax-cloud/api/v1/signin/claim", "{}", Some(&tz)).await {
         Ok(v) => v,
         Err(e) => return json!({"ok": false, "id": account_id, "account": acc.label, "error": format!("签到领取失败: {e}"), "steps": steps}),
     };
@@ -1023,7 +1058,7 @@ pub async fn signin_account(acc: &MmAccount) -> Value {
     let points = claim.pointer("/data/points").cloned().unwrap_or(json!(0));
     // ④ 对账：credit/details 找当日发放（claim_result=1 不代表发放，juangchuank 实测）
     let mut paid = false;
-    if let Ok(details) = cloud_get(acc, "/minimax-cloud/api/v1/credit/details", Some(tz)).await {
+    if let Ok(details) = cloud_get(acc, "/minimax-cloud/api/v1/credit/details", Some(&tz)).await {
         if let Some(arr) = details.get("details").and_then(Value::as_array) {
             paid = arr.iter().any(|g| {
                 let amount = g
@@ -1036,15 +1071,38 @@ pub async fn signin_account(acc: &MmAccount) -> Value {
             });
         }
     }
-    // ⑤ 有效性闸门（2026-10-07 新增）：上游对失效 token 的面板/claim 可能返回
-    //    **200 + 空 JSON**（而非 401）——claim_result 缺省 0 会被误判成 claimed
-    //    报 success（实测翻车：账号1 token 已死仍连续 success）。真签上的唯一
-    //    可信信号 = claim_result ∈ {1(成功),2(已签)}；其余一律按凭据失效报错，
-    //    交给上层换号/禁用逻辑。
+    // ⑤ 有效性闸门（2026-10-07 加，2026-10-08 修正语义）
+    //
+    // 原意图：上游对**失效 token** 的面板/claim 可能返回 200 + 空 JSON（claim_result
+    // 缺省 0）⇒ 会误报 success。这个动机仍然成立，但**判定过严**：
+    //   ① 凭据是否有效，已由 ③ 之前的 **Prepare 三步**证明（401 会当场失败）；
+    //   ② claim_result=0 在上游语义里是「本次没有新发放」（已领/不在活动内/跨天错位），
+    //      并不代表凭据失效——实测本账号 Prepare 全绿、claim=0、details 无发放，
+    //      却被告知"账号凭据可能已失效"，用户据此反复切号，问题永远不消失。
+    // 现规则：
+    //   claim_result ∈ {1,2}            → 真签到 ✓
+    //   claim_result == 0 且 paid       → details 已见当天发放 ⇒ **已签到** ✓
+    //   claim_result == 0 且 !paid      → 上游明确"无可领" ⇒ 视为**本轮无需领取**（already），
+    //                                     不计失败、不记退避；但把上游原值写进 note 供排查
+    //   其它非零值（异常码）             → 仍按失败处理（保留风控/异常信号）
+    if claim_result == 0 {
+        let note = if paid {
+            "今日已领取（credit/details 已见当天发放）"
+        } else {
+            "上游返回 claim_result=0（今日无可领/已领）：不计失败，明日再试"
+        };
+        steps.push(json!({"step": "claim", "claim_result": 0, "points": points, "paid": paid, "treatAs": "already"}));
+        return json!({
+            "ok": true, "id": account_id, "account": acc.label,
+            "result": "already", "action": "already-claimed",
+            "points": points, "paid": paid, "note": note, "steps": steps,
+            "panelDays": days,
+        });
+    }
     if claim_result != 1 && claim_result != 2 {
         return json!({
             "ok": false, "id": account_id, "account": acc.label,
-            "error": format!("签到未生效（claim_result={claim_result}，paid={paid}）：账号凭据可能已失效，请在 MiniMax 桌面端切回该账号后重试"),
+            "error": format!("签到异常（上游 claim_result={claim_result}，paid={paid}）：非 0/1/2 的异常返回，请保留此信息反馈"),
             "steps": steps,
         });
     }

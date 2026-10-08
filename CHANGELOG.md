@@ -1,3 +1,32 @@
+## 2.0.4 — 2026-10-08
+
+### 修复：MiniMax 签到「永远未签 + 误报凭据失效」（A 时区口径 + B claim=0 语义）
+
+**排查证据（实测）**：`POST /api/minimax/signin/run` 下 Prepare 三步
+（`/config`→`/agent`→`/channel/connections`）**全部 ok:true** ⇒ **凭据有效**，
+但报错文案却是「账号凭据可能已失效」✗；上游 `claim` 稳定返回 `claim_result=0`、details 无当天发放。
+
+**A. 时区口径（根因）**：`signin_account` 写死 `timezone_id=Asia/Shanghai`，而同文件注释明确写
+「domestic 走 `timezone_offset`」⇒ 口径不一致 ⇒ 面板匹配不到 `is_today` ⇒ `today.status` 取默认 0
+（误判"未签"）⇒ 去 claim ⇒ 上游按自身"今天"处理 ⇒ `claim_result=0`（**该链与全部观测自洽**）。
+**修复**：domestic 依次尝试 `timezone_offset=480`（分钟）→ `timezone_offset=28800`（秒）→
+`timezone_id=Asia/Shanghai`（旧口径兜底），**以"面板里出现 is_today"为准**命中即停；intl 维持 `timezone_id`。
+每次尝试写进 `steps[]`（含 tz/hasToday），便于排障；claim 与 details 复用命中的那个口径。
+
+**B. claim=0 语义修正**：原「有效性闸门」把 `claim_result ∉ {1,2}` 一律判"凭据失效"。
+但①凭据有效性已由 Prepare 证明（失效会 401 当场失败）；②`claim_result=0` 上游语义是
+「本次没有新发放」。现规则：
+- `∈ {1,2}` → 真签到 ✓
+- `== 0 且 paid` → **已签到**（details 已见当天发放）✓
+- `== 0 且 !paid` → 判 **already（本轮无需领取）**，**不计失败、不记退避**，上游原值写进 `note` ✓
+- 其它非 0 异常码 → 仍按失败（保留风控/异常信号）✓
+
+**效果**：2026-10-08 起该账号不再被永久记为"未签 + 失败"（此前 fail_streak=4 + 退避 ⇒ 越修越不动）。
+
+**测试**：`cargo test -p wb-switch-core minimax` → 27 passed
+
+---
+
 ## 2.0.3 — 2026-10-08
 
 ### 增强：积分巡检**写回余额**（MiniMax 落账号文件 + 全平台统一缓存）
