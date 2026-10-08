@@ -1,3 +1,26 @@
+## 2.0.2 — 2026-10-08
+
+### 新增：**统一积分巡检循环**（修复"部分账号积分没有及时监控"）
+
+**排查结论**：全项目**只有** `workbuddy_gateway::spawn_balance_patrol_loop()` 一个周期任务，
+且它**只刷 WorkBuddy/AutoClaw 池**账号（间隔 `balance_refresh_minutes`，当前 15 分钟）。
+MiniMax / Loomy / DuMate / 妙手 / TRAE / ChatGLM 等平台的积分**没有任何后台刷新**
+⇒ 只有打开对应页面时才按需拉 ⇒ 快照过期（实测：`loomy_accounts.json` 停更 **22 天**、
+`dumate_accounts.json` **7 天**、`credit_usage_snapshots.json` **84 分钟**）。
+
+**修复**：新增 `platform_checkin::credit_patrol_once()` + `spawn_credit_patrol_loop()`
+- 复用既有**统一入口** `get_platform_credits(account)`（按 platform 分发到各平台实现，
+  含今日刚补的 MiniMax 分支）⇒ 一次覆盖全部平台
+- 逐账号执行 + **单账号 30s 墙钟超时**（慢账号不拖死整轮）+ 账号间 200ms 间隔（与 balance patrol 同款）
+- 失败**不罚号不熔断**（巡逻失败≠账号故障），错误明细进 `errors[]`
+- 启动后延迟 90s 首跑，之后按 **`balance_refresh_minutes`**（复用同一旋钮，缺省 30）轮询
+- **每轮留痕**：println（stdout）+ 往签到日志写 `[积分巡检]` 条目（网关 stdout 不落盘，
+  页面/`GET /api/checkin/logs` 可直接确认"巡检跑过、结果如何"）
+
+**测试**：`cargo test -p wb-switch-core credit_patrol` → 1 passed（超时上限有界）
+
+---
+
 ## 2.0.1 — 2026-10-08
 
 ### 版本线切换：1.0.x → **2.x**（首个 2.x 版本为 2.0.1）

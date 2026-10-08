@@ -249,6 +249,9 @@ async fn serve(args: &[String]) {
     wb_switch_core::modules::minimax::spawn_signin_loop();
     // WorkBuddy 多账号网关：余额巡检循环（启动后 60s 首轮，之后每 balance_refresh_minutes 分钟；0 = 关闭）。
     wb_switch_core::modules::workbuddy_gateway::spawn_balance_patrol_loop();
+    // 2026-10-08：统一积分巡检（MiniMax/Loomy/DuMate/妙手/TRAE… 此前**无后台刷新**，
+    // 只有打开页面才按需拉 ⇒ 积分长期过期）。复用统一入口 get_platform_credits。
+    wb_switch_core::modules::platform_checkin::spawn_credit_patrol_loop();
     // 模型目录自动同步循环（契约 model-sync-contract.md §3.5：启动 5 分钟后首轮，
     // 之后每 intervalMinutes 分钟；0 = 关闭但循环空转，配置热更新每轮现读）。
     wb_switch_core::modules::model_sync::spawn_model_sync_loop();

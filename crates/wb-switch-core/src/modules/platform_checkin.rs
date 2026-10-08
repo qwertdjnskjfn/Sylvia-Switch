@@ -332,6 +332,115 @@ pub fn all_checkin_accounts() -> Vec<Value> {
     accounts
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// 统一积分巡检（2026-10-08）
+//
+// 现状：全项目**只有** `workbuddy_gateway::spawn_balance_patrol_loop()` 一个周期任务，
+// 且它只刷 **WorkBuddy/AutoClaw 池**账号；MiniMax / Loomy / DuMate / 妙手 / TRAE 等
+// 平台的积分**没有后台刷新**，只有打开对应页面时才按需拉 ⇒ 用户看到"积分没有及时监控"。
+// 这里复用既有统一入口 `get_platform_credits()`（它已按 platform 分发到各平台实现），
+// 以与 `balance_patrol_once` 相同的范式做周期巡检：**逐账号 + 单账号超时 + 失败隔离**。
+// ─────────────────────────────────────────────────────────────────────
+
+/// 单账号积分查询的墙钟上限（与签到巡检同思路：慢账号不拖死整轮）。
+pub const CREDIT_PATROL_ACCOUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 巡检一轮：遍历统一账号清单，逐账号查询积分。**绝不因单账号失败中断**。
+pub async fn credit_patrol_once() -> Value {
+    let mut updated = 0i64;
+    let mut failed = 0i64;
+    let mut skipped = 0i64;
+    let mut errors: Vec<Value> = Vec::new();
+    let accounts = all_checkin_accounts();
+    for acc in &accounts {
+        // 国际版 WorkBuddy 无积分体系；unsupported 平台直接跳过（不刷屏）
+        let platform = account_platform(acc);
+        let label = acc
+            .get("email")
+            .or_else(|| acc.get("nickname"))
+            .and_then(Value::as_str)
+            .unwrap_or("?")
+            .to_string();
+        let res = match tokio::time::timeout(CREDIT_PATROL_ACCOUNT_TIMEOUT, get_platform_credits(acc)).await {
+            Ok(v) => v,
+            Err(_) => json!({"ok": false, "error": "查询超时（已跳过，不影响其它账号）"}),
+        };
+        let ok = res.get("ok").and_then(Value::as_bool).unwrap_or(false);
+        if ok {
+            updated += 1;
+        } else {
+            let err = res.get("error").and_then(Value::as_str).unwrap_or("");
+            if err.contains("未知签到平台") || platform == PLATFORM_WORKBUDDY && is_intl_workbuddy(acc) {
+                skipped += 1;
+            } else {
+                failed += 1;
+                errors.push(json!({"account": label, "platform": platform, "error": err}));
+            }
+        }
+        // 账号间留间隔，避免瞬时限流（与 balance patrol 同款）
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    json!({
+        "ok": true,
+        "checked": accounts.len(),
+        "updated": updated,
+        "failed": failed,
+        "skipped": skipped,
+        "errors": errors,
+        "ts": now_ms(),
+    })
+}
+
+/// 积分巡检常驻循环：启动后延迟 90s 首跑（避开启动高峰），之后按配置间隔轮询。
+///
+/// 间隔复用既有 `balance_refresh_minutes`（默认 15 分钟）——与 WorkBuddy 池余额刷新同一旋钮，
+/// 用户可在「WorkBuddy 页 → 池配置」一处调；缺失/非法时回落到 30 分钟。
+pub fn spawn_credit_patrol_loop() {
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+        loop {
+            let r = credit_patrol_once().await;
+            // 留痕：网关 stdout 不落盘（launcher 启动），因此汇总同时写进签到日志，页面可查。
+            let updated = r.get("updated").and_then(Value::as_i64).unwrap_or(0);
+            let failed = r.get("failed").and_then(Value::as_i64).unwrap_or(0);
+            let checked = r.get("checked").and_then(Value::as_i64).unwrap_or(0);
+            println!("[积分巡检] 本轮 {checked} 个账号：成功 {updated}，失败 {failed}");
+            {
+                // 每轮都留痕（成功也写）：网关 stdout 不落盘，页面/日志里必须能确认"巡检跑过"
+                let brief: Vec<String> = r
+                    .get("errors")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .take(6)
+                            .map(|e| {
+                                format!(
+                                    "{}（{}）",
+                                    e.get("account").and_then(Value::as_str).unwrap_or("?"),
+                                    e.get("error").and_then(Value::as_str).unwrap_or("")
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let detail = if brief.is_empty() { String::new() } else { format!("｜{}", brief.join("；")) };
+                crate::modules::config::add_checkin_log(&json!({
+                    "result": "round",
+                    "ts": now_ms(),
+                    "accountId": "__credit_patrol__",
+                    "email": "[积分巡检]",
+                    "error": format!("{checked} 个账号：成功 {updated}，失败 {failed}{detail}"),
+                }));
+            }
+            let minutes = {
+                let m = crate::modules::workbuddy_gateway::load_config().balance_refresh_minutes;
+                if (1..=24 * 60).contains(&m) { m as u64 } else { 30 }
+            };
+            tokio::time::sleep(std::time::Duration::from_secs((minutes as u64) * 60)).await;
+        }
+    });
+}
+
 /// 按 id 查找可签到账号（含平台账号）。
 pub fn find_checkin_account(account_id: &str) -> Option<Value> {
     if let Some(acc) = crate::modules::account::find_account(account_id) {
@@ -4149,6 +4258,12 @@ mod autoclaw_probe_candidate_tests {
         assert_eq!(account_platform(&json!({"id": "wb1"})), PLATFORM_WORKBUDDY);
         // 非 minimax 前缀的 id 走空后缀（find_account 找不到 → 可操作报错）
         assert_eq!(minimax_id_suffix(&json!({"id": "other:1"})), "");
+    }
+
+    #[test]
+    fn credit_patrol_constants_are_bounded() {
+        // 巡检必须有单账号上限，避免慢账号拖死整轮（与签到同思路）
+        assert!(CREDIT_PATROL_ACCOUNT_TIMEOUT <= std::time::Duration::from_secs(60));
     }
 
     #[test]
