@@ -1,3 +1,22 @@
+## 1.0.70 — 2026-10-08
+
+### 修复：桌面端 MiniMax 账号**重复堆积**导致签到 claim 必然不生效
+
+**现象**：池内 3 个「桌面端-xxx」账号共用**同一个 `auth_path` + 同一个 `auth_key`**；
+桌面端 `auth.json` 里**只有 1 条登录记录** ⇒ 它们是同一个登录态的三份重复条目
+⇒ 签到 `claim_result=0 / paid=false`，页面永远「未签到」。
+
+**根因**：`capture_from_desktop` 的身份去重**只在 `user_id` 非空时生效**
+（2026-10-04 为解决"老账号不见了"改成按 user_id 去重），而桌面端 auth.json 的 `user_id` 可能为空
+⇒ 每次捕获都 push 新条目，长期堆积。
+
+**修复**：`user_id` 为空时**退化为按 `(auth_path, auth_key)` 去重**（同一登录槽位只留一条，命中则更新令牌）；
+新增回归测试 `desktop_capture_dedupes_when_user_id_missing`；已清理用户池内 3 条重复（保留最新）。
+
+**测试**：`cargo test -p wb-switch-core minimax` → 27 passed
+
+---
+
 ## 1.0.69 — 2026-10-08
 
 ### 修复：MiniMax（含**桌面端账号**）无法签到 —— 统一签到分发漏了 MiniMax 分支

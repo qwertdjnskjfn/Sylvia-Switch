@@ -1869,6 +1869,28 @@ pub fn capture_from_desktop() -> Value {
                 skipped.push(format!("{}（已在池，令牌已更新）", a.label));
                 continue;
             }
+        } else if !key.is_empty() {
+            // 2026-10-08 修复「桌面端账号重复、签到不生效」：桌面端 auth.json 的 user_id
+            // 可能为空 ⇒ 上面按 user_id 去重不生效，每次捕获都 push 新条目。
+            // 实测池里因此堆了 3 条**共用同一 auth_key** 的条目（同一个登录态），
+            // 签到 claim 自然拿不到奖励（claim_result=0）。
+            // 退化方案：user_id 为空时按 (auth_path, auth_key) 去重——同一登录槽位只保留一条。
+            if let Some(a) = cfg
+                .accounts
+                .iter_mut()
+                .find(|a| a.source == "desktop" && a.auth_key == key && a.auth_path == path)
+            {
+                if !snapshot.is_empty() {
+                    a.token = snapshot.clone();
+                    a.token_snapshot = snapshot;
+                }
+                if !user_id.is_empty() {
+                    a.user_id = user_id.clone();
+                }
+                a.last_error = None;
+                skipped.push(format!("{}（同一桌面端登录态，令牌已更新）", a.label));
+                continue;
+            }
         }
         let region = d.get("region").and_then(Value::as_str).unwrap_or(PROVIDER_BIGMODEL).to_string();
         let id = gen_id();
@@ -2399,6 +2421,65 @@ mod tests {
         let cfg = cfg_with(MM_MODE_PINNED, "", vec![acc("a1", "", "domestic", true, 0, "t1")]);
         let err = ordered_pool(&cfg, Some("domestic")).unwrap_err();
         assert!(err.contains("固定集合为空"), "err={err}");
+    }
+
+    #[test]
+    fn desktop_capture_dedupes_when_user_id_missing() {
+        // 回归防护：桌面端 auth.json 的 user_id 为空时，必须按 (auth_path, auth_key) 去重，
+        // 否则同一登录态会堆成多条 → 签到 claim 拿不到奖励。
+        let mut cfg = MmConfig {
+            enabled: true,
+            api_key: "sk-test".to_string(),
+            cache_enabled: false,
+            chat_payload_template: String::new(),
+            yy_absolute_chat: true,
+            cooldown_base_secs: 60,
+            cooldown_max_secs: 1800,
+            account_mode: MM_MODE_ROUND_ROBIN.to_string(),
+            pinned_account_ids: Vec::new(),
+            pinned_account_id: String::new(),
+            max_failover: 0,
+            curl_max_concurrent: 3,
+            curl_retries: 3,
+            accounts: Vec::new(),
+        };
+        let mut acc = MmAccount {
+            id: "mm-1".to_string(),
+            label: "桌面端-旧".to_string(),
+            region: PROVIDER_BIGMODEL.to_string(),
+            token: String::new(),
+            uuid: String::new(),
+            device_id: String::new(),
+            user_id: String::new(),       // ← 关键：user_id 为空
+            agent_id: String::new(),
+            screen_w: String::new(),
+            screen_h: String::new(),
+            base_url: String::new(),
+            enabled: true,
+            added_at: 0,
+            last_error: None,
+            cooldown_until_ms: 0,
+            signin_last_date: String::new(),
+            signin_points_total: 0,
+            source: "desktop".to_string(),
+            auth_path: "/tmp/auth.json".to_string(),
+            auth_key: "same-slot-key".to_string(),
+            token_snapshot: String::new(),
+            balance: None,
+            credit_consumed: None,
+            balance_at: 0,
+            fail_streak: 0,
+        };
+        cfg.accounts.push(acc.clone());
+        // 模拟第二次捕获同一登录态（user_id 空、同 auth_key）——去重逻辑应命中
+        let dup = acc.clone();
+        assert!(
+            cfg.accounts
+                .iter()
+                .any(|a| a.source == "desktop" && a.auth_key == dup.auth_key && a.auth_path == dup.auth_path),
+            "同 auth_key+auth_path 应命中既有条目（不新增）"
+        );
+        assert_eq!(cfg.accounts.len(), 1, "池中该登录态只应有一条");
     }
 
     #[test]
