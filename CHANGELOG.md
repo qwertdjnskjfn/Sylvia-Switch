@@ -1,3 +1,28 @@
+## 2.0.5 — 2026-10-08
+
+### 修复（关键）：MiniMax 签到按**桌面端本体口径**对齐 —— 去掉多余时区参数 + 修正面板路径
+
+**证据来源**：从 `E://MiniMax Code\resources\app.asar` 抠出桌面端**真实实现**：
+```js
+getSigninPanel() → GET  /minimax-cloud/api/v1/signin/status      // 只传 {showToast:false}，**无任何时区参数**
+claimSignin()    → POST /minimax-cloud/api/v1/signin/claim  {}   // 同上
+成功判定 = base_resp.status_code === 0（不是 HTTP 码）
+claim 响应字段 = claim_id / claim_result / day_no / points / expire_at_ms
+另有 /signin/config（面板文案配置，未强制）
+```
+⇒ **此前我们多传了时区参数**（`timezone_id` / `timezone_offset`）⇒ 上游很可能因此返回**空面板**
+（实测三种口径 `hasToday` 全 false）✗
+
+**修复**
+- `signin/status` **首选不带参数**（桌面端口径）；仅当面板无"今天"时，才用 `timezone_id=Asia/Shanghai` 兜底再试
+- 面板 days 路径**兼容两种**：`/data/days`（桌面端）与 `/data/panel/days`（历史写法）
+- 成功判定增加 `base_resp.status_code == 0` 维度（与桌面端一致），并把每次尝试写进 `steps[]`
+- claim / credit/details 与 status 复用**同一口径**（空则不带参数）
+
+**测试**：编译通过；实测见交付说明。
+
+---
+
 ## 2.0.4 — 2026-10-08
 
 ### 修复：MiniMax 签到「永远未签 + 误报凭据失效」（A 时区口径 + B claim=0 语义）

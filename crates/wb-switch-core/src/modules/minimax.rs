@@ -997,47 +997,59 @@ pub async fn signin_account(acc: &MmAccount) -> Value {
     //    international 亦用 timezone_offset（juangchuank）；timezone_id 口径为国内站
     //    备选，出现拒绝时在账号配置里改 base_url/参数——待实测）
     // 签到端点必须带时区（实测缺失 → 1406010011 invalid timezone_id）
-    // 时区口径（2026-10-08 修复）：domestic 按既有注释口径优先 `timezone_offset`，
-    // 若面板取不到 `is_today`（或调用失败）再回退 `timezone_id=Asia/Shanghai`。
-    // 此前写死 timezone_id ⇒ 面板匹配不到"今天" ⇒ today.status 取默认 0（误判未签）
-    // ⇒ 去 claim ⇒ 上游按其自身"今天"处理 ⇒ claim_result=0（实测复现）。
-    let tz_candidates: Vec<String> = if acc.region.as_str() == PROVIDER_ZAI {
-        vec!["timezone_id=Asia/Shanghai".to_string()]
-    } else {
-        vec![
-            "timezone_offset=480".to_string(),        // UTC+8，分钟口径（首选）
-            "timezone_offset=28800".to_string(),      // 秒口径（备选，兼容另一种实现）
-            "timezone_id=Asia/Shanghai".to_string(),  // 旧口径兜底
-        ]
-    };
-    let mut tz = tz_candidates[0].clone();
+    // 时区口径（2026-10-08 二次修正，**依据桌面端本体实现**）：
+    // 从 `E:\MiniMax Code\resources\app.asar` 抠出的真实调用是——
+    //   GET  /minimax-cloud/api/v1/signin/status           ← **不带任何时区参数**
+    //   POST /minimax-cloud/api/v1/signin/claim  {}        ← 同样不带
+    //   （客户端只传 {showToast:false}；成功判定看 base_resp.status_code === 0）
+    // ⇒ 我们此前**多传时区参数**，上游很可能因此返回空面板（实测三种时区口径 hasToday 全 false）。
+    // 现口径：**首选不带参数**；仅当面板里没有"今天"时，才把 timezone_id 作为兜底候选再试一次。
+    let mut tz = String::new();                     // 空 = 不带参数（桌面端口径）
     let mut panel = Value::Null;
-    for cand in &tz_candidates {
-        match cloud_get(acc, "/minimax-cloud/api/v1/signin/status", Some(cand)).await {
+    let mut days = json!([]);
+    // 面板 days 位置兼容：桌面端为 /data/days；历史实现的写法是 /data/panel/days
+    fn extract_days(v: &Value) -> Value {
+        v.pointer("/data/days")
+            .or_else(|| v.pointer("/data/panel/days"))
+            .cloned()
+            .unwrap_or(json!([]))
+    }
+    fn day_is_today(v: &Value) -> bool {
+        extract_days(v)
+            .as_array()
+            .map(|arr| arr.iter().any(|d| d.get("is_today").and_then(Value::as_bool) == Some(true)))
+            .unwrap_or(false)
+    }
+    for cand in ["", "timezone_id=Asia/Shanghai"] {
+        let opt = if cand.is_empty() { None } else { Some(cand) };
+        match cloud_get(acc, "/minimax-cloud/api/v1/signin/status", opt).await {
             Ok(v) => {
-                let has_today = v
-                    .pointer("/data/panel/days")
-                    .and_then(Value::as_array)
-                    .map(|arr| arr.iter().any(|d| d.get("is_today").and_then(Value::as_bool) == Some(true)))
-                    .unwrap_or(false);
-                let ok_bool = v.get("code").and_then(Value::as_i64).map(|c| c == 0).unwrap_or(true);
-                tz = cand.clone();
-                panel = v;
-                steps.push(json!({"step": "signin/status", "tz": cand, "hasToday": has_today, "ok": ok_bool}));
-                if has_today && ok_bool {
-                    break;   // 命中"今天"才算成功
+                let ok_code = v
+                    .pointer("/base_resp/status_code")
+                    .and_then(Value::as_i64)
+                    .map(|c| c == 0)
+                    .unwrap_or(true);
+                let has_today = day_is_today(&v);
+                steps.push(json!({"step": "signin/status", "tz": if cand.is_empty() { "(无参数·桌面端口径)" } else { cand },
+                                  "hasToday": has_today, "baseRespOk": ok_code}));
+                if panel.is_null() {
+                    tz = cand.to_string();
+                    days = extract_days(&v);
+                    panel = v;
+                }
+                if has_today && ok_code {
+                    tz = cand.to_string();
+                    days = extract_days(&panel);
+                    break;
                 }
             }
-            Err(e) => {
-                steps.push(json!({"step": "signin/status", "tz": cand, "ok": false, "error": e}));
-            }
+            Err(e) => steps.push(json!({"step": "signin/status", "tz": if cand.is_empty() { "(无参数)" } else { cand }, "ok": false, "error": e})),
         }
     }
     if panel.is_null() {
         return json!({"ok": false, "id": account_id, "account": acc.label,
-                      "error": "签到面板查询失败（已尝试所有时区口径）", "steps": steps});
+                      "error": "签到面板查询失败（无参数与 timezone_id 两种口径均失败）", "steps": steps});
     }
-    let days = panel.pointer("/data/panel/days").cloned().unwrap_or(json!([]));
     let today = panel
         .pointer("/data/panel/days")
         .and_then(Value::as_array)
@@ -1050,7 +1062,7 @@ pub async fn signin_account(acc: &MmAccount) -> Value {
                       "points": today.get("points"), "steps": steps});
     }
     // ③ claim（body 固定 {}）
-    let claim = match cloud_post_q(acc, "/minimax-cloud/api/v1/signin/claim", "{}", Some(&tz)).await {
+    let claim = match cloud_post_q(acc, "/minimax-cloud/api/v1/signin/claim", "{}", if tz.is_empty() { None } else { Some(&tz) }).await {
         Ok(v) => v,
         Err(e) => return json!({"ok": false, "id": account_id, "account": acc.label, "error": format!("签到领取失败: {e}"), "steps": steps}),
     };
@@ -1058,7 +1070,7 @@ pub async fn signin_account(acc: &MmAccount) -> Value {
     let points = claim.pointer("/data/points").cloned().unwrap_or(json!(0));
     // ④ 对账：credit/details 找当日发放（claim_result=1 不代表发放，juangchuank 实测）
     let mut paid = false;
-    if let Ok(details) = cloud_get(acc, "/minimax-cloud/api/v1/credit/details", Some(&tz)).await {
+    if let Ok(details) = cloud_get(acc, "/minimax-cloud/api/v1/credit/details", if tz.is_empty() { None } else { Some(&tz) }).await {
         if let Some(arr) = details.get("details").and_then(Value::as_array) {
             paid = arr.iter().any(|g| {
                 let amount = g
