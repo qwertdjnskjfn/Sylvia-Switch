@@ -1030,8 +1030,11 @@ pub async fn signin_account(acc: &MmAccount) -> Value {
                     .map(|c| c == 0)
                     .unwrap_or(true);
                 let has_today = day_is_today(&v);
+                // 探针（2026-10-08）：把原始响应截断带出，便于确认面板真实结构。
+                // 网关 stdout 不落盘，而 steps[] 会随 /api/minimax/signin/run 直接回传，最快。
+                let raw: String = serde_json::to_string(&v).unwrap_or_default().chars().take(2000).collect();
                 steps.push(json!({"step": "signin/status", "tz": if cand.is_empty() { "(无参数·桌面端口径)" } else { cand },
-                                  "hasToday": has_today, "baseRespOk": ok_code}));
+                                  "hasToday": has_today, "baseRespOk": ok_code, "raw": raw}));
                 if panel.is_null() {
                     tz = cand.to_string();
                     days = extract_days(&v);
@@ -1066,6 +1069,8 @@ pub async fn signin_account(acc: &MmAccount) -> Value {
         Ok(v) => v,
         Err(e) => return json!({"ok": false, "id": account_id, "account": acc.label, "error": format!("签到领取失败: {e}"), "steps": steps}),
     };
+    let claim_raw: String = serde_json::to_string(&claim).unwrap_or_default().chars().take(1200).collect();
+    steps.push(json!({"step": "signin/claim.raw", "raw": claim_raw}));
     let claim_result = claim.pointer("/data/claim_result").and_then(Value::as_i64).unwrap_or(0);
     let points = claim.pointer("/data/points").cloned().unwrap_or(json!(0));
     // ④ 对账：credit/details 找当日发放（claim_result=1 不代表发放，juangchuank 实测）
