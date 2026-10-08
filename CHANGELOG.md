@@ -1,3 +1,56 @@
+## 1.0.68 — 2026-10-08
+
+### 新增：签到「轮次汇总」落盘到签到日志（stdout 不可见 → 有据可查）
+
+**背景**：网关由 launcher 启动，**stdout 不落盘** ⇒ 调度层即使打印了本轮摘要，排障时也看不到，
+"签到到底跑没跑、跑了什么"只能靠猜。现在每轮结束都会往 `auto_checkin_logs.json` 写两条：
+- `[轮次汇总]`：成功/已签/失败/退避跳过/需重登 的计数
+- `[需重新登录]`（有才写）：具体账号与错误原因
+页面与 `GET /api/checkin/logs` 均可直接查看 ✓
+
+---
+
+### 修复：手动「一键签到」绕过加固循环（退避/超时对手动路径无效）
+
+**根因**：`POST /api/checkin/all` → `checkin::run_checkin_all()` 是**独立的裸循环**，
+不走 `run_checkin_cycle` ⇒ 手动签到仍会**硬刷**退避中的账号（实测第 2 轮仍重试 4 个过期账号）。
+
+**修复**：抽出 `run_accounts_hardened()` 作为**逐账号执行的唯一实现**，
+`run_checkin_cycle`（自动调度）与 `run_checkin_all`（手动）**共用**；
+手动回执新增 `succeeded/already/failures/backoffSkipped/needRelogin` 便于确认结果。
+
+---
+
+## 1.0.66 — 2026-10-08
+
+### 修复：全局签到「越修越糟」—— 失败退避 / 需重新登录识别 / 单账号超时隔离 / 调度留痕
+
+**排查结论（实测 `~/.wb-switch/auto_checkin_logs.json`）**：调度**正常触发**（今日 59 条日志，
+12:30 仍在写），其中 `success 7 + already 14`（AutoClaw/DuMate/Loomy/ChatGLM 实为正常）、
+`unsupported 6`（妙手不支持签到，非失败）、`error 32`。真正失败集中于**登录态/凭据过期**：
+TRAE（登录态 09-27 过期）、AutoClaw ×1（续期失败）、MiniMax ×2（`claim_result=0`）。
+
+**四个工程缺陷（导致"过期账号被反复硬刷、且失败不可诊断"）**
+| # | 缺陷 | 修复 |
+| --- | --- | --- |
+| 1 | 失败账号**无退避/封顶**：实测单日被重试 **6 次**（每 5min 一轮） | per-account **指数退避** 5min→10→20→…封顶 6h（`retry_delay_ms`） |
+| 2 | 登录态过期类错误**当普通失败**无限重试 | `classify_checkin_error()` 分类；连续 2 次 Auth 失败 ⇒ `needsRelogin`，**当日停试** |
+| 3 | 单账号**无墙钟上限**（共享 client 30s × 串行 19 账号） | `ACCOUNT_CHECKIN_TIMEOUT=45s` 包裹每个账号，**超时只跳过该账号** |
+| 4 | 调度层 `let _ = run_checkin_cycle(...)` **丢弃结果** | 新增 `log_checkin_round()`：status/账号数/退避数/需重登数进 stdout |
+
+**新增能力**
+- 状态记录：`~/.wb-switch/checkin_retry_state.json`（per-account: attempts/kind/day/nextRetryAtMs/needsRelogin/lastError）；
+  成功或已签到**立即清零**（幂等）
+- 调度档位：剩余未完成账号若全在退避 ⇒ 切 30min 兜底档（`all_pending_accounts_backing_off`），不再 5min 硬刷全量
+- 通知：`checkin-need-relogin` 独立提示「登录态已失效，暂停今日重试」（沿用既有节流）
+- 顺带清理 `auto_checkin_logs.json.tmp-*` × 7（atomic_write 偶发失败残留，最早 09-18）
+
+**测试**：`cargo test -p wb-switch-core checkin` → **45 passed**（新增 4 个：Auth/Transient 分类、
+退避增长与封顶、`should_attempt` 退避+跨天重置+needsRelogin、超时上限有界）。
+**验证**：见交付说明（手动触发一轮签到 → 观察 `backoffSkipped` / `needRelogin` 与状态文件落盘）。
+
+---
+
 ## 1.0.65 — 2026-10-07
 
 ### 修复：MiniMax 死 token 被「假签到成功」——上游对失效凭据返 200 空 JSON，claim_result=0 误判 claimed；补有效性闸门

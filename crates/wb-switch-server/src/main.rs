@@ -21,19 +21,43 @@ fn default_port() -> u16 {
 }
 
 /// 后台任务：自动签到启动即核验、每 30 分钟补签。
+/// 把签到一轮的关键字段打进 stdout（2026-10-08）：
+/// 修复"调度层 `let _ =` 吞掉结果"——此前循环崩掉或全失败时，日志里看不到任何痕迹。
+fn log_checkin_round(mode: &str, summary: &serde_json::Value) {
+    let status = summary.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+    let accounts = summary.get("accounts").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+    let backoff = summary.get("backoffSkipped").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+    let relogin = summary.get("needRelogin").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+    println!(
+        "[签到] {mode} 轮次结束: status={status} 账号={accounts} 退避跳过={backoff} 需重新登录={relogin}"
+    );
+    for item in summary.get("needRelogin").and_then(|v| v.as_array()).into_iter().flatten() {
+        if let Some(s) = item.as_str() {
+            println!("[签到]   ⚠ 需重新登录: {s}");
+        }
+    }
+}
+
 fn spawn_background_loops() {
     tokio::spawn(async move {
         if let Err(error) = config::compact_checkin_logs() {
             eprintln!("[签到] 历史日志整理失败: {error}");
         }
-        let _ = checkin::run_checkin_cycle(checkin::CheckinCycleMode::StartupVerify).await;
+        // 2026-10-08：不再 `let _ =` 丢弃本轮结果 —— 签到失效时必须留痕（stdout 日志）。
+        {
+            let summary = checkin::run_checkin_cycle(checkin::CheckinCycleMode::StartupVerify).await;
+            log_checkin_round("StartupVerify", &summary);
+        }
 
         let mut last_date = checkin::current_local_date();
         loop {
             // 计算距离下一个零点（00:00:05）的时长
             let midnight_dur = checkin::duration_until_next_midnight();
             // 常规巡检间隔：当天有未签到账号时 5 分钟积极重试，全部已签到时 30 分钟兜底巡检
-            let all_done = checkin::all_accounts_checked_in_today();
+            // 2026-10-08：若剩余未完成账号全部处于退避/待重新登录，也切到 30min 兜底档，
+            // 避免"几个号登录态过期"导致每 5 分钟重刷全部账号。
+            let all_done = checkin::all_accounts_checked_in_today()
+                || checkin::all_pending_accounts_backing_off();
             let check_interval = if all_done {
                 checkin::CHECKIN_RECOVERY_INTERVAL
             } else {
@@ -61,7 +85,8 @@ fn spawn_background_loops() {
                 println!("[签到] 跨天唤醒，立即执行新一天全账号自动签到");
             }
 
-            let _ = checkin::run_checkin_cycle(checkin::CheckinCycleMode::PeriodicRecovery).await;
+            let summary = checkin::run_checkin_cycle(checkin::CheckinCycleMode::PeriodicRecovery).await;
+            log_checkin_round("PeriodicRecovery", &summary);
         }
     });
 
@@ -197,6 +222,29 @@ async fn serve(args: &[String]) {
     // v1.5.0：账号池健康体检循环（默认每 2 小时轮转 1 个账号，策略可调）。
     wb_switch_core::modules::grok_pool::spawn_health_check_loop();
     wb_switch_core::modules::autoclaw_watch::spawn_watch_loop();
+    // 国际号轮换池（契约 docs/autoclaw-intl-pool-contract.md §3.4/§3.7）：
+    // TokenKeeper 续期循环（15min 扫描 + 401 即时触发，续期回调复用
+    // refresh_stored_account 按 region 路由国际网关）+ watch 订阅
+    // （60s 读探测结果，把 intl 号 banned/invalid/quota 单向映射进状态机）。
+    {
+        use wb_switch_core::modules::autoclaw_intl_pool;
+        let manager = autoclaw_intl_pool::pool_manager();
+        manager.install_default_refresh_callback();
+        // 启动对账（契约 §3.1 幂等入池的服务端兜底）：凭据里有 intl 条目但池
+        // 状态缺失（池文件被清/首次部署）时自动 join 重建，避免 list 全落
+        // "missing" 自愈视图。
+        let intl_creds: Vec<serde_json::Value> =
+            wb_switch_core::modules::autoclaw_accounts::load_accounts()
+                .into_iter()
+                .filter(|a| a.get("region").and_then(serde_json::Value::as_str) == Some("international"))
+                .collect();
+        let rejoined = manager.reconcile_from_credentials(&intl_creds);
+        if rejoined > 0 {
+            eprintln!("[intl-pool] 启动对账：从凭据重建 {rejoined} 个国际号池条目");
+        }
+        manager.spawn_token_keeper();
+        autoclaw_intl_pool::PoolManager::spawn_watch_subscriber();
+    }
     wb_switch_core::modules::zcode::spawn_auto_switch_loop();
     wb_switch_core::modules::minimax::spawn_signin_loop();
     // WorkBuddy 多账号网关：余额巡检循环（启动后 60s 首轮，之后每 balance_refresh_minutes 分钟；0 = 关闭）。

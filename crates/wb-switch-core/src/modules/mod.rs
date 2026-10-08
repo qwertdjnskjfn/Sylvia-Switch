@@ -2,6 +2,7 @@ pub mod account;
 pub mod account_protection;
 pub mod auth_file;
 pub mod autoclaw_accounts;
+pub mod autoclaw_intl_pool;
 pub mod autoclaw_watch;
 pub mod checkin;
 pub mod channel_health;

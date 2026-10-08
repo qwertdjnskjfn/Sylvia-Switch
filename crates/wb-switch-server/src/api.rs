@@ -136,6 +136,17 @@ pub fn router() -> Router {
         .route("/minimax/v1/chat/completions", post(api_minimax_chat))
         .route("/api/autoclaw/watch", get(api_autoclaw_watch_state))
         .route("/api/autoclaw/watch/probe", post(api_autoclaw_watch_probe))
+        // ── AutoClaw 国际号轮换池（契约 docs/autoclaw-intl-pool-contract.md §3.6；
+        //    管理面本机免鉴权与现状惯例一致，服务仅绑 127.0.0.1）──
+        .route("/api/autoclaw/intl/list", get(api_autoclaw_intl_list))
+        .route("/api/autoclaw/intl/summary", get(api_autoclaw_intl_summary))
+        .route("/api/autoclaw/intl/events", get(api_autoclaw_intl_events))
+        .route("/api/autoclaw/intl/policy", post(api_autoclaw_intl_policy))
+        .route("/api/autoclaw/intl/toggle", post(api_autoclaw_intl_toggle))
+        .route("/api/autoclaw/intl/remove", post(api_autoclaw_intl_remove))
+        .route("/api/autoclaw/intl/probe", post(api_autoclaw_intl_probe))
+        .route("/api/autoclaw/intl/refresh", post(api_autoclaw_intl_refresh))
+        .route("/api/autoclaw/intl/rotate", post(api_autoclaw_intl_rotate))
         .route("/api/glmplan/status", get(api_glmplan_status))
         .route("/api/glmplan/test", post(api_glmplan_test))
         .route("/api/glmplan/config", post(api_glmplan_config_save))
@@ -1065,6 +1076,13 @@ fn glm_proxy_auth_ok(headers: &HeaderMap, cfg: &glm_proxy::GlmProxyConfig) -> bo
 }
 
 fn glm_proxy_error(e: String, code: StatusCode) -> Response {
+    // M2（契约 autoclaw-intl-pool-contract.md §3.2）：国际 lane 池空 →
+    // 503 + 池水位原因文案（与 glmplan 空池语义一致）；其余上游错误保持原状态。
+    let code = if e.starts_with(glm_proxy::INTL_POOL_EMPTY_PREFIX) {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        code
+    };
     // OpenAI 风格错误体，Hermes / OpenAI SDK 可直接解析。
     (
         code,
@@ -1161,6 +1179,9 @@ fn anthropic_error(e: String, code: StatusCode) -> Response {
 fn anthropic_error_status(message: &str) -> StatusCode {
     if message.contains("未知模型") || message.contains("messages 字段") || message.contains("role") {
         StatusCode::BAD_REQUEST
+    } else if message.starts_with(glm_proxy::INTL_POOL_EMPTY_PREFIX) {
+        // M2（契约 §3.2）：国际 lane 池空 → 503 + 池水位文案（对齐 glmplan）。
+        StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::BAD_GATEWAY
     }
@@ -8551,6 +8572,266 @@ async fn api_autoclaw_watch_state() -> Response {
 
 async fn api_autoclaw_watch_probe() -> Response {
     json_ok(autoclaw_watch::probe_now().await)
+}
+
+// ---------------------------------------------------------------------------
+// AutoClaw 国际号轮换池（契约 docs/autoclaw-intl-pool-contract.md §3.6）
+// ---------------------------------------------------------------------------
+
+use wb_switch_core::modules::autoclaw_intl_pool;
+
+/// token 脱敏展示（契约 §3.6 list：脱敏 token；沿用 glmplan_mask_key 风格）。
+fn intl_mask_token(token: &str) -> String {
+    let raw = token.trim_start_matches("Bearer ");
+    if raw.len() <= 10 {
+        "*".repeat(raw.len())
+    } else {
+        format!("{}...{}", &raw[..6], &raw[raw.len() - 4..])
+    }
+}
+
+/// list 的账号行 = 轮换池运行态（rows）∪ 凭据事实（autoclaw_accounts.json
+/// intl 条目：label/sourceEmail/refresh token 脱敏/积分等）。池条目缺失时
+/// 凭据行也能展示（如状态文件被删后的自愈视图）。
+async fn api_autoclaw_intl_list() -> Response {
+    let pool_rows = autoclaw_intl_pool::pool_manager().rows();
+    let credentials: Vec<Value> = autoclaw_accounts::load_accounts()
+        .into_iter()
+        .filter(|a| a.get("region").and_then(Value::as_str) == Some("international"))
+        .collect();
+    let mut rows: Vec<Value> = Vec::new();
+    for rt in &pool_rows {
+        let Some(id) = rt.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let cred = credentials
+            .iter()
+            .find(|a| a.get("id").and_then(Value::as_str) == Some(id))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let mut row = rt.clone();
+        // 本机登录中条目防护标注（remove 端点据此拒绝；hidden_by_local_login
+        // 与本机实时账号同身份 = 桌面端当前登录）。
+        let is_local_login = cred
+            .get("localDiscoveryId")
+            .and_then(Value::as_str)
+            .zip(autoclaw_accounts::local_discovery_id())
+            .is_some_and(|(marked, local)| marked == local)
+            || id == "autoclaw:local";
+        row["label"] = cred.get("label").cloned().unwrap_or(Value::Null);
+        row["sourceEmail"] = cred
+            .pointer("/intlMeta/sourceEmail")
+            .cloned()
+            .unwrap_or(Value::Null);
+        row["deviceIsolated"] = cred
+            .pointer("/intlMeta/deviceIsolated")
+            .cloned()
+            .unwrap_or(json!(false));
+        row["registeredVia"] = cred
+            .pointer("/intlMeta/registeredVia")
+            .cloned()
+            .unwrap_or(Value::Null);
+        row["isLocalLogin"] = json!(is_local_login);
+        row["isCooling"] = json!(autoclaw_accounts::find_stored(id)
+            .map(|_| account_protection::is_account_cooling(id))
+            .unwrap_or(false));
+        // 脱敏 token 预览（契约：token 不出本机，管理页只展示掩码）。
+        row["tokenMasked"] = json!(cred
+            .get("accessToken")
+            .and_then(Value::as_str)
+            .map(intl_mask_token)
+            .unwrap_or_default());
+        row["refreshTokenMasked"] = json!(cred
+            .get("refreshToken")
+            .and_then(Value::as_str)
+            .map(intl_mask_token)
+            .unwrap_or_default());
+        // watch 探测观测态（最近一轮分类，契约 §3.7 订阅来源）。
+        row["watchState"] = autoclaw_watch::watch_state()
+            .get("accounts")
+            .and_then(Value::as_array)
+            .and_then(|arr| {
+                arr.iter()
+                    .find(|e| e.get("id").and_then(Value::as_str) == Some(id))
+            })
+            .and_then(|e| e.get("state").cloned())
+            .unwrap_or(Value::Null);
+        rows.push(row);
+    }
+    // 凭据里有但池条目缺失的 intl 号（异常自愈视图，前端可提示重新入池）。
+    for cred in &credentials {
+        let Some(id) = cred.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if rows.iter().any(|r| r.get("id").and_then(Value::as_str) == Some(id)) {
+            continue;
+        }
+        rows.push(json!({
+            "id": id,
+            "label": cred.get("label").cloned().unwrap_or(Value::Null),
+            "enabled": false,
+            "state": "missing",
+            "inPool": false,
+            "tokenMasked": cred.get("accessToken").and_then(Value::as_str).map(intl_mask_token).unwrap_or_default(),
+            "refreshTokenMasked": cred.get("refreshToken").and_then(Value::as_str).map(intl_mask_token).unwrap_or_default(),
+            "sourceEmail": cred.pointer("/intlMeta/sourceEmail").cloned().unwrap_or(Value::Null),
+            "isLocalLogin": false,
+        }));
+    }
+    json_ok(json!({ "accounts": rows, "total": rows.len() }))
+}
+
+async fn api_autoclaw_intl_summary() -> Response {
+    let mgr = autoclaw_intl_pool::pool_manager();
+    json_ok(mgr.summary())
+}
+
+async fn api_autoclaw_intl_events() -> Response {
+    let limit = 100usize; // 环形上限（契约 §2.2 events 100 条）
+    json_ok(json!({ "events": autoclaw_intl_pool::pool_manager().events(limit) }))
+}
+
+async fn api_autoclaw_intl_policy(Json(body): Json<Value>) -> Response {
+    let mgr = autoclaw_intl_pool::pool_manager();
+    // 空体 = 仅读取当前策略。
+    if body.as_object().is_none_or(|o| o.is_empty()) {
+        return json_ok(json!({ "ok": true, "policy": mgr.policy_value() }));
+    }
+    match mgr.update_policy(&body) {
+        Ok(applied) => json_ok(json!({ "ok": true, "policy": applied })),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_autoclaw_intl_toggle(Json(body): Json<Value>) -> Response {
+    let Some(id) = body.get("id").and_then(Value::as_str) else {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let Some(enabled) = body.get("enabled").and_then(Value::as_bool) else {
+        return json_err("缺少 enabled（布尔）".to_string(), StatusCode::BAD_REQUEST);
+    };
+    if autoclaw_intl_pool::pool_manager().set_enabled(id, enabled) {
+        json_ok(json!({ "ok": true, "id": id, "enabled": enabled }))
+    } else {
+        json_err("轮换池中不存在该账号".to_string(), StatusCode::NOT_FOUND)
+    }
+}
+
+/// remove（契约 §3.6）：连轮换池 PoolState 条目一并清理（§3.5 purge）+
+/// 凭据文件条目删除。本机登录中条目沿用现有防护逻辑：与本机实时账号同身份
+/// （localDiscoveryId 匹配）的 intl 号拒绝移除——桌面端正在用它的登录态。
+async fn api_autoclaw_intl_remove(Json(body): Json<Value>) -> Response {
+    let Some(id) = body.get("id").and_then(Value::as_str) else {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    };
+    // 本机登录中防护：localDiscoveryId 匹配本机发现 ID，或 id 本身就是
+    // 本机实时登录条目（platform_checkin::is_local_login_account 口径）。
+    if let Ok(cred) = autoclaw_accounts::find_stored(id) {
+        let local = autoclaw_accounts::local_discovery_id();
+        let is_local = cred
+            .get("localDiscoveryId")
+            .and_then(Value::as_str)
+            .zip(local.clone())
+            .is_some_and(|(marked, local_id)| marked == local_id)
+            || platform_checkin::is_local_login_account(&json!({
+                "id": id, "platform": "autoclaw"
+            }));
+        if is_local {
+            return json_err(
+                "该账号正在本机客户端登录中，禁止移除（请先在桌面端退出登录）".to_string(),
+                StatusCode::CONFLICT,
+            );
+        }
+    }
+    // 1) 轮换池条目清理（§3.5 purge）。
+    let purged = autoclaw_intl_pool::pool_manager().purge(id);
+    // 2) 凭据条目删除（复用现有 remove_account；两处独立幂等）。
+    let cred_removed = autoclaw_accounts::remove_account(id);
+    if purged || cred_removed {
+        json_ok(json!({ "ok": true, "purged": purged, "credentialRemoved": cred_removed }))
+    } else {
+        json_err("账号不存在".to_string(), StatusCode::NOT_FOUND)
+    }
+}
+
+/// probe（契约 §3.6）：单号立即探测，复用 watch 探针（glm_proxy::probe_account_chat
+/// 最小 chat 请求），结果按 watch::classify 分类并回写 watch 状态文件。
+async fn api_autoclaw_intl_probe(Json(body): Json<Value>) -> Response {
+    let Some(id) = body.get("id").and_then(Value::as_str) else {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let Ok(cred) = autoclaw_accounts::find_stored(id) else {
+        return json_err("账号不存在".to_string(), StatusCode::NOT_FOUND);
+    };
+    let Some(token) = cred
+        .get("accessToken")
+        .or_else(|| cred.get("token"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    else {
+        return json_err("账号缺少 accessToken，无法探测".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let region = cred
+        .get("region")
+        .and_then(Value::as_str)
+        .unwrap_or("international");
+    let (status, resp_body) = glm_proxy::probe_account_chat(region, token).await;
+    let (state, code, detail) = autoclaw_watch::classify(status, &resp_body);
+    // 探测结果同步映射进轮换状态机（契约 §3.7 单向数据流，即时生效）。
+    let mapped = autoclaw_intl_pool::pool_manager()
+        .apply_watch_result(id, state, &code, &detail);
+    json_ok(json!({
+        "ok": true,
+        "id": id,
+        "httpStatus": status,
+        "state": state,
+        "code": code,
+        "detail": detail,
+        "mapped": mapped,
+    }))
+}
+
+/// refresh（契约 §3.6）：单号手动续期。复用 refresh_stored_account（按区域
+/// 路由 intl 网关；成功回写凭据 + intlMeta.tokenExpireAt），再同步轮换状态。
+async fn api_autoclaw_intl_refresh(Json(body): Json<Value>) -> Response {
+    let Some(id) = body.get("id").and_then(Value::as_str) else {
+        return json_err("缺少 id".to_string(), StatusCode::BAD_REQUEST);
+    };
+    match autoclaw_accounts::refresh_stored_account(id).await {
+        Ok(new_access) => {
+            let expire = autoclaw_accounts::jwt_exp_from_access_token(&new_access);
+            autoclaw_intl_pool::pool_manager().mark_refresh_success(id, expire);
+            json_ok(json!({ "ok": true, "id": id, "tokenExpireAt": expire }))
+        }
+        Err(e) => {
+            autoclaw_intl_pool::pool_manager().mark_refresh_failure(id, &e);
+            json_err(format!("续期失败：{e}"), StatusCode::BAD_GATEWAY)
+        }
+    }
+}
+
+/// rotate（契约 §3.6）：手动推进/重置游标。{action:"reset"} 归零；
+/// {action:"advance", steps:N} 推进 N 步（缺省 1）。
+async fn api_autoclaw_intl_rotate(Json(body): Json<Value>) -> Response {
+    let action = body.get("action").and_then(Value::as_str).unwrap_or("advance");
+    let mgr = autoclaw_intl_pool::pool_manager();
+    let result = match action {
+        "reset" => mgr.rotate_cursor(true, 0),
+        "advance" => {
+            let steps = body.get("steps").and_then(Value::as_u64).unwrap_or(1).max(1);
+            mgr.rotate_cursor(false, steps)
+        }
+        other => {
+            return json_err(
+                format!("未知 action: {other}（可选 reset / advance）"),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+    };
+    match result {
+        Some(offset) => json_ok(json!({ "ok": true, "action": action, "cursorOffset": offset })),
+        None => json_err("轮换池为空，无游标可推进".to_string(), StatusCode::CONFLICT),
+    }
 }
 
 async fn api_glmplan_status() -> Response {

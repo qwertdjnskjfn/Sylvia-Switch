@@ -25,6 +25,8 @@ import MiaoshouPage from "@/pages/MiaoshouPage";
 import DuMatePage from "@/pages/DuMatePage";
 // ZCode 账号池页图标（独立 import 行：纯新增，不动既有 import 条目）
 import ZcodePage from "@/pages/ZcodePage";
+// AutoClaw 国际池页（Globe 图标由 gateway-registry 自带；此处仅注册页面）
+import AutoclawIntlPage from "@/pages/AutoclawIntlPage";
 import OpencodePage from "@/pages/OpencodePage";
 import TraeWorkCnPage from "@/pages/TraeWorkCnPage";
 import WorkbuddyPage from "@/pages/WorkbuddyPage";
@@ -462,6 +464,7 @@ export default function App() {
             <Route path="/miaoshou" element={<MiaoshouPage />} />
             <Route path="/dumate" element={<DuMatePage />} />
             <Route path="/zcode" element={<ZcodePage />} />
+            <Route path="/autoclaw-intl" element={<AutoclawIntlPage />} />
             <Route path="/channel-health" element={<ChannelHealthPage />} />
             <Route path="/channel-health/:gatewayId" element={<ChannelHealthDetailPage />} />
             <Route path="/model-test" element={<ModelTestPage />} />

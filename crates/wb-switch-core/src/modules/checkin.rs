@@ -28,6 +28,123 @@ static CHECKIN_ACCOUNTS_RUNNING: OnceLock<Mutex<HashSet<String>>> = OnceLock::ne
 /// Automatic recovery cadence shared by every host.
 pub const CHECKIN_RECOVERY_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
+// ─────────────────────────────────────────────────────────────────────
+// 失败退避 /「需重新登录」状态（2026-10-08）
+//
+// 修复的现状：登录态过期的账号被当作普通失败，按 5min 节奏**无限重试**
+// （实测单日 6 次），徒增请求且可能招致风控；同时「为什么没签、何时再试」
+// 没有任何落盘记录。现引入 per-account 退避状态 + 错误分类。
+// ─────────────────────────────────────────────────────────────────────
+
+/// 退避状态文件名（与日志/配置同目录，`~/.wb-switch/`）。
+const RETRY_STATE_FILE: &str = "checkin_retry_state.json";
+
+/// 单账号签到的**整体墙钟上限**：超时即跳过该账号，不让单账号拖死整轮。
+pub const ACCOUNT_CHECKIN_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// 连续「登录态类」失败达到该次数 ⇒ 判定需人工重新登录，**当日不再自动重试**。
+pub const AUTH_GIVE_UP_ATTEMPTS: u32 = 2;
+
+/// 错误分类：登录态/凭据类重试无意义，必须人工介入。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CheckinErrorKind {
+    /// 登录态/凭据/令牌过期 —— 重试无用，需重新登录或重新导入 token
+    Auth,
+    /// 瞬时故障（网络/超时/5xx）—— 退避后可重试
+    Transient,
+}
+
+/// 按错误文案判定失败性质（**纯函数**）。
+pub fn classify_checkin_error(msg: &str) -> CheckinErrorKind {
+    let m = msg.to_lowercase();
+    const AUTH_HINTS: [&str; 12] = [
+        "登录态", "凭据", "过期", "未登录", "重新登录", "登录凭证", "token", "refresh",
+        "20403", "auth", "claim_result=0", "paid=false",
+    ];
+    if AUTH_HINTS.iter().any(|h| m.contains(h)) {
+        CheckinErrorKind::Auth
+    } else {
+        CheckinErrorKind::Transient
+    }
+}
+
+/// 指数退避时长（毫秒，**纯函数**）：5min → 10 → 20 → 40 …，封顶 6h；
+/// `Auth` 类直接给满 6h（当天基本不再打扰）。
+pub fn retry_delay_ms(attempts: u32, kind: CheckinErrorKind) -> u64 {
+    const BASE_MS: u64 = 5 * 60 * 1000;
+    const CAP_MS: u64 = 6 * 60 * 60 * 1000;
+    if kind == CheckinErrorKind::Auth {
+        return CAP_MS;
+    }
+    let shift = attempts.saturating_sub(1).min(7); // 5min×2^7 = 640min > 6h 上限 ⇒ 封顶可达
+    BASE_MS.saturating_mul(1u64 << shift).min(CAP_MS)
+}
+
+fn retry_state_path() -> std::path::PathBuf {
+    crate::modules::config::store_dir().join(RETRY_STATE_FILE)
+}
+
+/// 读退避状态（缺失/损坏时返回空对象，不阻断签到）。
+pub fn load_retry_state() -> Value {
+    let path = retry_state_path();
+    match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str::<Value>(&text).unwrap_or_else(|_| json!({})),
+        Err(_) => json!({}),
+    }
+}
+
+/// 写退避状态（沿用既有原子写）。
+pub fn save_retry_state(state: &Value) {
+    if let Some(obj) = state.as_object() {
+        if obj.is_empty() {
+            return;
+        }
+    }
+    let text = serde_json::to_string_pretty(state).unwrap_or_default();
+    if let Err(e) = crate::modules::config::atomic_write(&retry_state_path(), &text) {
+        eprintln!("[自动签到] 退避状态写入失败: {e}");
+    }
+}
+
+/// 取某账号的退避条目。
+pub fn retry_entry<'a>(state: &'a Value, account_id: &str) -> Option<&'a Value> {
+    state.get(account_id).filter(|v| v.is_object())
+}
+
+/// 是否允许此刻尝试该账号（**幂等核心**，纯函数）：
+/// - 无条目 ⇒ 允许
+/// - 当日 `needsRelogin` ⇒ 一律不再自动重试
+/// - 否则比较 `nextRetryAtMs`
+pub fn should_attempt(entry: Option<&Value>, now_ms: i64) -> bool {
+    let Some(e) = entry else { return true };
+    let same_day = e.get("day").and_then(Value::as_str).unwrap_or("") == current_local_date();
+    if same_day && e.get("needsRelogin").and_then(Value::as_bool) == Some(true) {
+        return false;
+    }
+    let next = e.get("nextRetryAtMs").and_then(Value::as_i64).unwrap_or(0);
+    now_ms >= next
+}
+
+/// 是否**所有未完成账号都处于退避/待重新登录** ⇒ 调度可放宽到 30min 兜底档，
+/// 避免"因为某几个号一直失败 → 每 5 分钟重刷全部账号"。
+pub fn all_pending_accounts_backing_off() -> bool {
+    let state = load_retry_state();
+    let today = current_local_date();
+    let now = now_ms() as i64;
+    let logs = load_checkin_logs();
+    let pending: Vec<Value> = all_checkin_accounts()
+        .into_iter()
+        .filter(|acc| !accounts_checked_in_today(std::slice::from_ref(acc), &logs, &today))
+        .collect();
+    if pending.is_empty() {
+        return true;
+    }
+    pending.iter().all(|acc| match acc.get("id").and_then(Value::as_str) {
+        Some(id) => !should_attempt(retry_entry(&state, id), now),
+        None => true,
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CheckinCycleMode {
     /// Always verify every account against the server after a host starts.
@@ -388,6 +505,142 @@ fn heal_missing_local_account(accounts: &mut Vec<Value>) -> bool {
 /// 执行一轮自动签到。启动与周期轮次均逐账号查询服务端状态。
 ///
 /// 并发锁防止与手动签到/上一轮重复运行。
+/// 一轮签到的聚合结果（供两条调用路径复用）。
+pub struct CheckinRoundOutcome {
+    pub results: Vec<Value>,
+    pub succeeded: usize,
+    pub already: usize,
+    pub failures: Vec<String>,
+    pub backing_off: Vec<String>,
+    pub need_relogin: Vec<String>,
+}
+
+/// 逐账号执行签到的**唯一实现**（2026-10-08）：
+/// ① 退避/需重新登录 ⇒ 跳过（幂等，不徒增请求）
+/// ② 每个账号套 `ACCOUNT_CHECKIN_TIMEOUT` 墙钟 ⇒ 单账号卡死不影响其余
+/// ③ 失败写退避状态（分类 + 指数退避 + Auth 类连续 2 次 ⇒ 当日停试）
+/// ④ 成功/已签到 ⇒ 立即清零退避状态
+async fn run_accounts_hardened(accounts: Vec<Value>) -> CheckinRoundOutcome {
+    let mut out = CheckinRoundOutcome {
+        results: Vec::with_capacity(accounts.len()),
+        succeeded: 0,
+        already: 0,
+        failures: Vec::new(),
+        backing_off: Vec::new(),
+        need_relogin: Vec::new(),
+    };
+    let mut retry_state = load_retry_state();
+    let today = current_local_date();
+    let now = now_ms() as i64;
+    for acc in accounts {
+        let name = account_display_name(&acc);
+        let aid = acc
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if !aid.is_empty() && !should_attempt(retry_entry(&retry_state, &aid), now) {
+            out.backing_off.push(name.clone());
+            out.results.push(json!({
+                "accountId": aid, "email": name, "result": "backoff", "error": Value::Null,
+            }));
+            continue;
+        }
+        let result = match tokio::time::timeout(ACCOUNT_CHECKIN_TIMEOUT, checkin_account(&acc)).await {
+            Ok(r) => r,
+            Err(_) => json!({
+                "result": "error",
+                "error": format!(
+                    "该账号签到超过 {}s 未返回，已跳过本轮（其余账号不受影响）",
+                    ACCOUNT_CHECKIN_TIMEOUT.as_secs()
+                ),
+            }),
+        };
+        let kind_of = result.get("result").and_then(Value::as_str).unwrap_or("");
+        match kind_of {
+            "success" => out.succeeded += 1,
+            "already" => out.already += 1,
+            _ => {}
+        }
+        if kind_of == "error" {
+            let err = result
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("未知错误")
+                .to_string();
+            out.failures.push(format!("{name}（{err}）"));
+            if !aid.is_empty() {
+                let kind = classify_checkin_error(&err);
+                let prev = retry_entry(&retry_state, &aid)
+                    .and_then(|e| e.get("attempts"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as u32;
+                let attempts = prev + 1;
+                let needs = kind == CheckinErrorKind::Auth && attempts >= AUTH_GIVE_UP_ATTEMPTS;
+                let entry = json!({
+                    "attempts": attempts,
+                    "kind": match kind { CheckinErrorKind::Auth => "auth", _ => "transient" },
+                    "day": today,
+                    "nextRetryAtMs": now + retry_delay_ms(attempts, kind) as i64,
+                    "needsRelogin": needs,
+                    "lastError": err,
+                    "updatedAtMs": now,
+                });
+                if let Some(obj) = retry_state.as_object_mut() {
+                    obj.insert(aid.clone(), entry);
+                }
+                if needs {
+                    out.need_relogin.push(format!("{name}（{err}）"));
+                }
+            }
+        } else if !aid.is_empty() {
+            if let Some(obj) = retry_state.as_object_mut() {
+                obj.remove(&aid);
+            }
+        }
+        out.results.push(json!({
+            "accountId": aid,
+            "email": name,
+            "result": result.get("result").cloned().unwrap_or(Value::Null),
+            "error": result.get("error").cloned().unwrap_or(Value::Null),
+        }));
+    }
+    save_retry_state(&retry_state);
+    out
+}
+
+/// 把一轮签到的**汇总**也写进签到日志（2026-10-08）。
+///
+/// 背景：网关由 launcher 启动，**stdout 不落盘** ⇒ 调度层的 `println!` 排障时看不见。
+/// 这里以一条 `result = "round"` 的汇总条目落进既有日志（页面 / `GET /api/checkin/logs` 可见），
+/// 避免"调度是否跑了、跑了什么"只能靠猜。
+pub fn log_checkin_round_summary(round: &CheckinRoundOutcome) {
+    let summary = format!(
+        "成功 {} · 已签 {} · 失败 {} · 退避跳过 {} · 需重新登录 {}",
+        round.succeeded,
+        round.already,
+        round.failures.len(),
+        round.backing_off.len(),
+        round.need_relogin.len()
+    );
+    add_checkin_log(&json!({
+        "result": "round",
+        "ts": now_ms(),
+        "accountId": "__round__",
+        "email": "[轮次汇总]",
+        "error": summary,
+    }));
+    if !round.need_relogin.is_empty() {
+        add_checkin_log(&json!({
+            "result": "round",
+            "ts": now_ms(),
+            "accountId": "__need_relogin__",
+            "email": "[需重新登录]",
+            "error": round.need_relogin.join("；"),
+        }));
+    }
+}
+
 pub async fn run_checkin_cycle(_mode: CheckinCycleMode) -> Value {
     let Some(_guard) = RunFlagGuard::try_acquire(&CHECKIN_RUNNING) else {
         return json!({"status": "skipped", "reason": "already_running"});
@@ -411,32 +664,18 @@ pub async fn run_checkin_cycle(_mode: CheckinCycleMode) -> Value {
         "healedLocalAccount": healed_local_account,
         "accounts": [],
     });
-    let mut failures: Vec<String> = Vec::new();
-    let mut succeeded = 0usize;
-    let mut already = 0usize;
-    for acc in accounts {
-        let result = checkin_account(&acc).await;
-        match result.get("result").and_then(Value::as_str) {
-            Some("success") => succeeded += 1,
-            Some("already") => already += 1,
-            _ => {}
-        }
-        if result.get("result").and_then(Value::as_str) == Some("error") {
-            failures.push(format!(
-                "{}（{}）",
-                account_display_name(&acc),
-                result
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .unwrap_or("未知错误")
-            ));
-        }
-        summary["accounts"].as_array_mut().unwrap().push(json!({
-            "email": account_display_name(&acc),
-            "result": result.get("result").cloned().unwrap_or(Value::Null),
-            "error": result.get("error").cloned().unwrap_or(Value::Null),
-        }));
+    let outcome = run_accounts_hardened(accounts).await;
+    log_checkin_round_summary(&outcome);
+    let failures = outcome.failures;
+    let succeeded = outcome.succeeded;
+    let already = outcome.already;
+    let backing_off = outcome.backing_off;
+    let need_relogin = outcome.need_relogin;
+    for r in outcome.results {
+        summary["accounts"].as_array_mut().unwrap().push(r);
     }
+    summary["backoffSkipped"] = json!(backing_off);
+    summary["needRelogin"] = json!(need_relogin);
     // 有账号签到失败时推送桌面通知（同类 10 分钟节流，避免刷屏）。
     if !failures.is_empty() {
         crate::modules::notify::notify(
@@ -445,8 +684,19 @@ pub async fn run_checkin_cycle(_mode: CheckinCycleMode) -> Value {
             &format!("{} 个账号签到失败：{}", failures.len(), failures.join("；")),
         );
     }
+    if !need_relogin.is_empty() {
+        crate::modules::notify::notify(
+            "checkin-need-relogin",
+            "签到需重新登录",
+            &format!(
+                "{} 个账号登录态/凭据已失效，已暂停今日自动重试：{}",
+                need_relogin.len(),
+                need_relogin.join("；")
+            ),
+        );
+    }
     eprintln!(
-        "[自动签到] 本轮 {} 个账号：成功 {}，已签 {}，失败 {}{}",
+        "[自动签到] 本轮 {} 个账号：成功 {}，已签 {}，失败 {}{}{}{}",
         total,
         succeeded,
         already,
@@ -455,6 +705,16 @@ pub async fn run_checkin_cycle(_mode: CheckinCycleMode) -> Value {
             "（已自动补导本机账号）"
         } else {
             ""
+        },
+        if backing_off.is_empty() {
+            String::new()
+        } else {
+            format!("，退避跳过 {}", backing_off.len())
+        },
+        if need_relogin.is_empty() {
+            String::new()
+        } else {
+            format!("，需重新登录 {}", need_relogin.len())
         }
     );
     summary
@@ -502,17 +762,18 @@ pub async fn run_checkin_all() -> Value {
     };
     let mut accounts = all_checkin_accounts();
     heal_missing_local_account(&mut accounts);
-    let mut results: Vec<Value> = Vec::new();
-    for acc in accounts {
-        let r = checkin_account(&acc).await;
-        results.push(json!({
-            "accountId": acc.get("id").cloned().unwrap_or(Value::Null),
-            "email": account_display_name(&acc),
-            "result": r.get("result").cloned().unwrap_or(Value::Null),
-            "error": r.get("error").cloned().unwrap_or(Value::Null),
-        }));
-    }
-    json!({"accounts": results})
+    // 2026-10-08：与自动调度**共用**同一加固循环（超时隔离 / 退避跳过 / 状态落盘 / 成功清零），
+    // 此前手动「一键签到」是裸循环 ⇒ 过期账号照样被反复硬刷。
+    let outcome = run_accounts_hardened(accounts).await;
+    log_checkin_round_summary(&outcome);
+    json!({
+        "accounts": outcome.results,
+        "succeeded": outcome.succeeded,
+        "already": outcome.already,
+        "failures": outcome.failures,
+        "backoffSkipped": outcome.backing_off,
+        "needRelogin": outcome.need_relogin,
+    })
 }
 
 #[cfg(test)]
@@ -606,5 +867,60 @@ mod tests {
         assert!(dur.as_secs() <= 86405);
         let cur_date = current_local_date();
         assert_eq!(cur_date.len(), 10);
+    }
+}
+
+#[cfg(test)]
+mod checkin_retry_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn classifies_auth_errors() {
+        for msg in [
+            "登录态续期失败：刷新暂时不可用（用户未登录，请重新登录）",
+            "DuMate 签到失败（HTTP 200）: {\"message\":{\"global\":\"登录凭证已过期，请重新登录\"}}",
+            "TRAE 刷新令牌已失效（code=20403），请打开 TRAE Work CN 重新登录",
+            "签到未生效（claim_result=0，paid=false）：账号凭据可能已失效",
+        ] {
+            assert_eq!(classify_checkin_error(msg), CheckinErrorKind::Auth, "msg={msg}");
+        }
+        for msg in ["connection reset by peer", "上游 502", "请求超时"] {
+            assert_eq!(classify_checkin_error(msg), CheckinErrorKind::Transient, "msg={msg}");
+        }
+    }
+
+    #[test]
+    fn backoff_grows_and_caps() {
+        let k = CheckinErrorKind::Transient;
+        assert_eq!(retry_delay_ms(1, k), 5 * 60_000);
+        assert_eq!(retry_delay_ms(2, k), 10 * 60_000);
+        assert_eq!(retry_delay_ms(3, k), 20 * 60_000);
+        assert_eq!(retry_delay_ms(99, k), 6 * 60 * 60_000, "封顶 6h");
+        // 登录态类直接满 6h（当天不再自动重试）
+        assert_eq!(retry_delay_ms(1, CheckinErrorKind::Auth), 6 * 60 * 60_000);
+    }
+
+    #[test]
+    fn should_attempt_respects_backoff_and_relogin_flag() {
+        let now = 1_000_000i64;
+        assert!(should_attempt(None, now), "无条目 ⇒ 允许");
+        // 未到重试时间 ⇒ 跳过
+        let e = json!({"day": current_local_date(), "attempts": 1, "nextRetryAtMs": now + 60_000, "needsRelogin": false});
+        assert!(!should_attempt(Some(&e), now));
+        // 到点 ⇒ 允许
+        assert!(should_attempt(Some(&e), now + 60_001));
+        // 当日 needsRelogin ⇒ 永不再试（即使已过重试时间）
+        let e2 = json!({"day": current_local_date(), "attempts": 2, "nextRetryAtMs": 0, "needsRelogin": true});
+        assert!(!should_attempt(Some(&e2), now + 86_400_000));
+        // 隔天 ⇒ needsRelogin 失效，恢复尝试（跨天新的一天重新开始）
+        let e3 = json!({"day": "2000-01-01", "attempts": 9, "nextRetryAtMs": 0, "needsRelogin": true});
+        assert!(should_attempt(Some(&e3), now));
+    }
+
+    #[test]
+    fn account_timeout_is_bounded() {
+        assert!(ACCOUNT_CHECKIN_TIMEOUT <= Duration::from_secs(60), "单账号必须有墙钟上限，防单点拖死整轮");
+        assert!(AUTH_GIVE_UP_ATTEMPTS >= 1);
     }
 }

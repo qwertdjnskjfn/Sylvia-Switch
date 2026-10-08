@@ -1585,3 +1585,89 @@ export interface ZcodeStatus {
   error?: string | null;
   message?: string | null;
 }
+
+// ---- AutoClaw 国际号轮换池（契约 docs/autoclaw-intl-pool-contract.md §2/§3.6；仅 webui 后端支持）----
+
+/** 轮换策略（契约 §2.2 policy.strategy，后端 Strategy::parse 兼容常见变体）。 */
+export type AutoclawIntlStrategy = 'round-robin' | 'random' | 'least-used' | 'sticky';
+
+/** 单号运行态（契约 §2.2 accounts.<id>；GET /list 行结构，脱敏由后端负责）。 */
+export interface AutoclawIntlAccountRow {
+  id: string;
+  /** 展示名（来源凭据 label；缺省后端回退 id） */
+  label?: string | null;
+  /** 注册邮箱（intlMeta.sourceEmail，幂等去重键） */
+  sourceEmail?: string | null;
+  enabled: boolean;
+  weight?: number;
+  /** active | quota-out | cooldown | invalid | banned | disabled */
+  state: string;
+  inFlight?: number;
+  todayCalls?: number;
+  totalCalls?: number;
+  consecutiveFails?: number;
+  /** 秒级 epoch；null = 无冷却 */
+  cooldownUntil?: number | null;
+  /** 距冷却结束的秒数（后端按 now 计算，页面直接用） */
+  cooldownRemainSecs?: number | null;
+  banCode?: string | number | null;
+  bannedAt?: number | null;
+  /** 秒级 epoch；null = 未知（无法解析 JWT exp） */
+  tokenExpireAt?: number | null;
+  /** 距 token 过期的秒数（后端按 now 计算） */
+  tokenTtlSecs?: number | null;
+  lastRefreshAt?: number | null;
+  refreshFails?: number;
+  lastUsedAt?: number | null;
+  lastError?: string | null;
+}
+
+/** 池总览（契约 §3.6 summary；字段与 autoclaw_intl_pool::PoolState::summary 对齐）。 */
+export interface AutoclawIntlSummary {
+  lane: string;
+  strategy: string;
+  cursorOffset: number;
+  total: number;
+  healthy: number;
+  cooldown: number;
+  quotaOut: number;
+  banned: number;
+  invalid: number;
+  disabled: number;
+  poolInFlight: number;
+  poolConcurrentCap: number;
+  perAccountDailyCap: number;
+  todayCalls: number;
+  minHealthy: number;
+  lowWater: boolean;
+  autoReplace: boolean;
+  rotations: number;
+  replacements: number;
+  refreshes: number;
+}
+
+/** 策略补丁（POST /policy body；与后端 update_policy 允许的字段一一对应）。 */
+export interface AutoclawIntlPolicy {
+  strategy?: AutoclawIntlStrategy;
+  perAccountRatePerMin?: number;
+  perAccountDailyCap?: number;
+  poolConcurrentCap?: number;
+  accountConcurrentCap?: number;
+  quotaResetHour?: number;
+  autoReplace?: boolean;
+  minHealthy?: number;
+}
+
+/** 轮换事件（契约 §2.2 events；kind: join|rotate|cooldown|ban|quota|refresh|replace|disable）。 */
+export interface AutoclawIntlEvent {
+  ts: number;
+  kind: string;
+  accountId: string;
+  detail: string;
+}
+
+/** 接入信息（GET /access；后端聚合 glm_proxy 国际目录 + 网关端点）。 */
+export interface AutoclawIntlAccess {
+  baseUrl: string;
+  models: { id: string; region?: string; contextWindow?: number | null }[];
+}

@@ -1046,6 +1046,9 @@ pub(crate) async fn pump_anthropic_stream(
             &prepared.route.body_model,
             prepared.skipped_multimodal,
         );
+        // SSE 流结束 = release（契约 autoclaw-intl-pool-contract.md §3.3）：
+        // 国际 lane 的成功 lease 在此回写 Ok（国内 lane / 池外路径为 None）。
+        super::glm_proxy::intl_release_ok(&prepared.intl_lease);
         let (credits, ledger_id) = prepared.measurement.finish().await;
         if transformer.ok() {
             super::glm_proxy::record_success(

@@ -75,6 +75,11 @@ import type {
   ZcodeStatus,
   ZcodeAccount,
   ZcodeQuota,
+  AutoclawIntlAccountRow,
+  AutoclawIntlSummary,
+  AutoclawIntlPolicy,
+  AutoclawIntlEvent,
+  AutoclawIntlAccess,
 } from "./types";
 import type { ChannelDetail, ChannelHealthOverview } from "@/lib/channel-health-types";
 import type { ModelTestRequest, ModelTestResult } from "@/lib/model-test-types";
@@ -359,6 +364,17 @@ update_zcode_account: { method: "POST", path: "/api/zcode/accounts/update" },
   chatgpt_registered: { method: "GET", path: "/api/chatgpt/registered" },
   chatgpt_accounts: { method: "GET", path: "/api/chatgpt/accounts" },
   chatgpt_accounts_sync: { method: "POST", path: "/api/chatgpt/accounts/sync" },
+  // AutoClaw 国际号轮换池（契约 docs/autoclaw-intl-pool-contract.md §3.6；仅 webui 后端支持）
+  get_autoclaw_intl_list: { method: "GET", path: "/api/autoclaw/intl/list" },
+  get_autoclaw_intl_summary: { method: "GET", path: "/api/autoclaw/intl/summary" },
+  save_autoclaw_intl_policy: { method: "POST", path: "/api/autoclaw/intl/policy" },
+  toggle_autoclaw_intl_account: { method: "POST", path: "/api/autoclaw/intl/toggle" },
+  remove_autoclaw_intl_account: { method: "POST", path: "/api/autoclaw/intl/remove" },
+  probe_autoclaw_intl_account: { method: "POST", path: "/api/autoclaw/intl/probe" },
+  refresh_autoclaw_intl_account: { method: "POST", path: "/api/autoclaw/intl/refresh" },
+  rotate_autoclaw_intl_cursor: { method: "POST", path: "/api/autoclaw/intl/rotate" },
+  get_autoclaw_intl_events: { method: "GET", path: "/api/autoclaw/intl/events" },
+  get_autoclaw_intl_access: { method: "GET", path: "/api/autoclaw/intl/access" },
 };
 
 function queryString(args?: Record<string, unknown>): string {
@@ -2229,4 +2245,74 @@ export function removeZcode(id: string): Promise<{ ok?: boolean; message?: strin
 /** POST /api/zcode/quota——实时额度（id 缺省 = live 当前登录态；多通道合并）。 */
 export function zcodeQuota(id?: string): Promise<ZcodeQuota> {
   return call("zcode_quota", id ? { id } : {});
+}
+
+// ---- AutoClaw 国际号轮换池（契约 docs/autoclaw-intl-pool-contract.md §3.6；仅 webui 后端支持）----
+// 说明：v1 为 webui-first（桌面壳无对应 Tauri command）；9 个契约端点 + 1 个接入信息
+// 端点。后端由并行会话实现（autoclaw_intl_pool.rs 模块已在 core 注册）；未上线期间
+// 页面把 404 归一为「后端未就绪」空态，不打扰（参照 ZcodePage 初次加载静默失败惯例）。
+
+/** GET /api/autoclaw/intl/list——账号行（脱敏 token + 状态 + 用量 + 到期倒计时）。 */
+export async function getAutoclawIntlList(): Promise<{ accounts: AutoclawIntlAccountRow[] }> {
+  const res = await call<{ accounts?: AutoclawIntlAccountRow[] }>("get_autoclaw_intl_list");
+  return { accounts: Array.isArray(res.accounts) ? res.accounts : [] };
+}
+
+/** GET /api/autoclaw/intl/summary——池总览（healthy/策略/游标/今日调用/水位）。 */
+export function getAutoclawIntlSummary(): Promise<AutoclawIntlSummary> {
+  return call("get_autoclaw_intl_summary");
+}
+
+/** POST /api/autoclaw/intl/policy——热更新策略（即时生效；返回更新后总策略）。 */
+export function saveAutoclawIntlPolicy(
+  patch: AutoclawIntlPolicy,
+): Promise<{ ok?: boolean; policy?: AutoclawIntlPolicy; error?: string }> {
+  return call("save_autoclaw_intl_policy", patch as unknown as Record<string, unknown>);
+}
+
+/** POST /api/autoclaw/intl/toggle——单号启用/停用。 */
+export function toggleAutoclawIntlAccount(
+  id: string,
+  enabled: boolean,
+): Promise<{ ok?: boolean; error?: string }> {
+  return call("toggle_autoclaw_intl_account", { id, enabled });
+}
+
+/** POST /api/autoclaw/intl/remove——移除（连 PoolState 清理；本机登录中条目后端沿用现有防护）。 */
+export function removeAutoclawIntlAccount(
+  id: string,
+): Promise<{ ok?: boolean; error?: string }> {
+  return call("remove_autoclaw_intl_account", { id });
+}
+
+/** POST /api/autoclaw/intl/probe——单号立即探测（复用 watch 探针）。 */
+export function probeAutoclawIntlAccount(
+  id: string,
+): Promise<{ ok?: boolean; state?: string; detail?: string; error?: string }> {
+  return call("probe_autoclaw_intl_account", { id });
+}
+
+/** POST /api/autoclaw/intl/refresh——单号手动续期。 */
+export function refreshAutoclawIntlAccount(
+  id: string,
+): Promise<{ ok?: boolean; tokenExpireAt?: number | null; error?: string }> {
+  return call("refresh_autoclaw_intl_account", { id });
+}
+
+/** POST /api/autoclaw/intl/rotate——手动推进/重置游标（reset=true 回 0）。 */
+export function rotateAutoclawIntlCursor(
+  reset = false,
+): Promise<{ ok?: boolean; cursorOffset?: number; error?: string }> {
+  return call("rotate_autoclaw_intl_cursor", reset ? { reset: true } : {});
+}
+
+/** GET /api/autoclaw/intl/events——轮换事件流（环形 100 条，页面取最近 50）。 */
+export async function getAutoclawIntlEvents(limit = 50): Promise<{ events: AutoclawIntlEvent[] }> {
+  const res = await call<{ events?: AutoclawIntlEvent[] }>("get_autoclaw_intl_events", { limit });
+  return { events: Array.isArray(res.events) ? res.events : [] };
+}
+
+/** GET /api/autoclaw/intl/access——接入信息（base_url + intl 模型清单）。 */
+export function getAutoclawIntlAccess(): Promise<AutoclawIntlAccess> {
+  return call("get_autoclaw_intl_access");
 }

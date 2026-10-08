@@ -56,6 +56,8 @@ export const GATEWAY_NAV_ENTRIES: GatewayNavEntry[] = [
   { id: "dumate", path: "/dumate", label: "DuMate（百度搭子）", icon: Bot },
   // ZCode 账号池：2026-10-02 新增渠道（契约 docs/zcode-channel-contract.md §3）
   { id: "zcode", path: "/zcode", label: "ZCode 账号", icon: Bot },
+  // AutoClaw 国际池：2026-10-07 新增渠道（契约 docs/autoclaw-intl-pool-contract.md §5）
+  { id: "autoclaw-intl", path: "/autoclaw-intl", label: "AutoClaw 国际池", icon: Globe },
 ];
 
 /** 分组里未登记、但后端总览已返回且路由可达时的兜底图标。 */

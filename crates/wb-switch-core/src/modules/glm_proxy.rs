@@ -18,7 +18,8 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 
 use crate::modules::config::{atomic_write, now_ms, store_dir};
-use crate::modules::autoclaw_accounts::{pool_accounts, PoolAccount, AccountRegion};
+use crate::modules::autoclaw_accounts::{pool_accounts, pool_accounts_filtered, PoolAccount, AccountRegion};
+use crate::modules::autoclaw_intl_pool::{self, Lease, ReleaseOutcome};
 use crate::modules::platform_checkin::{autoclaw_data_dir, read_autoclaw_token};
 
 // ---------------------------------------------------------------------------
@@ -681,6 +682,11 @@ async fn try_send_for_account(
 /// 计量窗口在选中账号后、发请求前启动（覆盖整个上游调用），余额差才能
 /// 包住本次扣费；单账号 401 续期失败时自动切换下一个账号（失败尝试
 /// 不产生计费，计量窗口作废）。
+///
+/// M2（契约 docs/autoclaw-intl-pool-contract.md §3.2/§3.3）：region=international
+/// 的请求改走轮换池 `PoolManager.acquire()/release()` lease 模式（六重过滤 +
+/// 策略选号 + 错误族回写），不再走 pool_accounts_filtered 顺序过滤；国内 lane
+/// 保持原有顺序过滤路径零改动。
 async fn send_upstream_routed(
     payload: &Value,
     route: &GlmModelRoute,
@@ -690,11 +696,280 @@ async fn send_upstream_routed(
         PoolAccount,
         crate::modules::model_usage::Measurement,
         Option<crate::modules::account_protection::ConcurrencyGuard>,
+        Option<Lease>,
     ),
     String,
 > {
     // 区域决定：显式请求区域 > 模型目录归属区域。模型未识别时不会走到这里。
     send_upstream_routed_with_region(payload, route, Some(route.region)).await
+}
+
+// ---------------------------------------------------------------------------
+// 国际 lane 轮换池 lease（契约 docs/autoclaw-intl-pool-contract.md §3.2/§3.3）
+// ---------------------------------------------------------------------------
+
+/// 池空文案前缀：api 层据此把空池错误映射为 503（对齐 glmplan 空池语义），
+/// 其余上游错误仍走默认 502。
+pub const INTL_POOL_EMPTY_PREFIX: &str = "国际号轮换池暂无可用账号";
+
+/// 国际 lane 池空时的 503 文案（与 glmplan 空池语义一致：503 + 池水位原因）。
+/// 直接用池 summary 渲染各状态号数量，让调用方能判断是冷却中还是彻底没号。
+pub(crate) fn intl_pool_empty_message(summary: &Value) -> String {
+    let n = |key: &str| summary.get(key).and_then(Value::as_u64).unwrap_or(0);
+    format!(
+        "{INTL_POOL_EMPTY_PREFIX}（总数 {}：健康 {} / 冷却 {} / 额度用尽 {} / 封禁 {} / 失效 {} / 停用 {}；在途 {}/{}），请稍后重试或运行注册管线扩号",
+        n("total"),
+        n("healthy"),
+        n("cooldown"),
+        n("quotaOut"),
+        n("banned"),
+        n("invalid"),
+        n("disabled"),
+        n("poolInFlight"),
+        n("poolConcurrentCap"),
+    )
+}
+
+/// 国际 lane 单账号尝试（lease 语义，§3.3）：
+/// - 401：先触发续期（`PoolAccount::refresh`，沿用既有 401 重试语义）重试
+///   一次；仍 401 才 failover（池侧续期由 `release(AuthExpired)` 触发）；
+/// - 429 / 403「繁忙/稍后重试」：不再原地等待重试（lease 模式下该号已由
+///   状态机冷却，failover 换号比硬等更快），错误体读出交给错误族映射；
+/// - 410004 / 810001：错误体读出后由 `outcome_from_http` 精确映射。
+async fn intl_try_send_for_account(
+    payload: &Value,
+    route: &GlmModelRoute,
+    account: &PoolAccount,
+) -> Result<reqwest::Response, (u16, String)> {
+    let mut resp = match send_once(payload, &account.bearer(), &route.route_id, account.region).await
+    {
+        Ok(r) => r,
+        Err(e) => return Err((0, e)),
+    };
+    // 401 → 续期重试一次（既有语义）；续期后仍 401 → failover。
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        let new_token = match account.refresh().await {
+            Ok(t) => t,
+            Err(e) => {
+                return Err((
+                    401,
+                    format!("{}：登录态续期失败（{e}）", account.label),
+                ));
+            }
+        };
+        resp = match send_once(
+            payload,
+            &format!("Bearer {new_token}"),
+            &route.route_id,
+            account.region,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => return Err((0, format!("AutoClaw 网关请求失败: {e}"))),
+        };
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err((401, format!("{}：登录态失效", account.label)));
+        }
+    }
+    // 429 / 403：读出错误体交给错误族映射（403+410004 必须落 Banned 证据，
+    // 不得与「繁忙」限流混同），随后 failover。
+    let status = resp.status().as_u16();
+    if status == 429 || status == 403 {
+        let text = resp.text().await.unwrap_or_default();
+        return Err((status, text));
+    }
+    Ok(resp)
+}
+
+/// 国际 lane 的一次 acquire → 发送 尝试。
+/// 返回 Ok((response, lease)) 表示响应已确立 2xx（lease 未回写，由调用方
+/// 在响应结束时 intl_release_ok 回写）；Err 表示该号尝试失败（lease 已按
+/// 错误族回写并释放）。
+///
+/// lease 即选号依据（PoolManager 六重过滤 + 策略），发送账号按
+/// lease.account_id 从凭据层候选里解析，保证记账归属一致。
+async fn intl_lease_attempt(
+    payload: &Value,
+    route: &GlmModelRoute,
+    lease: &Lease,
+    account: &PoolAccount,
+) -> Result<reqwest::Response, String> {
+    let manager = autoclaw_intl_pool::pool_manager();
+    match intl_try_send_for_account(payload, route, account).await {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            if (200..300).contains(&status) {
+                // 成功：lease 保持未回写，响应原样交回调用方，等到「响应
+                // 结束」（非流式 body 读完 / SSE 流尾）再 intl_release_ok。
+                Ok(resp)
+            } else {
+                // 错误路径：读掉错误体（无流可保），按统一错误族映射回写。
+                let text = resp.text().await.unwrap_or_default();
+                let snippet: String = text.chars().take(300).collect();
+                let family = autoclaw_intl_pool::outcome_from_http(status, &text);
+                let err = error_text(
+                    reqwest::StatusCode::from_u16(status)
+                        .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+                    &snippet,
+                );
+                manager.release(lease, family);
+                Err(err)
+            }
+        }
+        Err((status, text)) => {
+            let family = if status == 0 {
+                // 连接层失败 / 续期失败：按文本匹配错误族。
+                if text.contains("登录态失效") || text.contains("续期失败") {
+                    ReleaseOutcome::AuthExpired
+                } else if text.contains("410004") {
+                    ReleaseOutcome::Banned {
+                        code: json!(410004),
+                        detail: text.chars().take(160).collect(),
+                    }
+                } else if text.contains("810001") {
+                    ReleaseOutcome::QuotaExhausted
+                } else {
+                    ReleaseOutcome::Failed(text.chars().take(160).collect())
+                }
+            } else {
+                // HTTP 错误（401/429/403/…）：统一走错误族映射，
+                // 410004 → Banned、810001 → QuotaExhausted、401 → AuthExpired、
+                // 429/繁忙 → RateLimited（契约 §3.3）。
+                autoclaw_intl_pool::outcome_from_http(status, &text)
+            };
+            let err = if status == 0 {
+                text.clone()
+            } else {
+                error_text(
+                    reqwest::StatusCode::from_u16(status)
+                        .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+                    &text.chars().take(300).collect::<String>(),
+                )
+            };
+            manager.release(lease, family);
+            Err(err)
+        }
+    }
+}
+
+/// 国际 lane 一次重试循环内的发送：整段响应（含 SSE 流式）都在同一个
+/// lease 内完成。成功路径返回未回写的 lease，由调用方在「响应结束」时
+/// `intl_release_ok(lease)` 回写——非流式 = body 读完即回写；SSE 流式 =
+/// 泵在流结束时回写（契约 §3.3：SSE 流结束才算 release）。
+///
+/// 选号以 lease 为准：`PoolManager.acquire()` 按六重过滤 + 策略给出账号，
+/// 再按 lease.account_id 从凭据层候选解析实际发送账号（记账归属一致）；
+/// 凭据层找不到（导入条目被移除/本机登录切换隐藏）时立即 release 失败，
+/// failover 重试由循环承接。
+async fn intl_send_with_lease(
+    payload: &Value,
+    route: &GlmModelRoute,
+) -> Result<
+    (
+        reqwest::Response,
+        PoolAccount,
+        crate::modules::model_usage::Measurement,
+        Option<crate::modules::account_protection::ConcurrencyGuard>,
+        Option<Lease>,
+    ),
+    String,
+> {
+    let pool = pool_accounts_filtered(Some(AccountRegion::International));
+    let manager = autoclaw_intl_pool::pool_manager();
+    if pool.is_empty() {
+        // 凭据层就没有国际号：直接给池水位文案（acquire 也会拦，提前给出
+        // 更准确的「池内无此号」语义而不是「全部账号不可用」）。
+        let summary = manager.summary();
+        return Err(intl_pool_empty_message(&summary));
+    }
+    let prot_cfg = crate::modules::account_protection::load_protection_config();
+    let max_concurrency = if prot_cfg.enabled {
+        prot_cfg.max_concurrency_per_account
+    } else {
+        usize::MAX
+    };
+
+    let mut last_error = String::new();
+    for _attempt in 0..10 {
+        // 每轮重新选号：acquire 按策略 + 六重过滤给出该次请求的账号
+        // （契约 §3.2）；失败 release 后下轮会换号/重选。
+        let Some(lease) = manager.acquire("international") else {
+            let summary = manager.summary();
+            return Err(intl_pool_empty_message(&summary));
+        };
+        let Some(account) = pool
+            .iter()
+            .find(|a| a.id == lease.account_id)
+            .cloned()
+            .or_else(|| {
+                pool.iter().find(|a| a.store_id.as_deref() == Some(lease.account_id.as_str()))
+                    .cloned()
+            })
+        else {
+            // 凭据层已无此号（移除/登录切换隐藏）：按 Failed 回写并返回。
+            manager.release(
+                &lease,
+                ReleaseOutcome::Failed("凭据层不存在该轮换池账号".to_string()),
+            );
+            last_error = format!("轮换池账号 {} 已不在凭据层", lease.account_id);
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            continue;
+        };
+        let guard = if prot_cfg.enabled {
+            match crate::modules::account_protection::try_acquire_concurrency_slot(
+                &account.id,
+                max_concurrency,
+            ) {
+                Some(g) => Some(g),
+                None => {
+                    // 保护层并发满：lease 记 Ok 之外的回写语义不适用（请求未发出），
+                    // 用 Failed 记失败但不动冷却；inFlight 由 release 归还。
+                    manager.release(
+                        &lease,
+                        ReleaseOutcome::Failed("保护层并发槽位已满".to_string()),
+                    );
+                    last_error = format!("账号 {} 保护层并发已满", account.label);
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let measurement =
+            crate::modules::model_usage::Measurement::start(&account.access_token, &route.body_model)
+                .await;
+        match intl_lease_attempt(payload, route, &lease, &account).await {
+            Ok(resp) => return Ok((resp, account, measurement, guard, Some(lease))),
+            Err(error) => {
+                measurement.abort();
+                drop(guard);
+                last_error = error;
+            }
+        }
+        if pool.len() == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+
+    if last_error.is_empty() {
+        last_error = "当前可用账号并发已达上限，请稍候重试".to_string();
+    }
+    Err(format!(
+        "国际号轮换池全部 {} 个账号均不可用：{}",
+        pool.len(),
+        last_error
+    ))
+}
+
+/// 成功 lease 的延迟回写（契约 §3.3：请求完成/SSE 流结束才算 release）。
+/// release(Ok) 记 todayCalls/totalCalls；lease 已回写（幂等登记表去重）时
+/// 重复调用无害。
+pub(crate) fn intl_release_ok(lease: &Option<Lease>) {
+    if let Some(lease) = lease {
+        autoclaw_intl_pool::pool_manager().release(lease, ReleaseOutcome::Ok);
+    }
 }
 
 /// 带区域参数的上游请求路由 (v1.0+ 区域隔离)
@@ -708,9 +983,15 @@ async fn send_upstream_routed_with_region(
         PoolAccount,
         crate::modules::model_usage::Measurement,
         Option<crate::modules::account_protection::ConcurrencyGuard>,
+        Option<Lease>,
     ),
     String,
 > {
+    // M2（契约 §3.2/§3.3）：国际 lane 改走轮换池 lease 模式；国内 lane 保持
+    // 原有 pool_accounts_filtered 顺序过滤路径零改动。
+    if matches!(region, Some(AccountRegion::International)) {
+        return intl_send_with_lease(payload, route).await;
+    }
     let cfg = load_config();
     let pool = ordered_pool_with_region(&cfg, region)?;
     let prot_cfg = crate::modules::account_protection::load_protection_config();
@@ -748,7 +1029,7 @@ async fn send_upstream_routed_with_region(
                 crate::modules::model_usage::Measurement::start(&account.access_token, &route.body_model)
                     .await;
             match try_send_for_account(payload, route, account).await {
-                Ok(resp) => return Ok((resp, account.clone(), measurement, guard)),
+                Ok(resp) => return Ok((resp, account.clone(), measurement, guard, None)),
                 Err(error) => {
                     measurement.abort();
                     drop(guard);
@@ -808,13 +1089,14 @@ pub async fn chat_completions_json(body: Value) -> Result<Value, String> {
     let mut payload = body.clone();
     payload["model"] = json!(route.body_model);
     let started = now_ms();
-    let (resp, account, measurement, _guard) = match send_upstream_routed_with_region(&payload, &route, region).await {
-        Ok(quad) => quad,
-        Err(e) => {
-            record_and_notify_failure(Some(&route), &requested_model, started, &e, skipped_multimodal);
-            return Err(e);
-        }
-    };
+    let (resp, account, measurement, _guard, intl_lease) =
+        match send_upstream_routed_with_region(&payload, &route, region).await {
+            Ok(quint) => quint,
+            Err(e) => {
+                record_and_notify_failure(Some(&route), &requested_model, started, &e, skipped_multimodal);
+                return Err(e);
+            }
+        };
     let status = resp.status();
     let text = resp
         .text()
@@ -833,6 +1115,9 @@ pub async fn chat_completions_json(body: Value) -> Result<Value, String> {
             return Err(error);
         }
     };
+    // 非流式：body 读完 = 请求结束，lease 回写 Ok（契约 §3.3）。intl_lease
+    // 仅国际 lane 为 Some；国内 lane None 无副作用。
+    intl_release_ok(&intl_lease);
     let mut usage = crate::modules::model_usage::extract_usage(&value);
     note_substitution(&mut usage, &requested_model, &route.body_model, skipped_multimodal);
     let (credits, ledger_id) = measurement.finish().await;
@@ -864,6 +1149,10 @@ pub(crate) struct PreparedStream {
     pub started: i64,
     pub measurement: crate::modules::model_usage::Measurement,
     pub _concurrency_guard: Option<crate::modules::account_protection::ConcurrencyGuard>,
+    /// 国际 lane 轮换池 lease（契约 §3.3）：成功响应的 lease 未回写，随
+    /// PreparedStream 进入泵，流结束时 `intl_release_ok` 回写；国内 lane
+    /// / 池外路径为 None。
+    pub intl_lease: Option<Lease>,
 }
 
 /// 解析路由、发起上游流式请求（计量窗口已随请求启动）。
@@ -878,8 +1167,9 @@ async fn prepare_stream(payload: &Value, requested_model: &str) -> Result<(Prepa
     let mut owned = payload.clone();
     owned["model"] = json!(route.body_model);
     let started = now_ms();
-    let (resp, account, measurement, guard) = match send_upstream_routed(&owned, &route).await {
-        Ok(quad) => quad,
+    let (resp, account, measurement, guard, intl_lease) = match send_upstream_routed(&owned, &route).await
+    {
+        Ok(quint) => quint,
         Err(e) => {
             record_and_notify_failure(Some(&route), requested_model, started, &e, skipped_multimodal);
             return Err(e);
@@ -901,6 +1191,7 @@ async fn prepare_stream(payload: &Value, requested_model: &str) -> Result<(Prepa
             started,
             measurement,
             _concurrency_guard: guard,
+            intl_lease,
         },
         resp,
     ))
@@ -945,6 +1236,7 @@ pub async fn chat_completions_stream(body: Value) -> Result<GlmUpstreamStream, S
         started,
         measurement,
         _concurrency_guard,
+        intl_lease,
     } = prepared;
     tokio::spawn(async move {
         let _keep_guard = _concurrency_guard;
@@ -984,6 +1276,8 @@ pub async fn chat_completions_stream(body: Value) -> Result<GlmUpstreamStream, S
             obj.insert("ttfbMs".to_string(), json!(ttfb));
         }
         note_substitution(&mut usage, &requested_model, &route.body_model, skipped_multimodal);
+        // SSE 流结束 = release（契约 §3.3）：成功 lease 在此回写 Ok。
+        intl_release_ok(&intl_lease);
         let (credits, ledger_id) = measurement.finish().await;
         record_success(&route, &account, &usage, credits, ledger_id, started, now_ms());
     });
