@@ -351,6 +351,7 @@ pub async fn credit_patrol_once() -> Value {
     let mut failed = 0i64;
     let mut skipped = 0i64;
     let mut errors: Vec<Value> = Vec::new();
+    let mut snapshot: Vec<Value> = Vec::new();
     let accounts = all_checkin_accounts();
     for acc in &accounts {
         // 国际版 WorkBuddy 无积分体系；unsupported 平台直接跳过（不刷屏）
@@ -361,13 +362,33 @@ pub async fn credit_patrol_once() -> Value {
             .and_then(Value::as_str)
             .unwrap_or("?")
             .to_string();
-        let res = match tokio::time::timeout(CREDIT_PATROL_ACCOUNT_TIMEOUT, get_platform_credits(acc)).await {
+        // MiniMax 有专用的「刷新并写回账号文件」入口（含 balance/credit_consumed/balance_at），
+        // 巡检直接复用它 ⇒ 不开页面也能看到最新余额（2026-10-08）。
+        let res = match tokio::time::timeout(CREDIT_PATROL_ACCOUNT_TIMEOUT, async {
+            if platform == PLATFORM_MINIMAX {
+                match crate::modules::minimax::refresh_and_save_credit_for(minimax_id_suffix(acc)).await {
+                    Some(bal) => json!({"ok": true, "balance": bal}),
+                    None => json!({"ok": false, "error": "查询 MiniMax 积分失败"}),
+                }
+            } else {
+                get_platform_credits(acc).await
+            }
+        })
+        .await
+        {
             Ok(v) => v,
             Err(_) => json!({"ok": false, "error": "查询超时（已跳过，不影响其它账号）"}),
         };
         let ok = res.get("ok").and_then(Value::as_bool).unwrap_or(false);
         if ok {
             updated += 1;
+            snapshot.push(json!({
+                "platform": platform,
+                "account": label,
+                "accountId": acc.get("id").cloned().unwrap_or(Value::Null),
+                "balance": extract_balance(&res),
+                "at": now_ms(),
+            }));
         } else {
             let err = res.get("error").and_then(Value::as_str).unwrap_or("");
             if err.contains("未知签到平台") || platform == PLATFORM_WORKBUDDY && is_intl_workbuddy(acc) {
@@ -380,6 +401,20 @@ pub async fn credit_patrol_once() -> Value {
         // 账号间留间隔，避免瞬时限流（与 balance patrol 同款）
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
+    // 统一「最近一次已知余额」缓存（2026-10-08）：各平台账户文件结构不一、且多数没有
+    // 落盘 helper，这里统一记一份，供页面/排障在**不打开平台页**时也能看到最新余额。
+    if !snapshot.is_empty() {
+        let text = serde_json::to_string_pretty(&json!({
+            "ts": now_ms(),
+            "accounts": snapshot,
+        }))
+        .unwrap_or_default();
+        if let Err(e) =
+            crate::modules::config::atomic_write(&credit_patrol_cache_file(), &text)
+        {
+            eprintln!("[积分巡检] 缓存写入失败: {e}");
+        }
+    }
     json!({
         "ok": true,
         "checked": accounts.len(),
@@ -387,8 +422,32 @@ pub async fn credit_patrol_once() -> Value {
         "failed": failed,
         "skipped": skipped,
         "errors": errors,
+        "accounts": snapshot,
         "ts": now_ms(),
     })
+}
+
+/// 巡检缓存文件路径（最近一次已知余额）。
+pub fn credit_patrol_cache_file() -> std::path::PathBuf {
+    crate::modules::config::store_dir().join("credit_patrol_cache.json")
+}
+
+/// 从各平台各异的返回里尽力取出**数值余额**（字段名不统一：balance / credits / totalRemaining…）。
+pub fn extract_balance(res: &Value) -> Option<f64> {
+    for key in ["balance", "credits", "totalRemaining", "remaining", "remainingTotal", "points"] {
+        if let Some(v) = res.get(key).and_then(Value::as_f64) {
+            return Some(v);
+        }
+    }
+    // 常见嵌套：{"data": {"balance": n}} / {"summary": {...}}
+    for parent in ["data", "summary", "credit", "result"] {
+        if let Some(inner) = res.get(parent) {
+            if let Some(v) = extract_balance(inner) {
+                return Some(v);
+            }
+        }
+    }
+    None
 }
 
 /// 积分巡检常驻循环：启动后延迟 90s 首跑（避开启动高峰），之后按配置间隔轮询。
@@ -4258,6 +4317,20 @@ mod autoclaw_probe_candidate_tests {
         assert_eq!(account_platform(&json!({"id": "wb1"})), PLATFORM_WORKBUDDY);
         // 非 minimax 前缀的 id 走空后缀（find_account 找不到 → 可操作报错）
         assert_eq!(minimax_id_suffix(&json!({"id": "other:1"})), "");
+    }
+
+    #[test]
+    fn extract_balance_covers_platform_shapes() {
+        // 各平台字段名不统一，必须都能取到（否则缓存里全是 null）
+        assert_eq!(extract_balance(&json!({"ok": true, "balance": 12.5})), Some(12.5));
+        assert_eq!(extract_balance(&json!({"ok": true, "credits": 88.0})), Some(88.0));
+        assert_eq!(extract_balance(&json!({"ok": true, "totalRemaining": 3.0})), Some(3.0));
+        assert_eq!(
+            extract_balance(&json!({"ok": true, "data": {"balance": 7.0}})),
+            Some(7.0),
+            "嵌套 data.balance 也要能取到"
+        );
+        assert_eq!(extract_balance(&json!({"ok": true})), None, "无余额字段 ⇒ None（缓存里记 null）");
     }
 
     #[test]

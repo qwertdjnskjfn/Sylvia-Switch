@@ -2103,6 +2103,13 @@ pub fn spawn_signin_loop() {
 }
 
 /// 按配置内账号 id 取账号（统一签到分发用）。
+/// 按账号 id 刷新并**写回**积分（巡检用；2026-10-08）。
+/// 与 `refresh_and_save_credit(&MmAccount)` 等价，只是多一步按 id 取账号。
+pub async fn refresh_and_save_credit_for(id: &str) -> Option<f64> {
+    let acc = find_account(id)?;
+    refresh_and_save_credit(&acc).await
+}
+
 pub fn find_account(id: &str) -> Option<MmAccount> {
     load_config().accounts.into_iter().find(|a| a.id == id)
 }

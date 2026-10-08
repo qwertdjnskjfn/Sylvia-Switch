@@ -1,3 +1,23 @@
+## 2.0.3 — 2026-10-08
+
+### 增强：积分巡检**写回余额**（MiniMax 落账号文件 + 全平台统一缓存）
+
+**背景**：2.0.2 的巡检把结果汇入用量投影，但**各平台账号文件的余额字段没写回** ⇒ 平台页仍需打开才刷新。
+
+**改动**
+- **MiniMax**：巡检改走 `minimax::refresh_and_save_credit_for(id)`（新增的按 id 便捷入口）——
+  复用既有「刷新并写回」实现，直接更新账号文件的 `balance / credit_consumed / balance_at` ✅
+- **全平台统一缓存**：新增 `~/.wb-switch/credit_patrol_cache.json`
+  `{ ts, accounts: [{platform, account, accountId, balance, at}] }` —— 各平台字段名不统一，
+  统一记一份「最近一次已知余额」，供页面/排障在**不打开平台页**时读取
+- 新增纯函数 `extract_balance()`：兼容 `balance / credits / totalRemaining / remaining / points`
+  及 `data.* / summary.*` 嵌套形态（+单测 5 个断言）
+- 巡检回执新增 `accounts[]`（含每账号余额），便于直接核对
+
+**测试**：`cargo test -p wb-switch-core extract_balance` 通过；
+
+---
+
 ## 2.0.2 — 2026-10-08
 
 ### 新增：**统一积分巡检循环**（修复"部分账号积分没有及时监控"）
