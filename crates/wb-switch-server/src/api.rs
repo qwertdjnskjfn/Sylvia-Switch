@@ -8775,6 +8775,80 @@ fn openai_tool_choice_to_anthropic(tc: Option<&Value>) -> Option<Value> {
     None
 }
 
+/// 把**非流式**的 `chat.completion` 响应包装成 OpenAI 风格的 **SSE 帧序列**（2026-10-09）。
+///
+/// 🔴 修复背景：ZCode 默认按流式解析（发 `stream: true`），而本网关此前无论
+/// `stream` 与否都只返回普通 JSON ⇒ ZCode 按 SSE 解析拿不到内容，
+/// 报 **`empty_model_response`**（"模型未返回任何内容"）。
+///
+/// ⚠️ 这是**伪流式**：不做逐 token 转发，而是把**已完成的完整响应**一次性拆成若干帧。
+/// 客户端功能完全正常（能拿到全部内容、工具调用、思维链），只是没有"逐字打字"观感。
+/// 上游其实支持真 SSE（Anthropic 事件流，实测事件序列 message_start/content_block_delta/…），
+/// 后续可升级为真流式转发；当前优先保证**能用**。
+fn minimax_sse_frames(c: &Value) -> String {
+    let id = c.get("id").and_then(Value::as_str).unwrap_or("minimax-sse");
+    let model = c.get("model").and_then(Value::as_str).unwrap_or("");
+    let created = c.get("created").and_then(Value::as_i64).unwrap_or(0);
+    let choice = c
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let msg = choice.get("message").cloned().unwrap_or_else(|| json!({}));
+    let content = msg.get("content").and_then(Value::as_str).unwrap_or("");
+    let reasoning = msg
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let finish = choice
+        .get("finish_reason")
+        .and_then(Value::as_str)
+        .unwrap_or("stop");
+
+    // 单帧构造：OpenAI chunk 形状（choices[0].delta + finish_reason）
+    let frame = |delta: Value, fr: Value| -> String {
+        let o = json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": fr}],
+        });
+        format!("data: {o}\n\n")
+    };
+
+    let mut out = String::with_capacity(512 + content.len());
+    // ① 角色帧（OpenAI 客户端据此初始化消息）
+    out.push_str(&frame(json!({"role": "assistant", "content": ""}), Value::Null));
+    // ② 思维链帧（如有）—— 用 reasoning_content 增量，与主响应字段名一致
+    if !reasoning.is_empty() {
+        out.push_str(&frame(json!({"reasoning_content": reasoning}), Value::Null));
+    }
+    // ③ 正文帧
+    if !content.is_empty() {
+        out.push_str(&frame(json!({"content": content}), Value::Null));
+    }
+    // ④ 工具调用帧（每个 index 一帧）
+    if let Some(tcs) = msg.get("tool_calls").and_then(Value::as_array) {
+        for (i, tc) in tcs.iter().enumerate() {
+            out.push_str(&frame(
+                json!({"tool_calls": [{
+                    "index": i,
+                    "id": tc.get("id").cloned().unwrap_or(Value::Null),
+                    "type": "function",
+                    "function": tc.get("function").cloned().unwrap_or(Value::Null),
+                }]}),
+                Value::Null,
+            ));
+        }
+    }
+    // ⑤ 结束帧（带 finish_reason）
+    out.push_str(&frame(json!({}), json!(finish)));
+    out.push_str("data: [DONE]\n\n");
+    out
+}
+
 async fn api_minimax_chat(headers: HeaderMap, Json(mut body): Json<Value>) -> Response {
     if !minimax_key_ok(&headers) {
         return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
@@ -8797,10 +8871,43 @@ async fn api_minimax_chat(headers: HeaderMap, Json(mut body): Json<Value>) -> Re
         tool_choice: openai_tool_choice_to_anthropic(body.get("tool_choice")),
         messages: body.get("messages").cloned().filter(|m| m.is_array()),
         max_tokens: body.get("max_tokens").and_then(Value::as_u64),
+        // 2026-10-09：思考配置逐字透传（上游禁止 thinking.type=disabled，会 400）
+        thinking: body.get("thinking").cloned().filter(|t| !t.is_null()),
+        reasoning_effort: body
+            .get("reasoning_effort")
+            .or_else(|| body.pointer("/extra_body/reasoning_effort"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|x| !x.is_empty())
+            .map(String::from),
     };
     let has_tools = req.tools.is_some();
+    // 2026-10-09：ZCode 等客户端默认发 `stream: true`（期望 SSE）。
+    // 此前无论 stream 与否都返回普通 JSON ⇒ 客户端按 SSE 解析拿不到内容，
+    // 报 `empty_model_response`。此处按 stream 分流。
+    let want_stream = body
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     match minimax::chat_once_full(&prompt, region.as_deref(), model.as_deref(), Some(req)).await {
-        Ok(v) => json_ok(v),
+        Ok(v) => {
+            if want_stream {
+                // 伪流式：把完整响应拆成合法 SSE 帧（详见 minimax_sse_frames 文档）
+                let sse = minimax_sse_frames(&v);
+                (
+                    StatusCode::OK,
+                    [
+                        (header::CONTENT_TYPE, "text/event-stream".to_string()),
+                        (header::CACHE_CONTROL, "no-cache".to_string()),
+                        (header::CONNECTION, "keep-alive".to_string()),
+                    ],
+                    axum::body::Body::from(sse),
+                )
+                    .into_response()
+            } else {
+                json_ok(v)
+            }
+        }
         Err((s, e)) => {
             let _ = has_tools;
             glm_proxy_error(e, StatusCode::from_u16(s).unwrap_or(StatusCode::BAD_GATEWAY))

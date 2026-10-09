@@ -1,3 +1,61 @@
+## 2.0.30 - 2026-10-09
+
+### 修复：ZCode `empty_model_response`（网关不支持 `stream:true` → SSE）
+
+#### 现象（用户报错原文）
+```
+provider=local-minimax-57890 model=MiniMax-M3.1-Flash-Preview
+reason=empty_model_response        →  ZCode 侧："模型未返回任何内容"
+```
+
+#### 根因：**流式协议不匹配**
+| 请求 | 改前返回 |
+| --- | --- |
+| `stream: false` | `application/json` ✅ |
+| **`stream: true`**（ZCode 默认）| **`application/json`** ❌ 不是 `text/event-stream` |
+
+ZCode 按 **SSE** 解析普通 JSON ⇒ 解析不出任何帧 ⇒ 判"模型未返回内容"。
+（网关此前无 SSE 分支，`stream` 参数被完全忽略。）
+
+#### 改动（`api.rs`）
+新增 `minimax_sse_frames()`：把**已完成的完整响应**拆成合法 OpenAI SSE 帧序列。
+
+| 帧 | 内容 |
+| --- | --- |
+| ① | `delta: {role:"assistant", content:""}`（角色帧，客户端据此初始化）|
+| ② | `delta: {reasoning_content: …}`（思维链，如有）|
+| ③ | `delta: {content: …}`（正文）|
+| ④ | 每个工具调用一帧 `delta.tool_calls[]`（含 `index`）|
+| ⑤ | `delta: {}` + `finish_reason` |
+| 末 | `data: [DONE]` |
+
+`api_minimax_chat` 按 `stream` 分流：`true` → `text/event-stream` + `no-cache` + `keep-alive`。
+
+> ⚠️ **这是"伪流式"**：不做逐 token 转发，而是把完整响应一次性拆帧。
+> 客户端功能完全正常（内容/思维链/工具调用都能拿到），只是没有"逐字打字"观感。
+> 上游其实支持真 SSE（Anthropic 事件流，实测 `message_start`/`content_block_delta`/…），
+> **后续可升级为真流式转发**；当前优先保证**能用**。
+
+#### 验证（2.0.30 线上实测）
+| 测试 | 结果 |
+| --- | --- |
+| 文本 + `stream:true` | ✅ `text/event-stream`，5 帧，内容 `'你好呀'`，思维链 134 字 |
+| **工具 + `stream:true`** | ✅ `finish_reason=**tool_calls**`，工具调用帧正确 |
+| 非流式回归 | ✅ `application/json`，正常 |
+
+#### 📌 教训：客户端「静默空响应」多半是协议层不匹配
+ZCode 报的是 `empty_model_response`（听起来像模型问题），实际是**网关没按客户端期望的协议应答**。
+**排查顺序应是**：先确认「客户端期望什么 Content-Type」→ 再看「我返回了什么」，
+而不是先去怀疑模型或上游（本次一开始我确实先怀疑了空响应）。
+
+#### 📌 一串"同一个用户任务引出三个真 bug"
+用户配 ZCode 后连报三个错，恰好串成一条链，每个都是**网关侧的真缺陷**：
+1. `unsupported content type 'image_url'` → 内容块未做 OpenAI→Anthropic 转换（2.0.29）
+2. `empty_model_response` → `stream:true` 未实现 SSE（2.0.30）
+3. （更早）`auth_failed` → 独立密钥渠道不认主密钥（2.0.21）
+
+**共性**：都是「网关对某客户端行为的**兼容面**没铺全」，而非模型/上游问题。
+
 ## 2.0.29 - 2026-10-09
 
 ### 修复：ZCode 带图请求 400（`unsupported content type 'image_url'`）
