@@ -63,6 +63,11 @@ const CHANNELS: &[ChannelEntry] = &[
     // DuMate（百度搭子）渠道（2026-10-01 接入）：api.rs 的 /dumate/v1 chat handler
     // 写 gateway_admin 请求日志，流量走 logs 口径。
     ChannelEntry { id: "dumate", name: "DuMate（百度搭子）", page: "/dumate", base: "/dumate/v1", traffic_source: "logs" },
+    // MiniMax 渠道（2026-10-09 补登记）：api.rs 的 /minimax/v1 chat handler 写
+    // gateway_admin 请求日志，流量走 logs 口径（与 kimi/glmweb/miaoshou/dumate 一致）。
+    // ⚠️ 对话链路当前上游侧异常（2026-10-05 排查：恒定 in=21、答非所问），
+    //    故其流量指标会偏弱——这是真实状态，不做粉饰。
+    ChannelEntry { id: "minimax", name: "MiniMax", page: "/minimax", base: "/minimax/v1", traffic_source: "logs" },
 ];
 
 // ---------------------------------------------------------------------------
@@ -550,6 +555,25 @@ fn collect_accounts(id: &str, now: i64) -> AccountStats {
             })
             .collect(),
         "trae" => crate::modules::trae_accounts::list_for_display(),
+        // MiniMax（2026-10-09）：桌面端账号池；status 口径同 gateway_overview。
+        "minimax" => crate::modules::minimax::load_config()
+            .accounts
+            .iter()
+            .map(|a| {
+                let cooling = a.cooldown_until_ms > crate::modules::minimax::now_ms();
+                json!({
+                    "name": a.label,
+                    "status": if !a.enabled {
+                        "disabled"
+                    } else if cooling || a.last_error.is_some() {
+                        "cooling"
+                    } else {
+                        "ok"
+                    },
+                    "enabled": a.enabled,
+                })
+            })
+            .collect(),
         // workbuddy：凭证模式，无账号池。
         _ => Vec::new(),
     };
@@ -778,6 +802,8 @@ fn checkin_keys(channel_id: &str) -> Vec<String> {
         // DuMate（百度搭子）：本机单账号（id=dumate:local，email/nickname 带
         // DuMate 字样），键即渠道前缀，靠 accountId/email 包含匹配命中。
         "dumate" => keys.push("dumate".to_string()),
+        // MiniMax（2026-10-09）：键含渠道前缀，签到条目按前缀匹配命中。
+        "minimax" => keys.push("minimax".to_string()),
         _ => {}
     }
     keys
@@ -828,7 +854,8 @@ fn format_ts(ms: i64) -> String {
 async fn collect_meta(entry: &ChannelEntry, now: i64) -> ChannelMeta {
     match entry.id {
         // GATEWAYS 表内渠道：enabled/health/modelCount 走 gateway_snapshot。
-        "glm" | "kimi" | "qoder" | "qwen" | "qwen-flash" | "grok" | "loomy" | "miaoshou" => {
+        "glm" | "kimi" | "qoder" | "qwen" | "qwen-flash" | "grok" | "loomy" | "miaoshou"
+        | "minimax" => {
             let snapshot = gateway_snapshot(entry.id).await;
             let overview_error = (snapshot.get("health").and_then(Value::as_str) == Some("error"))
                 .then(|| {

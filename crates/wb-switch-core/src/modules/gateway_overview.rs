@@ -76,6 +76,16 @@ const GATEWAYS: &[GatewayEntry] = &[
         page: "/dumate",
         base: "/dumate/v1",
     },
+    // MiniMax 网关（2026-10-09 补登记）：OpenAI 兼容反代 /minimax/v1
+    //（模型目录取桌面端 config.yaml 的真实清单，回退硬编码表）。
+    // ⚠️ 对话链路当前上游侧异常（2026-10-05 排查结论：请求恒定 in=21、答非所问），
+    //    但**模型目录/账号池是可靠的**，故仍登记进总览与模型可用性测试。
+    GatewayEntry {
+        id: "minimax",
+        name: "MiniMax",
+        page: "/minimax",
+        base: "/minimax/v1",
+    },
 ];
 
 /// 账号是否处于健康可用状态（用于统计）。
@@ -193,6 +203,12 @@ async fn fetch_models(gateway: &str) -> Result<Vec<Value>, String> {
             .unwrap_or_else(|_| json!({ "data": [] })),
         // DuMate：静态 4 模型目录（同步返回，同 qoder/grok 形态）。
         "dumate" => crate::modules::dumate::models_payload(),
+        // MiniMax（2026-10-09）：模型表取桌面端 config.yaml 的真实目录（defaultModel 置顶），
+        // 回退硬编码清单；与 /minimax/v1/models 同一数据源。
+        "minimax" => {
+            let cfg = crate::modules::minimax::load_config();
+            crate::modules::minimax::models_payload_filtered(&cfg, None)
+        }
         _ => return Ok(Vec::new()),
     };
     let list = payload
@@ -242,6 +258,27 @@ fn fetch_accounts(gateway: &str) -> Vec<Value> {
                     "name": a.get("nickname").or_else(|| a.get("email")).cloned().unwrap_or(Value::Null),
                     "status": "ok",
                     "enabled": true,
+                })
+            })
+            .collect(),
+        // MiniMax（2026-10-09）：桌面端账号池（minimax_config.json）。
+        // 字段按 `account_healthy` 的通用判据映射（enabled + status）：
+        // 冷却中或带 last_error → status 非 "ok"，总览/健康度会正确标为不健康。
+        "minimax" => crate::modules::minimax::load_config()
+            .accounts
+            .iter()
+            .map(|a| {
+                let cooling = a.cooldown_until_ms > crate::modules::minimax::now_ms();
+                json!({
+                    "name": a.label,
+                    "status": if !a.enabled {
+                        "disabled"
+                    } else if cooling || a.last_error.is_some() {
+                        "cooling"
+                    } else {
+                        "ok"
+                    },
+                    "enabled": a.enabled,
                 })
             })
             .collect(),

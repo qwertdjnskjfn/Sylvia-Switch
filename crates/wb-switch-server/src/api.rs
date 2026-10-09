@@ -127,6 +127,9 @@ pub fn router() -> Router {
         .route("/api/minimax/accounts/pin", post(api_minimax_accounts_pin))
         .route("/api/minimax/accounts/clear-cooldown", post(api_minimax_accounts_clear_cooldown))
         .route("/api/minimax/signin/run", post(api_minimax_signin_run))
+        .route("/api/minimax/signin/sweep", post(api_minimax_signin_sweep))
+        .route("/api/minimax/credit-movements", get(api_minimax_credit_movements))
+        .route("/api/minimax/points/reconcile", post(api_minimax_points_reconcile))
         .route("/api/minimax/test", post(api_minimax_test))
         .route("/api/minimax/desktop/discover", get(api_minimax_desktop_discover))
         .route("/api/minimax/desktop/details", get(api_minimax_desktop_details))
@@ -7999,12 +8002,27 @@ fn minimax_mask(key: &str) -> String {
 
 fn minimax_key_ok(headers: &HeaderMap) -> bool {
     let cfg = minimax::load_config();
+    // 未配置密钥 = 本机直连模式，放行（与 opencode 同口径）
+    if cfg.api_key.trim().is_empty() {
+        return true;
+    }
     let got = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()));
-    matches!(got, Some(k) if k == cfg.api_key)
+    match got {
+        Some(k) if k == cfg.api_key => true,
+        // 🔴 2026-10-09 兼容：模型可用性测试（`/api/model-test` → `model_probe::run`）
+        // 用**主网关密钥**回环自调用，而本网关是后加的独立密钥 → 会被判 401。
+        // 与 `opencode_proxy_auth_result` 完全同因同解（见该函数注释）：
+        // 接受主网关密钥，且**不静默**——调用侧会记一条请求日志。
+        Some(k) if k == glm_proxy::load_config().api_key => {
+            log_gateway_request("minimax", None, "(model-test 主密钥)", true, 0, "");
+            true
+        }
+        _ => false,
+    }
 }
 
 async fn api_minimax_status() -> Response {
@@ -8034,6 +8052,9 @@ async fn api_minimax_status() -> Response {
                 "usable": minimax::account_usable(a, minimax::now_ms()),
                 // 2026-10-05：熔断计数（连续失败，成功清零），供前端展示
                 "failStreak": a.fail_streak,
+                // 2026-10-08：桌面端实例隔离名（"" = 主实例；"acc2" = 隔离实例），
+                // 用于识别该账号的 auth.json / 设备指纹来自哪个实例
+                "desktopInstance": a.desktop_instance,
                 "isLocal": a.source == "desktop",
                 "pinned": cfg_pins.iter().any(|x| x == &a.id),
                 "pinOrder": cfg_pins.iter().position(|x| x == &a.id),
@@ -8318,6 +8339,13 @@ async fn api_minimax_accounts_add(Json(body): Json<Value>) -> Response {
         credit_consumed: None,
         balance_at: 0,
         fail_streak: 0,
+        // 桌面端实例隔离名（"" = 主实例；"acc2" 等 = 由 start-minimax-acc2.bat 启动的隔离实例）
+        desktop_instance: body
+            .get("desktopInstance")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string(),
     });
     if !cfg.enabled {
         cfg.enabled = true;
@@ -8390,65 +8418,198 @@ async fn api_minimax_signin_run(Json(body): Json<Value>) -> Response {
     if !cfg.enabled {
         return json_err("MiniMax 网关未启用".to_string(), StatusCode::SERVICE_UNAVAILABLE);
     }
-    let mut results = Vec::new();
-    for acc in &cfg.accounts {
-        if !acc.enabled {
-            continue;
+    // 🔴 2026-10-09：指定了 id 却不存在时**必须报错**。此前静默返回
+    // `200 {ok:true, results:[]}` ⇒ 调用方（脚本/UI）无法区分「签到成功但无账号」
+    // 与「id 写错了」，属于典型的错误静默。
+    if let Some(id) = &only_id {
+        if !cfg.accounts.iter().any(|a| a.id == *id) {
+            return json_err(
+                format!("账号不存在: {id}"),
+                StatusCode::NOT_FOUND,
+            );
         }
-        if let Some(id) = &only_id {
-            if &acc.id != id {
-                continue;
-            }
-        }
-        let res = minimax::signin_account(acc).await;
-        results.push(res);
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
+    // 目标账号先快照一份：回写阶段要 &mut cfg，不能同时借用迭代
+    let targets: Vec<minimax::MmAccount> = cfg
+        .accounts
+        .iter()
+        .filter(|a| a.enabled)
+        .filter(|a| only_id.as_deref().map(|i| i == a.id).unwrap_or(true))
+        .cloned()
+        .collect();
+    let mut results = Vec::new();
     // 签到结果回写签到日期 + 实时积分快照（按 id 匹配；成功/幂等都记当天，防重复触发）
     // 2026-10-04 修复：签到后积分不刷新——原代码只回写签到日期/累计分，而 status
     // 接口只读 balance 快照字段，导致「已签到但积分不变」。对齐 probe 范式：
     // 签成功后逐账号查 credit/details（desktop）或 membership_balance（web）写回
     // 三字段，UI 立即可见最新积分。
+    //
+    // 🔴 2026-10-09：改为**单循环串行**（before → signin → after → 回写）。
+    // 原先「先把所有账号签到完、再统一回写」的两段式结构下，**签到前余额拿不到**
+    // （那时已经在签到之后了），积分动向追踪无从实现。串行还让每账号的
+    // before/after 严格配对，不会被并发请求打乱。
     let mut cfg = minimax::load_config();
     let today = minimax::today_str();
     let mut credit_updated: Vec<String> = Vec::new();
-    for res in &results {
-        if res.get("ok").and_then(Value::as_bool) != Some(true) {
-            continue;
+
+    for acc in &targets {
+        // ① 签到**前**积分
+        let (balance_before, _) = minimax::refresh_credit_snapshot(acc).await;
+        // ② 签到
+        let res = minimax::signin_account(acc).await;
+        // ③ 签到**后**积分 + 差值 + 落盘动向
+        let (mv, consumed) = minimax::track_credit_movement(acc, &res, balance_before).await;
+        let mut out = res.clone();
+        if let Some(o) = out.as_object_mut() {
+            o.insert("balanceBefore".to_string(), json!(mv.balance_before));
+            o.insert("balanceAfter".to_string(), json!(mv.balance_after));
+            o.insert("balanceDelta".to_string(), json!(mv.delta));
+            o.insert("movementAt".to_string(), json!(mv.at_str));
         }
-        let Some(id) = res.get("id").and_then(Value::as_str).map(String::from) else {
-            continue;
-        };
-        let Some(acc) = cfg.accounts.iter().find(|a| a.id == id).cloned() else {
-            continue;
-        };
-        if let Some(a) = cfg.accounts.iter_mut().find(|a| a.id == id) {
-            a.signin_last_date = today.clone();
-            // 新领取（非幂等已领）时累加积分
-            if res.get("action").and_then(Value::as_str) == Some("claimed") {
-                let p = res
-                    .get("points")
-                    .and_then(Value::as_u64)
-                    .or_else(|| {
-                        res.get("points")
-                            .and_then(Value::as_str)
-                            .and_then(|s| s.parse::<u64>().ok())
-                    })
-                    .unwrap_or(0);
-                a.signin_points_total += p;
-            }
+        results.push(out);
+
+        let id = acc.id.clone();
+        // 🔴 2026-10-09：写回统一走 `apply_signin_outcome`（与自动签到 / 统一编排同一份）。
+        // 本路由此前自己内联一套，已踩过「failStreak 不清零」「lastError 不回写」两次坑。
+        // 必须并入本 cfg 后统一 save —— 若改调自带 save 的函数会被旧快照覆盖。
+        minimax::apply_signin_outcome(&mut cfg, &id, &res, mv.balance_after, consumed);
+        if res.get("ok").and_then(Value::as_bool) == Some(true) {
+            credit_updated.push(id);
         }
-        // 实时积分快照（2026-10-05：收敛到公共函数，与自动签到同一口径）
-        let (bal, consumed) = minimax::refresh_credit_snapshot(&acc).await;
-        if let Some(a) = cfg.accounts.iter_mut().find(|a| a.id == id) {
-            a.balance = bal;
-            a.credit_consumed = consumed;
-            a.balance_at = minimax::now_ms();
-        }
-        credit_updated.push(id);
+        // 账号间隔：避免短时间密集请求触发上游风控（原实现就有，保留）
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
     minimax::save_config(&cfg);
     json_ok(json!({ "ok": true, "results": results, "creditUpdated": credit_updated }))
+}
+
+/// 积分动向明细：`GET /api/minimax/credit-movements?id=<账号id>&limit=<条数>`
+///
+/// 供对账与排查使用：每次签到（成功/失败/幂等）都会落一条，含签到前后余额与差值。
+/// 不带 `id` 时返回全部账号，按时间倒序（`limit` 默认 100，上限 500）。
+async fn api_minimax_credit_movements(RawQuery(query): RawQuery) -> Response {
+    // 与项目惯例一致：手解 query string，不引 axum 的 Query 提取器
+    let raw = query.as_deref().unwrap_or("");
+    let id = raw
+        .split('&')
+        .find_map(|p| p.strip_prefix("id="))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let limit = raw
+        .split('&')
+        .find_map(|p| p.strip_prefix("limit="))
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(100)
+        .clamp(1, 500);
+    let mut all = minimax::load_movements();
+    all.sort_by(|a, b| b.at_ms.cmp(&a.at_ms));
+    if let Some(id) = &id {
+        all.retain(|m| &m.id == id);
+    }
+    let total = all.len();
+    all.truncate(limit);
+    json_ok(json!({
+        "ok": true,
+        "count": all.len(),
+        "total": total,
+        "movements": all,
+    }))
+}
+
+/// 累计积分对账（2026-10-09）：从动向流水回填账本 → 与条目上的累计值对齐。
+///
+/// 解决「签到日期有、累计却是 0」：累计值历史上只存在**账号条目**里，
+/// 条目一被删/重导就归零。本接口把流水（`claimed` 且 `points>0`）按身份归并回账本，
+/// 再把账本值灌回条目（只增不减，幂等）。
+async fn api_minimax_points_reconcile() -> Response {
+    // 先读账号池做 label → user_id 别名（历史动向早于 user_id 字段，只能按名字归并）
+    let snapshot = minimax::load_config();
+    let alias: Vec<(String, String)> = snapshot
+        .accounts
+        .iter()
+        .map(|a| (a.user_id.clone(), a.label.clone()))
+        .collect();
+    let ledger_touched = minimax::ledger_backfill_from_history(&alias);
+    let mut cfg = snapshot;
+    let mut fixed = 0usize;
+    for a in cfg.accounts.iter_mut() {
+        if minimax::reconcile_points_total(a) {
+            fixed += 1;
+        }
+    }
+    minimax::save_config(&cfg);
+    let rows: Vec<Value> = cfg
+        .accounts
+        .iter()
+        .map(|a| {
+            json!({
+                "id": a.id,
+                "label": a.label,
+                "userId": a.user_id,
+                "pointsTotal": a.signin_points_total,
+                "ledger": minimax::ledger_points(&a.user_id, &a.label),
+            })
+        })
+        .collect();
+    json_ok(json!({
+        "ok": true,
+        "ledgerTouched": ledger_touched,
+        "accountsFixed": fixed,
+        "accounts": rows,
+    }))
+}
+
+/// 全量账号签到编排（遍历 → 签到领取 → 重试 → 积分追踪 → 汇总）。
+///
+/// body（全部可选，缺省取环境变量再取内置默认）：
+/// `{ retry, intervalMs, skipClaimed, includeDisabled, dryRun, ids[] }`
+async fn api_minimax_signin_sweep(Json(body): Json<Value>) -> Response {
+    let base = minimax::sweep_options_from_env();
+    let opts = minimax::SweepOptions {
+        retry: body
+            .get("retry")
+            .and_then(Value::as_u64)
+            .map(|v| v as usize)
+            .unwrap_or(base.retry),
+        interval_ms: body
+            .get("intervalMs")
+            .and_then(Value::as_u64)
+            .unwrap_or(base.interval_ms),
+        skip_claimed: body
+            .get("skipClaimed")
+            .and_then(Value::as_bool)
+            .unwrap_or(base.skip_claimed),
+        include_disabled: body
+            .get("includeDisabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(base.include_disabled),
+        dry_run: body
+            .get("dryRun")
+            .and_then(Value::as_bool)
+            .unwrap_or(base.dry_run),
+    };
+    let ids: Vec<String> = body
+        .get("ids")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    // 🔴 2026-10-09（与 `/signin/run` 对齐）：**显式指定了 ids 却一个都不存在**时必须
+    // 报错。否则返回 `200 {ok:true, accounts:[]}`，脚本/UI 分不清「编排成功但无账号」
+    // 与「id 写错了」，属于典型的错误静默（同日 `/signin/run` 已修，此处补齐）。
+    if !ids.is_empty() {
+        let cfg = minimax::load_config();
+        if !cfg.accounts.iter().any(|a| ids.iter().any(|i| i == &a.id)) {
+            return json_err(
+                format!("账号不存在：{}", ids.join(", ")),
+                StatusCode::NOT_FOUND,
+            );
+        }
+    }
+    json_ok(minimax::signin_sweep(opts, &ids).await)
 }
 
 async fn api_minimax_probe(Json(body): Json<Value>) -> Response {

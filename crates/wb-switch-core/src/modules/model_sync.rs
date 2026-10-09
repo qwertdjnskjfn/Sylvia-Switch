@@ -162,6 +162,15 @@ pub const SYNC_SOURCES: &[SyncSource] = &[
         source: "静态目录（dumate-lite/turbo/ultra/points，档位 L0/L1/L2）",
         fetch: fetch_dumate,
     },
+    // MiniMax（2026-10-09）：模型表取桌面端 config.yaml 的真实目录（defaultModel
+    // 置顶），回退硬编码表——与 /minimax/v1/models 同源，不做人工补录。
+    SyncSource {
+        gateway: "minimax",
+        mode: SourceMode::Auto,
+        action: ListingAction::ReportOnly,
+        source: "桌面端 config.yaml 模型目录（defaultModel 置顶，回退硬编码表）",
+        fetch: fetch_minimax,
+    },
     SyncSource {
         gateway: "glmweb",
         mode: SourceMode::Manual,
@@ -392,6 +401,18 @@ fn fetch_manual() -> FetchFuture {
 /// 目录是编译期常量，不依赖桌面端是否在运行）。
 fn fetch_dumate() -> FetchFuture {
     Box::pin(async move { Ok(models_from_openai_list(&crate::modules::dumate::models_payload())) })
+}
+
+/// MiniMax 模型清单（2026-10-09）：与 `/minimax/v1/models` 同源
+/// （桌面端 `config.yaml` 真实目录，defaultModel 置顶，回退硬编码表）。
+/// 纯本地读配置，无需网络，故 `Box::pin(async { … })` 即可。
+fn fetch_minimax() -> FetchFuture {
+    Box::pin(async move {
+        let cfg = crate::modules::minimax::load_config();
+        Ok(models_from_openai_list(
+            &crate::modules::minimax::models_payload_filtered(&cfg, None),
+        ))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1276,19 +1297,19 @@ mod tests {
     // --- status 聚合与 nextRunHint ---
 
     #[test]
-    fn status_payload_lists_all_13_gateways() {
+    fn status_payload_lists_all_gateways() {
         let dir = temp_store();
         with_test_store(&dir, || {
             let payload = status_payload();
             let gateways = payload.get("gateways").and_then(Value::as_array).unwrap();
-            assert_eq!(gateways.len(), 13, "契约 G3：13 网关行齐全");
+            assert_eq!(gateways.len(), 14, "契约 G3：14 网关行齐全（含 minimax）");
             let names: Vec<&str> = gateways
                 .iter()
                 .map(|g| g.get("gateway").and_then(Value::as_str).unwrap())
                 .collect();
             for expected in [
                 "glm", "kimi", "grok", "qwen", "loomy", "miaoshou", "trae", "workbuddy",
-                "workbuddy-pool", "opencode", "dumate", "glmweb", "qoder",
+                "workbuddy-pool", "opencode", "dumate", "glmweb", "qoder", "minimax",
             ] {
                 assert!(names.contains(&expected), "缺 {expected}: {names:?}");
             }
