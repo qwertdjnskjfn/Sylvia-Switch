@@ -2275,12 +2275,38 @@ pub struct ChatRequest {
     pub tool_choice: Option<Value>,
     /// 完整消息历史（Anthropic 形状）。`None` 时退化为「单条 user + prompt」。
     pub messages: Option<Value>,
+    /// Anthropic thinking 配置：`{"type":"adaptive"|"enabled"|"disabled",
+    /// "budget_tokens":N}`。
+    ///
+    /// ⚠️ 实测（2026-10-09 直连上游）：**M3.1-Flash-Preview 禁止 disabled**
+    /// —— 传 `thinking.type="disabled"` 返回 HTTP 400
+    /// *"requires adaptive thinking"*；而**不传时默认就是开的**（官方 config.yaml
+    /// `thinking_config.mode: forced_on`）。故默认不写，留给调用方显式指定。
+    pub thinking: Option<Value>,
+    /// 思考强度（M3.1 特有）。官方 `thinking.effortOptions`：
+    /// `default|low|medium|high|xhigh|max`，`defaultModelThinking.effort: max`。
+    pub reasoning_effort: Option<String>,
     /// `max_tokens`；`None` 用 [`DEFAULT_CHAT_MAX_TOKENS`]。
     pub max_tokens: Option<u64>,
 }
 
 /// `max_tokens` 缺省值（2026-10-09 抽成常量，便于单测引用）。
-pub const DEFAULT_CHAT_MAX_TOKENS: u64 = 4096;
+///
+/// 🔴 2026-10-09 修正：**4096 → 32768**。
+/// 实测（M3.1-Flash-Preview）：不传 `max_tokens` 时输出**硬卡在 4096**——
+/// 要求「数到 3000」只数到 1630 就停（out=4096），而传 `max_tokens=32000`
+/// 可正常输出 8516 tokens 数完 3000。
+/// 旧值 4096 对长回答（代码生成、长文档、多步推理）是**静默截断**，
+/// 且原 `finish_reason` 恒为 `stop`，客户端完全无法察觉。
+/// 32768 是原值的 8 倍，覆盖绝大多数场景；模型上限为 128000（官方 config.yaml）。
+pub const DEFAULT_CHAT_MAX_TOKENS: u64 = 32768;
+
+/// 本次请求实际使用的 `max_tokens`（请求值优先，缺省用 [`DEFAULT_CHAT_MAX_TOKENS`]）。
+/// 抽成函数以便 `build_chat_payload` 与 `finish_reason_for` 用**同一个口径**，
+/// 避免"发出去的 max_tokens"与"截断判定用的 max_tokens"不一致。
+fn effective_max_tokens(req: Option<&ChatRequest>) -> u64 {
+    req.and_then(|r| r.max_tokens).unwrap_or(DEFAULT_CHAT_MAX_TOKENS)
+}
 
 /// 把 OpenAI 形状的 `messages` 归一成 **Anthropic 形状**（2026-10-09）。
 ///
@@ -2391,7 +2417,7 @@ fn scalar_to_text(v: &Value) -> String {
 fn build_chat_payload(model: &str, req: Option<&ChatRequest>, messages: Option<&Value>, prompt: &str) -> Value {
     let mut p = json!({
         "model": model,
-        "max_tokens": req.and_then(|r| r.max_tokens).unwrap_or(DEFAULT_CHAT_MAX_TOKENS),
+        "max_tokens": effective_max_tokens(req),
         "messages": messages
             .filter(|m| m.is_array())
             .cloned()
@@ -2403,6 +2429,14 @@ fn build_chat_payload(model: &str, req: Option<&ChatRequest>, messages: Option<&
     }
     if let Some(tc) = req.and_then(|r| r.tool_choice.as_ref()).filter(|t| !t.is_null()) {
         obj.insert("tool_choice".into(), tc.clone());
+    }
+    // 思考配置（2026-10-09）：thinking / reasoning_effort 必须**逐字透传**给上游，
+    // 网关不做归一化——上游对 `thinking.type="disabled"` 会直接 400。
+    if let Some(th) = req.and_then(|r| r.thinking.as_ref()).filter(|t| !t.is_null()) {
+        obj.insert("thinking".into(), th.clone());
+    }
+    if let Some(eff) = req.and_then(|r| r.reasoning_effort.as_deref()).map(str::trim).filter(|x| !x.is_empty()) {
+        obj.insert("reasoning_effort".into(), json!(eff));
     }
     p
 }
@@ -2491,6 +2525,35 @@ fn finish_reason_for_tool_calls(tool_calls: &[Value]) -> &'static str {
     }
 }
 
+/// 完整 `finish_reason` 判定（2026-10-09）：
+/// 1. 有工具调用 → `tool_calls`（OpenAI 规范，客户端据此回喂结果）
+/// 2. 输出打满 `max_tokens` → **`length`**（截断信号）
+/// 3. 否则 → `stop`
+///
+/// 🔴 为什么必须有第 2 条：此前恒返回 `stop`，而实测「不传 max_tokens」时
+/// 输出**硬卡在 4096 上限**（要求数到 3000 只数到 1630）——响应看起来是
+/// **正常结束**，客户端与用户都无法察觉被截断。**这种静默失败比报错更危险**
+/// （对比：报错至少能被重试逻辑捕获）。
+///
+/// 判据用 `output_tokens >= max_tokens`。注意上游 `output_tokens` 通常**包含**
+/// thinking tokens，故该判据对「思考占满预算」的情况同样会正确报 `length`
+/// —— 这正是我们想要的（思考吃光预算导致正文被截，也是截断）。
+fn finish_reason_for(tool_calls: &[Value], usage: &Value, max_tokens: u64) -> &'static str {
+    if !tool_calls.is_empty() {
+        return "tool_calls";
+    }
+    let out = usage
+        .get("output_tokens")
+        .or_else(|| usage.get("completion_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if max_tokens > 0 && out >= max_tokens {
+        "length"
+    } else {
+        "stop"
+    }
+}
+
 /// 单轮对话。
 ///
 /// `model`：调用方指定的模型名（如 `MiniMax-M3` / `MiniMax-M2.7`）；
@@ -2528,14 +2591,19 @@ async fn chat_with_account(
         // 2026-10-09：不再只取 text 块——`tool_use` 翻译为 OpenAI `tool_calls`、
         // `thinking` 翻译为 `reasoning_content`（否则工具调用能力被本网关掐死）。
         let (content, tool_calls, reasoning) = translate_anthropic_blocks(&v);
+        let usage = v
+            .get("usage")
+            .cloned()
+            .unwrap_or(json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}));
+        let finish = finish_reason_for(&tool_calls, &usage, effective_max_tokens(req));
         return Ok(json!({
             "id": v.get("id").cloned().unwrap_or(json!("minimax-desktop")),
             "object": "chat.completion",
             "created": now_ms() / 1000,
             // 上游未回 model 时回显**请求的**模型名（此前硬编码 M3.1-Flash-Preview，掩盖了实际未生效）
             "model": v.get("model").cloned().unwrap_or(json!(model.clone())),
-            "choices": [{"index": 0, "message": openai_assistant_message(&content, &tool_calls, &reasoning), "finish_reason": finish_reason_for_tool_calls(&tool_calls)}],
-            "usage": v.get("usage").cloned().unwrap_or(json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})),
+            "choices": [{"index": 0, "message": openai_assistant_message(&content, &tool_calls, &reasoning), "finish_reason": finish}],
+            "usage": usage,
             "minimax": {"account": acc.label, "region": acc.region, "route": "model-direct"},
         }));
     }
@@ -2585,13 +2653,18 @@ async fn chat_with_account(
             .map_err(|e| (502u16, format!("模型响应解析失败: {e}")))?;
         // 同上：tool_use → tool_calls、thinking → reasoning_content
         let (content, tool_calls, reasoning) = translate_anthropic_blocks(&v);
+        let usage = v
+            .get("usage")
+            .cloned()
+            .unwrap_or(json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}));
+        let finish = finish_reason_for(&tool_calls, &usage, effective_max_tokens(req));
         return Ok(json!({
             "id": v.get("id").cloned().unwrap_or(json!("minimax-desktop")),
             "object": "chat.completion",
             "created": now_ms() / 1000,
             "model": v.get("model").cloned().unwrap_or(json!(model.clone())),
-            "choices": [{"index": 0, "message": openai_assistant_message(&content, &tool_calls, &reasoning), "finish_reason": finish_reason_for_tool_calls(&tool_calls)}],
-            "usage": v.get("usage").cloned().unwrap_or(json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})),
+            "choices": [{"index": 0, "message": openai_assistant_message(&content, &tool_calls, &reasoning), "finish_reason": finish}],
+            "usage": usage,
             "minimax": {"account": acc.label, "region": acc.region, "route": "model-direct"},
         }));
     }

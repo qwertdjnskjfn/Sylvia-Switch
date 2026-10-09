@@ -1,3 +1,52 @@
+## 2.0.27 - 2026-10-09
+
+### 修复 MiniMax 两处 max_tokens 缺陷（静默截断 + 截断不可见）
+
+#### 起因
+用户问"M3.1-Flash-Preview 上下文与最大输出多少"，实测时发现网关有**两处静默失败**。
+
+#### ① 默认 max_tokens 过小：4096 →（静默截断长回答）
+`DEFAULT_CHAT_MAX_TOKENS` 原为 4096。实测（M3.1-Flash-Preview，要求「数到 3000」）：
+
+| 配置 | 输出 | 结果 |
+| --- | --- | --- |
+| 不传 max_tokens | out=**4096** | 只数到 **1630** 就停（被硬截断）|
+| `max_tokens=32000` | out=8516 | 正常数到 3000 |
+
+⇒ 长回答（代码生成、长文档、多步推理）会被静默砍断在 4096。
+
+#### ② `finish_reason` 恒为 `stop`（截断无法被察觉）
+此前无论是否被截断都返回 `stop`，客户端与用户都以为"正常结束"。
+**这种静默失败比报错更危险**（报错至少能被重试逻辑捕获）。
+
+#### 改动（`minimax.rs`）
+| 项 | 说明 |
+| --- | --- |
+| `DEFAULT_CHAT_MAX_TOKENS` | **4096 → 32768**（原值 8 倍；模型上限 128000，见官方 config.yaml）|
+| `effective_max_tokens(req)` | 新增。抽成函数使 `build_chat_payload` 与截断判定**用同一口径**，避免"发出去的 max_tokens"与"判定用的值"不一致 |
+| `finish_reason_for(tool_calls, usage, max_tokens)` | 新增。三级判定：有工具调用 → `tool_calls`；`output_tokens >= max_tokens` → **`length`**；否则 `stop` |
+| 两处响应构造 | 提取 `usage` 变量并传入 `finish_reason_for` |
+
+> 判据说明：上游 `output_tokens` 通常**包含 thinking tokens**，故"思考占满预算导致正文被截"也会正确报 `length`——这正是期望行为。
+
+#### 验证（2.0.27 线上实测）
+| 测试 | 结果 |
+| --- | --- |
+| 不传 max_tokens | 41.3s，out=**8096**，finish=**stop**，**数到 3000**（修复前只到 1630）|
+| `max_tokens=400` | 14.7s，out=400，finish=**length**，数到 140（正确报告截断）|
+| `cargo test -p wb-switch-core` | **785 passed / 0 failed** |
+
+#### 附：MiniMax-M3.1-Flash-Preview 官方规格（`~/.minimax/config.yaml`）
+| 项 | 值 |
+| --- | --- |
+| 上下文窗口 | **512000**（默认）/ **1000000**（可选，标注 `higher_usage`）|
+| 最大输出 | **128000** |
+| 单请求体上限 | 64 MiB |
+| 内联图片 / 视频 | 10 MiB / 50 MiB |
+| 附件数上限 | 4 |
+| thinking | **强制开启**（`mode: forced_on`），`reasoning_effort` 六档 |
+
+
 ## 2.0.25 - 2026-10-09
 
 ### MiniMax 完整能力：多轮上下文 + 工具调用（此前被网关掐死）
