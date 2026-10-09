@@ -306,6 +306,48 @@ fn fetch_accounts(gateway: &str) -> Vec<Value> {
                 "enabled": true,
             })]
         }
+                // 🔴 2026-10-09：`glm` 此前**没有分支** —— 落到 `_ => Vec::new()`
+        // ⇒ 总览显示「0 个账号」，误导用户以为账号池为空（实际池里有多账号、
+        // 且失败切换正常工作）。现改为读**轮换池实时状态**，既给出账号数，
+        // 也反映真实可用性（ok / cooldown / banned / quota-out）。
+        // 名称取自账号池的 label（池状态里只有 id），便于人读。
+        "glm" => {
+            let labels: std::collections::HashMap<String, String> =
+                crate::modules::autoclaw_accounts::load_accounts()
+                    .into_iter()
+                    .filter_map(|a| {
+                        let id = a.get("id").and_then(Value::as_str)?.to_string();
+                        let lb = a
+                            .get("label")
+                            .and_then(Value::as_str)
+                            .filter(|x| !x.is_empty())
+                            .unwrap_or(&id)
+                            .to_string();
+                        Some((id, lb))
+                    })
+                    .collect();
+            crate::modules::autoclaw_intl_pool::pool_manager()
+                .rows()
+                .into_iter()
+                .map(|r| {
+                    let id = r.get("id").and_then(Value::as_str).unwrap_or("");
+                    let state = r.get("state").and_then(Value::as_str).unwrap_or("ok");
+                    let pool_enabled = r.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+                    json!({
+                        "name": labels.get(id).cloned().unwrap_or_else(|| id.to_string()),
+                        // account_healthy 只认 ok/active/healthy；其余（cooldown/
+                        // banned/quota-out）会被判为不健康 —— 正是我们要的语义。
+                        // 🔴 状态值直接透出即可：account_healthy 认
+                        // "ok"/"active"/"healthy" 为健康，其余（cooldown/banned/
+                        // quota-out）判为不健康 —— 池的健康态正是 "active"，
+                        // 此前多加了 `&& state == "ok"` 反而把 active 账号全判死
+                        // （实测 healthyAccounts=0、渠道 health=cooling）。
+                        "status": state,
+                        "enabled": pool_enabled,
+                    })
+                })
+                .collect()
+        }
         _ => Vec::new(),
     }
 }

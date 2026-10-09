@@ -1053,6 +1053,52 @@ async fn intl_send_with_lease(
     ))
 }
 
+/// 从**HTTP 2xx** 的响应体里识别「业务层失败」（2026-10-09）。
+///
+/// 🔴 为什么需要：上游可能用 **HTTP 200 + body 业务错误码**表达风控/额度耗尽。
+/// 此时旧的 `intl_release_ok` 会把该账号记为 **Ok** ⇒ 不冷却、不摘出轮换
+/// ⇒ 下次请求**仍然选中这个已经不能用的账号** ⇒ 客户端反复拿到错误内容，
+/// **违背「触发风控/额度后自动无感切换」的预期**。
+///
+/// ⚠️ **判定保守**（关键）：只认「顶层 `code` 落在错误码白名单」的 JSON 信封，
+/// **绝不做子串包含匹配** —— 正常对话正文里完全可能出现 "810001" 这样的数字，
+/// 子串匹配会让**正常账号被误冷却**（比漏判更糟）。
+fn business_failure_from_body(body: &str) -> Option<autoclaw_intl_pool::ReleaseOutcome> {
+    use autoclaw_intl_pool::ReleaseOutcome;
+    let v: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+    let code = v.get("code")?;
+    let n: u64 = code
+        .as_u64()
+        .or_else(|| code.as_str().and_then(|x| x.trim().parse().ok()))?;
+    match n {
+        810001 => Some(ReleaseOutcome::QuotaExhausted),
+        410004 => Some(ReleaseOutcome::Banned {
+            code: code.clone(),
+            detail: format!(
+                "上游封禁(410004, HTTP 2xx): {}",
+                body.chars().take(160).collect::<String>()
+            ),
+        }),
+        401 => Some(ReleaseOutcome::AuthExpired),
+        _ => None,
+    }
+}
+
+/// 按**响应体内容**回写 lease（2xx 路径专用，2026-10-09）。
+///
+/// 与 [`intl_release_ok`] 的区别：先看 body 是不是业务层错误信封，
+/// 是则按对应错误族回写（触发冷却 / 摘出轮换 / 额度状态），否则记 Ok。
+/// 这样才能让「上游用 200 表达风控/额度耗尽」的账号**及时退出轮换**，
+/// 使后续请求自动落到下一个可用账号（无感切换）。
+pub(crate) fn intl_release_with_body(lease: &Option<Lease>, body: &str) {
+    let Some(lease) = lease else { return };
+    let manager = autoclaw_intl_pool::pool_manager();
+    match business_failure_from_body(body) {
+        Some(outcome) => manager.release(lease, outcome),
+        None => manager.release(lease, autoclaw_intl_pool::ReleaseOutcome::Ok),
+    }
+}
+
 /// 成功 lease 的延迟回写（契约 §3.3：请求完成/SSE 流结束才算 release）。
 /// release(Ok) 记 todayCalls/totalCalls；lease 已回写（幂等登记表去重）时
 /// 重复调用无害。
@@ -1210,9 +1256,11 @@ pub async fn chat_completions_json(body: Value) -> Result<Value, String> {
             return Err(error);
         }
     };
-    // 非流式：body 读完 = 请求结束，lease 回写 Ok（契约 §3.3）。intl_lease
-    // 仅国际 lane 为 Some；国内 lane None 无副作用。
-    intl_release_ok(&intl_lease);
+    // 非流式：body 读完 = 请求结束（契约 §3.3）。intl_lease 仅国际 lane 为
+    // Some；国内 lane None 无副作用。
+    // 🔴 2026-10-09：改传 body —— 上游可能用 200 + 业务错误码表达风控/额度耗尽，
+    // 需据此把账号正确摘出/冷却，否则下次仍会选中它（客户端反复失败）。
+    intl_release_with_body(&intl_lease, &text);
     let mut usage = crate::modules::model_usage::extract_usage(&value);
     note_substitution(&mut usage, &requested_model, &route.body_model, skipped_multimodal);
     let (credits, ledger_id) = measurement.finish().await;
@@ -1371,8 +1419,10 @@ pub async fn chat_completions_stream(body: Value) -> Result<GlmUpstreamStream, S
             obj.insert("ttfbMs".to_string(), json!(ttfb));
         }
         note_substitution(&mut usage, &requested_model, &route.body_model, skipped_multimodal);
-        // SSE 流结束 = release（契约 §3.3）：成功 lease 在此回写 Ok。
-        intl_release_ok(&intl_lease);
+        // SSE 流结束 = release（契约 §3.3）。
+        // 🔴 2026-10-09：传入累积的 SSE 文本 —— 若上游在 200 流里下发业务错误码
+        // （额度耗尽/风控），据此正确摘出账号，保证后续请求自动换到可用账号。
+        intl_release_with_body(&intl_lease, &sse_text);
         let (credits, ledger_id) = measurement.finish().await;
         record_success(&route, &account, &usage, credits, ledger_id, started, now_ms());
     });
@@ -1709,6 +1759,57 @@ mod tests {
     use super::*;
 
     // ---- 「可能已计费」不得换号（2026-10-09 修「一次操作扣两个账号」）----
+
+    #[test]
+    // ---- HTTP 2xx + 业务错误码识别（2026-10-09 修「触发风控/额度后不换号」）----
+
+    #[test]
+    fn business_failure_detects_quota_and_ban_envelopes() {
+        // 上游以 200 + 业务错误码表达额度耗尽 / 风控时，必须能识别出来，
+        // 否则该账号不会被摘出轮换 —— 下次请求仍选中它，客户端反复失败。
+        let quota = r#"{"code":810001,"message":"\u5f53\u65e5\u989d\u5ea6\u5df2\u7528\u5c3d"}"#;
+        assert!(
+            matches!(
+                business_failure_from_body(quota),
+                Some(autoclaw_intl_pool::ReleaseOutcome::QuotaExhausted)
+            ),
+            "810001 必须识别为额度耗尽"
+        );
+        let banned = r#"{"code":410004,"message":"banned"}"#;
+        assert!(
+            matches!(
+                business_failure_from_body(banned),
+                Some(autoclaw_intl_pool::ReleaseOutcome::Banned { .. })
+            ),
+            "410004 必须识别为封禁"
+        );
+        // 字符串形态的错误码也要认（上游两种都出现过）
+        let s_quota = r#"{"code":"810001"}"#;
+        assert!(
+            matches!(
+                business_failure_from_body(s_quota),
+                Some(autoclaw_intl_pool::ReleaseOutcome::QuotaExhausted)
+            ),
+            "字符串错误码同样识别"
+        );
+    }
+
+    #[test]
+    fn business_failure_does_not_misfire_on_normal_content() {
+        // 🔴 关键：正文里出现 "810001" 这类数字是**完全正常**的（模型可能在回答问题）。
+        // 若做子串匹配，会把健康账号误冷却 —— 比漏判更糟。故只认 JSON 信封的顶层 code。
+        let chatty = r#"{"choices":[{"message":{"content":"\u9519\u8bef\u7801 810001 \u662f\u4ec0\u4e48\u610f\u601d\uff1f"}}]}"#;
+        assert!(
+            business_failure_from_body(chatty).is_none(),
+            "正常对话正文里出现 810001 不得被判为失败"
+        );
+        // 顶层 code 是别的值（如成功码 0）同样不判
+        assert!(business_failure_from_body(r#"{"code":0,"data":{}}"#).is_none());
+        // 非 JSON 内容不判
+        assert!(business_failure_from_body("plain text 410004").is_none());
+        // 空内容不判
+        assert!(business_failure_from_body("").is_none());
+    }
 
     #[test]
     fn might_have_billed_is_not_confused_with_retryable_zero() {
