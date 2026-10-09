@@ -1,3 +1,51 @@
+## 2.0.25 - 2026-10-09
+
+### MiniMax 完整能力：多轮上下文 + 工具调用（此前被网关掐死）
+
+#### 现象（13:45 实测）
+| 能力 | 此前 | 现象 |
+| --- | --- | --- |
+| 基础输出 | OK | - |
+| **多轮上下文** | **失败** | 发完整 3 轮历史 → 仍答首轮答案（只取 messages 末条文本）|
+| **工具调用** | **失败** | `tool_calls=null`，模型**用文本编造** `[调用天气查询工具]` 后直接编造天气 |
+
+#### 根因
+**上游原生完全支持**（直连对照实测）：
+- 带 Anthropic 原生 `tools` → 返回 `tool_use` 块
+- 带 `tool_choice` → 正确强制调用
+
+**问题 100% 在本网关** —— `api_minimax_chat` 到 `chat_once` 这条链上**三层都不支持**：
+1. **请求侧**：`chat_once(prompt, region, model)` 签名无 tools；payload 硬编码
+   `json!({model, max_tokens:4096, messages:[单条]})` → tools / tool_choice / 多轮全丢
+2. **归一化缺失**：网关对外是 OpenAI 形状、上游要 Anthropic 形状，无转换
+3. **响应侧**：只提取 `type=="text"` 块 → `tool_use` / `thinking` 被丢弃
+
+#### 改动
+
+**`minimax.rs`（新增 `ChatRequest` + 4 个辅助函数）**
+| 项 | 说明 |
+| --- | --- |
+| `ChatRequest` | 承载 `model` / `tools` / `tool_choice` / `messages` / `max_tokens` |
+| `chat_once_full` | 新入口：透传上述全部字段；传 `None` 时行为与 `chat_once` 完全一致（向后兼容）|
+| `build_chat_payload` | 逐项透传；**空值不写入**，保持无工具场景的请求体形状不变（防行为漂移）|
+| `translate_anthropic_blocks` | `tool_use` → OpenAI `tool_calls`（input 序列化为 arguments 字符串）；`thinking` → `reasoning_content`；`text` → `content` |
+| `normalize_anthropic_messages` | OpenAI → Anthropic 形状：字符串 content → text 块数组；assistant.tool_calls → `tool_use` 块；**`role:"tool"` → `tool_result` 块**（否则工具结果回喂会被上游拒）|
+| `openai_assistant_message` / `finish_reason_for_tool_calls` | 有工具调用时 `content=null`、`finish_reason="tool_calls"`（OpenAI 规范，客户端据此回喂结果）|
+
+**`api.rs`**
+- `openai_tools_to_anthropic`：OpenAI 的 `{type:"function", function:{name, description, parameters}}` → Anthropic 的 `{name, description, input_schema}`
+- `openai_tool_choice_to_anthropic`：`"auto"` / `"required"` → `{type:"auto"}` / `{type:"any"}`；具名 → `{type:"tool", name}`
+- `api_minimax_chat` 改为调 `chat_once_full` 并透传 `tools` / `tool_choice` / 完整 `messages` / `max_tokens`
+
+#### 验证（2.0.25 线上实测）
+| 测试 | 结果 |
+| --- | --- |
+| 多轮上下文 | 6.4s，`in=72`，**正确答 `4`**（此前恒答 3）|
+| 单工具调用 | 4.5s，`finish_reason=tool_calls`，返回 `get_weather` 调用，参数 `{"city":"深圳"}` |
+| 工具结果回喂 | 4.1s，**正确复述 28C / 多云** |
+| **完整 agent 循环** | 第1轮 2.1s 并行调 **2 个工具** → 回喂 → 第2轮 2.2s **同时用上两个结果**（28C + 14:20）|
+| `cargo test -p wb-switch-core` | **785 passed / 0 failed** |
+
 ## 2.0.21 — 2026-10-09
 
 ### 补：MiniMax 鉴权兼容主网关密钥 + 模型可用性测试登记 minimax 渠道

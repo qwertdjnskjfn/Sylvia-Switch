@@ -8707,6 +8707,74 @@ fn minimax_last_message_text(body: &Value) -> String {
     String::new()
 }
 
+/// 把 OpenAI 形状的 `tools` 转成 **Anthropic 原生**形状（2026-10-09）。
+///
+/// | OpenAI | Anthropic |
+/// | --- | --- |
+/// | `{"type":"function","function":{"name","description","parameters"}}` | `{"name","description","input_schema"}` |
+///
+/// 已带 `input_schema` 的（调用方直接发 Anthropic 形状）原样透传。
+fn openai_tools_to_anthropic(tools: Option<&Value>) -> Option<Value> {
+    let arr = tools?.as_array()?;
+    if arr.is_empty() {
+        return None;
+    }
+    let mut out: Vec<Value> = Vec::with_capacity(arr.len());
+    for t in arr {
+        // 已是 Anthropic 形状
+        if t.get("input_schema").is_some() && t.get("name").is_some() {
+            out.push(t.clone());
+            continue;
+        }
+        let Some(f) = t.get("function") else { continue };
+        let Some(name) = f.get("name").and_then(Value::as_str) else { continue };
+        let mut item = json!({ "name": name });
+        if let Some(d) = f.get("description").and_then(Value::as_str) {
+            item["description"] = json!(d);
+        }
+        // OpenAI 的 parameters ↔ Anthropic 的 input_schema
+        item["input_schema"] = f
+            .get("parameters")
+            .cloned()
+            .unwrap_or_else(|| json!({"type":"object","properties":{}}));
+        out.push(item);
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(json!(out))
+    }
+}
+
+/// 把 OpenAI 的 `tool_choice` 转成 Anthropic 形状。
+///
+/// | OpenAI | Anthropic |
+/// | --- | --- |
+/// | `"auto"` / `"required"` / `"none"`（字符串）| `{"type":"auto"}` / `{"type":"any"}` |
+/// | `{"type":"function","function":{"name":…}}` | `{"type":"tool","name":…}` |
+fn openai_tool_choice_to_anthropic(tc: Option<&Value>) -> Option<Value> {
+    let t = tc?;
+    if t.is_null() {
+        return None;
+    }
+    if let Some(s) = t.as_str() {
+        return Some(match s {
+            "required" => json!({ "type": "any" }),
+            "none" => json!({ "type": "none" }),
+            _ => json!({ "type": "auto" }),
+        });
+    }
+    // OpenAI 具名格式
+    if let Some(name) = t.pointer("/function/name").and_then(Value::as_str) {
+        return Some(json!({ "type": "tool", "name": name }));
+    }
+    // 已是 Anthropic 形状
+    if t.get("type").and_then(Value::as_str).is_some() {
+        return Some(t.clone());
+    }
+    None
+}
+
 async fn api_minimax_chat(headers: HeaderMap, Json(mut body): Json<Value>) -> Response {
     if !minimax_key_ok(&headers) {
         return glm_proxy_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
@@ -8720,9 +8788,23 @@ async fn api_minimax_chat(headers: HeaderMap, Json(mut body): Json<Value>) -> Re
         .map(String::from);
     let prompt = minimax_last_message_text(&body);
     body["prompt"] = json!(prompt);
-    match minimax::chat_once(&prompt, region.as_deref(), model.as_deref()).await {
+
+    // 2026-10-09：透传 tools / tool_choice / 完整 messages（此前只传末条文本，
+    // 导致多轮与工具调用两项能力被网关掐死——实测上游原生是支持的）。
+    let req = minimax::ChatRequest {
+        model: model.clone(),
+        tools: openai_tools_to_anthropic(body.get("tools")),
+        tool_choice: openai_tool_choice_to_anthropic(body.get("tool_choice")),
+        messages: body.get("messages").cloned().filter(|m| m.is_array()),
+        max_tokens: body.get("max_tokens").and_then(Value::as_u64),
+    };
+    let has_tools = req.tools.is_some();
+    match minimax::chat_once_full(&prompt, region.as_deref(), model.as_deref(), Some(req)).await {
         Ok(v) => json_ok(v),
-        Err((s, e)) => glm_proxy_error(e, StatusCode::from_u16(s).unwrap_or(StatusCode::BAD_GATEWAY)),
+        Err((s, e)) => {
+            let _ = has_tools;
+            glm_proxy_error(e, StatusCode::from_u16(s).unwrap_or(StatusCode::BAD_GATEWAY))
+        }
     }
 }
 
