@@ -1,3 +1,49 @@
+## 2.0.28 - 2026-10-09
+
+### 默认思考强度改为 max（"开最大推理"）+ ZCode 接入改 1M 上下文
+
+#### ① 网关：`reasoning_effort` 缺省值改为 `max`
+新增 `DEFAULT_REASONING_EFFORT = "max"`，`build_chat_payload` 在客户端**未指定**时注入。
+
+| 行为 | 改前 | 改后 |
+| --- | --- | --- |
+| 客户端不传 `reasoning_effort` | 上游用官方 `default` | **本网关注入 `max`** |
+| 客户端显式传值 | 以客户端为准 | 以客户端为准（不变）|
+| 想回退官方默认 | — | 传 `"default"` |
+
+官方 `effortOptions`：`default|low|medium|high|xhigh|max`；官方 `defaultEffort: default`。
+本次把缺省拉到最高档，满足"开最大推理"的需求。
+
+#### ② ZCode 接入脚本：上下文 512K → **1M**，并修正 `maxOutputTokens` 位置
+- `contextWindow`: 512000 → **1000000**（官方 `contextWindowOptions` 支持 1000000，
+  标注 `higher_usage` = 更耗额度；这是用户指定 `[1m]` 的有意选择）
+- M2.7 系不抬高（官方上限 200000，声明超出模型能力无意义）
+- 🔴 **`maxOutputTokens` 位置修正**（zcode.cjs schema 实证）：
+  | 字段 | 正确位置 | 形状 |
+  | --- | --- | --- |
+  | `contextWindow` | `config.properties.contextWindow` | number |
+  | `maxOutputTokens` | **`config.optionSpecs.maxOutputTokens.max`** | **`{max: N}` 对象**（不是 number！）|
+  | `reasoningLevel` | **`config.optionSpecs.reasoningLevel.values`** | string[] |
+
+  早前误将 `maxOutputTokens` 写在 `properties` 下 —— 该处是 `.strict()` schema，
+  不存在此字段。本次已修正，并会**主动清除**旧配置里误放的字段。
+
+#### ⚠️ 验证局限（如实记录）
+| 想验的 | 手段 | 结果 |
+| --- | --- | --- |
+| effort 是否生效 | 对比 `reasoning_content` 长度 | ❌ **不可用**：单次测量噪声极大（历史样本 240/265/322/416/421/549/565 字，档位间无单调关系）|
+| effort 是否被透传 | 传非法值 `INVALID_XYZ` 看是否报错 | ❌ **不可用**：上游对该参数**宽容**，非法值也返回 200 |
+
+**结论**：代码路径已确认（常量 + 注入逻辑 + 已部署），但**运行时效果无法用黑盒响应特征区分**。
+若需确证，应在网关加"实际发送的 effort"日志（本次未做）。
+
+> 📌 **通用教训**：如果被观测方对参数的响应**不显著**或**过于宽容**，
+> 那么"改完再测"可能**永远测不出结论**。此时正确做法是**加日志/回显**，
+> 而不是反复跑黑盒测试（今天在这一点上花了 3 轮）。
+
+#### ③ 部署
+2.0.28 已上线，`OUTAGE = 1.0s`；单测 785 passed / 0 failed。
+
 ## 2.0.27 - 2026-10-09
 
 ### 修复 MiniMax 两处 max_tokens 缺陷（静默截断 + 截断不可见）
@@ -45,7 +91,6 @@
 | 内联图片 / 视频 | 10 MiB / 50 MiB |
 | 附件数上限 | 4 |
 | thinking | **强制开启**（`mode: forced_on`），`reasoning_effort` 六档 |
-
 
 ## 2.0.25 - 2026-10-09
 

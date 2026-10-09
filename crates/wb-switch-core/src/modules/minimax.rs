@@ -2301,6 +2301,15 @@ pub struct ChatRequest {
 /// 32768 是原值的 8 倍，覆盖绝大多数场景；模型上限为 128000（官方 config.yaml）。
 pub const DEFAULT_CHAT_MAX_TOKENS: u64 = 32768;
 
+/// 默认思考强度（2026-10-09，用户要求「开最大推理」）。
+///
+/// 官方 `thinking.effortOptions`：`default|low|medium|high|xhigh|max`，
+/// 官方默认是 `default`。此处取**最高档 max** 作为缺省值。
+///
+/// ⚠️ **客户端显式传 `reasoning_effort` 时以客户端为准**（保留灵活性）。
+/// 影响：思考更充分但更慢、更耗 token。若要回退官方默认，传 `"default"`。
+pub const DEFAULT_REASONING_EFFORT: &str = "max";
+
 /// 本次请求实际使用的 `max_tokens`（请求值优先，缺省用 [`DEFAULT_CHAT_MAX_TOKENS`]）。
 /// 抽成函数以便 `build_chat_payload` 与 `finish_reason_for` 用**同一个口径**，
 /// 避免"发出去的 max_tokens"与"截断判定用的 max_tokens"不一致。
@@ -2435,9 +2444,15 @@ fn build_chat_payload(model: &str, req: Option<&ChatRequest>, messages: Option<&
     if let Some(th) = req.and_then(|r| r.thinking.as_ref()).filter(|t| !t.is_null()) {
         obj.insert("thinking".into(), th.clone());
     }
-    if let Some(eff) = req.and_then(|r| r.reasoning_effort.as_deref()).map(str::trim).filter(|x| !x.is_empty()) {
-        obj.insert("reasoning_effort".into(), json!(eff));
-    }
+    // 思考强度：客户端显式指定优先，否则用 DEFAULT_REASONING_EFFORT（当前为 max）。
+    // 2026-10-09：此前「不传 = 上游用官方 default」，改为「不传 = 本网关默认 max」，
+    // 以满足「开最大推理」的需求；客户端仍可传 "default" 显式回退。
+    let effort = req
+        .and_then(|r| r.reasoning_effort.as_deref())
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+        .unwrap_or(DEFAULT_REASONING_EFFORT);
+    obj.insert("reasoning_effort".into(), json!(effort));
     p
 }
 
