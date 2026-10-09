@@ -1056,7 +1056,48 @@ impl Drop for CurlPermit {
 /// ⇒ 正确做法是留在 curl，把它"不稳"的两处补上：
 ///   1) **并发闸门**（`CurlPermit`，默认最多 3 个同时在飞）—— 治 `os error 231（管道耗尽）`；
 ///   2) **瞬时重试**（最多 3 次，递增退避）—— 治 `curl exit 26（读错误）` 这类抖动。
-fn chat_via_curl(url: &str, payload: &Value, token: &str, timeout_secs: u64) -> Result<(u16, String), String> {
+/// curl 层失败：区分「请求未发出」与「**可能已送达并计费**」（2026-10-09）。
+///
+/// 🔴 背景缺陷（用户报「扣减积分却扣了两个账号」）：
+/// 此前 curl 的任何失败都被压成 `String`，上层于是「一律重试 / 一律换号」。
+/// 但 curl 的退出码能精确区分语义：
+///
+/// | curl exit | 含义 | 请求是否送达 | 上游是否计费 | 重试/换号 |
+/// | --- | --- | --- | --- | --- |
+/// | 6 / 7 / 35 | 域名解析 / 连接 / SSL 握手失败 | ❌ 未送达 | ❌ 未计费 | ✅ 安全 |
+/// | **28** | **操作超时** | ✅ **已送达** | ⚠️ **可能已计费** | ❌ **禁止** |
+/// | **52 / 56** | 空回复 / 接收数据失败 | ✅ **已送达** | ⚠️ **可能已计费** | ❌ **禁止** |
+///
+/// 成因链：账号 A 发出请求 → 上游已扣 A 的费 → curl `--max-time` 超时（exit 28）
+/// → 判失败 → 重试或换号 B → 上游**又扣 B 的费** ⇒ 两个账号双边扣费。
+///
+/// 故 `maybe_billed = true` 时，**三层重试（curl 内层 / 401 刷新 / 外层换号）都必须止步**，
+/// 直接把错误透出 —— 宁可不重试，也不静默多扣一个账号的额度。
+#[derive(Debug, Clone)]
+pub struct CurlFailure {
+    pub msg: String,
+    /// 请求**可能已送达并计费** ⇒ 禁止任何形式的重试/换号。
+    pub maybe_billed: bool,
+}
+
+impl CurlFailure {
+    /// 由 curl 退出码判定（取向保守：凡无法排除"已送达"的，一律按已送达处理）。
+    fn from_exit(code: Option<i32>, stderr_text: String) -> Self {
+        let body: String = stderr_text.chars().take(160).collect();
+        let maybe_billed = matches!(code, Some(28) | Some(52) | Some(56));
+        Self {
+            msg: format!("curl 退出码 {code:?}（传输层失败）：{body}"),
+            maybe_billed,
+        }
+    }
+
+    /// 非传输层失败（本地错误：序列化/调起/写 stdin），请求确实没发出。
+    fn local(msg: String) -> Self {
+        Self { msg, maybe_billed: false }
+    }
+}
+
+fn chat_via_curl(url: &str, payload: &Value, token: &str, timeout_secs: u64) -> Result<(u16, String), CurlFailure> {
     let cfg = load_config();
     let tries = cfg.curl_retries.clamp(1, 10);
     let gate = if cfg.curl_max_concurrent == 0 {
@@ -1072,10 +1113,28 @@ fn chat_via_curl(url: &str, payload: &Value, token: &str, timeout_secs: u64) -> 
         }
         match chat_via_curl_once(url, payload, token, timeout_secs, gate) {
             Ok(v) => return Ok(v),
-            Err(e) => last_err = e,
+            Err(e) => {
+                // 🔴 2026-10-09：请求**可能已送达并计费**时**立即止步，不再重试**。
+                // 重试 = 上游对同一账号再扣一次费（account 内层的双边扣费来源）。
+                if e.maybe_billed {
+                    return Err(CurlFailure {
+                        msg: format!(
+                            "第 {}/{} 次尝试时上游响应异常，但请求可能已产生计费，已停止重试以避免重复扣费。{}",
+                            attempt + 1,
+                            tries,
+                            e.msg
+                        ),
+                        maybe_billed: true,
+                    });
+                }
+                last_err = e.msg;
+            }
         }
     }
-    Err(format!("curl 连续 {tries} 次失败（已含并发闸门{gate} 与退避重试）：{last_err}"))
+    Err(CurlFailure {
+        msg: format!("curl 连续 {tries} 次失败（已含并发闸门{gate} 与退避重试）：{last_err}"),
+        maybe_billed: false,
+    })
 }
 
 fn chat_via_curl_once(
@@ -1084,13 +1143,13 @@ fn chat_via_curl_once(
     token: &str,
     timeout_secs: u64,
     gate: usize,
-) -> Result<(u16, String), String> {
+) -> Result<(u16, String), CurlFailure> {
     use std::io::Write;
     use std::process::{Command, Stdio};
     let _permit = CurlPermit::acquire(gate); // 并发闸门：防管道/句柄耗尽（os error 231）
 
     // 中文经命令行传参会产出非法 UTF-8（AGENTS.md 坑 #6）→ 走 stdin
-    let body_bytes = serde_json::to_vec(payload).map_err(|e| format!("payload 序列化失败: {e}"))?;
+    let body_bytes = serde_json::to_vec(payload).map_err(|e| CurlFailure::local(format!("payload 序列化失败: {e}")))?;
     let mut child = Command::new("curl")
         .arg("-s")                    // 静默（不要进度条污染 stdout）
         .arg("--max-time").arg(timeout_secs.to_string())
@@ -1106,22 +1165,22 @@ fn chat_via_curl_once(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("调起 curl 失败（系统需自带 curl.exe）: {e}"))?;
+        .map_err(|e| CurlFailure::local(format!("调起 curl 失败（系统需自带 curl.exe）: {e}")))?;
 
     // 写 stdin 后关闭（curl 读到 EOF 才会发请求）
     {
         let mut sin = child
             .stdin
             .take()
-            .ok_or_else(|| "取 curl stdin 失败".to_string())?;
+            .ok_or_else(|| CurlFailure::local("取 curl stdin 失败".to_string()))?;
         sin.write_all(&body_bytes)
-            .map_err(|e| format!("写 curl stdin 失败: {e}"))?;
+            .map_err(|e| CurlFailure::local(format!("写 curl stdin 失败: {e}")))?;
         // sin 在此 drop → 关闭管道
     }
 
     let out = child
         .wait_with_output()
-        .map_err(|e| format!("等待 curl 失败: {e}"))?;
+        .map_err(|e| CurlFailure::local(format!("等待 curl 失败: {e}")))?;
 
     let mut body = String::from_utf8_lossy(&out.stdout).to_string();
     // 拆出末尾的 http_code（curl 非 0 退出时 stdout 可能只有状态码行）
@@ -1134,11 +1193,10 @@ fn chat_via_curl_once(
         body.truncate(i);
     }
     if !out.status.success() && body.trim().is_empty() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        return Err(format!(
-            "curl 退出码 {:?}（传输层失败）：{}",
+        // 传输层失败：按 curl 退出码判定「是否可能已送达」（28/52/56 → 是）
+        return Err(CurlFailure::from_exit(
             out.status.code(),
-            err.chars().take(160).collect::<String>()
+            String::from_utf8_lossy(&out.stderr).to_string(),
         ));
     }
     Ok((status, body))
@@ -2661,7 +2719,18 @@ async fn chat_with_account(
         })
         .await
         .map_err(|e| (502u16, format!("对话任务异常: {e}")))?
-        .map_err(|e| (502u16, e))?;
+        .map_err(|e| {
+            // 🔴 2026-10-09：请求「可能已送达并计费」时用哨兵状态码 —— 外层
+            // `is_retryable_status` 会因此**拒绝换号**，避免第二个账号被上游再扣一次费。
+            if e.maybe_billed {
+                (
+                    crate::modules::glm_proxy::MIGHT_HAVE_BILLED,
+                    e.msg,
+                )
+            } else {
+                (502u16, e.msg)
+            }
+        })?;
         if !(200..300).contains(&st) {
             return Err((st, format!("模型直连 HTTP {st}: {}", text.chars().take(150).collect::<String>())));
         }
@@ -2724,7 +2793,18 @@ async fn chat_with_account(
         })
         .await
         .map_err(|e| (502u16, format!("对话任务异常: {e}")))?
-        .map_err(|e| (502u16, e))?;
+        .map_err(|e| {
+            // 🔴 2026-10-09：请求「可能已送达并计费」时用哨兵状态码 —— 外层
+            // `is_retryable_status` 会因此**拒绝换号**，避免第二个账号被上游再扣一次费。
+            if e.maybe_billed {
+                (
+                    crate::modules::glm_proxy::MIGHT_HAVE_BILLED,
+                    e.msg,
+                )
+            } else {
+                (502u16, e.msg)
+            }
+        })?;
         if !(200..300).contains(&st) {
             return Err((st, format!("模型直连 HTTP {st}: {}", text.chars().take(150).collect::<String>())));
         }
@@ -2960,6 +3040,15 @@ pub async fn chat_once_full(
 /// 而非网关鉴权失败（网关鉴权用的是本渠道自己的 api_key）→ 因此 401 也应换号
 /// （账号 JWT 过期/失效是最常见失败之一，见 1.0.41）。
 pub fn is_retryable_status(status: u16) -> bool {
+    // 🔴 2026-10-09：「请求可能已送达并计费」**一律禁止换号重试**。
+    //
+    // 成因：账号 A 发出请求 → 上游已扣 A 的费 → 响应超时/中断 → 若此处返回 true
+    // 就会换号 B 重试 → 上游又扣 B 的费 ⇒ **同一次操作两个账号双边扣费**
+    // （用户报「扣减积分却扣了两个账号」的成因）。
+    // 取向：宁可不重试（把错误透出），也不静默多扣一个账号的额度。
+    if status == crate::modules::glm_proxy::MIGHT_HAVE_BILLED {
+        return false;
+    }
     status == 0
         || status == 401
         || status == 403
@@ -3587,7 +3676,19 @@ pub fn points_ledger_path() -> std::path::PathBuf {
     {
         static D: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
         return D
-            .get_or_init(|| std::env::temp_dir().join("wb-switch-test-store"))
+            .get_or_init(|| {
+                // ⚠️ 必须**按进程唯一 + 启动即清空**：固定目录名会让上一次测试运行的
+                // 账本残留参与本次断言（实测 `label:mm-8` 累到 4000，把 400 的期望打崩）。
+                let dir = std::env::temp_dir()
+                    .join(format!("wb-switch-test-store-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&dir);
+                let _ = std::fs::create_dir_all(&dir);
+                // 🔴 2026-10-09 修正：此处必须返回**目录下的文件路径**。
+                // 此前直接 `return dir`（漏了文件名）⇒ `atomic_write` 把文件写向一个
+                // 目录路径而失败（错误被 `let _ =` 吞掉）⇒ `load_ledger` 永远读到空
+                // ⇒ `signin_points_total` 恒为 0，测试 `left: 0` 失败。
+                dir.join("minimax_points_ledger.json")
+            })
             .clone();
     }
     #[cfg(not(test))]
@@ -3600,6 +3701,102 @@ fn ledger_key(user_id: &str, label: &str) -> String {
         format!("uid:{user_id}")
     } else {
         format!("label:{label}")
+    }
+}
+
+/// 账本写锁（进程级）。
+///
+/// 🔴 2026-10-09：账本是「读—改—写」且原先**无锁**。两个并发写入（手动签到 ×
+/// 统一编排 sweep）会同时 `atomic_write` 同一目标 ⇒ Windows 上后到的 rename
+/// 直接 `os error 5 拒绝访问`（tmp 名唯一但目标是同一个文件）。单测并行时必现，
+/// 生产只是窗口更小 —— 已实测报错，故补锁。临界区只包「读改写」，不含网络调用。
+fn ledger_lock() -> &'static std::sync::Mutex<()> {
+    static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    L.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// **记一天的「已确认到账」签到积分**（按天去重），返回 `(累计, 本次是否新增)`。
+///
+/// 🔴 2026-10-09（口径纠偏，用户实测截图「累计 0 分」逼出来的）：
+/// 旧口径只认 `action == "claimed"`（**本机**领到的）。但桌面端客户端自带自动签到 ——
+/// **客户端先领了**，服务端再跑只会拿到 `status=3` / `claim_result=2` ⇒ 判成
+/// `already-claimed` ⇒ **本机永远记 0**，而用户看到的是「今天确实签到、也确实到账了」。
+/// 实测 MiniMax614670：面板 `is_today, status=3, points=400`、`paid=true`，累计却是 0。
+///
+/// 现口径：**当天上游确认已签到就记一次**（`status=3` / 本机 `claimed` / `paid=true`），
+/// 按 `(身份, 日期)` 去重 ⇒ 既覆盖客户端先领，又不会重复计数（同日跑 10 次也只记一次）。
+///
+/// 旧格式兼容：老账本只有 `points` 没有 `days`，无法反推历史值属于哪天
+/// ⇒ 首次写入时把旧值**归到调用当天**（保守：宁可少记也不重复记）。
+pub fn ledger_add_day(user_id: &str, label: &str, date: &str, points: u64) -> (u64, bool) {
+    if points == 0 {
+        return (ledger_points(user_id, label), false);
+    }
+    let _guard = ledger_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let key = ledger_key(user_id, label);
+    let mut all = load_ledger();
+    let mut days: serde_json::Map<String, Value> = all
+        .get(&key)
+        .and_then(|v| v.get("days"))
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if days.is_empty() {
+        // 旧格式迁移：把历史累计归到「今天」，避免同一天被记两次
+        let legacy = all
+            .get(&key)
+            .and_then(|v| v.get("points"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if legacy > 0 {
+            days.insert(date.to_string(), json!(legacy));
+        }
+    }
+    if days.get(date).and_then(Value::as_u64).unwrap_or(0) > 0 {
+        let total: u64 = days.values().filter_map(Value::as_u64).sum();
+        return (total, false); // 当天已记过 ⇒ 幂等
+    }
+    days.insert(date.to_string(), json!(points));
+    let total: u64 = days.values().filter_map(Value::as_u64).sum();
+    all.insert(
+        key,
+        json!({"points": total, "days": Value::Object(days), "updated_at_ms": now_ms(),
+               "label": label, "user_id": user_id}),
+    );
+    if let Ok(s) = serde_json::to_string_pretty(&Value::Object(all)) {
+        let _ = crate::modules::config::atomic_write(&points_ledger_path(), &s);
+    }
+    (total, true)
+}
+
+/// 从一次签到结果里取「本次的签到积分」。
+fn signin_points_of(res: &Value) -> u64 {
+    res.get("points")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            res.get("points")
+                .and_then(Value::as_str)
+                .and_then(|s| s.parse::<u64>().ok())
+        })
+        .unwrap_or(0)
+}
+
+/// 这次签到**是否可记为「当天已到账」**（纯函数，便于单测）。
+///
+/// 记：`claimed`（本机领到）；`already-claimed` 且不是「上游明确无可领」
+/// （只有 `result == "already"` **且** `paid != true` 才是无可领）。
+/// 不记：失败、上游无可领。
+fn credited_today(res: &Value) -> bool {
+    if res.get("ok").and_then(Value::as_bool) != Some(true) {
+        return false;
+    }
+    match res.get("action").and_then(Value::as_str).unwrap_or("") {
+        "claimed" => true,
+        "already-claimed" => {
+            res.get("paid").and_then(Value::as_bool) == Some(true)
+                || res.get("result").and_then(Value::as_str) != Some("already")
+        }
+        _ => false,
     }
 }
 
@@ -3637,26 +3834,6 @@ pub fn ledger_points(user_id: &str, label: &str) -> u64 {
     by_uid.max(by_label)
 }
 
-/// 累加账本（`claimed` 时调用）。返回累加后的值。
-pub fn ledger_add(user_id: &str, label: &str, points: u64) -> u64 {
-    let key = ledger_key(user_id, label);
-    let mut all = load_ledger();
-    let cur = all
-        .get(&key)
-        .and_then(|v| v.get("points"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let next = cur + points;
-    all.insert(
-        key,
-        json!({"points": next, "updated_at_ms": now_ms(), "label": label, "user_id": user_id}),
-    );
-    if let Ok(s) = serde_json::to_string_pretty(&Value::Object(all)) {
-        let _ = crate::modules::config::atomic_write(&points_ledger_path(), &s);
-    }
-    next
-}
-
 /// **一次性回填/校正**条目上的 `signin_points_total`：取「条目现值」与「账本值」的较大者。
 ///
 /// 用途：① 新导入条目从账本恢复历史累计（不再从 0 开始）；
@@ -3680,6 +3857,7 @@ pub fn reconcile_points_total(acc: &mut MmAccount) -> bool {
 ///
 /// **幂等**：逐键取 `max(账本现值, 流水求和)`，重复调用不会翻倍。
 pub fn ledger_backfill_from_history(alias: &[(String, String)]) -> usize {
+    let _guard = ledger_lock().lock().unwrap_or_else(|e| e.into_inner());
     // label → user_id 映射（只取身份像样的，避免把 web 账号的空身份写进键）
     let alias_map: std::collections::HashMap<&str, &str> = alias
         .iter()
@@ -3687,15 +3865,22 @@ pub fn ledger_backfill_from_history(alias: &[(String, String)]) -> usize {
         .map(|(uid, label)| (label.as_str(), uid.as_str()))
         .collect();
 
-    // 流水按键求和（优先 uid；历史无 uid 时按 label，并在能映射时升级成 uid）
-    let mut sums: std::collections::HashMap<String, (u64, String, String)> =
+    // 流水按 **(键, 日期)** 归集；同日多条取 **max**（同一天只记一次，与
+    // `ledger_add_day` 的去重口径一致）。只统计「已确认到账」：
+    //   `claimed`（本机领到） 或 `already-claimed` 且 `paid`（客户端先领、details 已见发放）
+    let mut per: std::collections::HashMap<String, (String, String, std::collections::BTreeMap<String, u64>)> =
         std::collections::HashMap::new();
     for m in load_movements() {
-        if m.action != "claimed" {
+        let credited = m.action == "claimed" || (m.action == "already-claimed" && m.paid);
+        if !credited {
             continue;
         }
         let p = m.points.unwrap_or(0);
         if p == 0 {
+            continue;
+        }
+        let date = m.at_str.chars().take(10).collect::<String>();
+        if date.len() < 10 {
             continue;
         }
         let uid = if !m.user_id.is_empty() {
@@ -3704,27 +3889,50 @@ pub fn ledger_backfill_from_history(alias: &[(String, String)]) -> usize {
             alias_map.get(m.label.as_str()).map(|s| s.to_string()).unwrap_or_default()
         };
         let key = ledger_key(&uid, &m.label);
-        let e = sums
-            .entry(key)
-            .or_insert((0, m.label.clone(), uid));
-        e.0 += p;
+        let e = per.entry(key).or_insert((m.label.clone(), uid, Default::default()));
+        let slot = e.2.entry(date).or_insert(0);
+        if p > *slot {
+            *slot = p;
+        }
     }
 
     let mut all = load_ledger();
     let mut touched = 0usize;
-    for (key, (sum, label, uid)) in sums {
-        let cur = all
+    for (key, (label, uid, days)) in per {
+        let mut merged: serde_json::Map<String, Value> = all
             .get(&key)
-            .and_then(|v| v.get("points"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        if sum <= cur {
+            .and_then(|v| v.get("days"))
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        // 旧格式（只有 points、无 days）⇒ 把历史累计归到流水里最早那一天
+        if merged.is_empty() {
+            let legacy = all
+                .get(&key)
+                .and_then(|v| v.get("points"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if legacy > 0 {
+                if let Some(first) = days.keys().next() {
+                    merged.insert(first.clone(), json!(legacy));
+                }
+            }
+        }
+        let mut changed = false;
+        for (d, p) in &days {
+            if merged.get(d).and_then(Value::as_u64).unwrap_or(0) < *p {
+                merged.insert(d.clone(), json!(p));
+                changed = true;
+            }
+        }
+        if !changed {
             continue;
         }
+        let total: u64 = merged.values().filter_map(Value::as_u64).sum();
         all.insert(
             key,
-            json!({"points": sum, "updated_at_ms": now_ms(), "label": label, "user_id": uid,
-                   "source": "backfill-from-movements"}),
+            json!({"points": total, "days": Value::Object(merged), "updated_at_ms": now_ms(),
+                   "label": label, "user_id": uid, "source": "backfill-from-movements"}),
         );
         touched += 1;
     }
@@ -3914,26 +4122,22 @@ pub fn apply_signin_outcome(
     consumed: Option<f64>,
 ) {
     let signed = res.get("ok").and_then(Value::as_bool) == Some(true);
-    let claimed = res.get("action").and_then(Value::as_str) == Some("claimed");
     let Some(a) = cfg.accounts.iter_mut().find(|x| x.id == acc_id) else {
         return;
     };
     if signed {
         a.signin_last_date = today_str();
-        if claimed {
-            let p = res
-                .get("points")
-                .and_then(Value::as_u64)
-                .or_else(|| {
-                    res.get("points")
-                        .and_then(Value::as_str)
-                        .and_then(|s| s.parse::<u64>().ok())
-                })
-                .unwrap_or(0);
-            a.signin_points_total += p;
-            // 🔴 2026-10-09：累计值同时写入**按身份记账的账本**。条目会被删/重导，
-            // 只存在条目上必然归零（实测小螺帽 00:42 领 400 后条目重建 ⇒ 显示 0）。
-            ledger_add(&a.user_id, &a.label, p);
+        // 🔴 2026-10-09（口径纠偏）：只认 `claimed` 会让「客户端先领」的账号**永远是 0**
+        // （实测 MiniMax614670：面板 status=3/points=400/paid=true，累计却 0）。
+        // 改为「当天上游确认已到账即记」，按 (身份, 日期) 去重 ⇒ 同日重复跑不重复计。
+        let p = signin_points_of(res);
+        if credited_today(res) && p > 0 {
+            ledger_add_day(&a.user_id, &a.label, &today_str(), p);
+            // 条目上的累计以账本为准（跨条目存活），**只增不减**
+            let want = ledger_points(&a.user_id, &a.label);
+            if want > a.signin_points_total {
+                a.signin_points_total = want;
+            }
         }
         a.fail_streak = 0;
         a.last_error = None;
@@ -5016,6 +5220,61 @@ mod tests {
         assert_ne!(ledger_key("1", "x"), ledger_key("2", "x"));
     }
 
+    /// 🔴 2026-10-09 口径纠偏：客户端先签 ⇒ 服务端只拿到 `already-claimed`，
+    /// 但当天**确实到账**（面板 `status=3` / `paid=true`）⇒ 必须记。
+    #[test]
+    fn credited_today_covers_client_first_claim() {
+        // 本机领到
+        assert!(credited_today(&json!({"ok": true, "action": "claimed", "points": 400})));
+        // 面板 status=3 提前返回（无 paid / result 字段）—— 客户端已签
+        assert!(credited_today(&json!({"ok": true, "action": "already-claimed", "points": 400})));
+        // claim_result=2 但 details 已见当日发放
+        assert!(credited_today(&json!({"ok": true, "action": "already-claimed",
+                                        "result": "already", "paid": true, "points": 400})));
+        // 上游明确「今日无可领」⇒ 不记
+        assert!(!credited_today(&json!({"ok": true, "action": "already-claimed",
+                                         "result": "already", "paid": false, "points": 400})));
+        // 失败 / 未知动作 ⇒ 不记
+        assert!(!credited_today(&json!({"ok": false, "action": "failed"})));
+        assert!(!credited_today(&json!({"ok": true, "action": "skipped"})));
+    }
+
+    /// 按天记账：同日重复调用**只记一次**；跨天累加；旧格式（只有 points）迁移不重复计。
+    #[test]
+    fn ledger_add_day_is_idempotent_per_date_and_migrates_legacy() {
+        let uid = format!("t-{}", uuid::Uuid::new_v4().simple());
+        let lbl = "测试账号";
+
+        // 首次：无历史
+        let (t1, added1) = ledger_add_day(&uid, lbl, "2026-10-09", 400);
+        assert!(added1);
+        assert_eq!(t1, 400);
+        // 同日再跑 5 次（already-claimed 也会走这里）⇒ 仍是 400
+        for _ in 0..5 {
+            let (t, added) = ledger_add_day(&uid, lbl, "2026-10-09", 400);
+            assert!(!added, "同一天不得重复计入");
+            assert_eq!(t, 400);
+        }
+        // 次日 ⇒ 累加
+        let (t2, added2) = ledger_add_day(&uid, lbl, "2026-10-10", 400);
+        assert!(added2);
+        assert_eq!(t2, 800);
+
+        // 旧格式迁移：另一个 uid 手工塞一个「只有 points」的条目
+        let uid2 = format!("t-legacy-{}", uuid::Uuid::new_v4().simple());
+        let key = ledger_key(&uid2, lbl);
+        let mut all = load_ledger();
+        all.insert(key, json!({"points": 400, "label": lbl, "user_id": uid2}));
+        let _ = crate::modules::config::atomic_write(
+            &points_ledger_path(),
+            &serde_json::to_string_pretty(&Value::Object(all)).unwrap(),
+        );
+        // 当天再记 ⇒ 旧值被归到今天，**不得**变成 800
+        let (t3, added3) = ledger_add_day(&uid2, lbl, "2026-10-09", 400);
+        assert!(!added3, "旧格式的历史值应视为已计入当天");
+        assert_eq!(t3, 400, "不得把同一天算两遍");
+    }
+
     /// 🔴 防回归：账本/动向等**记账文件在测试里必须落临时目录**。
     /// 真实事故（2026-10-09）：`ledger_add` 走生产路径，把 `label:mm-8 = 1200`
     /// 写进了用户的 `minimax_points_ledger.json`；而 reconcile 会把脏值灌进真实账号
@@ -5176,30 +5435,40 @@ mod tests {
     /// 写回口径：只有真 `claimed` 才累加积分；`already-claimed` 累加会产生幻影分。
     #[test]
     fn apply_signin_outcome_accumulates_only_on_claimed() {
+        // 唯一身份 ⇒ 测试之间互不干扰（账本按身份记账，落在临时目录）
+        let uid = format!("t-mm-{}", uuid::Uuid::new_v4().simple());
         let mut cfg = load_config();
         cfg.accounts = vec![acc("mm-8", "desktop", PROVIDER_BIGMODEL, true, 0, "tok")];
-        cfg.accounts[0].signin_points_total = 100;
+        cfg.accounts[0].user_id = uid;
         cfg.accounts[0].fail_streak = 3;
         cfg.accounts[0].last_error = Some("旧错误".into());
 
-        // ① 真领取：累加 + 清零熔断
+        // ① 真领取：记账 + 清零熔断 + 写余额
+        //    （2026-10-09 口径纠偏：累计以**账本**为准，条目初值不再叠加）
         let res = json!({"ok": true, "action": "claimed", "points": 400});
         apply_signin_outcome(&mut cfg, "mm-8", &res, Some(500.0), Some(1.0));
-        assert_eq!(cfg.accounts[0].signin_points_total, 500);
+        assert_eq!(cfg.accounts[0].signin_points_total, 400);
         assert_eq!(cfg.accounts[0].fail_streak, 0);
         assert_eq!(cfg.accounts[0].last_error, None);
         assert_eq!(cfg.accounts[0].balance, Some(500.0));
         assert_eq!(cfg.accounts[0].signin_last_date, today_str());
 
-        // ② 已签到：不累加，但日期与熔断照常更新
+        // ② 同日 already-claimed（客户端先签的情形）⇒ **记过一次就不再记**，
+        //    不得产生幻影分
         let res2 = json!({"ok": true, "action": "already-claimed", "points": 400});
         apply_signin_outcome(&mut cfg, "mm-8", &res2, Some(500.0), Some(1.0));
-        assert_eq!(cfg.accounts[0].signin_points_total, 500, "重复签到不得产生幻影分");
+        assert_eq!(cfg.accounts[0].signin_points_total, 400, "同一天重复签到不得产生幻影分");
 
-        // ③ 失败：只记原因，不动积分与日期，也不累加 fail_streak（避免误熔断）
+        // ③ 上游明确「今日无可领」⇒ 不记分
+        let res4 = json!({"ok": true, "action": "already-claimed", "result": "already",
+                          "paid": false, "points": 400});
+        apply_signin_outcome(&mut cfg, "mm-8", &res4, Some(500.0), Some(1.0));
+        assert_eq!(cfg.accounts[0].signin_points_total, 400);
+
+        // ④ 失败：只记原因，不动积分与日期，也不累加 fail_streak（避免误熔断）
         let res3 = json!({"ok": false, "error": "invalid access token"});
         apply_signin_outcome(&mut cfg, "mm-8", &res3, None, None);
-        assert_eq!(cfg.accounts[0].signin_points_total, 500);
+        assert_eq!(cfg.accounts[0].signin_points_total, 400);
         assert_eq!(cfg.accounts[0].fail_streak, 0, "环境性失败不得累加熔断");
         assert_eq!(cfg.accounts[0].last_error.as_deref(), Some("invalid access token"));
     }
@@ -5279,6 +5548,48 @@ mod tests {
         assert_eq!(c[1]["source"]["data"], json!("QUJD"));
     }
 
+    // ---- 「可能已计费」不得重试/换号（2026-10-09 修「一次操作扣两个账号」）----
+
+    #[test]
+    fn curl_failure_marks_timeout_as_maybe_billed() {
+        // curl exit 28 = 操作超时 -> 请求已发出、上游可能已计费 -> 必须禁止重试
+        let f = CurlFailure::from_exit(Some(28), "Operation timed out".into());
+        assert!(f.maybe_billed, "超时(28)必须标记为可能已计费");
+        assert!(f.msg.contains("28"));
+    }
+
+    #[test]
+    fn curl_failure_marks_empty_reply_and_recv_error_as_maybe_billed() {
+        // 52 = 空回复、56 = 接收数据失败：都已送达上游
+        assert!(CurlFailure::from_exit(Some(52), "empty reply".into()).maybe_billed);
+        assert!(CurlFailure::from_exit(Some(56), "recv failure".into()).maybe_billed);
+    }
+
+    #[test]
+    fn curl_failure_keeps_connect_errors_retryable() {
+        // 6=域名解析失败 7=连接失败 35=SSL握手失败 -> 请求未送达 -> 可安全重试
+        for code in [Some(6), Some(7), Some(35)] {
+            let f = CurlFailure::from_exit(code, "connect failed".into());
+            assert!(!f.maybe_billed, "exit={code:?} 未送达，应可重试");
+        }
+        // 本地错误（序列化/调起/写 stdin）同样可重试
+        assert!(!CurlFailure::local("序列化失败".into()).maybe_billed);
+    }
+
+    #[test]
+    fn maybe_billed_status_blocks_account_failover() {
+        // 核心保证：哨兵状态码不会被判为可重试 -> 不会换号 -> 第二个账号不会被扣费
+        assert!(
+            !is_retryable_status(crate::modules::glm_proxy::MIGHT_HAVE_BILLED),
+            "「可能已计费」必须禁止换号，否则同一次操作会扣两个账号"
+        );
+        // 对照：普通网络/服务端错误仍可换号（不影响可用性）
+        assert!(is_retryable_status(0), "未送达仍可换号");
+        assert!(is_retryable_status(502), "502 仍可换号");
+        assert!(is_retryable_status(429), "限流仍可换号");
+    }
+
+    #[test]
     fn sweep_targets_dedupe_preserves_order() {
         let ids = vec!["a", "b", "a", "c", "b"];
         let mut seen = std::collections::HashSet::new();

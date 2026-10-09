@@ -1,3 +1,128 @@
+## 2.0.31 - 2026-10-09
+
+### 修复：「一次操作扣两个账号积分」—— 可能已计费的失败被换号重试
+
+#### 现象（用户报告）
+> 扣减用户积分时，会**同时扣掉两个账号**的积分，而不是只扣当前操作用户的。
+
+#### 根因：**「请求未送达」与「已送达但响应异常」被混为一谈**
+
+系统有多层失败重试（curl 内层 / 401 刷新 / 换号 failover）。判定"可否重试"时，
+**所有网络层失败都被压成同一个标记**（`status = 0` / curl 错误 String），
+而该标记被无条件视为**可重试**。但这两类语义完全不同：
+
+| 失败 | 请求是否送达 | 上游是否计费 | 重试/换号 |
+| --- | --- | --- | --- |
+| 连接阶段（DNS / 拒绝 / 构造）| ❌ 未送达 | ❌ 未计费 | ✅ 安全 |
+| **超时 / 响应体 / 解码异常** | ✅ **已送达** | ⚠️ **可能已计费** | ❌ **会双边扣费** |
+
+**成因链（实测可复现）**：
+```
+账号 A 发出请求 → 上游已扣 A 的费
+    ↓ 响应超时 → 判"失败" → measurement.abort()（不计量）→ 换号
+账号 B 重试     → 上游又扣 B 的费
+    ↓ 成功
+⇒ A、B【两个账号都被扣费】，而系统只记录了 B
+```
+用户在上游账单里看到的就是"一次操作扣了两个账号"。
+
+#### 改动
+
+**① `glm_proxy.rs`（GLM/AutoClaw 轮换池）**
+| 项 | 说明 |
+| --- | --- |
+| 新增 `MIGHT_HAVE_BILLED: u16 = u16::MAX` | 「可能已计费」哨兵状态码 |
+| 新增 `send_once_classified()` | 按 `reqwest::Error::is_connect()/is_request()` 分类：连接阶段 → `0`（可重试）；超时/响应体/解码 → `MIGHT_HAVE_BILLED`（禁止） |
+| 新增 `is_retryable_failure()` | 唯一被拒的情形是哨兵值 |
+| `intl_try_send_for_account` | 改用 classified 发送，**透传状态码**（原先 `Err((0, e))` 把分类信息丢掉）|
+| `intl_lease_attempt` / `intl_send_with_lease` | 返回类型 `String` → `(u16, String)`，**把状态码带到决策点** |
+| **外层换号循环** | 🔴 `st == MIGHT_HAVE_BILLED` 时**直接返回错误，不换号** |
+| `family` / `err` 构造 | 哨兵与 `0` 同等对待（网络层失败，**不惩罚账号**：不改健康分/不冷却——这不是账号的问题）|
+
+**② `minimax.rs`（MiniMax 渠道）—— 三层重试全部加固**
+| 项 | 说明 |
+| --- | --- |
+| 新增 `CurlFailure { msg, maybe_billed }` | 替代裸 `String` 错误，携带分类 |
+| `CurlFailure::from_exit()` | 按 **curl 退出码**判定：`6/7/35`（解析/连接/SSL）→ 未送达，可重试；**`28`（超时）/`52`（空回复）/`56`（接收失败）→ 可能已计费，禁止** |
+| `chat_via_curl` **内层重试** | 🔴 `maybe_billed` 时**立即止步**（原先任何错误都重试，等于对同一账号重复扣费）|
+| `chat_with_account` | `maybe_billed` → 包装为 `MIGHT_HAVE_BILLED` 状态码向上透传 |
+| `is_retryable_status()` | 🔴 排除哨兵值（原先 `status == 0` 与 `>= 500` 都会导致换号）|
+
+> **取向说明**：宁可**不重试**（把错误透出、由用户决定是否再发），
+> 也**不静默多扣一个账号的额度**。可用性损失仅在"超时"这一窄场景，代价可接受。
+
+#### ③ 顺带修复：测试隔离路径的 bug（阻塞门禁）
+`points_ledger_path()` 的 `#[cfg(test)]` 分支返回的是**目录**而非**文件**
+（漏了 `join("minimax_points_ledger.json")`）⇒ `atomic_write` 写向目录路径失败
+（错误被 `let _ =` 吞掉）⇒ `load_ledger` 永远读到空 ⇒ 既有测试
+`apply_signin_outcome_accumulates_only_on_claimed` 断言 `0 vs 400` 失败。
+现已返回目录下的**文件**路径；另一处同类实现（`credit_movements_path`）用的是
+`with_file_name(...)`，本就正确。
+
+#### 验证
+| 项 | 结果 |
+| --- | --- |
+| 新增单测 **8 个** | ✅ 全过（含：哨兵与 0 不撞值、超时/空回复/接收失败标记为 maybe_billed、连接类保持可重试、**哨兵状态码必须禁止换号**）|
+| 全量单测 | **800 passed / 0 failed**（修复前 799 passed / 1 failed）|
+
+#### 📌 教训
+1. **「失败」不等于「没发生」** —— 超时类失败的请求**已经到达上游并可能计费**。
+   把网络错误压成同一个标记再一律重试，是**跨账号重复扣费**的典型成因。
+2. **错误分类信息一旦在传递链中被丢弃（`format!` 成 String），下游就再也无法做正确决策**。
+   本次修复的关键不是加判断，而是**把分类信息一路带到决策点**。
+3. **测试隔离实现要检查返回值是文件还是目录** —— 写向目录的失败会被静默吞掉，
+   表现为"读到空值"而非报错（比报错更难查）。
+
+## 2.0.32 - 2026-10-09
+
+### 🔴 P0：累计积分口径错 ⇒ 「客户端先签」的账号永远显示 0 分
+
+**现象**（用户截图）：桌面端-MiniMax614670「签到 2026-10-09 · 累计 **0** 分」，
+但当天**确实签到并到账 400 分**。
+
+**取证**（ 原始面板）：
+```
+days: [ {day_no:5, is_today:true, status:3, points:400}, ... ]   status=3 = 已签到
+→ 响应 points=400、paid=true（credit/details 已见当日发放）
+```
+
+**根因**：累计只认 `action == claimed`（**本机**领到的）。而桌面端客户端自带自动签到 ——
+**客户端先领了**，服务端再跑只会拿到 `status=3` / `claim_result=2` ⇒ 判成 `already-claimed`
+⇒ **永远不累加**。即「口径统计的是本机执行次数」，而不是「这个账号累计拿到多少」。
+
+**修复**：口径改为 **按 (身份, 日期) 记「已确认到账」**：
+- `credited_today(res)`（纯函数）：`claimed` ⇒ 记；`already-claimed` 且**不是**
+  「上游明确无可领」（`result==already` 且 `paid!=true`）⇒ 也记；失败/无可领 ⇒ 不记。
+- `ledger_add_day(uid, label, date, points)`：**按天去重**（同日跑 10 次只记一次），
+  账本结构升级为 `{ points, days: { 2026-10-09: 400 } }`。
+- 旧格式（只有 `points` 无 `days`）迁移：首次写入把历史值**归到调用当天**，宁可少记不重复记。
+- `ledger_backfill_from_history` 同步升级：统计口径放宽为
+  `claimed` **或** `already-claimed && paid`，按 `(键, 日期)` 归集、同日取 max。
+
+**测试**：新增 `credited_today_covers_client_first_claim`、
+`ledger_add_day_is_idempotent_per_date_and_migrates_legacy`；改写
+`apply_signin_outcome_accumulates_only_on_claimed` 为新语义。
+`cargo test` **800 passed / 0 failed**。
+
+### 🔴 P1：`atomic_write` 在 Windows 上会**静默丢写**
+
+**现象**：`[atomic] rename FAILED: 拒绝访问 (os error 5)`，写入直接放弃。
+根因：Windows 上 `rename` 覆盖已存在文件会被**杀毒/索引器短暂独占锁**挡住。
+影响面**不限于账本**——所有走 `atomic_write` 的用户数据（账号池、配置、缓存）都可能丢更新，
+且只有一行 stderr 打印，极难归因。
+
+**修复**：rename 失败按 10/20/40/80/160ms 退避**重试 5 次**；写 tmp 失败也清理残留 tmp；
+错误信息带上目标路径；全失败才返回 Err。
+
+### P1：账本并发写锁
+账本是「读—改—写」且原先无锁，两个并发写入（手动签到 × sweep）会同时写同一目标。
+新增进程级 `ledger_lock()`（`OnceLock<Mutex<()>>`），临界区只包读改写、不含网络调用。
+**通律：Windows 上的「rename 覆盖」必须假设它会失败，要重试。**
+
+### P2：单测临时目录必须按进程唯一 + 启动清空
+固定目录名会让上一次测试运行的账本残留参与本次断言（实测 `label:mm-8` 累到 4000，
+把 400 的期望打崩）。改为 `%TEMP%/wb-switch-test-store-<pid>`，`OnceLock` 初始化时清空。
+
 ## 2.0.30 - 2026-10-09
 
 ### 修复：ZCode `empty_model_response`（网关不支持 `stream:true` → SSE）
