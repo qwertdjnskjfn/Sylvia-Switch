@@ -2358,7 +2358,8 @@ fn normalize_anthropic_messages(messages: &Value) -> Value {
                     }
                     Value::Array(_) => {
                         if let Some(a) = t.as_array() {
-                            blocks.extend(a.iter().cloned());
+                            // 同样做块转换（assistant 回传里也可能带 image_url）
+                            blocks.extend(openai_blocks_to_anthropic(a));
                         }
                     }
                     _ => {}
@@ -2398,7 +2399,9 @@ fn normalize_anthropic_messages(messages: &Value) -> Value {
                     vec![json!({ "type": "text", "text": s })]
                 }
             }
-            Some(Value::Array(a)) => a.iter().cloned().collect(),
+            // 2026-10-09：数组型 content 不再原样透传 —— 走块转换
+            // （ZCode 发的是 OpenAI 形状的 image_url，上游只认 Anthropic 的 image 块）
+            Some(Value::Array(a)) => openai_blocks_to_anthropic(a),
             Some(other) => vec![json!({ "type": "text", "text": scalar_to_text(other) })],
             None => vec![],
         };
@@ -2407,6 +2410,67 @@ fn normalize_anthropic_messages(messages: &Value) -> Value {
         out.push(json!({ "role": role, "content": content }));
     }
     json!(out)
+}
+
+/// 把 **OpenAI 形状的内容块数组**转成 **Anthropic 形状**（2026-10-09）。
+///
+/// 🔴 修复背景：ZCode 报错 `unsupported content type 'image_url' (2013)`。
+/// 此前 user/system 分支对数组型 content 是**原样透传**，而两边的图片块形状不同：
+///
+/// | 协议 | 图片块 |
+/// | --- | --- |
+/// | OpenAI | `{"type":"image_url","image_url":{"url":"data:image/png;base64,XXX"}}` |
+/// | Anthropic | `{"type":"image","source":{"type":"base64","media_type":"image/png","data":"XXX"}}` |
+///
+/// 转换规则：
+/// - `text` → 形状相同，原样
+/// - `image_url`（`data:<mime>;base64,<data>`）→ `image` + `source.type=base64`
+/// - `image_url`（`http(s)://…`）→ `image` + `source.type=url`
+/// - `image` / `tool_use` / `tool_result` 等**已是 Anthropic 形状** → 原样
+/// - **其余未知类型 → 丢弃**（不透传）。理由：上游对未知块类型是**硬 400 整单失败**
+///   （见本次事故），丢弃虽会少一块内容，但能让请求整体成功 —— 两害相权取其轻。
+///   注意刻意**不记日志**：这里在热路径上，且 `content` 可能较长。
+fn openai_blocks_to_anthropic(arr: &[Value]) -> Vec<Value> {
+    let mut out = Vec::with_capacity(arr.len());
+    for b in arr {
+        match b.get("type").and_then(Value::as_str) {
+            Some("text") => out.push(b.clone()),
+            Some("image_url") => {
+                let url = b
+                    .pointer("/image_url/url")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                // data:<mime>;base64,<payload>
+                if let Some(rest) = url.strip_prefix("data:") {
+                    if let Some((mime, data)) = rest.split_once(";base64,") {
+                        if !mime.is_empty() && !data.is_empty() {
+                            out.push(json!({
+                                "type": "image",
+                                "source": {"type": "base64", "media_type": mime, "data": data},
+                            }));
+                            continue;
+                        }
+                    }
+                }
+                // 远程 URL（Anthropic 支持 url 型 source）
+                if url.starts_with("http://") || url.starts_with("https://") {
+                    out.push(json!({
+                        "type": "image",
+                        "source": {"type": "url", "url": url},
+                    }));
+                    continue;
+                }
+                // 无法识别 → 丢弃（避免整单 400）
+            }
+            // 已是 Anthropic 形状（image / tool_use / tool_result / thinking …）→ 原样
+            Some("image") | Some("tool_use") | Some("tool_result") | Some("thinking") => {
+                out.push(b.clone())
+            }
+            // 其余未知类型 → 丢弃
+            _ => {}
+        }
+    }
+    out
 }
 
 /// 把任意 JSON 标量/结构转成纯文本（用于 tool_result 等场景）。
@@ -5142,6 +5206,79 @@ mod tests {
 
     /// 目标集必须「不漏且不重复」：按 id 去重且保序。
     #[test]
+    // ---- OpenAI -> Anthropic 内容块转换（2026-10-09 修 image_url 400 事故）----
+
+    #[test]
+    fn image_url_data_uri_becomes_anthropic_base64() {
+        // ZCode 报错原文：unsupported content type 'image_url' (2013)
+        let blocks = json!([
+            {"type": "text", "text": "看看这张图"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}},
+        ]);
+        let out = openai_blocks_to_anthropic(blocks.as_array().unwrap());
+        assert_eq!(out.len(), 2, "两块都应保留");
+        assert_eq!(out[0]["type"], json!("text"), "text 块原样");
+        assert_eq!(out[1]["type"], json!("image"), "image_url -> image");
+        assert_eq!(out[1]["source"]["type"], json!("base64"));
+        assert_eq!(out[1]["source"]["media_type"], json!("image/png"));
+        assert_eq!(out[1]["source"]["data"], json!("iVBORw0KGgo="));
+        // 关键断言：不得再出现 image_url 字样（否则上游仍 400）
+        assert!(!out[1].to_string().contains("image_url"));
+    }
+
+    #[test]
+    fn image_url_remote_becomes_anthropic_url_source() {
+        let blocks = json!([
+            {"type": "image_url", "image_url": {"url": "https://x.test/a.jpg"}},
+        ]);
+        let out = openai_blocks_to_anthropic(blocks.as_array().unwrap());
+        assert_eq!(out[0]["type"], json!("image"));
+        assert_eq!(out[0]["source"]["type"], json!("url"));
+        assert_eq!(out[0]["source"]["url"], json!("https://x.test/a.jpg"));
+    }
+
+    #[test]
+    fn unknown_block_types_are_dropped_not_passed_through() {
+        // 上游对未知块是硬 400（整单失败）→ 未知类型必须丢弃而非透传
+        let blocks = json!([
+            {"type": "text", "text": "keep"},
+            {"type": "input_audio", "input_audio": {"data": "xxx"}},
+            {"type": "totally_unknown", "foo": 1},
+        ]);
+        let out = openai_blocks_to_anthropic(blocks.as_array().unwrap());
+        assert_eq!(out.len(), 1, "只保留已知块");
+        assert_eq!(out[0]["text"], json!("keep"));
+    }
+
+    #[test]
+    fn anthropic_shaped_blocks_pass_through_untouched() {
+        // 已是 Anthropic 形状的块不能被二次改写
+        let blocks = json!([
+            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "AAA"}},
+            {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+        ]);
+        let out = openai_blocks_to_anthropic(blocks.as_array().unwrap());
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], blocks[0], "image 块原样");
+        assert_eq!(out[1], blocks[1], "tool_result 块原样");
+    }
+
+    #[test]
+    fn normalize_messages_converts_user_image_content() {
+        // 端到端：user 消息里带 image_url，经 normalize 后应为 Anthropic 形状
+        let msgs = json!([
+            {"role": "user", "content": [
+                {"type": "text", "text": "看图"},
+                {"type": "image_url", "image_url": {"url": "data:image/webp;base64,QUJD"}},
+            ]},
+        ]);
+        let out = normalize_anthropic_messages(&msgs);
+        let c = &out[0]["content"];
+        assert_eq!(c[1]["type"], json!("image"));
+        assert_eq!(c[1]["source"]["media_type"], json!("image/webp"));
+        assert_eq!(c[1]["source"]["data"], json!("QUJD"));
+    }
+
     fn sweep_targets_dedupe_preserves_order() {
         let ids = vec!["a", "b", "a", "c", "b"];
         let mut seen = std::collections::HashSet::new();

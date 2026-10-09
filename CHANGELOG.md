@@ -1,3 +1,56 @@
+## 2.0.29 - 2026-10-09
+
+### 修复：ZCode 带图请求 400（`unsupported content type 'image_url'`）
+
+#### 现象（用户报错原文）
+```
+provider=local-minimax-57890 model=MiniMax-M3.1-Flash-Preview
+reason=invalid_request status=400
+模型直连 HTTP 400: invalid params, messages.337.content.1:
+  unsupported content type 'image_url' (2013)
+```
+
+#### 根因
+`normalize_anthropic_messages` 对**数组型 content 是原样透传**，但两边图片块形状不同：
+
+| 协议 | 图片块 |
+| --- | --- |
+| OpenAI（ZCode 发的）| `{"type":"image_url","image_url":{"url":"data:image/png;base64,XXX"}}` |
+| Anthropic（上游要的）| `{"type":"image","source":{"type":"base64","media_type":"image/png","data":"XXX"}}` |
+
+⇒ 上游不认识 `image_url`，**硬 400 整单失败**。
+
+#### 改动（`minimax.rs`）
+新增 `openai_blocks_to_anthropic()`，替换两处「原样透传」：
+
+| 输入块 | 输出 |
+| --- | --- |
+| `text` | 原样 |
+| `image_url` + `data:<mime>;base64,<payload>` | `image` + `source.type=base64` |
+| `image_url` + `http(s)://…` | `image` + `source.type=url` |
+| `image` / `tool_use` / `tool_result` / `thinking`（已是 Anthropic 形状）| 原样 |
+| **其余未知类型** | **丢弃** |
+
+> **为什么未知类型要丢弃而不是透传**：上游对未知块是**硬 400（整单失败）**。
+> 丢一块只是少一点内容，透传会让**整个请求失败**——两害相权取其轻。
+
+#### 验证（2.0.29 线上实测）
+| 测试 | 结果 |
+| --- | --- |
+| `image_url` data URI（PNG 1x1 / 8x8 / 64x64 / 256x256）| ✅ **全部 200，模型答「红色」（视觉识别正确）** |
+| Anthropic 原生 `image` 块（对照）| ✅ 200 |
+| 含未知块 `input_audio` | ✅ 200（被丢弃，请求不失败）|
+| 纯 text 数组（回归）| ✅ 200 |
+| **新增单测 5 个** | ✅ 全过（含"输出中不得再出现 image_url"断言）|
+| 全量单测 | **790 passed / 0 failed**（785 → 790）|
+
+#### 📌 教训
+1. **协议转换必须覆盖「内容块」层级**，不能只做消息层级（`role`/`content` 的字符串形式）。
+   本次漏的是**块数组内部**的差异，表现为上游报"不支持的 content type"。
+2. **未知类型宁可丢弃也不要透传** —— 上游对未知块是整单 400，透传等于把局部问题升级为全量失败。
+3. 验证时**要用程序生成的有效载荷**：本次第一次 400 是我抄来的 base64 **并非有效 PNG**，
+   换成自生成的 PNG 后全部通过 —— 别把"测试数据错"误判成"代码错"。
+
 ## 2.0.28 - 2026-10-09
 
 ### 默认思考强度改为 max（"开最大推理"）+ ZCode 接入改 1M 上下文
