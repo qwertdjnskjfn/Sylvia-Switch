@@ -1,3 +1,41 @@
+## 2.0.45 - 2026-10-10
+
+### 妙手渠道：保留上游原始响应（可诊断性）+ 502 排查结论
+
+#### 用户报
+ZCode 用妙手（）报 ，
+上游信息：`CatPaw 后端创建对话失败: 系统内部异常`（`retry="false"`）。
+
+#### 排查（三步排除）
+| 假设 | 验证 | 结论 |
+| --- | --- | --- |
+| prompt 过大（ZCode 大 system prompt）| 4KB prompt 对比 | ❌ 无关 |
+| 并发限流（agent 循环）| 并发 4 路 | ❌ 全成功 |
+| **上游偶发故障** | 8 次串行统计 | ✅ **2/8 = 25%** |
+
+#### 改动：create_chat 不再吞掉上游原始响应
+```rust
+// 旧：resp.json() 失败时只剩「error decoding response body」，原始内容丢失、无法诊断
+let value: Value = resp.json().await.map_err(|e| ...)?;
+// 新：先取原始文本 + HTTP 状态，解析失败时带上前 300 字
+let status = resp.status();
+let raw = resp.text().await.unwrap_or_default();
+let value: Value = serde_json::from_str(&raw).map_err(|e| { /* 带 raw 前 300 字 */ })?;
+```
+
+#### 结论
+| 时刻 | 成功率 |
+| --- | --- |
+| 23:26（故障期）| 2/8 = 25% |
+| 23:32（复测）| **6/6 = 100%**（5.2~16.5s）|
+
+**根因：妙手上游偶发故障，非配置/网关问题；已自行恢复。**
+ZCode 报错已标 `retryable=true` ⇒ **重试即可**。
+该渠道不稳定是**固有特性**（延迟 5s~247s 波动 + 偶发建会话失败），
+已在 `docs/miaoshou-capabilities.md` 记录。
+
+**遗留**：`miaoshou.rs` 另有 2 处同形态（裸 `.json()`）待统一处理。
+
 ## 2.0.44 - 2026-10-10
 
 ### 修复账号卡片的两个「签到标签」问题（承接 2.0.43 的顺带发现）

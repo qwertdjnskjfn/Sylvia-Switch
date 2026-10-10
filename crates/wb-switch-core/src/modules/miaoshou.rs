@@ -1014,10 +1014,20 @@ pub async fn create_chat(token: &str, prompt: &str) -> Result<String, String> {
     )
     .await
     .map_err(|e| format!("妙手建会话失败: {e}"))?;
-    let value: Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("妙手建会话响应解析失败: {e}"))?;
+    // 🔴 2026-10-10：先取**原始文本**再解析 —— 此前直接用 `.json()`，
+    // 上游返回非 JSON（错误页/限流页/空 body）时错误信息只剩
+    // 「error decoding response body」，**原始内容被丢弃、无法诊断**。
+    // 实测该形态占失败的大多数（8 次调用中 6 次），必须保留现场。
+    let status = resp.status();
+    let raw = resp.text().await.unwrap_or_default();
+    let value: Value = serde_json::from_str(&raw).map_err(|e| {
+        let head: String = raw.chars().take(300).collect();
+        format!(
+            "妙手建会话响应解析失败: {e} | HTTP {} | 原始响应前 300 字: {}",
+            status.as_u16(),
+            if head.trim().is_empty() { "(空响应体)" } else { &head }
+        )
+    })?;
     if value.get("code").and_then(Value::as_i64).unwrap_or(-1) != 0 {
         return Err(format!(
             "妙手建会话被拒: {}",
