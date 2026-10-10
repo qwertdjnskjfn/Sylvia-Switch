@@ -53,7 +53,8 @@ const TOKEN_SOURCE_STORAGE_KEY = "wb-switch:token-stats:source";
 const RANKING_LIMIT = 10;
 
 function isSourceKey(value: unknown): value is SourceKey {
-  return value === "workbuddy" || value === "autoclaw";
+  // 2026-10-10：+minimax（数据来自网关计量记录，见后端 minimax_source）
+  return value === "workbuddy" || value === "autoclaw" || value === "minimax";
 }
 
 function readPreferredTokenSource(): SourceKey {
@@ -1278,6 +1279,8 @@ export default function TokenStatsPage() {
       ? active
       : available.includes("workbuddy")
         ? "workbuddy"
+        : available.includes("minimax")
+          ? "minimax"
         : available[0];
     if (!next) return;
     if (next !== active) setActive(next);
@@ -1300,7 +1303,8 @@ export default function TokenStatsPage() {
               <h1 className="text-[28px] font-semibold tracking-tight">Token 统计</h1>
               <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
                 当前数据更新于 {stats ? formatDateTime(stats.generatedAt) : "—"}。AutoClaw
-                的 OpenClaw 会话已纳入统计；TRAE Work CN
+                的 OpenClaw 会话、以及 MiniMax
+                的网关调用记录均已纳入统计；TRAE Work CN
                 不产生本地 Token 日志，其用量请在「积分统计」查看。
               </p>
             </>
@@ -1333,6 +1337,13 @@ export default function TokenStatsPage() {
                   disabled={Boolean(stats && !stats.sources.some((item) => item.source === "autoclaw"))}
                 >
                   AutoClaw
+                </TabsTrigger>
+                <TabsTrigger
+                  className="max-w-full whitespace-normal"
+                  value="minimax"
+                  disabled={Boolean(stats && !stats.sources.some((item) => item.source === "minimax"))}
+                >
+                  MiniMax
                 </TabsTrigger>
               </TabsList>
             </Tabs>

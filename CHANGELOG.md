@@ -1,3 +1,63 @@
+## 2.0.38 - 2026-10-10
+
+### Token 统计页接入 MiniMax（第三个数据来源）
+
+用户反馈：`Token 统计` 页顶部文案只提到 AutoClaw，**MiniMax 也应显示**。
+
+#### 根因：Token 统计页与用量统计页走的是**两套数据源**
+| 页面 | 数据源 | 2.0.36 前 |
+| --- | --- | --- |
+| 积分统计 / 模型监控 | `model_usage`（渠道计量记录）| ✅ 已在 2.0.36 接入 MiniMax |
+| **Token 统计** | **`token_stats`（扫描本地 `.jsonl` 会话日志）** | ❌ **未接入** |
+
+⚠️ **关键差异**：`token_stats` 靠**扫描本地日志文件**（workbuddy → `~/.workbuddy/projects`；
+autoclaw → `~/.openclaw-autoclaw/agents` + `~/.openclaw/agents`）。
+
+**而 MiniMax 桌面端不产出这类日志** —— 实测 `~/.minimax` 下只有
+`v2/observability/events/*.jsonl`（遥测事件）与 `AppData/Roaming/MiniMax/observability-outbox.jsonl`，
+**均不含 token 用量** ⇒ **不能复用 `source_from_roots` 扫描器**。
+
+#### 实现：新增 `minimax_source()`，从网关计量记录聚合
+- 数据源：`glm_usage_records.json` 中 `channel="minimax"` 的条目（由 2.0.36 的
+  `minimax::call_metrics` 落库）—— Token 直接取自上游 `usage`，**口径比日志解析更准**。
+- **输出与扫描器逐字段同构** ⇒ 前端渲染逻辑零改动：
+  `source / coverageStartAt / coverageEndAt / filesScanned / parseErrors /
+   summary / daily / dailyByModel / hours / models / projects / sessions`
+- **字段映射**（两套口径对齐，关键）：
+  | token_stats | model_usage |
+  | --- | --- |
+  | `input` | `promptTokens`（**含**缓存读取，与 workbuddy 口径一致）|
+  | `output` | `completionTokens` |
+  | `cacheRead` | `cachedTokens` |
+  | `cacheWrite` | `0`（上游该项实测恒为 0）|
+  | `uncachedInput` | `uncachedPromptTokens` |
+- **维度适配**：MiniMax 无「项目/会话」概念 ⇒ `projects` 与 `sessions` 用**账号**承载
+  （`sessionId` = 账号 id，`title` = 账号标签），使前端列表仍有意义而非空表。
+- 复用既有 `Totals::value()` / `units::normalize_input_tokens_u64` ⇒ **口径与另两个来源完全一致**。
+
+#### 前端
+| 文件 | 改动 |
+| --- | --- |
+| `lib/types.ts` | `TokenStatsSource["source"]` 联合类型 +`"minimax"` |
+| `pages/TokenStatsPage.tsx` | `isSourceKey` +minimax；Tabs 增加 **MiniMax** 触发器；默认选中兜底链 +minimax；**顶部文案更新**（原文案只提 AutoClaw）|
+
+#### 验证
+| 项 | 结果 |
+| --- | --- |
+| 单测 | **813 passed / 0 failed**（+4：形状同构 / summary 字段 / 分组带 key / cutoff 边界）|
+| 既有测试 | `get_statistics_returns_workbuddy_and_autoclaw_sources` 按**预期契约变更**更新为三个来源（**扩展**非削弱）|
+| E2E `/api/token-stats` | ✅ `sources = [workbuddy, autoclaw, minimax]` |
+| MiniMax summary | ✅ `input=209 / output=42 / total=251 / records=3` |
+| 维度 | ✅ `models`=1（M3.1-Flash-Preview）/ `sessions`=2 账号 / `daily` / `hours` / `projects` 齐全 |
+| 前端产物 | ✅ `TokenStatsPage-*.js` 含 `minimax`，线上 index hash 已更新 |
+| **回归** | ✅ workbuddy 160137 条 / autoclaw 11 条 —— 数值与改动前一致 |
+
+#### 📌 教训
+**「同一份数据，两个页面」要查清各自的数据源** —— 我上一轮只接了 `model_usage`
+（覆盖积分统计/模型监控），却漏了 `token_stats`（Token 统计页），
+因为二者是**完全独立的两套取数机制**（一个读记录、一个扫日志）。
+**新渠道接入前应先列出「哪些页面/接口会展示该渠道」，逐个确认数据源。**
+
 ## 2.0.37 - 2026-10-10
 
 ### 🔴 P0 修正：`extract_usage` 不认 Anthropic 口径 ⇒ MiniMax 的 Token 恒为 0

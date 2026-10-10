@@ -627,6 +627,210 @@ fn autoclaw_source(home: &Path, cutoff: Option<i64>) -> Value {
     source_from_roots(roots, "autoclaw", cutoff)
 }
 
+/// MiniMax 来源（2026-10-10）。
+///
+/// ⚠️ **与 workbuddy/autoclaw 的取数方式不同**：MiniMax 桌面端**不产出**
+/// jsonl 会话日志 —— 实测 `~/.minimax` 下只有 `v2/observability/events/*.jsonl`
+/// （遥测事件）与 `AppData/Roaming/MiniMax/observability-outbox.jsonl`，
+/// **均不含 token 用量**，故**不能复用 [`source_from_roots`] 扫描器**。
+///
+/// 改为读取**网关自己的计量记录**（`glm_usage_records.json` 中 `channel="minimax"`
+/// 的条目）。该数据由 `minimax::call_metrics` 在每次调用后落库，Token 直接取自
+/// 上游 `usage`（含缓存字段），口径比日志解析更准。
+///
+/// 输出形状与 [`source_from_roots`] **逐字段同构**，前端无需任何改动：
+/// `source / coverageStartAt / coverageEndAt / filesScanned / parseErrors /
+///  summary / daily / dailyByModel / hours / models / projects / sessions`。
+///
+/// 字段映射（两套口径的对齐）：
+/// | token_stats | model_usage 记录 |
+/// | --- | --- |
+/// | `input` | `promptTokens`（**含**缓存读取，与 workbuddy 口径一致）|
+/// | `output` | `completionTokens` |
+/// | `cacheRead` | `cachedTokens` |
+/// | `cacheWrite` | `0`（上游该项实测恒为 0；Anthropic 的 `cache_creation_input_tokens` 为 0）|
+/// | `uncachedInput` | `uncachedPromptTokens` |
+/// | `records` | 记录条数 |
+///
+/// `projects` 用**账号标签**（MiniMax 无「项目」概念，账号是更有意义的维度）；
+/// `sessions` 同样按账号聚合（无会话概念，用 `sessionId` 承载账号 id）。
+fn minimax_source(cutoff: Option<i64>) -> Value {
+    use crate::modules::model_usage;
+
+    // 只取本渠道、时间戳有效、且在范围内的记录。
+    let recs: Vec<Value> = model_usage::load_records()
+        .into_iter()
+        .filter(|r| model_usage::record_matches_provider(r, Some("minimax")))
+        .filter(|r| {
+            let ts = r.get("ts").and_then(Value::as_i64).unwrap_or(0);
+            ts > 0 && cutoff.is_none_or(|minimum| ts >= minimum)
+        })
+        .collect();
+
+    let num = |r: &Value, key: &str| -> u64 {
+        r.get(key)
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .map(|v| v as u64)
+            .unwrap_or(0)
+    };
+    let usage_of = |r: &Value| Usage {
+        // input 取 promptTokens（含缓存读取），与 workbuddy 侧「input 含 cacheRead」同口径。
+        input: num(r, "promptTokens"),
+        output: num(r, "completionTokens"),
+        read: num(r, "cachedTokens"),
+        // 上游未提供缓存写入（Anthropic 的 cache_creation_input_tokens 实测为 0）。
+        write: 0,
+    };
+    let bucket_key = |r: &Value, kind: &str| -> String {
+        let ts = r.get("ts").and_then(Value::as_i64).unwrap_or(0);
+        match kind {
+            "hour" => crate::modules::stats::window::floor_to_bucket(
+                ts,
+                3_600_000,
+            )
+            .to_string(),
+            _ => {
+                // 本地日 YYYY-MM-DD（与 workbuddy 侧一致：按本机时区切日）。
+                let day_start = crate::modules::stats::window::local_day_start_ms(ts);
+                chrono::DateTime::from_timestamp_millis(day_start)
+                    .map(|d| d.with_timezone(&Local).format("%Y-%m-%d").to_string())
+                    .unwrap_or_default()
+            }
+        }
+    };
+
+    // ---- 汇总 ----
+    let mut total = Totals::default();
+    // ---- 各维度分组：day / hour / model / account ----
+    let mut by_day: std::collections::BTreeMap<String, Totals> = Default::default();
+    let mut by_hour: std::collections::BTreeMap<String, Totals> = Default::default();
+    let mut by_model: std::collections::BTreeMap<String, Totals> = Default::default();
+    let mut by_account: std::collections::BTreeMap<String, Totals> = Default::default();
+    // dailyByModel: model -> day -> Totals
+    let mut by_model_day: std::collections::BTreeMap<String, std::collections::BTreeMap<String, Totals>> =
+        Default::default();
+    let mut min_ts = i64::MAX;
+    let mut max_ts = i64::MIN;
+
+    for r in &recs {
+        let u = usage_of(r);
+        let ts = r.get("ts").and_then(Value::as_i64).unwrap_or(0);
+        min_ts = min_ts.min(ts);
+        max_ts = max_ts.max(ts);
+        let model = r
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|m| !m.is_empty())
+            .unwrap_or("未知模型")
+            .to_string();
+        let account = r
+            .get("accountLabel")
+            .and_then(Value::as_str)
+            .filter(|a| !a.is_empty())
+            .unwrap_or("MiniMax")
+            .to_string();
+        let day = bucket_key(r, "day");
+        let hour = bucket_key(r, "hour");
+
+        total.add(u);
+        by_day.entry(day.clone()).or_default().add(u);
+        by_hour.entry(hour).or_default().add(u);
+        by_model.entry(model.clone()).or_default().add(u);
+        by_account.entry(account).or_default().add(u);
+        by_model_day
+            .entry(model)
+            .or_default()
+            .entry(day)
+            .or_default()
+            .add(u);
+    }
+
+    // 排序：数值降序（与扫描器各维度的排序口径保持一致观感）。
+    let mut models: Vec<Value> = by_model
+        .into_iter()
+        .map(|(k, t)| {
+            let mut v = t.value();
+            v["key"] = json!(k);
+            v
+        })
+        .collect();
+    models.sort_by(|a, b| {
+        b.get("total").and_then(Value::as_u64).unwrap_or(0)
+            .cmp(&a.get("total").and_then(Value::as_u64).unwrap_or(0))
+    });
+
+    let to_list = |m: std::collections::BTreeMap<String, Totals>| -> Vec<Value> {
+        m.into_iter()
+            .map(|(k, t)| {
+                let mut v = t.value();
+                v["key"] = json!(k);
+                v
+            })
+            .collect()
+    };
+    let daily = to_list(by_day);
+    let hours = to_list(by_hour);
+    let accounts = to_list(by_account);
+
+    let daily_by_model: Map<String, Value> = by_model_day
+        .into_iter()
+        .map(|(model, days)| {
+            let list: Vec<Value> = days
+                .into_iter()
+                .map(|(day, t)| {
+                    let mut v = t.value();
+                    v["key"] = json!(day);
+                    v
+                })
+                .collect();
+            (model, json!(list))
+        })
+        .collect();
+
+    // sessions：MiniMax 无「会话」概念，用**账号**承载（sessionId 放账号 id），
+    // title 放账号标签 —— 这样前端会话列表仍有意义，而不是空表。
+    let sessions: Vec<Value> = accounts
+        .iter()
+        .map(|a| {
+            let key = a.get("key").cloned().unwrap_or(json!("MiniMax"));
+            json!({
+                "key": key,
+                "sessionId": key,
+                "title": key,
+                "project": "MiniMax",
+                "total": a.get("total").cloned().unwrap_or(json!(0)),
+                "input": a.get("input").cloned().unwrap_or(json!(0)),
+                "output": a.get("output").cloned().unwrap_or(json!(0)),
+                "cacheRead": a.get("cacheRead").cloned().unwrap_or(json!(0)),
+                "cacheWrite": a.get("cacheWrite").cloned().unwrap_or(json!(0)),
+                "uncachedInput": a.get("uncachedInput").cloned().unwrap_or(json!(0)),
+                "records": a.get("records").cloned().unwrap_or(json!(0)),
+                "cacheHitRate": a.get("cacheHitRate").cloned().unwrap_or(Value::Null),
+            })
+        })
+        .collect();
+
+    // projects：同样按账号维度（见函数文档）。
+    let projects = accounts.clone();
+
+    json!({
+        "source": "minimax",
+        "coverageStartAt": if min_ts == i64::MAX { Value::Null } else { json!(min_ts) },
+        "coverageEndAt": if max_ts == i64::MIN { Value::Null } else { json!(max_ts) },
+        // 无日志文件可扫：用记录数代替，保持字段存在（前端用于「已扫描 N 个文件」提示）。
+        "filesScanned": recs.len(),
+        "parseErrors": 0,
+        "summary": total.value(),
+        "daily": daily,
+        "dailyByModel": Value::Object(daily_by_model),
+        "hours": hours,
+        "models": models,
+        "projects": projects,
+        "sessions": sessions,
+    })
+}
+
 /// Return WorkBuddy and AutoClaw aggregates.
 /// `days` is interpreted in Rust using the same millisecond clock for every source.
 pub fn get_statistics(days: Option<i64>) -> Value {
@@ -647,6 +851,8 @@ pub fn get_statistics(days: Option<i64>) -> Value {
             // AutoClaw（OpenClaw 内核）的 agent 会话：
             // 优先扫描 ~/.openclaw-autoclaw/agents，并兼容 ~/.openclaw/agents
             autoclaw_source(&home, cutoff),
+            // MiniMax：无本地会话日志，改读网关计量记录（详见 minimax_source 文档）
+            minimax_source(cutoff),
         ],
     })
 }
@@ -674,6 +880,69 @@ pub(crate) fn totals_from_usage_for_test(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    // ---- MiniMax source（2026-10-10）----
+    // 说明：`minimax_source` 读的是**真实计量文件**（glm_usage_records.json），
+    // 故此处只断言「输出形状与扫描器同构」这类不依赖具体数据的约束；
+    // 数值正确性由 E2E 实测覆盖（见 CHANGELOG 2.0.38）。
+
+    #[test]
+    fn minimax_source_shape_matches_file_scanner_contract() {
+        // 无论有无数据，顶层字段必须与 source_from_roots 一致 ——
+        // 少一个字段前端就会渲染异常（前端按同一契约消费）。
+        let v = minimax_source(None);
+        for key in [
+            "source", "coverageStartAt", "coverageEndAt", "filesScanned",
+            "parseErrors", "summary", "daily", "dailyByModel", "hours",
+            "models", "projects", "sessions",
+        ] {
+            assert!(v.get(key).is_some(), "缺字段：{key}");
+        }
+        assert_eq!(v["source"], json!("minimax"), "source 必须是 minimax");
+        assert_eq!(v["parseErrors"], json!(0), "本来源无文件解析，恒为 0");
+    }
+
+    #[test]
+    fn minimax_summary_exposes_the_same_totals_fields() {
+        // summary 与扫描器的 Totals::value() 同构：少字段会让前端 NaN。
+        let v = minimax_source(None);
+        let s = &v["summary"];
+        for key in [
+            "total", "input", "output", "cacheRead", "cacheWrite",
+            "uncachedInput", "records", "cacheHitRate",
+        ] {
+            assert!(s.get(key).is_some(), "summary 缺字段：{key}");
+        }
+    }
+
+    #[test]
+    fn minimax_groups_carry_key_for_frontend_listing() {
+        // models / projects / sessions / daily / hours 里每一项都必须带 `key`，
+        // 否则前端列表无法渲染（既有契约）。
+        let v = minimax_source(None);
+        for group in ["models", "projects", "sessions", "daily", "hours"] {
+            if let Some(list) = v[group].as_array() {
+                for (i, item) in list.iter().enumerate() {
+                    assert!(item.get("key").is_some(), "{group}[{i}] 缺 key");
+                    assert!(item.get("total").is_some(), "{group}[{i}] 缺 total");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cutoff_in_the_past_still_returns_a_valid_document() {
+        // 时间范围过滤：极早的 cutoff 不应 panic，且形状依旧完整。
+        let v = minimax_source(Some(0));
+        assert_eq!(v["source"], json!("minimax"));
+        assert!(v.get("summary").is_some());
+        // 未来 cutoff ⇒ 无记录命中，summary 应为全 0（而不是缺字段）
+        let v2 = minimax_source(Some(i64::MAX / 2));
+        assert_eq!(v2["summary"]["records"], json!(0));
+        assert_eq!(v2["summary"]["input"], json!(0));
+    }
+
     use super::*;
     use std::fs;
 
@@ -942,16 +1211,19 @@ mod tests {
     }
 
     #[test]
-    fn get_statistics_returns_workbuddy_and_autoclaw_sources() {
+    fn get_statistics_returns_workbuddy_autoclaw_and_minimax_sources() {
         let value = get_statistics(None);
         let sources = value["sources"].as_array().expect("sources");
         let names: Vec<_> = sources
             .iter()
             .map(|source| source["source"].as_str().unwrap_or_default())
             .collect();
+        // 2026-10-10：新增 `minimax` 来源（本地无 jsonl 会话日志，
+        // 改读网关计量记录，详见 `minimax_source` 文档）。
+        // 顺序固定 —— 前端 tab 与默认选中依赖它稳定。
         assert_eq!(
             names,
-            ["workbuddy", "autoclaw"]
+            ["workbuddy", "autoclaw", "minimax"]
         );
     }
 
