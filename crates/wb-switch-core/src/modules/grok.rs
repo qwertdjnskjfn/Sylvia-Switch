@@ -220,6 +220,7 @@ fn prepare_messages_body(cfg: &G2aProxyConfig, body: &[u8], thinking_disabled: b
         return body.to_vec();
     };
     v["model"] = json!(canonical_g2a_model(cfg, &model));
+    normalize_effort_fields(&mut v);
     if !thinking_disabled && v.get("thinking").is_none() {
         let max_tokens = v.get("max_tokens").and_then(Value::as_u64).unwrap_or(0);
         if let Some(budget) =
@@ -231,7 +232,67 @@ fn prepare_messages_body(cfg: &G2aProxyConfig, body: &[u8], thinking_disabled: b
     serde_json::to_vec(&v).unwrap_or_else(|_| body.to_vec())
 }
 
-/// 1.1.0 工具协议块：每步调用前强制可见规划，最终答复前强制可见收尾。
+/// effort 档位归一化为上游接受的英文名。
+///
+/// 上游（grok2api → Grok Build）只接受 `minimal | low | medium | high | xhigh | max`
+/// 六档，其它取值一律 `400 不支持 output_config.effort=%q`
+/// （见 `conversation/messages_request.go` 的 switch）。而客户端（实测 ZCode）
+/// 会把 UI 上的**中文档位名**（如「最高」）原样塞进字段 ⇒ 请求直接 400。
+fn canonical_effort(raw: &str) -> Option<&'static str> {
+    let key: String = raw
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    match key.as_str() {
+        "max" | "maximum" | "ultra" | "extreme" | "最高" | "极大" | "顶格" => Some("max"),
+        "xhigh" | "extrahigh" | "extra-high" | "超高" | "特高" => Some("xhigh"),
+        "high" | "高" | "较高" => Some("high"),
+        "medium" | "mid" | "中" | "中等" | "中档" => Some("medium"),
+        "low" | "低" | "较低" => Some("low"),
+        "minimal" | "min" | "minimum" | "最低" | "极小" => Some("minimal"),
+        _ => None,
+    }
+}
+
+/// 归一化请求体里的 effort：`output_config.effort` 与 `thinking.effort`。
+///
+/// 上游两处最终汇入**同一个** switch 校验（grok2api 先取 thinking.effort，
+/// 再被 output_config.effort 覆盖，最后统一校验）⇒ 任一非法都会 400，故必须
+/// 同时处理。无法识别的取值**剥离该字段**（退回由 budget_tokens 推断），
+/// 而不是让整通请求失败；`output_config` 因剥离而变空时整块摘掉。
+fn normalize_effort_fields(v: &mut Value) {
+    for path in [["output_config", "effort"], ["thinking", "effort"]] {
+        let Some(raw) = v
+            .get(path[0])
+            .and_then(|o| o.get(path[1]))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        match canonical_effort(&raw) {
+            Some(eff) => v[path[0]][path[1]] = json!(eff),
+            None => {
+                if let Some(obj) = v[path[0]].as_object_mut() {
+                    obj.remove(path[1]);
+                }
+            }
+        }
+    }
+    let empty_oc = v
+        .get("output_config")
+        .and_then(Value::as_object)
+        .is_some_and(|o| o.is_empty());
+    if empty_oc {
+        if let Some(obj) = v.as_object_mut() {
+            obj.remove("output_config");
+        }
+    }
+}
+
+/// 工具调用协议注入块：每步调用前强制可见规划，最终答复前强制可见收尾。
 /// grok-4.7 的内部思考是服务端加密的，客户端永远看不到——该协议把规划/收尾
 /// 外置为可见文本，配合调用链摘要构成客户端可见的完整思考链。
 const TOOL_PROTOCOL_BLOCK: &str = "【工具调用协议·必须遵守】\n\
@@ -2618,6 +2679,82 @@ mod tests {
         // ⑤ 非 JSON / 无 model → 原样返回（不猜测性改造）
         let raw = b"not-json-at-all";
         assert_eq!(prepare_messages_body(&cfg, raw, false), raw.to_vec());
+    }
+
+    /// 2.0.48：effort 档位归一化 —— 中文档位名是上游 400 的直接来源
+    /// （ZCode 实测传 `output_config.effort="最高"`）。
+    #[test]
+    fn effort_is_normalized_to_upstream_tiers() {
+        let cfg = g2a_proxy_config_from_value(&json!({
+            "enabled": true, "base_url": "http://x", "api_key": "k",
+            "models": ["grok-4.7"], "default_thinking_budget_tokens": 4000
+        }))
+        .unwrap();
+
+        // ① 中文「最高」→ max（回归用例：ZCode TraceID abb916e3 的 400）
+        let out = prepare_messages_body(
+            &cfg,
+            r#"{"model":"grok-4.7","max_tokens":8000,"output_config":{"effort":"最高"},"messages":[]}"#.as_bytes(),
+            false,
+        );
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["output_config"]["effort"], "max");
+
+        // ② 其余中文档位与常见别名
+        for (input, want) in [
+            ("高", "high"),
+            ("中", "medium"),
+            ("低", "low"),
+            ("最低", "minimal"),
+            ("ultra", "max"),
+            ("XHIGH", "xhigh"),
+            (" minimal ", "minimal"),
+        ] {
+            let body = format!(
+                r#"{{"model":"grok-4.7","max_tokens":8000,"output_config":{{"effort":"{input}"}},"messages":[]}}"#
+            );
+            let out = prepare_messages_body(&cfg, body.as_bytes(), false);
+            let v: Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(v["output_config"]["effort"], want, "input={input}");
+        }
+
+        // ③ thinking.effort 同一处校验，也要归一
+        let out = prepare_messages_body(
+            &cfg,
+            r#"{"model":"grok-4.7","max_tokens":8000,"thinking":{"type":"enabled","budget_tokens":4000,"effort":"最高"},"messages":[]}"#.as_bytes(),
+            false,
+        );
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["thinking"]["effort"], "max");
+        assert_eq!(v["thinking"]["budget_tokens"], 4000, "只改档位，不动预算");
+
+        // ④ 无法识别 → 剥离该字段（不让整通请求 400）
+        let out = prepare_messages_body(
+            &cfg,
+            r#"{"model":"grok-4.7","max_tokens":8000,"output_config":{"effort":"爆表"},"messages":[]}"#.as_bytes(),
+            false,
+        );
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert!(v.get("output_config").is_none(), "空 output_config 应整块摘掉");
+
+        // ⑤ 剥离 effort 但保留 output_config 里其它字段（如 format）
+        let out = prepare_messages_body(
+            &cfg,
+            r#"{"model":"grok-4.7","max_tokens":8000,"output_config":{"effort":"爆表","format":{"type":"json_schema","schema":{"type":"object"}}},"messages":[]}"#.as_bytes(),
+            false,
+        );
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert!(v["output_config"].get("effort").is_none());
+        assert_eq!(v["output_config"]["format"]["type"], "json_schema");
+
+        // ⑥ 合法英文原样不动（幂等）
+        let out = prepare_messages_body(
+            &cfg,
+            br#"{"model":"grok-4.7","max_tokens":8000,"output_config":{"effort":"high"},"messages":[]}"#,
+            false,
+        );
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["output_config"]["effort"], "high");
     }
 
     /// 1.0.5：逃生开关取值（大小写/空白不敏感）。

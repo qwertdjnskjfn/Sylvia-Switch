@@ -1104,6 +1104,91 @@ async fn create_chat_once(token: &str, prompt: &str) -> Result<String, String> {
     Ok(chat_id)
 }
 
+/// 判别「上游后端创建对话失败」。
+///
+/// 🔴 2026-10-10：ZCode 反复报
+/// `妙手发起生成被拒: <mc-agent-error error="CatPaw 后端创建对话失败: 系统内部异常" retry="false">`。
+///
+/// 这是**妙手服务端**的间歇性故障，本地无法复现（三组对照实验：并发 3 路 / 19KB
+/// 与 38KB 大 prompt / 无间隔连发 5 次，均未触发该错误，失败样本只有超时）。
+/// 特征是「后端创建对话失败」——换一个全新的 chatId 常常就能成功，
+/// 因此**值得重试**（重试的只是「建会话 + 发起」这一**秒级**阶段，不含后面的生成轮询）。
+fn is_backend_create_error(msg: &str) -> bool {
+    const PATTERNS: [&str; 5] = [
+        "创建对话失败",
+        "系统内部异常",
+        "mc-agent-error",
+        "后端创建",
+        "内部异常",
+    ];
+    PATTERNS.iter().any(|p| msg.contains(p))
+}
+
+/// 妙手 agent 链路失败留痕：追加写 `store_dir()/miaoshou-agent.log`。
+///
+/// 网关 stdout 不落盘（既有约定），故障现场必须自己留痕，否则事后只能靠猜。
+/// 记录模型、prompt 长度、尝试次数、是否可重试与上游原文，供下次定位取证。
+fn log_agent_failure(line: &str) {
+    let p = store_dir().join("miaoshou-agent.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(p)
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "[{}] {}", now_ms(), line);
+    }
+}
+
+/// 完整开启一轮 agent 会话 → `(chatId, conversationId)`。
+///
+/// 🔴 2026-10-10 自愈：把「建会话 + 发起生成」整体包一层重试（最多 3 次，
+/// 退避 2s → 5s），覆盖两类可恢复错误：建会话限流（`is_rate_limit_error`）
+/// 与后端创建对话失败（`is_backend_create_error`）。
+///
+/// ⚠️ **只重试这一段**——建会话与发起都是秒级操作，代价可接受；
+/// 后面的生成轮询（最长 240s）**绝不重试**，否则单次请求耗时会翻倍到不可接受。
+pub async fn open_agent_conversation(
+    token: &str,
+    prompt: &str,
+    model: &str,
+) -> Result<(String, String), String> {
+    const BACKOFFS_SECS: [u64; 2] = [2, 5]; // 共 3 次尝试
+    let mut last_err = String::new();
+    for attempt in 0..=BACKOFFS_SECS.len() {
+        match create_chat(token, prompt).await {
+            Ok(chat_id) => match kick_agent_stream(token, &chat_id, prompt, model).await {
+                Ok(conv) => return Ok((chat_id, conv)),
+                Err(e) => last_err = e,
+            },
+            Err(e) => last_err = e,
+        }
+        let retryable = is_rate_limit_error(&last_err) || is_backend_create_error(&last_err);
+        log_agent_failure(&format!(
+            "attempt={} retryable={} model={} prompt_len={} err={}",
+            attempt + 1,
+            retryable,
+            model,
+            prompt.chars().count(),
+            last_err
+        ));
+        if !retryable || attempt == BACKOFFS_SECS.len() {
+            return Err(if retryable {
+                format!(
+                    "{last_err}（妙手上游服务不稳定，已自动重试 {} 次仍未恢复；\
+                     这是妙手服务端故障，与本地网关无关。建议稍等 30 秒重试，\
+                     或在 ZCode 切到「本地MiniMax(57890)」渠道）",
+                    attempt + 1
+                )
+            } else {
+                last_err
+            });
+        }
+        tokio::time::sleep(Duration::from_secs(BACKOFFS_SECS[attempt])).await;
+    }
+    Err(last_err)
+}
+
 /// 发起生成 → conversationId（生成在服务端异步进行，约 80s）。
 pub async fn kick_agent_stream(
     token: &str,
@@ -1602,8 +1687,8 @@ pub async fn chat_completions(account: &Value, body: &Value) -> Result<Value, St
     let (model, caps) = resolve_caps(model_raw, body);
     let prompt = inject_caps(&prompt, caps, body.get("tools"));
 
-    let chat_id = create_chat(&token, &prompt).await?;
-    let conversation_id = kick_agent_stream(&token, &chat_id, &prompt, &model).await?;
+    // 2026-10-10：建会话 + 发起生成整体走自愈重试（见 open_agent_conversation 文档）
+    let (_chat_id, conversation_id) = open_agent_conversation(&token, &prompt, &model).await?;
 
     let deadline = Instant::now() + Duration::from_secs(HISTORY_POLL_TIMEOUT_SECS);
     let mut text = String::new();
@@ -1867,6 +1952,34 @@ mod tests {
             "请求 messages 为空",
         ] {
             assert!(!is_rate_limit_error(msg), "不应重试业务错误: {msg}");
+        }
+    }
+
+    // ---- 后端创建对话失败判别（2026-10-10）----
+
+    #[test]
+    fn backend_create_error_matches_upstream_instability() {
+        // ✅ 应重试：妙手服务端间歇性故障（换新 chatId 常能恢复）
+        for msg in [
+            "妙手发起生成被拒: <mc-agent-error error=\"CatPaw 后端创建对话失败: 系统内部异常\" retry=\"false\">",
+            "妙手发起生成被拒: CatPaw 后端创建对话失败",
+            "妙手发起生成被拒: 系统内部异常",
+            "妙手建会话被拒: 后端创建对话失败",
+        ] {
+            assert!(is_backend_create_error(msg), "应判为后端故障可重试: {msg}");
+        }
+    }
+
+    #[test]
+    fn backend_create_error_does_not_match_real_business_errors() {
+        // ❌ 不应重试：真正的业务性拒绝——重试只会浪费配额
+        for msg in [
+            "妙手账号缺少 accessToken（请重新导入登录态）",
+            "请求 messages 为空",
+            "妙手建会话被拒: 账号无权限",
+            "妙手建会话被拒: 积分不足",
+        ] {
+            assert!(!is_backend_create_error(msg), "不应重试业务错误: {msg}");
         }
     }
 

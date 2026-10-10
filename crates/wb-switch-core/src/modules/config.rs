@@ -566,6 +566,13 @@ pub fn utc_iso() -> String {
 // ---------------------------------------------------------------------------
 
 /// 原子写文件（临时文件 + rename），对照 Python atomic_write。
+///
+/// 🔴 2026-10-09：Windows 上 `rename` 覆盖已存在文件会被**杀毒/索引器短暂独占锁**挡住，
+/// 报 `os error 5 拒绝访问`。原实现一次失败就放弃 ⇒ **静默丢掉整次写入**
+/// （实测单测并行时必现；生产表现为「配置/账本偶尔没保存」，且只有一行
+/// `[atomic] rename FAILED` 打印，极难归因）。
+/// 修法：rename 失败按 10/20/40/80/160ms 退避重试 5 次；
+/// 全部失败才报错，并在错误里带上目标路径，便于定位。
 pub fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
     let file_name = path
         .file_name()
@@ -573,14 +580,26 @@ pub fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
         .unwrap_or_default();
     let tmp = path.with_file_name(format!("{file_name}.tmp-{}", uuid::Uuid::new_v4().simple()));
     if let Err(e) = std::fs::write(&tmp, content) {
-        eprintln!("[atomic] write tmp FAILED: {e}");
+        eprintln!("[atomic] write tmp FAILED: {}: {e}", path.display());
+        let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        eprintln!("[atomic] rename FAILED: {e}");
-        return Err(e);
+    let mut last: Option<std::io::Error> = None;
+    for i in 0..5u32 {
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(10 << i));
+            }
+        }
     }
-    Ok(())
+    let e = last.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::Other, "rename failed without error")
+    });
+    eprintln!("[atomic] rename FAILED (5 retries): {}: {e}", path.display());
+    let _ = std::fs::remove_file(&tmp);
+    Err(std::io::Error::new(e.kind(), format!("{}: {e}", path.display())))
 }
 
 // ---------------------------------------------------------------------------

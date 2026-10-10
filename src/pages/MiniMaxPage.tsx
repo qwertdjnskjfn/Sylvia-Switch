@@ -203,6 +203,17 @@ export default function MiniMaxPage() {
         await refresh();
         return null;
       }
+      // 🔴 2026-10-09：`remove:<id>` 此前**漏了前缀拦截** —— 上面只覆盖了
+      // clearCooldown / pin / probe，而「移除」按钮传的正是 `remove:<id>`，
+      // 落到下面的精确匹配表（只有 `removeMinimaxAccount`）⇒ 恒定抛
+      // 「未知操作: remove:<id>」，账号**永远删不掉**。
+      if (prefix("remove")) {
+        const id = name.slice("remove:".length) || (body.id as string);
+        await api.removeMinimaxAccount({ id });
+        setMsg({ type: "ok", text: okText });
+        await refresh();
+        return null;
+      }
       const actions: Record<string, () => Promise<unknown>> = {
         saveMinimaxConfig: () => api.saveMinimaxConfig(body),
         capture: () => api.captureMinimaxDesktop(),
@@ -472,7 +483,14 @@ export default function MiniMaxPage() {
                           积分 {a.balance.toFixed(2)} · 已用 {(a.creditConsumed ?? 0).toFixed(2)}
                         </Badge>
                       ) : null}
-                      <Badge variant="secondary" className="h-5 px-1.5 text-[10px]">
+                      <Badge
+                        variant="secondary"
+                        className="h-5 px-1.5 text-[10px]"
+                        title={
+                          "「累计」= 本机记录的该账号历次 claim 成功积分之和（按账号身份记账，跨条目存活）。\n" +
+                          "当日重复签到不会重复累加；上游没有「历史签到累计」接口，权威余额请看左边「积分」。"
+                        }
+                      >
                         签到 {a.signinLastDate ? a.signinLastDate : "未签"} · 累计 {a.signinPointsTotal} 分
                       </Badge>
                     </div>

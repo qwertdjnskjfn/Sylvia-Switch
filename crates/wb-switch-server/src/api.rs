@@ -4389,15 +4389,12 @@ async fn api_miaoshou_v1_chat_completions(
                 .map(|a| a.as_slice())
                 .unwrap_or(&[]),
         );
-        let chat_id = match miaoshou::create_chat(&token, &prompt).await {
-            Ok(id) => id,
-            Err(e) => {
-                log_gateway_request("miaoshou", key_id.as_deref(), &model, false, started.elapsed().as_millis() as u64, &e);
-                return glm_proxy_error(e, StatusCode::BAD_GATEWAY);
-            }
-        };
-        let conv = match miaoshou::kick_agent_stream(&token, &chat_id, &prompt, &model).await {
-            Ok(c) => c,
+        // 2026-10-10：与非流式路径**同一实现**（含建会话/发起生成的自愈重试）。
+        // ⚠️ 两条路径分头实现已踩过 3 次坑（failStreak 清零 / lastError 回写 / 能力解析），
+        // 任何改动必须走 `miaoshou::open_agent_conversation` 这一个入口。
+        let (_chat_id, conv) = match miaoshou::open_agent_conversation(&token, &prompt, &model).await
+        {
+            Ok(v) => v,
             Err(e) => {
                 log_gateway_request("miaoshou", key_id.as_deref(), &model, false, started.elapsed().as_millis() as u64, &e);
                 return glm_proxy_error(e, StatusCode::BAD_GATEWAY);
