@@ -4274,12 +4274,16 @@ async fn api_miaoshou_v1_chat_completions(
             return glm_proxy_error(e, StatusCode::SERVICE_UNAVAILABLE);
         }
     };
-    let want_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let want_stream_raw = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let model = body
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or(miaoshou::DEFAULT_MODEL)
         .to_string();
+    // 2026-10-10：启用「思考/工具」能力时必须走**非流式** —— 能力解析需要完整文本
+    // （拆 <thinking> 段、提取 tool_call JSON）。内容完全一致，仅传输方式不同。
+    let (_, caps) = miaoshou::resolve_caps(&model, &body);
+    let want_stream = want_stream_raw && !caps.any();
 
     if want_stream {
         // 流式：建会话 → 发起生成 → SSE 连接，帧转换后透传

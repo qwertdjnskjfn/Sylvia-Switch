@@ -1211,6 +1211,302 @@ fn extract_history_usage(history: &Value) -> Value {
 }
 
 /// OpenAI 兼容非流式对话：create → kick → 轮询 history 聚合全文。
+/// 能力开关（2026-10-10）：控制「思考分离」与「工具调用解析」。
+///
+/// ⚠️ **本质说明与能力边界**（均有实测支撑）：
+///
+/// | 能力 | 实现方式 | 实测状态 |
+/// | --- | --- | --- |
+/// | **思考分离** | prompt 约定 `<thinking>/<answer>` → 解析进 `reasoning_content` | ✅ **有效**（实测 344 字推理段成功拆出）|
+/// | **工具调用** | ~~prompt 注入工具协议~~ | ❌ **不可行** —— 上游 Agent 会识别并**拒绝**注入的工具协议（三种措辞全部失败，拒绝理由："它并非真实的工具协议…并不可信"）。**已改为不注入**；`tools` 仅用于①解析自发输出②向调用方说明边界。|
+///
+/// ⇒ 调用方须知：**妙手的工具在其服务端闭包执行**（自带联网搜索等），
+///   **无法被外部客户端编排**。需要标准 `tool_calls` 请用 MiniMax 渠道。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Caps {
+    /// 拆分思考段到 reasoning_content
+    pub thinking: bool,
+    /// 模拟 OpenAI tool_calls
+    pub tools: bool,
+}
+
+impl Caps {
+    pub fn any(self) -> bool {
+        self.thinking || self.tools
+    }
+}
+
+/// 解析模型名后缀 → (真实模型名, 能力)。后缀可组合、顺序无关。
+///
+/// 支持的写法（大小写不敏感，用 `-` 或 `_` 分隔均可）：
+/// * `glm-5.3-flash-thinking`        → 思考
+/// * `glm-5.3-flash-tools`           → 工具
+/// * `glm-5.3-flash-thinking-tools`  → 两者
+/// * `glm-5.3-flash-think`           → 思考（简写）
+fn strip_caps_suffix(model: &str) -> (String, Caps) {
+    let mut caps = Caps::default();
+    let mut base = model.to_string();
+    // 从尾部反复剥离，直到没有可识别后缀为止（顺序无关）
+    loop {
+        let lower = base.to_lowercase();
+        if lower.ends_with("-thinking-tools") || lower.ends_with("_thinking_tools") {
+            caps.thinking = true;
+            caps.tools = true;
+            base.truncate(base.len() - "-thinking-tools".len());
+        } else if lower.ends_with("-tools") {
+            caps.tools = true;
+            base.truncate(base.len() - "-tools".len());
+        } else if lower.ends_with("-thinking") {
+            caps.thinking = true;
+            base.truncate(base.len() - "-thinking".len());
+        } else if lower.ends_with("-think") {
+            caps.thinking = true;
+            base.truncate(base.len() - "-think".len());
+        } else if lower.ends_with("-reasoning") {
+            caps.thinking = true;
+            base.truncate(base.len() - "-reasoning".len());
+        } else {
+            break;
+        }
+    }
+    (base, caps)
+}
+
+/// 综合「模型名后缀」与「请求参数」得出最终能力开关（任一命中即启用）。
+pub fn resolve_caps(model: &str, body: &Value) -> (String, Caps) {
+    let (base, mut caps) = strip_caps_suffix(model);
+    // 参数通道 ①：显式 `thinking`
+    if let Some(t) = body.get("thinking") {
+        let on = match t {
+            Value::Bool(b) => *b,
+            Value::Object(_) => t.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+            Value::String(s) => !s.is_empty() && s != "disabled",
+            _ => false,
+        };
+        if on {
+            caps.thinking = true;
+        }
+    }
+    // 参数通道 ②：`reasoning_effort` 非空（与 MiniMax 生态一致，便于客户端复用习惯）
+    if body
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .map(|s| !s.trim().is_empty() && s.trim() != "none")
+        .unwrap_or(false)
+    {
+        caps.thinking = true;
+    }
+    // 参数通道 ③：`tools` 非空数组
+    if body
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|a| !a.is_empty())
+        .unwrap_or(false)
+    {
+        caps.tools = true;
+    }
+    (base, caps)
+}
+
+/// 把能力约定注入 prompt（在用户内容**之前**追加指令块）。
+///
+/// ⚠️ **只注入思考协议**。工具协议**有意不注入** —— 实测上游 Agent 会识别并拒绝
+/// 用户消息里的"工具协议"（详见函数体内的实测记录）。`tools` 参数保留仅为
+/// 调用点兼容，不再产生 prompt 变化。
+pub fn inject_caps(prompt: &str, caps: Caps, tools: Option<&Value>) -> String {
+    if !caps.any() {
+        return prompt.to_string();
+    }
+    let _ = tools; // 工具清单不再注入（见函数文档：上游会拒绝）
+    let mut head = String::new();
+    // 🔴 2026-10-10 实测结论：**不注入工具协议**。
+    //
+    // 妙手上游是 Agent 形态，它知道自己真实的工具集（网络搜索等），会**主动识别
+    // 并拒绝**用户消息里注入的"工具协议"—— 实测三种措辞强度全部失败，且拒绝理由
+    // 一致："它并非真实的工具协议…并不可信"。这是**设计层面的对抗**（模型只信任
+    // system 层声明的真实工具），**越强硬越被判定为操纵** ⇒ 不再尝试。
+    //
+    // 保留 `Caps.tools` 的意义：① 解析层仍能识别模型**自发**输出的 tool_call（兜底）；
+    // ② 文档/API 层可据此向调用方说明"妙手不支持外部工具编排"。
+    if caps.thinking {
+        head.push_str(
+            r#"# 思考协议（必须严格遵守）
+先用 <thinking></thinking> 标签写出你的完整推理过程，再用 <answer></answer> 标签给出最终回答。
+两个标签都必须出现且各出现一次。
+
+"#,
+        );
+    }
+    if head.is_empty() {
+        return prompt.to_string();
+    }
+    format!("{head}---\n{prompt}")
+}
+
+/// 解析结果：正文 / 思考段 / 工具调用。
+#[derive(Debug, Default)]
+pub struct CapParse {
+    pub content: String,
+    pub reasoning: Option<String>,
+    /// OpenAI 形状的 tool_calls（仅当解析出且语法完整）
+    pub tool_calls: Option<Value>,
+}
+
+/// 从模型输出里拆出思考段与工具调用（纯函数，便于单测）。
+///
+/// **容错原则**：任何一项解析失败都**只跳过该项**，正文永远保留原文
+/// （宁可降级成普通回答，也绝不因解析丢内容）。
+pub fn parse_caps(text: &str, caps: Caps) -> CapParse {
+    let mut content = text.to_string();
+    let mut reasoning = None;
+
+    if caps.thinking {
+        if let Some((think, rest)) = extract_tag(&content, "thinking") {
+            reasoning = Some(think.clone());
+            // 同步剔除 <answer> 外壳（若有）；无 answer 标签时用剔除 thinking 后的余文
+            let after = match extract_tag(&rest, "answer") {
+                Some((ans, _)) => ans,
+                None => rest.clone(),
+            };
+            content = after.trim().to_string();
+        } else if let Some((think, rest)) = extract_tag(&content, "reasoning") {
+            // 兼容 <reasoning> 变体
+            reasoning = Some(think.clone());
+            content = rest.trim().to_string();
+        }
+    }
+
+    let mut tool_calls = None;
+    if caps.tools {
+        if let Some(tc) = extract_tool_call(&content) {
+            // 剔除调用 JSON（含其前后同一行的寒暄），只留 JSON 作为 tool_calls
+            let cleaned = remove_tool_call_text(&content);
+            content = cleaned.trim().to_string();
+            tool_calls = Some(tc);
+        }
+    }
+
+    CapParse { content, reasoning, tool_calls }
+}
+
+/// 提取 `<tag>…</tag>`，返回 (内部内容, 去掉该段的剩余文本)。标签缺失返回 None。
+fn extract_tag(text: &str, tag: &str) -> Option<(String, String)> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let i = text.find(&open)?;
+    let j = text[i + open.len()..].find(&close)?;
+    let inner = text[i + open.len()..i + open.len() + j].trim().to_string();
+    let mut rest = String::new();
+    rest.push_str(&text[..i]);
+    rest.push_str(&text[i + open.len() + j + close.len()..]);
+    Some((inner, rest))
+}
+
+/// 从任意文本中提取第一个「含 tool_call 键」的 JSON 对象（**容忍前后有寒暄**）。
+fn extract_tool_call(text: &str) -> Option<Value> {
+    // 扫所有 '{' 起点，尝试括号配平解析（跳过字符串内的括号）
+    for (start, _) in text.char_indices().filter(|(_, c)| *c == '{') {
+        let mut depth = 0i32;
+        let mut in_str = false;
+        let mut esc = false;
+        for (off, c) in text[start..].char_indices() {
+            if in_str {
+                if esc {
+                    esc = false;
+                } else if c == '\\' {
+                    esc = true;
+                } else if c == '"' {
+                    in_str = false;
+                }
+                continue;
+            }
+            match c {
+                '"' => in_str = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let slice = &text[start..start + off + 1];
+                        if let Ok(v) = serde_json::from_str::<Value>(slice) {
+                            if let Some(call) = v.get("tool_call") {
+                                return normalize_tool_call(call);
+                            }
+                            // 也接受直接给 {"name":…,"arguments":…} 的写法
+                            if v.get("name").is_some() && v.get("arguments").is_some() {
+                                return normalize_tool_call(&v);
+                            }
+                        }
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// 把模型给的 `{"name":…,"arguments":{…}}` 包成 OpenAI `tool_calls` 数组。
+fn normalize_tool_call(call: &Value) -> Option<Value> {
+    let name = call.get("name").and_then(Value::as_str)?;
+    let args = call.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let args_str = match args {
+        Value::String(s) => s,
+        other => serde_json::to_string(&other).unwrap_or_else(|_| "{}".to_string()),
+    };
+    Some(json!([{
+        "id": format!("call_{}", uuid::Uuid::new_v4().simple()),
+        "type": "function",
+        "index": 0,
+        "function": {"name": name, "arguments": args_str},
+    }]))
+}
+
+/// 从正文里剔除 tool_call JSON 及其同一行的寒暄前缀（保留其他内容）。
+fn remove_tool_call_text(text: &str) -> String {
+    let Some(start) = text.find("{\"tool_call\"") else {
+        return text.to_string();
+    };
+    // 配平找到该 JSON 的结束位置
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut esc = false;
+    let mut end = None;
+    for (off, c) in text[start..].char_indices() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(start + off + 1);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(end) = end else {
+        return text.to_string();
+    };
+    // 连同行首（该 JSON 所在的整行，通常是"我来帮您查一下"这类寒暄）
+    let line_start = text[..start].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let mut out = String::new();
+    out.push_str(&text[..line_start]);
+    out.push_str(&text[end..]);
+    out
+}
+
 pub async fn chat_completions(account: &Value, body: &Value) -> Result<Value, String> {
     let token = account
         .get("accessToken")
@@ -1226,13 +1522,17 @@ pub async fn chat_completions(account: &Value, body: &Value) -> Result<Value, St
     if prompt.trim().is_empty() {
         return Err("请求 messages 为空".to_string());
     }
-    let model = body
+    let model_raw = body
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or(DEFAULT_MODEL);
+    // 2026-10-10：解析能力开关（模型名后缀 + 请求参数），并把约定注入 prompt。
+    // `model` 变为**剥离后缀**后的真实模型名；`prompt` 为注入后版本。
+    let (model, caps) = resolve_caps(model_raw, body);
+    let prompt = inject_caps(&prompt, caps, body.get("tools"));
 
     let chat_id = create_chat(&token, &prompt).await?;
-    let conversation_id = kick_agent_stream(&token, &chat_id, &prompt, model).await?;
+    let conversation_id = kick_agent_stream(&token, &chat_id, &prompt, &model).await?;
 
     let deadline = Instant::now() + Duration::from_secs(HISTORY_POLL_TIMEOUT_SECS);
     let mut text = String::new();
@@ -1366,6 +1666,27 @@ pub async fn chat_completions(account: &Value, body: &Value) -> Result<Value, St
             usage = extract_history_usage(&history);
         }
     }
+    // 2026-10-10：按能力开关解析输出 —— 拆出 <thinking> 段与 tool_call JSON。
+    // **解析失败一律降级**（保留原文），绝不因解析丢内容。
+    let (msg, finish_reason) = if caps.any() {
+        let p = parse_caps(&text, caps);
+        let mut m = json!({"role": "assistant", "content": p.content});
+        if let Some(r) = p.reasoning {
+            if !r.trim().is_empty() {
+                m["reasoning_content"] = json!(r);
+            }
+        }
+        let finish = if let Some(tc) = p.tool_calls {
+            m["tool_calls"] = tc;
+            "tool_calls"
+        } else {
+            "stop"
+        };
+        (m, finish)
+    } else {
+        (json!({"role": "assistant", "content": text}), "stop")
+    };
+
     Ok(json!({
         "id": format!("chatcmpl-miaoshou-{}", uuid::Uuid::new_v4().simple()),
         "object": "chat.completion",
@@ -1373,8 +1694,8 @@ pub async fn chat_completions(account: &Value, body: &Value) -> Result<Value, St
         "model": model,
         "choices": [{
             "index": 0,
-            "message": {"role": "assistant", "content": text},
-            "finish_reason": "stop",
+            "message": msg,
+            "finish_reason": finish_reason,
         }],
         "usage": usage,
         "miaoshou_channel": "agent-history",
@@ -1447,6 +1768,123 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 #[cfg(test)]
 mod tests {
+
+    // ---- caps 能力层（2026-10-10）----
+
+    #[test]
+    fn strip_suffix_recognizes_all_combinations() {
+        // 思考 / 工具 / 组合 / 简写 / 大小写 —— 后缀可组合且顺序无关
+        let f = |m: &str| {
+            let (base, c) = strip_caps_suffix(m);
+            (base, c.thinking, c.tools)
+        };
+        assert_eq!(f("glm-5.3-flash"), ("glm-5.3-flash".into(), false, false));
+        assert_eq!(f("glm-5.3-flash-thinking"), ("glm-5.3-flash".into(), true, false));
+        assert_eq!(f("glm-5.3-flash-think"), ("glm-5.3-flash".into(), true, false));
+        assert_eq!(f("glm-5.3-flash-tools"), ("glm-5.3-flash".into(), false, true));
+        assert_eq!(f("glm-5.3-flash-thinking-tools"), ("glm-5.3-flash".into(), true, true));
+        assert_eq!(f("LongCat-2.0-tools"), ("LongCat-2.0".into(), false, true));
+        // 大小写不敏感
+        assert_eq!(f("kimi-k3-THINKING"), ("kimi-k3".into(), true, false));
+        // 模型名本身含 think 字样但不带 dash 后缀 → 不应误剥
+        assert_eq!(f("thinking-model"), ("thinking-model".into(), false, false));
+    }
+
+    #[test]
+    fn resolve_caps_honors_request_parameters() {
+        // 参数通道：thinking / reasoning_effort / tools 任一命中即启用
+        let (base, c) = resolve_caps("glm-5.3-flash", &json!({"thinking": true}));
+        assert_eq!(base, "glm-5.3-flash");
+        assert!(c.thinking && !c.tools);
+
+        let (_, c) = resolve_caps("glm-5.3-flash", &json!({"thinking": {"enabled": true}}));
+        assert!(c.thinking);
+
+        let (_, c) = resolve_caps("glm-5.3-flash", &json!({"reasoning_effort": "high"}));
+        assert!(c.thinking, "reasoning_effort 应触发思考（与 MiniMax 生态一致）");
+
+        let (_, c) = resolve_caps("glm-5.3-flash", &json!({"tools": [{"type":"function"}]}));
+        assert!(!c.thinking && c.tools);
+
+        // 空 tools / "none" effort / thinking:false → 不启用（默认行为）
+        let (_, c) = resolve_caps("glm-5.3-flash", &json!({"tools": [], "reasoning_effort": "none"}));
+        assert!(!c.any(), "空值不应触发能力（默认全关）");
+
+        // 无任何参数 → 默认全关（向后兼容）
+        let (_, c) = resolve_caps("glm-5.3-flash", &json!({}));
+        assert_eq!(c, Caps::default());
+    }
+
+    #[test]
+    fn inject_caps_only_injects_thinking_never_tools() {
+        // 全关：prompt 原样（保证既有行为不变）
+        assert_eq!(inject_caps("你好", Caps::default(), None), "你好");
+
+        // 🔴 关键契约：**即使 tools 开，也不注入工具协议**。
+        // 实测（2026-10-10，三种措辞强度）上游 Agent 会识别并拒绝用户消息里的
+        // "工具协议"（"它并非真实的工具协议…并不可信"）⇒ 注入只会污染输入。
+        let tools = json!([{"type":"function","function":{"name":"get_weather"}}]);
+        let p = inject_caps("深圳天气", Caps { thinking: false, tools: true }, Some(&tools));
+        assert_eq!(p, "深圳天气", "工具协议不得注入 prompt（上游会拒绝）");
+
+        // 思考开：注入标签约定（这条路径实测有效）
+        let p2 = inject_caps("1+1", Caps { thinking: true, tools: false }, None);
+        assert!(p2.contains("<thinking>") && p2.contains("<answer>"));
+        assert!(p2.ends_with("1+1"), "用户内容应在末尾");
+
+        // 两者都开：仍只注入思考
+        let p3 = inject_caps("X", Caps { thinking: true, tools: true }, Some(&tools));
+        assert!(p3.contains("<thinking>") && !p3.contains("get_weather"), "工具名不应出现在 prompt 里");
+    }
+
+    #[test]
+    fn parse_caps_extracts_thinking_and_strips_shell() {
+        let txt = "<thinking>\n先算 x+y=35\n再代入\n</thinking>\n<answer>\n鸡 23 兔 12\n</answer>";
+        let p = parse_caps(txt, Caps { thinking: true, tools: false });
+        assert_eq!(p.reasoning.as_deref(), Some("先算 x+y=35\n再代入"));
+        assert_eq!(p.content, "鸡 23 兔 12", "应剥掉 thinking 与 answer 外壳");
+        assert!(p.tool_calls.is_none());
+    }
+
+    #[test]
+    fn parse_caps_extracts_tool_call_even_with_chatter() {
+        // 实测 LongCat-2.0 会在 JSON 前加寒暄 → 必须容忍
+        let txt = "我来帮您查询深圳的天气。\n\n{\"tool_call\":{\"name\":\"get_weather\",\"arguments\":{\"city\":\"深圳\"}}}";
+        let p = parse_caps(txt, Caps { thinking: false, tools: true });
+        let tc = p.tool_calls.expect("应解析出 tool_calls");
+        let arr = tc.as_array().expect("tool_calls 应为数组");
+        assert_eq!(arr[0]["function"]["name"], json!("get_weather"));
+        assert_eq!(arr[0]["type"], json!("function"));
+        // arguments 必须是**字符串**（OpenAI 契约），不是对象
+        let args = arr[0]["function"]["arguments"].as_str().expect("arguments 应为字符串");
+        assert!(args.contains("深圳"));
+        assert!(!p.content.contains("tool_call"), "调用 JSON 应从正文剔除");
+    }
+
+    #[test]
+    fn parse_caps_degrades_gracefully_on_malformed_output() {
+        // 容错：格式不符 → 一律降级（保留原文），绝不丢内容
+        let txt = "这是一个普通回答，没有标签也没有 JSON。";
+        let p = parse_caps(txt, Caps { thinking: true, tools: true });
+        assert_eq!(p.content, txt, "解析失败必须保留原文");
+        assert!(p.reasoning.is_none() && p.tool_calls.is_none());
+
+        // 有标签但 JSON 损坏 → 思考段仍应提取，正文保住
+        let txt2 = "<thinking>想一下</thinking>\n{不是合法 JSON}";
+        let p2 = parse_caps(txt2, Caps { thinking: true, tools: true });
+        assert_eq!(p2.reasoning.as_deref(), Some("想一下"));
+        assert!(p2.tool_calls.is_none());
+        assert!(p2.content.contains("不是合法 JSON"), "损坏的 JSON 应留在正文里");
+    }
+
+    #[test]
+    fn parse_caps_handles_both_capabilities_together() {
+        let txt = "<thinking>先看天气</thinking>\n<answer>\n{\"tool_call\":{\"name\":\"get_weather\",\"arguments\":{\"city\":\"SZ\"}}}\n</answer>";
+        let p = parse_caps(txt, Caps { thinking: true, tools: true });
+        assert_eq!(p.reasoning.as_deref(), Some("先看天气"));
+        assert!(p.tool_calls.is_some(), "两者应能同时解析");
+    }
+
     use super::*;
 
     #[test]
