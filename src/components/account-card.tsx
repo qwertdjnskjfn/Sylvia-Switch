@@ -1,4 +1,4 @@
-import { ArrowRight, Check, CircleCheck, Clock3, Coins, Ellipsis, Loader2, Pencil, PlaneTakeoff, RefreshCw, Sparkles, Star, Trash2, TriangleAlert } from "lucide-react";
+import { ArrowRight, Check, CircleCheck, Clock3, Coins, Ellipsis, Loader2, Pencil, PlaneTakeoff, RefreshCw, Sparkles, Star, Trash2, TriangleAlert, CircleSlash } from "lucide-react";
 import { useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
@@ -270,7 +270,14 @@ export function AccountCard({
   const statusChips = (
     <>
       {todayCheckedIn !== undefined && (
-        <Badge variant={todayCheckedIn ? "success" : "secondary"} className={cn(chipClass, !todayCheckedIn && "text-muted-foreground")}><CircleCheck /> {todayCheckedIn ? "已签到" : "未签到"}</Badge>
+        // 2026-10-10：三态 —— true=已签到 / false=未签到 / null=该平台无签到概念。
+        // 此前 null 被当 falsy 渲染成「未签到」，对妙手等**无签到功能**的平台是误导
+        // （后端设计本就用 null 表达「不适用」，见 platform_checkin 的注释）。
+        todayCheckedIn == null ? (
+          <Badge variant="outline" className={cn(chipClass, "text-muted-foreground")} title="该平台无每日签到"><CircleSlash /> 不适用</Badge>
+        ) : (
+          <Badge variant={todayCheckedIn ? "success" : "secondary"} className={cn(chipClass, !todayCheckedIn && "text-muted-foreground")}><CircleCheck /> {todayCheckedIn ? "已签到" : "未签到"}</Badge>
+        )
       )}
       {platformName && (
         <Badge variant="secondary" className={cn(chipClass, "text-muted-foreground")}>{platformName}</Badge>

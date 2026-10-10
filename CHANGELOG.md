@@ -1,3 +1,54 @@
+## 2.0.44 - 2026-10-10
+
+### 修复账号卡片的两个「签到标签」问题（承接 2.0.43 的顺带发现）
+
+#### 问题 A：妙手等**无签到功能**的平台显示「未签到」
+
+**根因**：后端设计正确，前端未处理三态。
+```rust
+// 后端（platform_checkin）：该平台无每日签到，用 null（而非 false）表达
+obj.insert("todayCheckedIn".to_string(), Value::Null);
+```
+```tsx
+// 前端（account-card）：null 被当 falsy ⇒ 渲染成「未签到」（对无签到平台是误导）
+{todayCheckedIn ? "已签到" : "未签到"}
+```
+
+**修复**：改为**三态渲染**
+| 值 | 显示 |
+| --- | --- |
+| `true` | 已签到（绿色）|
+| `false` | 未签到（灰色）|
+| **`null`** | **不适用**（outline + tooltip「该平台无每日签到」）|
+
+#### 问题 B：MiniMax 显示「未签到」，但**当天确实已签到成功**
+
+**根因**：`minimax::signin_panel_status` **读错了 JSON 路径**。
+```rust
+.pointer("/data/panel/days")   // 🔴 找 "panel" 层
+```
+而实测上游返回 `{"data":{"scene":2,"days":[…]}}` —— **没有 `panel` 层**！
+⇒ `pointer()` 返回 `None` ⇒ `unwrap_or(0)` ⇒ `today_status = 0` ⇒ **`todayCheckedIn` 恒为 `false`**
+（现象：卡片恒显示「未签到」，与 `signin_last_date` 矛盾）。
+
+**修复**：改为 `/data/days`，并保留 `/data/panel/days` 作兼容回退。
+
+#### 验证（2.0.44 线上）
+| 平台 | 修复前 | 修复后 |
+| --- | --- | --- |
+| minimax ×3 | ❌ `False`（当天已签）| ✅ **`True`** |
+| miaoshou ×2 | ❌ 显示「未签到」| ✅ `null` → 前端「不适用」|
+| workbuddy / autoclaw / dumate | ✅ `True` | ✅ **未变**（无回归）|
+| 单测 | — | **820 passed / 0 failed** |
+| 前端产物 | — | ✅ 含「不适用」 |
+
+#### 📌 教训
+1. **`pointer()` 读不到就是静默 0** —— 路径写错不会报错，只会让**语义塌陷**
+   （`today_status=0` 被理解为"未签到"，而真值是 3="已签到"）。
+   **凡用 `unwrap_or(默认值)` 的地方，默认值都必须能表达"读不到"**，否则故障被伪装成业务状态。
+2. **JSX 里改条件渲染要留意嵌套** —— 我在 `{cond && ( … )}` 内又套了 `{…}`，
+   被 tsc 拦下（`')' expected`）。**表达式容器内不能再写 `{}`**，注释也要用 `//` 而非 `{/* */}`。
+
 ## 2.0.43 - 2026-10-10
 
 ### 🔴 修复：非 WorkBuddy 平台的账号卡片「积分显示不出来」

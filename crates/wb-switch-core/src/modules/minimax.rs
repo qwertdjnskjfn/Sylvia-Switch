@@ -4573,8 +4573,14 @@ pub async fn signin_panel_status(acc: &MmAccount) -> Value {
     let tz = "timezone_id=Asia/Shanghai";
     match cloud_get(acc, "/minimax-cloud/api/v1/signin/status", Some(tz)).await {
         Ok(v) => {
+            // 🔴 2026-10-10 修正路径：实测上游返回 {"data":{"scene":2,"days":[…]}}，
+            // **没有 `panel` 层**。此前读 `/data/panel/days` ⇒ pointer 返回 None
+            // ⇒ `unwrap_or(0)` ⇒ `todayCheckedIn` **恒为 false**
+            // （现象：账号卡片显示「未签到」，而当天其实已签到成功）。
+            // 保留 panel 路径作兼容（历史/其它版本可能不同）。
             let today_status = v
-                .pointer("/data/panel/days")
+                .pointer("/data/days")
+                .or_else(|| v.pointer("/data/panel/days"))
                 .and_then(Value::as_array)
                 .and_then(|arr| {
                     arr.iter()
