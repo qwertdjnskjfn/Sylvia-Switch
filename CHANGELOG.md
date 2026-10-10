@@ -1,3 +1,45 @@
+## 2.0.46 - 2026-10-10
+
+### 妙手渠道：统一响应解析（消除 2 处遗留的「吞原始响应」）
+
+承接 2.0.45 —— 当时只修了 `create_chat`，`miaoshou.rs` 还剩 **2 处**同形态
+（裸 `.json()`，上游返回非 JSON 时原始内容被丢弃）。
+
+#### 改动：抽出公共辅助 `json_with_context`，3 处收敛为同一实现
+```rust
+/// 读取响应体并解析 JSON；**失败时保留原始内容**便于诊断。
+async fn json_with_context(resp: reqwest::Response, what: &str) -> Result<Value, String> {
+    let status = resp.status();
+    let raw = resp.text().await.unwrap_or_default();
+    serde_json::from_str::<Value>(&raw).map_err(|e| {
+        let head: String = raw.chars().take(300).collect();
+        format!("妙手{what}响应解析失败: {e} | HTTP {} | 原始响应前 300 字: {}",
+            status.as_u16(),
+            if head.trim().is_empty() { "(空响应体)" } else { &head })
+    })
+}
+```
+
+| # | 调用点 | 改动 |
+| --- | --- | --- |
+| ① | 新增 `json_with_context` | 公共辅助（DRY，避免继续复制）|
+| ② | `create_chat` | 改用公共辅助（替换 2.0.45 的内联版）|
+| ③ | `kick_agent_stream`（发起生成）| 裸 `.json()` → 公共辅助 |
+| ④ | `conversation_history`（会话历史）| 裸 `.json()` → 公共辅助 |
+
+#### 验证（2.0.46 线上）
+| 项 | 结果 |
+| --- | --- |
+| 单测 | **820 passed / 0 failed** |
+| E2E（4 次完整调用，覆盖 3 处路径）| ✅ **4/4 成功**（9.9s ~ 45.2s）|
+
+**⇒ 妙手整条调用链（create → agent-stream → history）现在解析失败时都会带出上游原始响应。**
+
+#### 📌 教训（与 2.0.43 同源）
+**「错误信息吞掉上下文」是排查灾难** —— `.json()` 失败只剩 `error decoding response body`，
+把「上游返回了什么」这一最关键信息丢掉了。**凡解析外部响应，失败时都要保留原始内容（截断）**。
+本次若非先补上这个能力，25% 成功率的上游故障根本无从定位。
+
 ## 2.0.45 - 2026-10-10
 
 ### 妙手渠道：保留上游原始响应（可诊断性）+ 502 排查结论

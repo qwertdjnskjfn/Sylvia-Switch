@@ -207,6 +207,26 @@ async fn post_json_with_fallback(
         .map_err(|e| format!("请求失败: {e}"))
 }
 
+/// 读取响应体并解析 JSON；**失败时保留原始内容**便于诊断。
+///
+/// 🔴 2026-10-10：此前多处直接 `.json()` —— 上游返回非 JSON（错误页 / 限流页 / 空体）时，
+/// 错误信息只剩「error decoding response body」，**原始内容被丢弃、无法诊断**。
+/// 实测妙手建会话失败（8 次中 6 次）正是此形态；补齐上下文后可直接看到上游返回了什么。
+///
+/// `what` 用于错误前缀（如 `"建会话"` / `"发起生成"` / `"会话历史"`）。
+async fn json_with_context(resp: reqwest::Response, what: &str) -> Result<Value, String> {
+    let status = resp.status();
+    let raw = resp.text().await.unwrap_or_default();
+    serde_json::from_str::<Value>(&raw).map_err(|e| {
+        let head: String = raw.chars().take(300).collect();
+        format!(
+            "妙手{what}响应解析失败: {e} | HTTP {} | 原始响应前 300 字: {}",
+            status.as_u16(),
+            if head.trim().is_empty() { "(空响应体)" } else { &head }
+        )
+    })
+}
+
 /// 妙手 API 请求头。⚠️ 鉴权头是 `X-Auth-Token`（实测必须；单发
 /// `access-token` 会被网关以 4010 拒绝），与桌面端 doFetch 一致同时下发
 /// `X-Auth-Token` 与 `access-token`，另带 `client-id`。
@@ -1014,20 +1034,8 @@ pub async fn create_chat(token: &str, prompt: &str) -> Result<String, String> {
     )
     .await
     .map_err(|e| format!("妙手建会话失败: {e}"))?;
-    // 🔴 2026-10-10：先取**原始文本**再解析 —— 此前直接用 `.json()`，
-    // 上游返回非 JSON（错误页/限流页/空 body）时错误信息只剩
-    // 「error decoding response body」，**原始内容被丢弃、无法诊断**。
-    // 实测该形态占失败的大多数（8 次调用中 6 次），必须保留现场。
-    let status = resp.status();
-    let raw = resp.text().await.unwrap_or_default();
-    let value: Value = serde_json::from_str(&raw).map_err(|e| {
-        let head: String = raw.chars().take(300).collect();
-        format!(
-            "妙手建会话响应解析失败: {e} | HTTP {} | 原始响应前 300 字: {}",
-            status.as_u16(),
-            if head.trim().is_empty() { "(空响应体)" } else { &head }
-        )
-    })?;
+    // 解析失败时保留上游原始响应（见 json_with_context 文档）
+    let value: Value = json_with_context(resp, "建会话").await?;
     if value.get("code").and_then(Value::as_i64).unwrap_or(-1) != 0 {
         return Err(format!(
             "妙手建会话被拒: {}",
@@ -1072,10 +1080,7 @@ pub async fn kick_agent_stream(
     )
     .await
     .map_err(|e| format!("妙手发起生成失败: {e}"))?;
-    let value: Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("妙手发起生成响应解析失败: {e}"))?;
+    let value: Value = json_with_context(resp, "发起生成").await?;
     let conv = value
         .pointer("/data/conversationId")
         .and_then(Value::as_str)
@@ -1143,10 +1148,7 @@ pub async fn conversation_history(token: &str, conversation_id: &str) -> Result<
     let resp = get_with_fallback(&url, &headers, stream_client())
         .await
         .map_err(|e| format!("妙手会话历史请求失败: {e}"))?;
-    let value: Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("妙手会话历史解析失败: {e}"))?;
+    let value: Value = json_with_context(resp, "会话历史").await?;
     Ok(value)
 }
 
