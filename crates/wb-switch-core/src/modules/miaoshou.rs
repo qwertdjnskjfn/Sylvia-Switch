@@ -1012,8 +1012,61 @@ pub fn models_payload() -> Value {
         }))
 }
 
+/// 判别「可重试的限流 / 传输层错误」。
+///
+/// 🔴 2026-10-10：妙手上游对建会话有**配额限制**（实测触发后返回
+/// `HTTP 429 refused` 并持续一段时间；未触发时也可能表现为连接被中断）。
+/// 这类错误**重试有意义**（等冷却结束即可恢复）。
+///
+/// ⚠️ **不覆盖业务错误** —— 如上游 agent 返回的 `mc-agent-error`（带 `retry="false"`）
+/// 是确定性拒绝，重试无意义且浪费配额。
+fn is_rate_limit_error(msg: &str) -> bool {
+    const PATTERNS: [&str; 7] = [
+        "HTTP 429",
+        "refused",
+        "UNEXPECTED_EOF",
+        "connection",
+        "timed out",
+        "超时",
+        "响应解析失败", // 非 JSON 体多半是限流页（如 "refused" / HTML 错误页）
+    ];
+    PATTERNS.iter().any(|p| msg.contains(p))
+}
+
 /// 建会话 → chatId。
+///
+/// 带**限流退避重试**：上游对建会话有配额（429 粘性拒绝），
+/// 对限流/传输类错误重试 3 次（退避 1s → 3s）；业务错误不重试。
 pub async fn create_chat(token: &str, prompt: &str) -> Result<String, String> {
+    const BACKOFFS_SECS: [u64; 2] = [1, 3]; // 共 3 次尝试
+    let mut last_err = String::new();
+    for attempt in 0..=BACKOFFS_SECS.len() {
+        match create_chat_once(token, prompt).await {
+            Ok(id) => return Ok(id),
+            Err(e) => {
+                let retryable = is_rate_limit_error(&e);
+                if !retryable || attempt == BACKOFFS_SECS.len() {
+                    return Err(if retryable {
+                        // 方案 1：明确告知用户「是限流」而不是笼统 502
+                        format!(
+                            "{e}（上游限流，已重试 {} 次仍未恢复；请等待约 30~60 秒后重试，\
+                             或改用 MiniMax 渠道）",
+                            attempt
+                        )
+                    } else {
+                        e
+                    });
+                }
+                tokio::time::sleep(Duration::from_secs(BACKOFFS_SECS[attempt])).await;
+                last_err = e;
+            }
+        }
+    }
+    Err(last_err)
+}
+
+/// 单次建会话（不含重试）。
+async fn create_chat_once(token: &str, prompt: &str) -> Result<String, String> {
     let chat_id = uuid::Uuid::new_v4().to_string();
     let body = json!({
         "chatId": chat_id,
@@ -1034,6 +1087,12 @@ pub async fn create_chat(token: &str, prompt: &str) -> Result<String, String> {
     )
     .await
     .map_err(|e| format!("妙手建会话失败: {e}"))?;
+    // 🔴 先看 HTTP 状态 —— reqwest 对 4xx **不报错**，429 会带着 "refused" 体
+    // 进到解析阶段被误判成「解析失败」。显式识别后才能触发退避重试 + 明确提示。
+    let status = resp.status();
+    if status.as_u16() == 429 {
+        return Err("妙手建会话被上游限流: HTTP 429 refused".to_string());
+    }
     // 解析失败时保留上游原始响应（见 json_with_context 文档）
     let value: Value = json_with_context(resp, "建会话").await?;
     if value.get("code").and_then(Value::as_i64).unwrap_or(-1) != 0 {
@@ -1780,6 +1839,37 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 #[cfg(test)]
 mod tests {
+
+    // ---- 限流判别（2026-10-10）----
+
+    #[test]
+    fn rate_limit_error_classifies_retryable_cases() {
+        // ✅ 应重试：限流 / 传输层（等冷却可恢复）
+        for msg in [
+            "妙手建会话被上游限流: HTTP 429 refused",
+            "妙手建会话响应解析失败: expected value | HTTP 429 | 原始响应前 300 字: refused",
+            "请求失败: error sending request: connection closed before message completed",
+            "请求失败: <urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING]>",
+            "妙手建会话失败: 请求超时",
+            "妙手会话历史请求失败: timed out",
+        ] {
+            assert!(is_rate_limit_error(msg), "应判为可重试: {msg}");
+        }
+    }
+
+    #[test]
+    fn rate_limit_error_does_not_retry_business_errors() {
+        // ❌ 不应重试：业务性拒绝（retry=false）——重试无意义且浪费已紧张的配额
+        for msg in [
+            "妙手发起生成被拒: <mc-agent-error error=\"CatPaw 后端创建对话失败: 系统内部异常\" retry=\"false\">",
+            "妙手建会话被拒: 账号无权限",
+            "妙手账号缺少 accessToken（请重新导入登录态）",
+            "请求 messages 为空",
+        ] {
+            assert!(!is_rate_limit_error(msg), "不应重试业务错误: {msg}");
+        }
+    }
+
 
     // ---- caps 能力层（2026-10-10）----
 
