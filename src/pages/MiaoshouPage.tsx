@@ -24,7 +24,8 @@ import {
 import { cn } from "@/lib/utils";
 import * as api from "@/lib/api";
 import { useRefreshAllListener } from "@/lib/refresh-all";
-import type { MiaoshouAccountInfo, MiaoshouModelInfo, MiaoshouStatusItem } from "@/lib/types";
+import { CopyButton } from "@/components/ui/copy-button";
+import type { MiaoshouAccessInfo, MiaoshouAccountInfo, MiaoshouModelInfo, MiaoshouStatusItem } from "@/lib/types";
 import {
   Select,
   SelectContent,
@@ -61,6 +62,8 @@ function formatRefreshTime(ts: number | null | undefined): string {
 export default function MiaoshouPage() {
   const [accounts, setAccounts] = useState<MiaoshouAccountInfo[]>([]);
   const [status, setStatus] = useState<MiaoshouStatusItem[]>([]);
+  // 接入信息（Base URL / API Key）：来自 /api/miaoshou/status 顶层（2026-10-10 新增）
+  const [access, setAccess] = useState<MiaoshouAccessInfo | null>(null);
   const [models, setModels] = useState<MiaoshouModelInfo[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
   const [msg, setMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
@@ -78,6 +81,10 @@ export default function MiaoshouPage() {
   const loadStatus = useCallback(async () => {
     const res = await api.getMiaoshouStatus();
     setStatus(res.accounts ?? []);
+    // 接入信息：后端顶层字段（缺失时保持 null，区块显示占位）
+    if (res.apiKey && res.basePath) {
+      setAccess({ apiKey: res.apiKey, basePath: res.basePath });
+    }
   }, []);
 
   const loadModels = useCallback(async (force = false) => {
@@ -197,6 +204,27 @@ export default function MiaoshouPage() {
       setTesting(false);
     }
   }
+
+
+  // 接入信息：Base URL 用运行时 origin 拼接 —— 网关端口可能被 launcher 调整，
+  // 故后端只给相对 basePath，前端绝不硬编码 127.0.0.1:57890。
+  const origin =
+    typeof window !== "undefined" && window.location?.origin
+      ? window.location.origin
+      : "http://127.0.0.1:57890";
+  const baseUrl = `${origin}${(access?.basePath ?? "/miaoshou/v1/chat/completions").replace(
+    /\/chat\/completions$/,
+    "",
+  )}`;
+  const sampleModel = models[0]?.id ?? "glm-5.3-flash";
+  const curlExample = access
+    ? [
+        `curl -X POST '${origin}${access.basePath}' \\`,
+        `  -H 'Authorization: Bearer ${access.apiKey}' \\`,
+        `  -H 'Content-Type: application/json' \\`,
+        `  -d '{"model":"${sampleModel}","messages":[{"role":"user","content":"你好"}]}'`,
+      ].join("\n")
+    : "";
 
   return (
     <div className="mx-auto w-full max-w-[1180px] min-w-0 px-4 py-6 sm:px-8 sm:py-9">
@@ -426,6 +454,39 @@ export default function MiaoshouPage() {
                   );
                 })
               )}
+            </div>
+          </CardContent>
+        </Card>
+      </section>
+
+      <section className="mt-10 min-w-0 space-y-2.5" aria-label="接入信息">
+        <div className="min-w-0 px-1">
+          <h2 className="text-[13px] font-medium leading-5">接入信息</h2>
+          <p className="mt-0.5 text-xs text-muted-foreground">
+            把妙手模型接入任意 OpenAI 兼容客户端。凭证由本机妙手桌面端登录态自动派生，
+            无需手动填写上游 token；调用会经本网关按账号池转发。
+          </p>
+        </div>
+        <Card className="min-w-0 gap-0 overflow-hidden rounded-xl py-0 shadow-none">
+          <CardContent className="p-0">
+            <div className="flex flex-wrap items-center gap-2 border-b border-border/50 px-4 py-3.5 sm:px-5">
+              <span className="text-xs text-muted-foreground">Base URL</span>
+              <code className="max-w-full overflow-x-auto rounded bg-muted/70 px-2 py-1 text-xs">{baseUrl}</code>
+              <CopyButton text={baseUrl} label="Base URL" />
+              <span className="ml-2 text-xs text-muted-foreground">API Key</span>
+              <code className="rounded bg-muted/70 px-2 py-1 text-xs">{access ? access.apiKey : "—"}</code>
+              {access ? <CopyButton text={access.apiKey} label="API Key" /> : null}
+            </div>
+            <div className="px-4 py-3.5 sm:px-5">
+              <div className="text-[12px] font-medium">调用示例（curl）</div>
+              <pre className="mt-1.5 min-w-0 overflow-x-auto rounded bg-muted/60 p-2 text-[10px] leading-4">{curlExample}</pre>
+              <div className="mt-1.5">
+                <CopyButton text={curlExample} label="调用示例" />
+              </div>
+              <p className="mt-2 text-[11px] leading-5 text-muted-foreground">
+                模型名从下方「模型目录」选取；当前账号池有 {accounts.length} 个账号。
+                妙手积分按月刷新，额度用尽时会返回上游错误。
+              </p>
             </div>
           </CardContent>
         </Card>

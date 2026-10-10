@@ -4119,6 +4119,11 @@ async fn api_miaoshou_status() -> Response {
     json_ok(json!({
         "installed": platform_checkin::miaoshou_desktop_installed(),
         "accounts": items,
+        // 2026-10-10：补「接入信息」——此前只返回 installed/accounts，前端页面
+        // 因此**没有 Base URL / API Key 可展示**（用户报「接入信息缺失」的直接原因）。
+        // 路径用**相对形式**（与 loomy 一致），由前端拼 origin，端口变化自适应。
+        "apiKey": glm_proxy::load_config().api_key,
+        "basePath": "/miaoshou/v1/chat/completions",
     }))
 }
 

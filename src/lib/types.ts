@@ -1059,6 +1059,17 @@ export interface MiaoshouStatusItem {
 }
 
 /** 妙手签到结果（保留接口；妙手实际无每日签到，后端恒返回不支持）。 */
+/**
+ * 妙手接入信息（GET /api/miaoshou/status 的顶层字段，2026-10-10 新增）。
+ *
+ * `basePath` 是**相对路径**，前端拼 `window.location.origin` 得到完整 Base URL
+ * —— 端口变化时无需改动（网关端口可被 launcher 调整）。
+ */
+export interface MiaoshouAccessInfo {
+  apiKey: string;
+  basePath: string;
+}
+
 export interface MiaoshouModelInfo {
   id: string;
   object: string;

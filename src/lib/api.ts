@@ -1324,7 +1324,17 @@ export async function miaoshouRemoveAccount(uid: string): Promise<{ ok: boolean 
 }
 
 /** 账号状态与积分明细；妙手无每日签到（积分按月刷新），checkinSupported 恒为 false。 */
-export async function getMiaoshouStatus(): Promise<{ accounts: MiaoshouStatusItem[] }> {
+export async function getMiaoshouStatus(): Promise<{
+  accounts: MiaoshouStatusItem[];
+  /**
+   * 接入信息（2026-10-10 新增；**可选**以兼容旧后端）：
+   * 网关 API Key + 转发路径（**相对**形式，前端拼 `location.origin`，
+   * 端口变化自适应）。页面「接入信息」区块据此渲染。
+   */
+  apiKey?: string;
+  basePath?: string;
+  installed?: boolean;
+}> {
   return call("get_miaoshou_status");
 }
 

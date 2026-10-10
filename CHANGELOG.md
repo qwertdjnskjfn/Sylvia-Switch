@@ -1,3 +1,49 @@
+## 2.0.39 - 2026-10-10
+
+### 补齐妙手「接入信息」区块（用户报「接入信息缺失/未显示」）
+
+#### 排查结论：**后端数据全部正常，缺的是前端展示层**
+| 层 | 检查 | 结果 |
+| --- | --- | --- |
+| 总览 | `/api/gateways/overview` 的 miaoshou 项 | ✅ 存在（`health=ok`、`acc=2`、`models=8`）|
+| 端点 | `/api/miaoshou/{status,accounts,models}` | ✅ 全部 200 |
+| 数据 | 账号 token / `installed` / 模型目录 | ✅ 2 账号有 token、`installed=true`、8 模型有内容 |
+| 凭证 | `/api/miaoshou/credits` | ✅ 积分充足（1199.68 / 1200.00，体验版）|
+| 可用性 | 真实对话 | ✅ `glm-5.3-flash` 10.4s、`LongCat-2.0` 8.4s 均成功 |
+| **前端** | `MiaoshouPage` 的区块清单 | ❌ **只有**「账号池 / 签到状态与积分 / 模型目录 / 试一试」，**没有「接入信息」** |
+| **契约** | `/api/miaoshou/status` 返回字段 | ❌ 只有 `{installed, accounts}`，**无 apiKey/basePath** ⇒ 前端无数据可显示 |
+
+**根因**：对比 `MiniMaxPage`（有 `<Section title="接入信息">` 展示 Base URL / API Key / curl 示例），
+`MiaoshouPage` **从来没有这个区块**，且后端 status 也未提供相应字段 ⇒
+用户拿不到「把妙手接入其他客户端」所需的 Base URL 与密钥。
+
+#### 改动
+| 端 | 文件 | 内容 |
+| --- | --- | --- |
+| 后端 | `api.rs` | `api_miaoshou_status` 顶层增加 `apiKey`（取 `glm_proxy::load_config().api_key`）与 `basePath`（`/miaoshou/v1/chat/completions`）|
+| 前端 | `lib/types.ts` | 新增 `MiaoshouAccessInfo { apiKey, basePath }` |
+| 前端 | `lib/api.ts` | `getMiaoshouStatus()` 返回类型补 `apiKey?` / `basePath?` / `installed?`（**可选**，兼容旧后端）|
+| 前端 | `pages/MiaoshouPage.tsx` | 新增「接入信息」区块：Base URL + API Key（均带复制按钮）+ curl 调用示例；插在「模型目录」之前 |
+
+**设计要点**：
+- **路径用相对形式**（与 loomy 一致），前端拼 `window.location.origin` ⇒
+  **端口变化自适应**（网关端口可被 launcher 调整，绝不硬编码 `127.0.0.1:57890`）。
+- 区块在数据缺失时显示占位（`—`），不报错、不影响其余功能。
+
+#### 验证
+| 项 | 结果 |
+| --- | --- |
+| `tsc --noEmit` | ✅ 通过 |
+| `GET /api/miaoshou/status` | ✅ 键变为 `[accounts, apiKey, basePath, installed]`，`basePath=/miaoshou/v1/chat/completions` |
+| 前端产物 | ✅ `index-*.js` 含「接入信息」×8 + `miaoshou/v1/chat/completions` |
+| 回归 | ✅ 账号数 2、`installed=true` 不变；既有区块未受影响 |
+
+#### 📌 教训
+**「XX 缺失」要先分清是「数据没有」还是「界面没显示」** ——
+本次后端 6 层检查（总览/端点/数据/凭证/可用性/契约）全部通过，
+问题只在**前端从未渲染该信息** + **后端未提供该字段**（两者都要补）。
+若只看后端就会误判为「一切正常」，只看前端则会误判为「接口坏了」。
+
 ## 2.0.38 - 2026-10-10
 
 ### Token 统计页接入 MiniMax（第三个数据来源）
