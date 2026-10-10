@@ -1,3 +1,84 @@
+## 2.0.37 - 2026-10-10
+
+### 🔴 P0 修正：`extract_usage` 不认 Anthropic 口径 ⇒ MiniMax 的 Token 恒为 0
+
+2.0.36 上线后 E2E 实测发现：MiniMax 记录里 `promptTokens/completionTokens/totalTokens` **全为 0**。
+
+**根因**：`extract_usage` 只读 **OpenAI 口径**（`prompt_tokens`/`completion_tokens`/`total_tokens`），
+而 MiniMax 上游**直返 Anthropic 口径**：
+
+```json
+{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":209,"output_tokens":35}
+```
+
+⇒ 两个口径都读不到 ⇒ 全 0。**连带** `totalTokens` 也为 0（Anthropic 不返回该字段）。
+
+**修复**（`model_usage::extract_usage`）：
+- `prompt_tokens`/`completion_tokens` 全缺时回退 `input_tokens`/`output_tokens`；
+- `total_tokens` 缺失时按 **输入+输出** 合成（Anthropic 不提供）；
+- `reasoning_tokens` 增补 `output_tokens_details` 路径；
+- **OpenAI 口径存在时优先使用，绝不被回退覆盖**（GLM/loomy 等渠道行为逐字不变）。
+
+**验证**：E2E 实测 `prompt=209 / completion=42 / total=251`，与上游 usage **逐字一致** ✅
+
+**新增单测 3 个**：Anthropic 口径读取 / OpenAI 口径优先 / 空 usage 不 panic。**809 passed / 0 failed**。
+
+---
+
+## 2.0.36 - 2026-10-10
+
+### MiniMax 接入统计模块：Token（输入/输出/缓存）+ 积分消耗
+
+需求：统计模块新增 MiniMax 的调用次数 / Token / 积分，并保持与现有 UI、数据格式一致。
+
+**盘点结论：基础设施已具备，缺的是「把 MiniMax 调用接进现有管道」。**
+既有 `model_usage` 已支持 `channel` 维度、`extract_usage` 已支持缓存 token、
+`record_matches_provider` 对未知 channel 走兜底匹配（`minimax` 无需改该函数即可命中）。
+
+#### ① 后端：调用计量（`minimax.rs` 新增 `mod call_metrics`）
+| 环节 | 实现 |
+| --- | --- |
+| Token | 复用 `extract_usage()`，字段名与 GLM 记录**完全一致** |
+| 积分 | MiniMax **无「消耗流水」接口**（`credit/details` 只是发放明细）⇒ 按 GLM 侧同款「调用前后余额差」计量 |
+| 采样时机 | 调用**前**用 `tokio::spawn` **并行**采样（`credits_remaining` 是真实网络请求 250–600ms，串行会拖慢每次对话）|
+| 取不到 | `credits=null` + `creditsPending=true`，**绝不伪造 0**（遵项目红线「缺省值不能当业务状态」）|
+| 余额为负 | 期间有充值/过期 ⇒ 不记，标 pending |
+| 成功/失败 | 两条路径**都落记录**（否则调用次数只统计成功数，失败率无从体现）|
+| 换号重试前 | `abort()` 丢弃采样（该次尝试不产生计费）|
+| 额外字段 | `balanceAfter` 随记录落库 ⇒ overview 的「当前余额」**零额外上游请求** |
+
+#### ② 后端：渠道隔离（`model_usage.rs`）
+- `summary` 的 `balance` 原先**无条件**取 `wallet_balance()`（AutoClaw 钱包），
+  且 `daysRemaining = GLM余额 / 本渠道日均消耗` **串了口径** ⇒ 对 minimax 会显示错误数据。
+  现改为**仅 autoclaw/glm 保留原逻辑**，其他渠道置 `null`（前端显示空状态）。
+- `accounts-overview` 的 platforms 增加 `minimax`，余额取最新记录的 `balanceAfter`。
+
+#### ③ 前端
+| 文件 | 改动 |
+| --- | --- |
+| `components/model-monitor.tsx` | provider 下拉增加 `MiniMax`；空状态文案去渠道化（原文写死「GLM 代理」）|
+| `pages/ModelUsagePage.tsx` | 徽章/圆点配色 +minimax（violet）；徽章显示名 +minimax（并**修正**此前 `else → "TRAE"` 的误标，未知渠道现在回显原值）|
+
+#### ④ 验证
+| 项 | 结果 |
+| --- | --- |
+| `gate.ps1` | ✅ 5/5（版本同步 / check / **806 测试** / tsc / clippy 棘轮 157≤147，**不增长**）|
+| 单测 | 806 → **809 passed / 0 failed** |
+| E2E 明细 | ✅ 3 条记录，字段齐全 |
+| E2E `summary?channel=minimax` | ✅ `balance=null`（渠道隔离生效）|
+| E2E `monitor?provider=minimax` | ✅ **按模型+时间范围**：`models=1`、`series=25` 点 |
+| E2E `accounts-overview` | ✅ `minimax balance=3107.18` |
+| **回归** | ✅ autoclaw 2106 calls / loomy 1608 calls / trae 18 calls —— **均无影响** |
+
+#### 📌 教训
+1. **协议口径差异会在「统计」层面静默失败**：Token 记 0 不报错、单测全绿，
+   只有**端到端发一次真实请求**才暴露 ⇒ **新增计量必须做 E2E 实测，不能只靠单测**。
+2. **渠道之间的「余额」不可共用**：AutoClaw 钱包 ≠ MiniMax 积分，
+   混用会显示错误数据（本例 `daysRemaining` 甚至是分子分母跨渠道）。
+   新增渠道时须显式声明其余额口径来源。
+3. **`creditsPending` 是诚实性的关键**：取不到就标 pending，不写 0 ——
+   否则统计里会出现「这次没扣分」的假数据。
+
 ## 2.0.35 - 2026-10-09
 
 ### 多账号自动切换机制：补齐两处缺口（让"全局账号可用 + 无感切换"真正成立）

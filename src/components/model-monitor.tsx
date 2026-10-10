@@ -134,6 +134,7 @@ export const MONITOR_PROVIDER_OPTIONS = [
   { key: "autoclaw", label: "AutoClaw" },
   { key: "loomy", label: "Loomy" },
   { key: "trae_work_cn", label: "TRAE Work CN" },
+  { key: "minimax", label: "MiniMax" },
 ] as const;
 
 export function ModelMonitorPanel({
@@ -337,7 +338,7 @@ export function ModelMonitorPanel({
       {!hasData ? (
         <Card>
           <CardContent className="p-5 text-sm text-muted-foreground">
-            该时间范围内暂无调用记录。通过 GLM 代理发起对话后，监控数据会实时出现在这里。
+            该时间范围内暂无调用记录。通过对应渠道发起对话后，监控数据会实时出现在这里。
           </CardContent>
         </Card>
       ) : (

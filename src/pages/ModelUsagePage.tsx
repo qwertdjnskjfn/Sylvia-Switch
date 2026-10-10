@@ -256,7 +256,9 @@ export default function ModelUsagePage() {
                       ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/20"
                       : acc.provider === "loomy"
                         ? "bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/20"
-                        : "bg-sky-500/10 text-sky-600 dark:text-sky-400 border-sky-500/20";
+                        : acc.provider === "minimax"
+                          ? "bg-violet-500/10 text-violet-600 dark:text-violet-400 border-violet-500/20"
+                          : "bg-sky-500/10 text-sky-600 dark:text-sky-400 border-sky-500/20";
 
                   return (
                     <tr
@@ -277,7 +279,9 @@ export default function ModelUsagePage() {
                                 ? "bg-emerald-500"
                                 : acc.provider === "loomy"
                                   ? "bg-amber-500"
-                                  : "bg-sky-500",
+                                  : acc.provider === "minimax"
+                                    ? "bg-violet-500"
+                                    : "bg-sky-500",
                             )}
                             aria-hidden="true"
                           />
@@ -287,7 +291,11 @@ export default function ModelUsagePage() {
                               ? "AutoClaw"
                               : acc.provider === "loomy"
                                 ? "Loomy"
-                                : "TRAE"}
+                                : acc.provider === "minimax"
+                                  ? "MiniMax"
+                                  : acc.provider === "trae_work_cn"
+                                    ? "TRAE"
+                                    : acc.provider}
                           </Badge>
                           {isSelected ? (
                             <CheckCircle2 className="size-3.5 text-primary ml-auto shrink-0" />
@@ -407,7 +415,7 @@ export default function ModelUsagePage() {
             {models.length === 0 ? (
               <Card>
                 <CardContent className="p-5 text-sm text-muted-foreground">
-                  该范围内暂无调用记录。通过 GLM 代理发起对话后，用量会实时出现在这里。
+                  该范围内暂无调用记录。通过对应渠道发起对话后，用量会实时出现在这里。
                 </CardContent>
               </Card>
             ) : (

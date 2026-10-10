@@ -2955,6 +2955,112 @@ pub async fn chat_once(
 /// 透传 `tools` / `tool_choice` / 完整 `messages`，并把上游的 `tool_use` /
 /// `thinking` 块翻译成 OpenAI 形状（`tool_calls` / `reasoning_content`）。
 ///
+
+/// MiniMax 调用计量（Token + 积分），2026-10-10。
+///
+/// 落库统一走 `model_usage::record_channel_call("minimax", …)`，字段名与 GLM 记录
+/// **完全一致** ⇒ 前端图表/列表与 `/api/glm-usage/*` 聚合逻辑零改动即可消费。
+mod call_metrics {
+    use super::*;
+    use serde_json::{json, Value};
+
+    /// 「调用前余额」的后台采样句柄。
+    ///
+    /// 必须并行采样：`credits_remaining` 是一次真实上游请求（实测 250–600ms），
+    /// 串行进关键路径会直接拖慢每一次对话。
+    pub struct BalanceProbe {
+        handle: Option<tokio::task::JoinHandle<Option<f64>>>,
+    }
+
+    /// 启动调用前余额采样（**不阻塞**）。
+    pub fn start(acc: &MmAccount) -> BalanceProbe {
+        // spawn 要求 'static，故克隆账号条目（MmAccount: Clone）。
+        let owned = acc.clone();
+        BalanceProbe {
+            handle: Some(tokio::spawn(async move { credits_remaining(&owned).await })),
+        }
+    }
+
+    /// 放弃采样（本次尝试将换号重试，不产生计费）。
+    ///
+    /// 注：用普通参数而非 `self` —— Rust 只允许在 `impl` 块的方法里按值接收 `self`。
+    pub fn abort(probe: BalanceProbe) {
+        if let Some(h) = probe.handle {
+            h.abort();
+        }
+    }
+
+    /// 结算本次调用并落一条 usage 记录。
+    ///
+    /// * `response` —— 成功时的上游响应（从中提取 usage）；失败时传 `None`。
+    /// * `error`    —— 失败原因；成功时传 `None`。
+    pub async fn settle(
+        probe: BalanceProbe,
+        acc: &MmAccount,
+        requested_model: &str,
+        actual_model: &str,
+        response: Option<&Value>,
+        latency_ms: u64,
+        error: Option<&str>,
+    ) {
+        let ok = error.is_none();
+        // Token：复用既有口径（自动覆盖缓存 token）。
+        let usage = response
+            .map(crate::modules::model_usage::extract_usage)
+            .unwrap_or_else(|| {
+                json!({
+                    "promptTokens": 0, "completionTokens": 0, "totalTokens": 0,
+                    "reasoningTokens": Value::Null, "cachedTokens": 0,
+                    "uncachedPromptTokens": 0, "cacheHit": false,
+                })
+            });
+        let pick = |k: &str| usage.get(k).cloned().unwrap_or(json!(0));
+
+        // 积分：调用后余额 vs 调用前余额。取不到 → null + pending（不伪造 0）。
+        let before = match probe.handle {
+            Some(h) => h.await.ok().flatten(),
+            None => None,
+        };
+        let after = credits_remaining(acc).await;
+        let (credits, credits_pending) = match (before, after) {
+            // 余额差为负 = 期间有充值/过期，不是「本次花费」⇒ 不记。
+            (Some(b), Some(a)) if a < b => (Value::Null, true),
+            (Some(b), Some(a)) => (json!(b - a), false),
+            _ => (Value::Null, true),
+        };
+
+        let mut rec = json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "ts": now_ms(),
+            "model": actual_model,
+            "requestedModel": requested_model,
+            "routeId": Value::Null,
+            "accountId": acc.id,
+            "accountLabel": acc.label,
+            "promptTokens": pick("promptTokens"),
+            "completionTokens": pick("completionTokens"),
+            "totalTokens": pick("totalTokens"),
+            "reasoningTokens": usage.get("reasoningTokens").cloned().unwrap_or(Value::Null),
+            "cachedTokens": pick("cachedTokens"),
+            "uncachedPromptTokens": pick("uncachedPromptTokens"),
+            "cacheHit": usage.get("cacheHit").cloned().unwrap_or(json!(false)),
+            "credits": credits,
+            "creditsPending": credits_pending,
+            // 后置余额随记录落库：`accounts-overview` 的「当前余额」列据此展示，
+            // 免去在汇总层再发一次上游请求（`credits_remaining` 是一次真实网络调用）。
+            "balanceAfter": after.map(|b| json!((b * 100.0).round() / 100.0)).unwrap_or(Value::Null),
+            "ledgerId": Value::Null,
+            "latencyMs": latency_ms,
+            "ttfbMs": Value::Null,
+            "ok": ok,
+        });
+        if let Some(e) = error {
+            rec["error"] = json!(e.chars().take(300).collect::<String>());
+        }
+        crate::modules::model_usage::record_channel_call("minimax", rec);
+    }
+}
+
 /// `req` 为 `None` 或各字段为空时，行为与 [`chat_once`] 完全一致（向后兼容）。
 pub async fn chat_once_full(
     prompt: &str,
@@ -2997,6 +3103,9 @@ pub async fn chat_once_full(
     let mut last: Option<(u16, String)> = None;
     for k in 0..attempts {
         let acc = &pool[(start + k) % pool.len()];
+        // 2026-10-10：调用**前**并行采样余额（供积分归因）。spawn 在下方立即 await。
+        let probe = call_metrics::start(acc);
+        let call_started = now_ms();
         match chat_with_account(
             acc,
             prompt,
@@ -3013,6 +3122,20 @@ pub async fn chat_once_full(
                 if let Some(o) = v.as_object_mut() {
                     o.insert("failover".to_string(), json!(k));
                 }
+                // 2026-10-10：落计量（Token + 积分）。用响应里的 `model` 回显，
+                // 避免上游改名后统计口径漂移；`settle` 内部只读不改响应体。
+                // 延迟取 `call_started`（本次尝试发起时刻）——不可在 settle 前才取，
+                // 否则 latency 恒为 0。
+                call_metrics::settle(
+                    probe,
+                    acc,
+                    &model,
+                    v.get("model").and_then(Value::as_str).unwrap_or(&model),
+                    Some(&v),
+                    now_ms().saturating_sub(call_started),
+                    None,
+                )
+                .await;
                 return Ok(v);
             }
             Err((st, msg)) => {
@@ -3023,9 +3146,23 @@ pub async fn chat_once_full(
                 // pinned 时**集合内**允许换号；只有候选只剩 1 个才严格不换。
                 // 越界保护：pool 在 pinned 模式下恒等于「固定集合 ∩ 可用」，天然不会换出集合。
                 let strict = cfg.account_mode == MM_MODE_PINNED && pool.len() <= 1;
+                // 该账号不再重试时（含最终失败）：把这次失败也记进统计，
+                // 否则「调用次数」只统计成功数，失败率无从体现。
                 if strict || !retryable {
+                    call_metrics::settle(
+                        probe,
+                        acc,
+                        &model,
+                        &model,
+                        None,
+                        now_ms().saturating_sub(call_started),
+                        Some(&msg),
+                    )
+                    .await;
                     return Err((st, msg));
                 }
+                // 还要换号重试：本次尝试作废（不产生计费），丢弃采样即可。
+                call_metrics::abort(probe);
                 last = Some((st, msg));
             }
         }

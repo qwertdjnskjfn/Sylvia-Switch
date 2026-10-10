@@ -434,6 +434,7 @@ pub fn extract_usage(response: &Value) -> Value {
     let num = |v: &Value, key: &str| v.get(key).and_then(Value::as_f64).unwrap_or(0.0);
     let reasoning = usage
         .pointer("/completion_tokens_details/reasoning_tokens")
+        .or_else(|| usage.pointer("/output_tokens_details/reasoning_tokens"))
         .and_then(Value::as_f64);
     let cached = usage
         .pointer("/prompt_tokens_details/cached_tokens")
@@ -442,9 +443,26 @@ pub fn extract_usage(response: &Value) -> Value {
         .or_else(|| usage.get("cache_read_input_tokens"))
         .and_then(Value::as_f64)
         .unwrap_or(0.0);
+    // 🔴 2026-10-10：兼容 **Anthropic 口径**（MiniMax 上游直返该形状）。
+    // 实测 MiniMax 返回 {"cache_creation_input_tokens":0,"cache_read_input_tokens":0,
+    //   "input_tokens":209,"output_tokens":35} —— 只有 `prompt_tokens`/`completion_tokens`
+    //   口径时全为 0 ⇒ 统计里 Token 恒 0。取不到 OpenAI 字段时回退 Anthropic 字段。
     let prompt = num(&usage, "prompt_tokens");
     let completion = num(&usage, "completion_tokens");
-    let total = num(&usage, "total_tokens");
+    let (prompt, completion) = if prompt > 0.0 || completion > 0.0 {
+        (prompt, completion)
+    } else {
+        (num(&usage, "input_tokens"), num(&usage, "output_tokens"))
+    };
+    let total = {
+        let t = num(&usage, "total_tokens");
+        if t > 0.0 {
+            t
+        } else {
+            // 两口径都没有 total 时按输入+输出合成（Anthropic 不返回 total）。
+            prompt + completion
+        }
+    };
     let uncached_prompt = (prompt - cached).max(0.0);
     let cache_hit = cached > 0.0;
     json!({
@@ -559,7 +577,23 @@ async fn summarize_statistics(channel: Option<&str>) -> Value {
 
     let (seven_total, seven_models) = build_summary(&records, Some(week_start));
     // 余额与续航预测：日均消耗取近 7 天代理调用积分均值（签到加赠不计入）。
-    let balance = wallet_balance().await.ok();
+    // 2026-10-10：余额口径**按渠道隔离**。
+    // `wallet_balance()` 取的是 **AutoClaw 钱包**，只对 autoclaw/glm 渠道成立；
+    // 对 minimax 等渠道会显示**别的渠道的余额**，且 `daysRemaining` 的
+    // 分子（GLM 余额）/ 分母（本渠道日均消耗）串了口径 ⇒ 数值无意义。
+    // 故非 autoclaw 渠道一律置 null（前端显示为空状态），**不改动 autoclaw 原逻辑**。
+    let is_wallet_channel = match channel {
+        None => true,
+        Some(c) => {
+            let c = c.trim().to_lowercase();
+            c.is_empty() || c == "all" || c == "autoclaw" || c == "glm"
+        }
+    };
+    let balance = if is_wallet_channel {
+        wallet_balance().await.ok()
+    } else {
+        None
+    };
     let daily_avg = seven_total.credits / 7.0;
     let days_remaining = match (balance, daily_avg > 0.0) {
         (Some(balance), true) => Some((balance / daily_avg * 10.0).round() / 10.0),
@@ -832,6 +866,24 @@ pub fn get_monitor_filtered(window_hours: i64, bucket_ms: i64, provider: Option<
 }
 
 /// 汇总多账号（AutoClaw, Loomy, TRAE Work CN）的模型使用与关键指标。
+/// 取该 provider **最新一条**记录里的 `balanceAfter`（毫秒时间戳最新的优先）。
+///
+/// MiniMax 的余额口径：上游没有「消耗流水」，只能用调用后的 `credit/details`
+/// 余额求和近似（见 `minimax::call_metrics`）。把该值随记录落库，汇总层即可
+/// 零开销展示「当前余额」，而不必在汇总时再发一次上游请求。
+fn latest_balance_after(records: &[Value], provider: &str) -> Option<f64> {
+    records
+        .iter()
+        .filter(|r| record_matches_provider(r, Some(provider)))
+        .filter_map(|r| {
+            let b = r.get("balanceAfter").and_then(Value::as_f64)?;
+            let ts = r.get("ts").and_then(Value::as_i64).unwrap_or(0);
+            Some((ts, b))
+        })
+        .max_by_key(|(ts, _)| *ts)
+        .map(|(_, b)| (b * 100.0).round() / 100.0)
+}
+
 pub async fn get_accounts_overview() -> Value {
     let now = now_ms();
     let records = load_records();
@@ -854,6 +906,10 @@ pub async fn get_accounts_overview() -> Value {
         ("autoclaw", "AutoClaw", "AutoClaw 账号", autoclaw_balance_val, "积分"),
         ("loomy", "Loomy", "Loomy 账号", loomy_balance_val, "积分"),
         ("trae_work_cn", "TRAE Work CN", "TRAE Work CN 账号", trae_balance_val, "额度"),
+        // 2026-10-10：MiniMax 渠道。余额不在此发上游请求（`credits_remaining` 是一次
+        // 真实网络调用，汇总层发不起），改为取**最新一条记录里的 balanceAfter** ——
+        // 该值由 `minimax::call_metrics::settle` 顺带落库，零额外开销。
+        ("minimax", "MiniMax", "MiniMax 账号", None, "积分"),
     ];
 
     let mut account_items = Vec::new();
@@ -883,7 +939,9 @@ pub async fn get_accounts_overview() -> Value {
             "provider": provider_id,
             "name": name,
             "label": label,
-            "balance": balance.map(|b| (b * 100.0).round() / 100.0),
+            // minimax 的 balance 走「最新记录的 balanceAfter」（见 platforms 注释）。
+            "balance": balance.map(|b| (b * 100.0).round() / 100.0)
+                .or_else(|| latest_balance_after(&records, provider_id)),
             "balanceUnit": unit,
             "calls": agg.calls,
             "okCalls": agg.calls.saturating_sub(agg.failed),
@@ -922,6 +980,129 @@ pub fn recent_records(limit: usize) -> Vec<Value> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    // ---- MiniMax 计量接入（2026-10-10）----
+    // 说明：本组只覆盖「纯函数 + 数据形状」，**不触网**。
+    // 真实扣费链路（余额差归因）依赖上游，无法在单测里跑；
+    // 其正确性靠「调用前后余额差 + creditsPending 标注」的设计约束保证，
+    // 并由 E2E 实测（见 CHANGELOG 2.0.36）确认。
+
+    #[test]
+    fn minimax_records_match_the_existing_channel_filter() {
+        // 关键：minimax 记录必须能被现有 provider 过滤命中，
+        // 否则 /api/glm-usage/*?provider=minimax 恒为空（前端点了没数据）。
+        let rec = json!({
+            "channel": "minimax",
+            "accountId": "abc",
+            "accountLabel": "桌面端-小螺帽3968",
+            "promptTokens": 100,
+        });
+        assert!(record_matches_provider(&rec, Some("minimax")), "minimax 应命中自身");
+        assert!(record_matches_provider(&rec, Some("MINIMAX")), "过滤应大小写不敏感");
+        // 不应污染既有渠道的过滤结果。
+        assert!(!record_matches_provider(&rec, Some("autoclaw")), "不应归入 autoclaw");
+        assert!(!record_matches_provider(&rec, Some("loomy")), "不应归入 loomy");
+    }
+
+    #[test]
+    fn latest_balance_after_picks_newest_for_minimax_only() {
+        let recs = vec![
+            json!({"channel": "minimax", "ts": 100, "balanceAfter": 100.0}),
+            json!({"channel": "minimax", "ts": 300, "balanceAfter": 300.0}),
+            json!({"channel": "minimax", "ts": 200, "balanceAfter": 200.0}),
+            // 别的渠道：即便时间更新也不该被取用
+            json!({"channel": "loomy", "ts": 999, "balanceAfter": 999.0}),
+            // 无余额字段：应被跳过而不是当成 0
+            json!({"channel": "minimax", "ts": 400}),
+        ];
+        assert_eq!(latest_balance_after(&recs, "minimax"), Some(300.0));
+        // 没有余额字段时返回 None ⇒ 前端显示空状态，而不是错误的 0
+        assert_eq!(
+            latest_balance_after(&vec![json!({"channel": "minimax", "ts": 1})], "minimax"),
+            None
+        );
+        // 其他 provider 不受影响（各渠道余额口径不同）
+        assert_eq!(latest_balance_after(&recs, "loomy"), Some(999.0));
+    }
+
+    #[test]
+    #[test]
+    fn extract_usage_reads_anthropic_shape_input_output_tokens() {
+        // 🔴 2026-10-10 实测：MiniMax 上游直返 **Anthropic 口径**
+        // {"cache_creation_input_tokens":0,"cache_read_input_tokens":0,
+        //  "input_tokens":209,"output_tokens":35}
+        // 此前只读 prompt_tokens/completion_tokens ⇒ 统计里 Token **恒为 0**。
+        let resp = json!({"usage": {
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 30,
+            "input_tokens": 209,
+            "output_tokens": 35,
+        }});
+        let u = extract_usage(&resp);
+        assert_eq!(u["promptTokens"], json!(209.0), "Anthropic input_tokens 必须被采纳");
+        assert_eq!(u["completionTokens"], json!(35.0), "Anthropic output_tokens 必须被采纳");
+        // Anthropic 不返回 total_tokens ⇒ 应按输入+输出合成
+        assert_eq!(u["totalTokens"], json!(244.0), "缺 total 时按 输入+输出 合成");
+        // 缓存读取走 cache_read_input_tokens
+        assert_eq!(u["cachedTokens"], json!(30.0));
+        assert_eq!(u["uncachedPromptTokens"], json!(179.0));
+    }
+
+    #[test]
+    fn extract_usage_prefers_openai_shape_when_present() {
+        // OpenAI 口径存在时**不得**被 Anthropic 回退覆盖（GLM/loomy 等渠道不受影响）。
+        let resp = json!({"usage": {
+            "prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120,
+            "prompt_tokens_details": {"cached_tokens": 10},
+            // 同时混入 Anthropic 字段（值为 0/无关），不应影响结果
+            "input_tokens": 999, "output_tokens": 888,
+        }});
+        let u = extract_usage(&resp);
+        assert_eq!(u["promptTokens"], json!(100.0));
+        assert_eq!(u["completionTokens"], json!(20.0));
+        assert_eq!(u["totalTokens"], json!(120.0), "OpenAI 有 total 时优先用它，而非相加");
+        assert_eq!(u["cachedTokens"], json!(10.0));
+    }
+
+    #[test]
+    fn extract_usage_handles_empty_usage_as_zero_not_panic() {
+        // 空/缺 usage：返回全 0（不 panic），空状态由前端展示
+        let u = extract_usage(&json!({}));
+        assert_eq!(u["promptTokens"], json!(0.0));
+        assert_eq!(u["completionTokens"], json!(0.0));
+        assert_eq!(u["cacheHit"], json!(false));
+    }
+
+    fn summary_bucket_exposes_token_credits_and_cache_fields() {
+        // 前端图表消费的字段契约：调用次数 / 输入输出合计 / 缓存 / 积分 缺一不可。
+        let agg = UsageAgg {
+            calls: 3,
+            failed: 1,
+            prompt: 100.0,
+            completion: 50.0,
+            cached: 20.0,
+            uncached_prompt: 80.0,
+            cache_hit_calls: 1,
+            credits: 12.5,
+            ..Default::default()
+        };
+        let v = agg.to_summary_bucket();
+        for f in [
+            "calls", "failedCalls", "promptTokens", "completionTokens", "totalTokens",
+            "credits", "creditsPendingCount", "cachedTokens", "uncachedPromptTokens",
+            "cacheHitCalls", "cacheHitRate",
+        ] {
+            assert!(v.get(f).is_some(), "汇总缺字段：{f}");
+        }
+        assert_eq!(v["calls"], json!(3));
+        assert_eq!(v["failedCalls"], json!(1));
+        // token 类字段在聚合里是 f64（便于算 cacheHitRate 等比率），
+        // 故断言也用 f64 字面量 —— serde_json 的 Number(20.0) != Number(20)。
+        assert_eq!(v["cachedTokens"], json!(20.0));
+        assert_eq!(v["credits"], json!(12.5));
+    }
+
     use super::*;
 
     fn record(ts: i64, model: &str, credits_pending: bool) -> Value {
