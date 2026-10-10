@@ -1,3 +1,63 @@
+## 2.0.43 - 2026-10-10
+
+### 🔴 修复：非 WorkBuddy 平台的账号卡片「积分显示不出来」
+
+#### 现象（用户截图）
+账号页卡片对 **MiniMax / 妙手** 等渠道恒显示 `0` / `0 个积分包` / `暂无可用积分`，
+个别卡片卡在 `积分查询中…`（尽管这些渠道**确实有余额**）。
+
+#### 根因：**两层断裂**（实测定位）
+
+**第 1 层 —— 主链路直接 400**
+```
+前端 call("get_credit_expiry") → POST /api/credits → api_credits
+  api_credits 只做 account::find_account(id)   ← 只查【WorkBuddy 账号池】
+  而 minimax/miaoshou 的 id 形如 "minimax:45b2e308c3be" / "miaoshou:3022607961"
+  ⇒ 查不到 ⇒ HTTP 400「账号不存在」
+```
+实测证据：修复前 `minimax` / `miaoshou` 调该端点均返回 **HTTP 400**；
+`workbuddy` 正常（`totalRemaining=2952.4`、`resources=66`）。
+
+**第 2 层 —— 字段契约不统一**
+即使走到 `platform_checkin::get_platform_credits`（平台分发），各分支返回形状不一：
+| 平台 | 返回 | 符合前端消费的 `CreditExpiry`？ |
+| --- | --- | --- |
+| workbuddy / dumate | `totalRemaining` + `resources` | ✅ |
+| **minimax** | `{"ok":true,"balance":v}` | ❌ 缺 `totalRemaining` / `resources` |
+| miaoshou / loomy / chatglm | 各自形状 | ❌ |
+
+而前端 `account-card` 只认：
+```tsx
+formatCredits(credit.totalRemaining ?? 0)   // → 恒 0
+resources.length                             // → 恒 0 ⇒「0 个积分包」+「暂无可用积分」
+```
+
+#### 修复（两处，互补）
+| # | 位置 | 改动 |
+| --- | --- | --- |
+| ① | `api_credits`（**主链路**）| 先走 WorkBuddy 池（原路径不变）；查不到则从**统一账号表**取该账号 → 用其已聚合的 `credits` 转成 `CreditExpiry` 契约（**零额外上游请求** —— 卡片会并行查几十个账号，不宜逐个打上游）；无 `credits` 时回退平台分发 |
+| ② | `platform_checkin::get_platform_credits` | 出口**统一归一化**：缺 `totalRemaining` 时按 `balance → total → available → remainingCredits → remaining → credit.balance` 优先级补齐；缺 `resources` 补 `[]`（**additive**，不覆盖任何原有字段）|
+| 新增 | `find_unified_account_by_id()` / `unified_credits_to_expiry()` | 统一账号表查找 + 契约转换（字符串数值容错解析）|
+
+#### 验证（2.0.43 线上，`POST /api/credits`）
+| 平台 | 修复前 | 修复后 |
+| --- | --- | --- |
+| minimax | ❌ HTTP 400 | ✅ `ok=true` `totalRemaining=3107` |
+| miaoshou | ❌ HTTP 400 | ✅ `ok=true` `totalRemaining=1192.87` |
+| loomy | ❌ HTTP 400 | ✅ `ok=true` `totalRemaining=3605` |
+| chatglm | ❌ HTTP 400 | ✅ `ok=true` `totalRemaining=0`（真实为 0）|
+| **workbuddy** | ✅ 正常 | ✅ **未变**（`resources=66`，仍走原路径）|
+| dumate | ✅ 正常 | ✅ 未变（`resources=10`）|
+
+#### 📌 教训
+1. **「显示 0」不等于「数据为 0」** —— 本次后端**确实拿到了余额**（MiniMax 3107、妙手 1192.87），
+   只是**前端读的字段名不存在**（`undefined ?? 0`）。**`?? 0` 是危险的默认值**：
+   它把「字段缺失」伪装成「值为 0」，掩盖了真实故障。
+2. **多平台分发必须统一出参契约** —— 各平台分支各自返回形状，只在「恰好被前端消费」的那条链路上暴露问题。
+3. **排查要打到「前端真实调用链」** —— 我先改了 `platform_checkin`（分发层），
+   实测后才发现主链路走的是 `credits::get_credit_expiry`（另一条）。
+   **先用前端代码定位端点，再顺藤摸瓜到实现**，别凭函数名猜。
+
 ## 2.0.41 - 2026-10-10
 
 ### 妙手能力层：按实测结论收敛 —— 思考保留、工具移除注入

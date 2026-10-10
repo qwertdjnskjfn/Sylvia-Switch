@@ -981,10 +981,98 @@ fn checkin_status_item(account: &Value, mut status: Value) -> Value {
 
 async fn api_credits(Json(body): Json<Value>) -> Response {
     let id = body.get("accountId").and_then(|v| v.as_str()).unwrap_or("");
-    let Some(acc) = account::find_account(id) else {
-        return json_err("账号不存在".to_string(), StatusCode::BAD_REQUEST);
-    };
-    json_ok(credits::get_credit_expiry(&acc).await)
+
+    // ① WorkBuddy 账号池：原路径（行为逐字不变）
+    if let Some(acc) = account::find_account(id) {
+        return json_ok(credits::get_credit_expiry(&acc).await);
+    }
+
+    // ② 非 WorkBuddy 平台（minimax / miaoshou / loomy / chatglm / grok / zcode …）
+    //
+    // 🔴 2026-10-10 修复：这些账号**不在** WorkBuddy 池里（id 形如
+    // `minimax:45b2e308c3be`），此前直接落 400「账号不存在」⇒ 前端卡片
+    // 恒显示「0 / 0 个积分包 / 暂无可用积分」。现改为从统一账号表取数。
+    if let Some(acc) = find_unified_account_by_id(id).await {
+        // 优先用 unified 已聚合的 credits 转成 CreditExpiry 契约
+        // （**零额外上游请求** —— 卡片会并行查几十个账号，不宜逐个打上游）。
+        if let Some(cr) = acc.get("credits").filter(|c| !c.is_null()) {
+            return json_ok(unified_credits_to_expiry(&acc, cr));
+        }
+        // 兜底：走平台分发（含 2.0.42 的字段归一化）
+        return json_ok(platform_checkin::get_platform_credits(&acc).await);
+    }
+
+    json_err("账号不存在".to_string(), StatusCode::BAD_REQUEST)
+}
+
+/// 按 id 从**统一账号表**里取一行（非 WorkBuddy 平台的账号在此表内）。
+async fn find_unified_account_by_id(id: &str) -> Option<Value> {
+    if id.is_empty() {
+        return None;
+    }
+    let all = unified_accounts::unified_accounts().await;
+    all.get("accounts")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|a| a.get("id").and_then(Value::as_str) == Some(id))
+        .cloned()
+}
+
+/// 把统一账号的 `credits`（`{available,total,used,packages}`）转成前端卡片消费的
+/// `CreditExpiry` 契约（`totalRemaining` + `resources[]`）。
+///
+/// 数值上游多为**字符串**，此处统一容错解析为 f64。
+fn unified_credits_to_expiry(acc: &Value, cr: &Value) -> Value {
+    fn as_f64(v: Option<&Value>) -> Option<f64> {
+        let v = v?;
+        v.as_f64()
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+            .filter(|n| n.is_finite())
+    }
+    let total = as_f64(cr.get("total"))
+        .or_else(|| as_f64(cr.get("available")))
+        .unwrap_or(0.0);
+    let resources: Vec<Value> = cr
+        .get("packages")
+        .and_then(Value::as_array)
+        .map(|ps| {
+            ps.iter()
+                .map(|p| {
+                    json!({
+                        "packageCode": Value::Null,
+                        "packageName": p.get("name").cloned().unwrap_or(Value::Null),
+                        "total": as_f64(p.get("total")).unwrap_or(0.0),
+                        "remaining": as_f64(p.get("remaining")).unwrap_or(0.0),
+                        "used": as_f64(p.get("used")).unwrap_or(0.0),
+                        "status": Value::Null,
+                        "expireAt": p.get("expireAt").cloned().unwrap_or(Value::Null),
+                        "expired": false,
+                        "expiringSoon": p
+                            .get("expiringSoon")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({
+        "ok": true,
+        "accountId": acc.get("id").cloned().unwrap_or(Value::Null),
+        "accountName": acc.get("displayName").cloned().unwrap_or(Value::Null),
+        "updatedAt": wb_switch_core::modules::config::now_ms(),
+        "totalCapacity": Value::Null,
+        "totalRemaining": total,
+        "remainingTotal": total,
+        "expiringSoonRemaining": as_f64(cr.get("expiringSoonRemaining")),
+        "expiredRemaining": Value::Null,
+        "soonestExpireAt": cr.get("soonestExpireAt").cloned().unwrap_or(Value::Null),
+        "expiringSoon": false,
+        "expired": false,
+        "resources": resources,
+        // 保留原始口径，便于前端/调试对照（additive，不影响既有消费）
+        "source": "unified",
+    })
 }
 
 fn query_flag_enabled(query: Option<&str>, name: &str) -> bool {

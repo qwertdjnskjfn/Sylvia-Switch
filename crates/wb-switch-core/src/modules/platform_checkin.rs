@@ -3475,7 +3475,8 @@ pub async fn get_chatglm_credits(account: &Value) -> Value {
 }
 
 pub async fn get_platform_credits(account: &Value) -> Value {
-    let result = match account_platform(account) {
+    // `mut`：出口处会做 CreditExpiry 契约归一化（补 totalRemaining / resources）
+    let mut result = match account_platform(account) {
         PLATFORM_AUTOCLAW => {
             if let Some(store_id) = account.get("autoclawStoreId").and_then(Value::as_str) {
                 get_autoclaw_pool_credits(store_id).await
@@ -3519,6 +3520,52 @@ pub async fn get_platform_credits(account: &Value) -> Value {
         },
         _ => json!({"ok": false, "error": "未知签到平台"}),
     };
+    // ── 统一归一化到 CreditExpiry 契约（2026-10-10）──────────────────────────
+    // 🔴 背景：前端 `account-card` 只认 `credit.totalRemaining`（大数字）与
+    // `credit.resources`（积分包明细）。而本分发的各平台分支返回形状不一：
+    //   workbuddy / dumate → 完整契约 ✅
+    //   minimax            → {"ok":true,"balance":v}   （缺 totalRemaining/resources）
+    //   miaoshou / loomy / chatglm → 各自形状           （同上）
+    // ⇒ 这些渠道的卡片恒显示「0 / 0 个积分包 / 暂无可用积分」，
+    //   尽管后端确实取到了余额（实测 MiniMax 3107、妙手 1192.87）。
+    //
+    // 处理：**只补缺、不改有**（additive）。workbuddy/dumate 的字段逐字不变。
+    if result.get("ok").and_then(Value::as_bool) == Some(true) {
+        // ① 补 totalRemaining：按优先级从各平台自有字段取第一个可用的**正数**
+        if result.get("totalRemaining").is_none() {
+            let num = |k: &str| result.get(k).and_then(Value::as_f64);
+            let fallback = num("balance")
+                .or_else(|| num("total"))
+                .or_else(|| num("available"))
+                .or_else(|| num("remainingCredits"))
+                .or_else(|| num("remaining"))
+                .or_else(|| {
+                    // 部分平台把数值放在嵌套对象里（如 {credit:{balance:N}}）
+                    result
+                        .get("credit")
+                        .and_then(|c| c.get("balance"))
+                        .and_then(Value::as_f64)
+                });
+            if let Some(v) = fallback {
+                if v.is_finite() && v >= 0.0 {
+                    if let Some(o) = result.as_object_mut() {
+                        o.insert("totalRemaining".to_string(), json!(v));
+                        // remainingTotal 供 credit_usage 快照口径使用（见下方）
+                        o.entry("remainingTotal".to_string()).or_insert(json!(v));
+                    }
+                }
+            }
+        }
+        // ② 补 resources：无「积分包」概念的渠道给空数组，
+        //    让前端稳定走「0 个积分包」分支而不是 undefined（两者渲染相同，
+        //    但显式空数组可避免 `?? []` 掩盖真实缺口）。
+        if result.get("resources").is_none() {
+            if let Some(o) = result.as_object_mut() {
+                o.insert("resources".to_string(), json!([]));
+            }
+        }
+    }
+
     if result.get("ok").and_then(Value::as_bool) == Some(true) {
         if let Some(account_id) = account
             .get("id")
