@@ -1,138 +1,111 @@
-# workbuddy-switch
+# wb-switch
 
-WorkBuddy 账号切换桌面 App（Tauri），支持积分到期监控与自动签到。
-
-同时提供 npm / webui 版本，方便在浏览器中使用同一套账号管理能力。
-
-- **桌面 App**：从 GitHub Releases 下载 macOS、Windows 或 Linux 安装包（Tauri，推荐日常使用）
-- **npm / webui**：`npm i -g workbuddy-switch` 后运行 `workbuddy-switch`，浏览器打开操作界面
-
-多账号共享登录态（`workbuddy-desktop.info`），一键切换 WorkBuddy 登录账号，并支持将当前账号的会话复制给目标账号（云端归属目标）。
+多渠道 AI 账号管理与统一网关工具：把散落在十几个 AI 客户端里的登录态、账号池、积分与签到，
+收敛到一套本地服务里统一管理，并对外提供 OpenAI / Anthropic 兼容的反向代理接口。
 
 <p align="center">
-  <img src="public/icon-transparent.png" alt="WorkBuddy Switch 图标" width="128" />
+  <img src="public/icon-transparent.png" alt="wb-switch 图标" width="128" />
 </p>
 
-<p align="center">
-  <strong>workbuddy-switch</strong><br />
-  WorkBuddy 账号切换工具
-</p>
+## 这是什么
 
+桌面 AI 客户端（WorkBuddy、AutoClaw、TRAE、Loomy、Qwen、Qoder、MiniMax、Kimi、Grok、DuMate、
+妙手、ChatGLM、ZCode …）每家一套登录态、一套积分、一套签到。本项目把这些能力收进一个本地服务：
 
-### 在线演示
+- **统一账号池**：一个渠道多个账号，支持固定账号集合、轮询、区域隔离、熔断冷却与自动换号；
+- **统一签到**：所有渠道的每日签到聚合到一个入口，支持自动补签与批量领取；
+- **统一网关**：把账号池包装成 OpenAI / Anthropic 兼容接口，供 ZCode、OpenCode、Cursor 等
+  客户端当作一个供应商使用；
+- **健康与观测**：渠道健康看板、模型目录自动同步、模型实测对话、用量与工具调用监控。
 
-[打开 GitHub Pages 在线演示](https://changexbc.github.io/workbuddy-switch/)（只读演示；账号、积分与请求记录均为虚构数据，所有业务操作均已禁用。）
-
-## 快速开始
-
-### npm 安装（webui）
-
-```bash
-npm i -g workbuddy-switch
-workbuddy-switch              # 启动本地服务 + 自动打开浏览器
-workbuddy-switch status       # 终端查看当前账号
-```
-
-webui 界面与桌面 App 一致：WorkBuddy 账号切换、积分到期监控、自动签到、会话复制、Token 统计与 token 保活。
-
-### 桌面 App
-
-前往 [GitHub Releases](https://github.com/changexbc/workbuddy-switch/releases/latest) 下载对应平台的安装包：
-
-| 平台 | 安装包 | 安装方式 |
-| --- | --- | --- |
-| macOS Apple Silicon（M 系列，arm64） | `workbuddy-switch_<版本>_aarch64.dmg` | 打开 DMG，将 `workbuddy-switch.app` 拖入「应用程序」 |
-| macOS Intel（x86_64） | `workbuddy-switch_<版本>_x86_64.dmg` | 打开 DMG，将 `workbuddy-switch.app` 拖入「应用程序」 |
-| Windows x64 | `workbuddy-switch_<版本>_x64-setup.exe` | 运行安装程序并按提示完成安装 |
-| Linux x64 | `workbuddy-switch_<版本>_amd64.deb` / `workbuddy-switch_<版本>_amd64.AppImage` | Debian/Ubuntu 安装 `.deb`；其他发行版可给 AppImage 添加执行权限后直接运行 |
-
-macOS 首次启动若提示无法验证开发者，先在 Finder 中按住 Control 点击应用并选择「打开」，或前往「系统设置 → 隐私与安全性」选择「仍要打开」。仅当安装包来自上述官方 Releases、且系统仍提示「已损坏」时，再执行：
-
-```bash
-xattr -rd com.apple.quarantine "/Applications/workbuddy-switch.app"
-```
-
-应用能启动但切换账号时提示无权限，请参阅下方 [macOS 权限说明](#macos-权限说明)。
+后端是 Rust（axum + tokio），前端是 React + shadcn/ui，由 RustEmbed 编译期嵌入二进制，
+部署时**只需一个可执行文件**，无运行时依赖。
 
 ## 功能
 
 | 模块 | 说明 |
 | --- | --- |
-| 账号管理 | OAuth 扫码登录、从本机导入、手动添加 token、删除账号 |
-| 账号切换 | 备份认证文件 → 关闭 WorkBuddy → 写入目标账号 → 重启，切换过程实时进度反馈 |
-| 会话复制 | 将当前账号勾选的会话以新 id 复制给目标账号（jsonl 正文 + `workbuddy.db` 索引 + edge-sync 注册） |
-| 自动签到 | 默认开启；启动时立即检查，运行期间每 30 分钟自动补签；一键全部签到；30 天签到日志 |
-| Token 保活 | 惰性刷新（操作前不足阈值刷新）+ 每日保活（默认每天无条件刷新一次，阈值 >0 时仅刷新剩余不足该天数的账号），避免 refresh token 过期 |
-| 积分到期查询 | 自动查询每个账号的 WorkBuddy 积分资源、剩余量和到期时间；7 天内到期高亮并按到期优先排序 |
-| 积分统计 | 汇总 WorkBuddy 官方请求用量，展示每日趋势、模型分布、账号消耗和请求明细；官方数据不可用时明确回退到本地余额快照观察 |
-| Token 统计 | 查看 WorkBuddy 的 Token 总览；输入、输出、缓存读写按 K/M/B 展示，趋势图同时呈现每日 Token 构成与调用次数，并提供构成占比、热力图、项目/模型 Top 10 和会话排行 |
-| 自动更新 | 配置 GitHub Releases 源检查新版本；整包更新经签名校验（tauri-updater） |
-| 权限检测 | macOS 授权引导（App 管理 / 完全磁盘访问拖拽授权 + 自动检测） |
+| 账号管理 | 扫码登录、本机导入、手动添加凭据；账号池支持固定集合与多账号互备 |
+| 统一签到 | 聚合全部渠道的每日签到：启动即核验、周期补签、一键全量、签到日志与积分快照 |
+| 反向代理 | `/glm-proxy`、`/glm-plan`、`/minimax`、`/qwen`、`/kimi`、`/grok`、`/loomy`、`/workbuddy`、`/opencode` 等渠道端点，OpenAI / Anthropic 双协议 |
+| 账号池治理 | 区域隔离、选号策略（轮询 / 本机优先 / 仅本机 / 固定集合）、熔断指数退避、失败自动换号 |
+| 渠道健康 | 加权健康评分、阈值预警、时间范围对比、横向对比 |
+| 模型目录同步 | 定期拉取上游模型目录 → 差异对账 → 自动上架，带变更日志 |
+| 模型实测 | 聊天式模型连通性测试，实时延迟与流式响应 |
+| 用量统计 | 积分到期监控、请求用量统计、Token 统计、工具调用监控 |
+| 自动更新 | GitHub Releases 源检查新版本 |
 
-## 使用
+## 安装与使用
 
-1. **添加账号**：账号页 →「扫码登录」（OAuth device flow）或「从本机导入」「手动添加」
-2. **切换账号**：账号卡片 →「切换」，可勾选复制当前会话
-3. **自动签到**：账号页可直接开关；设置页可调整保活参数、立即签到并查看日志
-4. **查看积分到期**：账号页会自动查询各账号积分资源；点击「刷新积分」可手动更新，临近到期的资源会高亮，并把快过期账号按最近到期时间排序，最前面的标记为「建议优先使用」
-5. **查看积分统计**：侧栏进入「积分统计」，查看总览、近 30 天趋势、模型分类、账号消耗与请求明细；筛选账号或时间范围不会重复请求官方接口，点击「刷新统计」才会重新采集
-6. **查看 Token 统计**：侧栏进入「Token 统计」，选择 WorkBuddy，查看输入、输出、缓存读写和调用次数。图表使用 K/M/B 单位，趋势图将每日 Token 总量与构成、调用次数合并展示；项目、模型和会话排行默认显示 Top 10，不足 10 项时按实际数量展示。
-7. **更新**：应用会自动检查公开 GitHub Releases；发现新版本后可在左下角直接升级，也可从设置页打开 Release 页面手动下载。
+### 方式一：npm
 
-## 界面预览
+```bash
+npm i -g workbuddy-switch
+workbuddy-switch                    # 启动本地服务并自动打开浏览器
+workbuddy-switch status             # 终端查看当前账号
+workbuddy-switch serve --port 57900 # 换端口启动
+```
 
-### 管理 WorkBuddy 账号
+服务默认监听 `http://127.0.0.1:57890`。端口被占用时用 `--port` 换一个即可。
 
-账号卡片集中展示登录状态、签到状态、积分余额和到期资源，支持切换 WorkBuddy 当前账号。临期积分会直接标注在对应卡片内，并按紧迫程度优先排列。
+### 方式二：从源码构建
 
-<table>
-  <thead>
-    <tr>
-      <th>浅色模式</th>
-      <th>深色模式</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td><img src="docs/images/accounts-overview-light.png" alt="账号管理页面（浅色模式，账号信息已脱敏）" /></td>
-      <td><img src="docs/images/accounts-overview-dark.png" alt="账号管理页面（深色模式，账号信息已脱敏）" /></td>
-    </tr>
-  </tbody>
-</table>
+前置：Rust 1.80+、Node.js 20+。
 
-### 积分统计
+```bash
+git clone https://github.com/changexbc/workbuddy-switch.git
+cd workbuddy-switch
 
-积分统计页展示官方请求用量、每日趋势、模型分布、账号消耗和请求明细。数据来源和更新时间会明确显示。
+# 前端先构建（RustEmbed 会把它嵌进二进制，顺序不能反）
+npm install
+npm run build
 
-<table>
-  <thead>
-    <tr>
-      <th>浅色模式</th>
-      <th>深色模式</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td><img src="docs/images/credit-statistics-light.png" alt="积分统计趋势页面（浅色模式）" /></td>
-      <td><img src="docs/images/credit-statistics-dark.png" alt="积分统计趋势页面（深色模式）" /></td>
-    </tr>
-  </tbody>
-</table>
+# 再构建后端
+cargo build --release -p wb-switch-server
+# 产物：target/release/wb-switch
+```
 
-### Token 统计
+从源码构建时建议把 `CARGO_TARGET_DIR` 指向一个**纯 ASCII 路径**
+（例如 `E:\wb-target`），否则路径含中文时部分构建脚本会失败：
 
-Token 统计页按来源展示 Token 总览和每日趋势，覆盖 WorkBuddy：输入、输出、缓存读写使用 K/M/B 紧凑单位，趋势图用堆叠柱表示每日 Token 总量与构成，用虚线表示调用次数；同时提供 Token 构成占比、活跃热力图、项目/模型 Top 10 和会话排行，帮助快速定位主要消耗来源。
+```bash
+CARGO_TARGET_DIR=E:/wb-target cargo build --release -p wb-switch-server
+```
 
+### 方式三：桌面安装包
 
-### macOS 权限说明
+前往 [GitHub Releases](https://github.com/changexbc/workbuddy-switch/releases/latest) 下载对应平台安装包。
 
-切换账号需要写入 WorkBuddy 认证文件，macOS 要求授权「App 管理」（或「完全磁盘访问」）：
+## 配置说明
 
-1. 首次切换报「无权限」时，点「打开系统设置」
-2. 优先在 **App 管理** 里打开 workbuddy-switch 开关；若没有，则去 **完全磁盘访问** 把 workbuddy-switch 拖进带箭头的框
-3. 授权后重启本应用生效；设置页「权限检测」可随时验证
+项目运行数据统一存放在 `~/.wb-switch/`（Windows 为 `%USERPROFILE%\.wb-switch\`），
+按渠道拆分为独立 JSON 文件，全部在首次运行时自动生成，**无需手工创建**：
 
-> webui 模式：由启动服务的终端进程权限决定；若终端已授权完全磁盘访问则无需额外操作。
+| 文件 | 用途 |
+| --- | --- |
+| `accounts.json` | WorkBuddy 主账号库（凭据为 `enc:v1` 加密，密钥派生自本机信息） |
+| `autoclaw_accounts.json` | AutoClaw 账号池 |
+| `glm_proxy_config.json` | GLM 代理配置与账号池 |
+| `minimax_config.json` | MiniMax 渠道账号池与选号策略 |
+| `zcode_accounts.json` | ZCode 账号池 |
+| `auto_checkin_logs.json` | 统一签到日志 |
+| `gateway_api_keys.json` | 网关访问密钥 |
+
+在 Web 界面的「设置」页可以调整签到参数、保活阈值、冷却基数与上限等。
+各渠道的账号导入、凭据与代理配置都在对应渠道页面内完成。
+
+## 安全说明
+
+- 所有上游凭据在本地以 `enc:v1`（AES-256-GCM）加密存储，密钥由本机信息派生，不落盘明文；
+- 服务默认只监听 `127.0.0.1`，不对外网暴露；
+- 网关访问需要密钥鉴权（`Authorization: Bearer <key>`）；
+- 本仓库不包含任何真实账号凭据、令牌或个人身份信息。
+
+## 贡献
+
+欢迎提交 Issue 与 PR。新增渠道时请一并补充：后端模块 + 单元测试 + 路由注册 +
+统一网关三处注册（`gateway_overview` / `model_sync` / `channel_health`）+ 前端页面 +
+统一签到接入（`platform_checkin.rs`）+ CHANGELOG 条目。
 
 ## 致谢
 

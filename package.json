@@ -2,6 +2,27 @@
   "name": "wb-switch-rust",
   "private": true,
   "version": "1.0.38",
+  "description": "多渠道 AI 账号管理与统一网关：统一账号池、统一签到、OpenAI/Anthropic 兼容反代（前端工程；后端为 Rust workspace）",
+  "license": "MIT",
+  "homepage": "https://github.com/changexbc/workbuddy-switch#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/changexbc/workbuddy-switch.git"
+  },
+  "bugs": {
+    "url": "https://github.com/changexbc/workbuddy-switch/issues"
+  },
+  "keywords": [
+    "ai",
+    "account-pool",
+    "proxy",
+    "openai-compatible",
+    "anthropic-compatible",
+    "gateway",
+    "rust",
+    "react",
+    "self-hosted"
+  ],
   "type": "module",
   "scripts": {
     "dev": "vite",

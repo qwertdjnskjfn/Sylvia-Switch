@@ -33,8 +33,11 @@ ALLOW = [
 
 def run_clippy_json():
     env = dict(os.environ)
-    env["CARGO_TARGET_DIR"] = r"E:\wb-target"
-    env["PATH"] = r"E:\mingw64\bin;<user-home>\.cargo\bin;" + env.get("PATH", "")
+    env.setdefault("CARGO_TARGET_DIR", os.path.join(WS, "..", "wb-target"))
+    # PATH 追加工具链目录：优先用 PATH 里已有的 cargo，其次用户主目录下的 .cargo/bin
+    extra = [p for p in (r"E:\mingw64\bin", os.path.join(os.path.expanduser("~"), ".cargo", "bin")) if os.path.isdir(p)]
+    if extra:
+        env["PATH"] = os.pathsep.join(extra + [env.get("PATH", "")])
     r = subprocess.run(
         ["cargo", "clippy", "-p", "wb-switch-core", "-p", "wb-switch-server",
          "--message-format=json"],

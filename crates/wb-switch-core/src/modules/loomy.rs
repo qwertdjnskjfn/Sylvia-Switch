@@ -705,11 +705,13 @@ mod tests {
     #[test]
     fn user_hash_matches_node_impl() {
         // config-path.js：sha256(username) 十六进制前 12 位。
-        // 参考向量：sha256("user") 前缀（与实机目录名比对）。
-        let hash = user_hash("user");
+        // 参考向量：用合成用户名验证「取前 12 位」的实现口径
+        // （真机目录名因人而异，不写入源码）。
+        let user = "sample-user";
+        let hash = user_hash(user);
         assert_eq!(hash.len(), 12);
         let mut hasher = Sha256::new();
-        hasher.update(b"user");
+        hasher.update(user.as_bytes());
         let full: String = hasher
             .finalize()
             .iter()

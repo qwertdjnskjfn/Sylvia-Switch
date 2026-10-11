@@ -55,3 +55,27 @@ nul
 
 # AI 工具会话状态（不该入库）
 .mimosa/
+.zcode/
+.zcode-tmp-*.py
+
+# 环境变量与本地密钥（安全兜底：任何 .env / 私钥都不应进仓库）
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.keystore
+
+# 运行时数据目录（本地生成，含真实凭据与账号池）
+.wb-switch/
+
+# 大体积媒体/归档（按需保留必要文件）
+*.zip
+*.tar.gz
+*.7z
+
+# 系统临时产物
+Thumbs.db
+ehthumbs.db
+desktop.ini

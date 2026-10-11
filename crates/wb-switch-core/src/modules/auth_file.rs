@@ -341,7 +341,7 @@ fn import_from_encrypted_auth_file(root: &Value) -> Option<Value> {
     }))
 }
 
-/// 手机号脱敏：13800138000 → 180****2401。
+/// 手机号脱敏：13800138000 → 138****8000。
 fn mask_phone(phone: &str) -> String {
     let chars: Vec<char> = phone.chars().collect();
     if chars.len() == 11 {
@@ -442,8 +442,8 @@ mod tests {
 
     #[test]
     fn mask_phone_masks_middle_digits() {
-        assert_eq!(mask_phone("13800138000"), "180****2401");
         assert_eq!(mask_phone("13800138000"), "138****8000");
+        assert_eq!(mask_phone("13012345678"), "130****5678");
         // 非 11 位原样返回（如虚拟号）。
         assert_eq!(mask_phone("12345"), "12345");
     }
