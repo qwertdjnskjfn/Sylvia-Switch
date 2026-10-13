@@ -1,6 +1,6 @@
-// workbuddy-switch postinstall：从「平台包」复制本平台二进制。
+// sylvia-switch postinstall：从「平台包」复制本平台二进制。
 //
-// 平台分包（esbuild 模式）：二进制发布在独立 npm 包（workbuddy-switch-<platform>-<arch>），
+// 平台分包（esbuild 模式）：二进制发布在独立 npm 包（sylvia-switch-<platform>-<arch>），
 // 主包声明为 optionalDependencies，安装时 npm 自动装好平台包，postinstall 只需复制——
 // 不依赖 GitHub，国内镜像（npmmirror）也能稳定安装。
 //
@@ -17,11 +17,11 @@ const FILE = {
   "linux-arm64": "wb-switch-linux-arm64",
 }[`${process.platform}-${process.arch}`];
 
-const PLATFORM_PKG = `workbuddy-switch-${process.platform}-${process.arch}`;
+const PLATFORM_PKG = `sylvia-switch-${process.platform}-${process.arch}`;
 
 if (!FILE) {
   console.warn(
-    `workbuddy-switch: 跳过平台 ${process.platform}-${process.arch}（当前不支持），` +
+    `sylvia-switch: 跳过平台 ${process.platform}-${process.arch}（当前不支持），` +
       `可手动下载二进制后放置到 bin/ 目录`,
   );
   process.exit(0);
@@ -31,7 +31,7 @@ const binDir = path.join(__dirname, "..", "bin");
 const target = path.join(binDir, FILE);
 
 function fail(msg) {
-  console.error(`workbuddy-switch install: ${msg}`);
+  console.error(`sylvia-switch install: ${msg}`);
   console.error(
     "安装失败。请确认安装了对应平台包（npm 会自动装），或设置 WB_SWITCH_BINARY 指向本地二进制。",
   );
@@ -48,7 +48,7 @@ function copyFrom(src) {
     return fail(`平台包二进制异常（仅 ${size} 字节）`);
   }
   console.log(
-    `workbuddy-switch: 二进制就绪 → ${target} (${(size / 1048576).toFixed(1)}MB)`,
+    `sylvia-switch: 二进制就绪 → ${target} (${(size / 1048576).toFixed(1)}MB)`,
   );
 }
 
@@ -69,7 +69,7 @@ async function main() {
   } catch (e) {
     // 平台包缺失：可能是 optionalDependencies 没装上（如手动安装/旧版 npm）
     if (fs.existsSync(target)) {
-      console.log("workbuddy-switch: 二进制已存在，跳过");
+      console.log("sylvia-switch: 二进制已存在，跳过");
       return;
     }
     return fail(

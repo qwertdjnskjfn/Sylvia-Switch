@@ -8,7 +8,7 @@ const host = process.env.TAURI_DEV_HOST;
 // GitHub Pages serves only the public demo from the repository subpath.
 // Normal WebUI and Tauri builds intentionally keep Vite's root base.
 // @ts-expect-error process is a nodejs global
-const base = process.env.VITE_PAGES_DEMO === "1" ? "/workbuddy-switch/" : "/";
+const base = process.env.VITE_PAGES_DEMO === "1" ? "/Sylvia-Switch/" : "/";
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({

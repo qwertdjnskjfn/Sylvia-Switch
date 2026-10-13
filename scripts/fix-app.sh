@@ -11,7 +11,8 @@ if [ ! -d dist ]; then
 fi
 
 for profile in debug release; do
-  APP="target/$profile/bundle/macos/workbuddy-switch.app"
+  APP="target/$profile/bundle/macos/Sylvia Switch.app"
+  [ -d "$APP" ] || APP="target/$profile/bundle/macos/workbuddy-switch.app"  # 兼容旧产物名
   [ -d "$APP" ] || APP="src-tauri/target/$profile/bundle/macos/wb-switch.app"  # 兼容旧路径
   if [ -d "$APP" ]; then
     rm -rf "$APP/Contents/Resources/dist" 2>/dev/null || true

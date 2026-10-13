@@ -44,7 +44,7 @@ jobs:
                   "update_os": "macos",
                   "update_arch": "aarch64",
                   "update_bundle": "macos",
-                  "update_archive_name": "workbuddy-switch-macos-aarch64.app.tar.gz",
+                  "update_archive_name": "sylvia-switch-macos-aarch64.app.tar.gz",
               },
               {
                   "name": "mac-x64",
@@ -56,7 +56,7 @@ jobs:
                   "update_os": "macos",
                   "update_arch": "x86_64",
                   "update_bundle": "macos",
-                  "update_archive_name": "workbuddy-switch-macos-x86_64.app.tar.gz",
+                  "update_archive_name": "sylvia-switch-macos-x86_64.app.tar.gz",
               },
               {
                   "name": "win-x64",
@@ -68,7 +68,7 @@ jobs:
                   "update_os": "windows",
                   "update_arch": "x86_64",
                   "update_bundle": "nsis",
-                  "update_archive_name": "workbuddy-switch-windows-x86_64-setup.exe",
+                  "update_archive_name": "sylvia-switch-windows-x86_64-setup.exe",
               },
               {
                   "name": "linux-x64",
@@ -170,7 +170,7 @@ jobs:
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          PKG_DIR="npm/platform/workbuddy-switch-${{ matrix.platform_tag }}"
+          PKG_DIR="npm/platform/sylvia-switch-${{ matrix.platform_tag }}"
           # 用 tag 版本同步 platform 包版本（git 里的可能滞后）
           VER="${GITHUB_REF_NAME#v}"
           perl -pi -e "s/\"version\": \"[0-9.]+\"/\"version\": \"$VER\"/" "$PKG_DIR/package.json"
@@ -200,13 +200,13 @@ jobs:
           echo "bundle after build:"
           find "$BUNDLE_ROOT" -type f | sort || true
           if [ "${{ matrix.bundles }}" = "nsis" ]; then
-            STALE=$(find "$BUNDLE_ROOT" -type f -name '*-setup.exe' ! -name "workbuddy-switch_${VER}_x64-setup.exe" || true)
+            STALE=$(find "$BUNDLE_ROOT" -type f -name '*-setup.exe' ! -name "sylvia-switch_${VER}_x64-setup.exe" || true)
             if [ -n "$STALE" ]; then
               echo "error: stale Windows installer still present:" >&2
               printf '%s\n' "$STALE" >&2
               exit 1
             fi
-            test -f "$BUNDLE_ROOT/nsis/workbuddy-switch_${VER}_x64-setup.exe"
+            test -f "$BUNDLE_ROOT/nsis/sylvia-switch_${VER}_x64-setup.exe"
           fi
           find "$BUNDLE_ROOT" -type f \
             \( -name '*.dmg' -o -name '*.exe' -o -name '*.msi' -o -name '*.deb' \
@@ -214,8 +214,8 @@ jobs:
             -exec cp {} dist-bin/ \;
           # mac：纯命令行打 dmg（CI 无 Finder，Tauri 自带的 bundle_dmg.sh 会失败）
           if [ "${{ matrix.bundles }}" = "app" ]; then
-            sh scripts/make-dmg.sh "$VER" "${{ matrix.update_arch }}" "target/${{ matrix.target }}/release/bundle/macos/workbuddy-switch.app"
-            cp "workbuddy-switch_${VER}_${{ matrix.update_arch }}.dmg" dist-bin/
+            sh scripts/make-dmg.sh "$VER" "${{ matrix.update_arch }}" "target/${{ matrix.target }}/release/bundle/macos/Sylvia Switch.app"
+            cp "sylvia-switch_${VER}_${{ matrix.update_arch }}.dmg" dist-bin/
           fi
 
       - name: Generate updater manifest
@@ -234,7 +234,7 @@ jobs:
           echo "updater bundle dir: $BUNDLE_DIR (version $VER)"
           ls -la "$BUNDLE_DIR" || true
           if [ "$UPDATE_OS" = "windows" ]; then
-            ARCHIVE="$BUNDLE_DIR/workbuddy-switch_${VER}_x64-setup.exe"
+            ARCHIVE="$BUNDLE_DIR/sylvia-switch_${VER}_x64-setup.exe"
           else
             ARCHIVE="$(find "$BUNDLE_DIR" -maxdepth 1 -type f -name '*.app.tar.gz' | sort)"
             COUNT=$(printf '%s\n' "$ARCHIVE" | sed '/^$/d' | wc -l | tr -d ' ')
@@ -251,7 +251,7 @@ jobs:
           cp "$ARCHIVE" "dist-bin/$UPDATE_ARCHIVE_NAME"
           cp "$ARCHIVE.sig" "dist-bin/$UPDATE_ARCHIVE_NAME.sig"
           if [ "$UPDATE_OS" = "windows" ]; then
-            cmp -s "dist-bin/$UPDATE_ARCHIVE_NAME" "dist-bin/workbuddy-switch_${VER}_x64-setup.exe"
+            cmp -s "dist-bin/$UPDATE_ARCHIVE_NAME" "dist-bin/sylvia-switch_${VER}_x64-setup.exe"
           fi
           UPDATE_VERSION="$VER" sh scripts/gen-update-json.sh
           MANIFEST="$BUNDLE_DIR/latest-${UPDATE_OS}-${UPDATE_ARCH}.json"

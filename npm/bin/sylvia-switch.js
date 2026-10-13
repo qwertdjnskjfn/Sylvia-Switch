@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// wb-switch npm 入口：spawn 平台二进制（postinstall 下载，见 scripts/install.js）。
+// Sylvia Switch npm 入口：spawn 平台二进制（postinstall 下载，见 scripts/install.js）。
 const { spawnSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
@@ -16,14 +16,14 @@ const FILE = {
 }[`${process.platform}-${process.arch}`];
 
 if (!FILE) {
-  console.error(`wb-switch: 不支持平台 ${process.platform}-${process.arch}`);
+  console.error(`sylvia-switch: 不支持平台 ${process.platform}-${process.arch}`);
   process.exit(1);
 }
 
 const binPath = path.join(binDir, FILE);
 if (!fs.existsSync(binPath)) {
   console.error(
-    "wb-switch: 未找到平台二进制，请重新安装（npm install -g wb-switch 触发下载）",
+    "sylvia-switch: 未找到平台二进制，请重新安装（npm install -g sylvia-switch 触发下载）",
   );
   process.exit(1);
 }

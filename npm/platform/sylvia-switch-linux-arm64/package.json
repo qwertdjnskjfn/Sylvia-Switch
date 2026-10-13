@@ -1,7 +1,7 @@
 {
-  "name": "workbuddy-switch-linux-arm64",
+  "name": "sylvia-switch-linux-arm64",
   "version": "1.0.38",
-  "description": "workbuddy-switch platform binary (linux-arm64)",
+  "description": "sylvia-switch platform binary (linux-arm64)",
   "os": [
     "linux"
   ],

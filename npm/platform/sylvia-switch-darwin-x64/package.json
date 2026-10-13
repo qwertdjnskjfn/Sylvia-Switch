@@ -1,7 +1,7 @@
 {
-  "name": "workbuddy-switch-darwin-x64",
+  "name": "sylvia-switch-darwin-x64",
   "version": "1.0.38",
-  "description": "workbuddy-switch platform binary (darwin-x64)",
+  "description": "sylvia-switch platform binary (darwin-x64)",
   "os": [
     "darwin"
   ],

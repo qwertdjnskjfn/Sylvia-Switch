@@ -42,10 +42,10 @@
 ### 方式一：npm
 
 ```bash
-npm i -g workbuddy-switch
-workbuddy-switch                    # 启动本地服务并自动打开浏览器
-workbuddy-switch status             # 终端查看当前账号
-workbuddy-switch serve --port 57900 # 换端口启动
+npm i -g sylvia-switch
+sylvia-switch                    # 启动本地服务并自动打开浏览器
+sylvia-switch status             # 终端查看当前账号
+sylvia-switch serve --port 57900 # 换端口启动
 ```
 
 服务默认监听 `http://127.0.0.1:57890`。端口被占用时用 `--port` 换一个即可。
@@ -67,8 +67,8 @@ workbuddy-switch serve --port 57900 # 换端口启动
 前置：Rust 1.80+、Node.js 20+。
 
 ```bash
-git clone https://github.com/changexbc/workbuddy-switch.git
-cd workbuddy-switch
+git clone https://github.com/qwertdjnskjfn/Sylvia-Switch.git
+cd Sylvia-Switch
 
 # 前端先构建（RustEmbed 会把它嵌进二进制，顺序不能反）
 npm install
@@ -88,7 +88,7 @@ CARGO_TARGET_DIR=E:/wb-target cargo build --release -p wb-switch-server
 
 ### 方式三：桌面安装包
 
-前往 [GitHub Releases](https://github.com/changexbc/workbuddy-switch/releases/latest) 下载对应平台安装包。
+前往 [GitHub Releases](https://github.com/qwertdjnskjfn/Sylvia-Switch/releases/latest) 下载对应平台安装包。
 
 ## 配置说明
 

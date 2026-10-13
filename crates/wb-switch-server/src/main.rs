@@ -1,10 +1,10 @@
-//! workbuddy-switch CLI：npm 安装形态的入口。
+//! Sylvia Switch CLI：本地服务入口（npm 安装形态与源码构建共用）。
 //!
 //! ```bash
-//! workbuddy-switch              # 启动本地服务 + 打开浏览器 webui
-//! workbuddy-switch serve        # 只起服务不开浏览器（--port / --no-open）
-//! workbuddy-switch status       # 终端输出当前账号
-//! workbuddy-switch version      # 版本号
+//! sylvia-switch              # 启动本地服务 + 打开浏览器 webui
+//! sylvia-switch serve        # 只起服务不开浏览器（--port）
+//! sylvia-switch status       # 终端输出当前账号
+//! sylvia-switch version      # 版本号
 //! ```
 
 mod api;
@@ -136,7 +136,7 @@ fn print_status() {
         }))
     });
     let running = process::is_workbuddy_running();
-    println!("workbuddy-switch v{}", update::APP_VERSION);
+    println!("Sylvia Switch v{}", update::APP_VERSION);
     println!("WorkBuddy 运行中: {}", if running { "是" } else { "否" });
     match current {
         Some(c) => {
@@ -159,7 +159,7 @@ async fn main() {
     match cmd {
         "status" => print_status(),
         "version" | "--version" | "-V" => {
-            println!("workbuddy-switch {}", env!("CARGO_PKG_VERSION"));
+            println!("Sylvia Switch {}", env!("CARGO_PKG_VERSION"));
         }
         "serve" | _ => serve(&args).await,
     }
@@ -203,7 +203,7 @@ async fn serve(args: &[String]) {
     }
     let listener = bound.expect("listener bound");
 
-    println!("workbuddy-switch v{}", update::APP_VERSION);
+    println!("Sylvia Switch v{}", update::APP_VERSION);
     println!("webui: http://{addr}");
     println!("按 Ctrl+C 停止服务。");
 
