@@ -1,10 +1,12 @@
-# wb-switch
+# Sylvia Switch
 
 多渠道 AI 账号管理与统一网关工具：把散落在十几个 AI 客户端里的登录态、账号池、积分与签到，
 收敛到一套本地服务里统一管理，并对外提供 OpenAI / Anthropic 兼容的反向代理接口。
 
+> **[在线演示](https://qwertdjnskjfn.github.io/Sylvia-Switch/)**（只读；账号、积分与请求记录均为虚构数据，所有业务操作已禁用）
+
 <p align="center">
-  <img src="public/icon-transparent.png" alt="wb-switch 图标" width="128" />
+  <img src="public/icon-transparent.png" alt="Sylvia Switch 图标" width="128" />
 </p>
 
 ## 这是什么
