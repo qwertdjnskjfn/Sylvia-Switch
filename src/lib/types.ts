@@ -544,6 +544,8 @@ export interface GlmUsageRecord {
   ts: number;
   model: string;
   routeId: string;
+  /** 渠道标记：workbuddy / workbuddy-native / minimax / trae …（历史记录可能缺失） */
+  channel?: string | null;
   accountId?: string | null;
   accountLabel?: string | null;
   ledgerId?: string | null;

@@ -710,13 +710,28 @@ export async function testGlmProxy(model: string, prompt: string): Promise<{
   return call("test_glm_proxy", { model, prompt });
 }
 
-/** 模型用量统计汇总（今日/近7天/全部，按模型分列）。 */
-export async function getGlmUsageSummary(): Promise<GlmUsageStatistics> {
-  return call("get_glm_usage_summary");
+/**
+ * 模型用量统计汇总（今日/近7天/全部，按模型分列）。
+ * @param channel 可选，渠道过滤（前缀匹配，如 `workbuddy` 同时覆盖
+ *                `workbuddy` 与 `workbuddy-native` 两条链路）；不传等价历史行为。
+ */
+export async function getGlmUsageSummary(channel?: string): Promise<GlmUsageStatistics> {
+  return call("get_glm_usage_summary", channel ? { channel } : undefined);
 }
 
-export async function getGlmUsageRecords(limit = 100): Promise<{ records: GlmUsageRecord[] }> {
-  return call("get_glm_usage_records", { limit });
+/**
+ * 最近调用记录。
+ * @param limit 条数上限（后端上限 500）
+ * @param channel 可选，渠道前缀过滤；**后端在截断前过滤**，渠道稀疏时也能取满。
+ */
+export async function getGlmUsageRecords(
+  limit = 100,
+  channel?: string,
+): Promise<{ records: GlmUsageRecord[] }> {
+  return call(
+    "get_glm_usage_records",
+    channel ? { limit, channel } : { limit },
+  );
 }
 
 /**

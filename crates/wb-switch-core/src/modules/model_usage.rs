@@ -972,10 +972,35 @@ pub async fn get_accounts_overview() -> Value {
 
 /// 明细记录（按时间倒序，最多 limit 条）。
 pub fn recent_records(limit: usize) -> Vec<Value> {
+    recent_records_filtered(limit, None)
+}
+
+/// 带渠道过滤的最近记录（`channel` 为**前缀**匹配：`workbuddy` 同时命中
+/// `workbuddy` 与 `workbuddy-native` 两条链路）。
+///
+/// 🔴 过滤必须发生在 `truncate` **之前**：若先截断再过滤，渠道记录稀疏时
+/// （实测 workbuddy* 仅占全量约 7%）在最近 N 条里几乎取不到数据，
+/// 前端会出现「总览有数、明细空白」的假故障。此点由单测固化。
+pub fn recent_records_filtered(limit: usize, channel: Option<&str>) -> Vec<Value> {
     let mut records = load_records();
     records.reverse();
+    if let Some(prefix) = channel.map(str::trim).filter(|s| !s.is_empty()) {
+        records.retain(|r| channel_prefix_matches(r, prefix));
+    }
     records.truncate(limit);
     records
+}
+
+/// 纯函数：记录是否属于某渠道前缀（不触盘，供单测固化匹配口径）。
+///
+/// 前缀匹配是刻意的：前端只要传 `workbuddy` 就能同时拿到 `workbuddy`（OpenCode 借道）
+/// 与 `workbuddy-native`（ACP 直连）两条链路的记录，不必分别请求再合并。
+fn channel_prefix_matches(record: &Value, prefix: &str) -> bool {
+    record
+        .get("channel")
+        .and_then(Value::as_str)
+        .map(|c| c.starts_with(prefix))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -987,6 +1012,33 @@ mod tests {
     // 真实扣费链路（余额差归因）依赖上游，无法在单测里跑；
     // 其正确性靠「调用前后余额差 + creditsPending 标注」的设计约束保证，
     // 并由 E2E 实测（见 CHANGELOG 2.0.36）确认。
+
+    #[test]
+    fn channel_prefix_filter_covers_both_workbuddy_links() {
+        // 统计页「独立渠道面板」靠前缀过滤一次拿全两条链路：
+        // workbuddy（OpenCode 借道）+ workbuddy-native（ACP 直连）。
+        let native = json!({"channel": "workbuddy-native", "model": "deepseek-v4.1-flash"});
+        let borrow = json!({"channel": "workbuddy", "model": "opencode/mimo-v2.6"});
+        let other = json!({"channel": "minimax", "model": "MiniMax-M3"});
+        let legacy = json!({"model": "glm-5.3"}); // 无 channel 字段的历史记录
+
+        assert!(channel_prefix_matches(&native, "workbuddy"));
+        assert!(channel_prefix_matches(&borrow, "workbuddy"));
+        assert!(!channel_prefix_matches(&other, "workbuddy"));
+        // 无 channel 字段不得误命中（否则会把历史 GLM 记录混进渠道面板）。
+        assert!(!channel_prefix_matches(&legacy, "workbuddy"));
+
+        // 前缀不能反向放宽：传 native 全名只应命中 native 那条。
+        assert!(channel_prefix_matches(&native, "workbuddy-native"));
+        assert!(!channel_prefix_matches(&borrow, "workbuddy-native"));
+
+        // 🔴 空串是 Rust 中任何字符串的前缀（`"x".starts_with("") == true`），
+        // 因此本函数对空串会「全命中」。**空串必须由调用方拦掉**——
+        // `recent_records_filtered` 里的 `.filter(|s| !s.is_empty())` 正是这道闸。
+        // 本测试只固化「函数本身全命中」这一事实（不触碰磁盘），
+        // 闸门有效性由上面那条 `.trim()` 路径的代码审查保证。
+        assert!(channel_prefix_matches(&borrow, ""), "空串在本函数内是全命中的");
+    }
 
     #[test]
     fn minimax_records_match_the_existing_channel_filter() {

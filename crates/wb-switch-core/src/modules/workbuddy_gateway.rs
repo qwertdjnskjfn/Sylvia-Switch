@@ -143,6 +143,15 @@ pub struct GatewayConfig {
     pub sanitize_enabled: bool,
     /// 余额巡检间隔（分钟，驱动分层选号）；0 = 关闭巡检（增补 §2.1）。
     pub balance_refresh_minutes: u64,
+    /// 国际区（www.workbuddy.ai）出站代理，如 `http://127.0.0.1:18502`。
+    /// **空 = 直连**（当前默认，也是直连可达时的正确取值）；非空 = 国际区 chat/rpc 走它。
+    ///
+    /// 🔴 这不是「配了就更好」的字段——它只在**直连不可达**时才有意义，且一旦所指向的
+    /// 出口失效会变成**唯一**故障点（2026-10-13 实翻车：直连已恢复而代理全挂，
+    /// 导致国际区连续 11 小时 503）。**改动前先实测直连**，详见
+    /// `workbuddy_upstream.rs::intl_proxy_config` 的取值对照表。国内区**不走**代理——
+    /// Clash 抖动掐 SSE 的历史口径（workbuddy_upstream.rs 2026-10-12 注释）。
+    pub intl_proxy: String,
 }
 
 impl Default for GatewayConfig {
@@ -161,6 +170,7 @@ impl Default for GatewayConfig {
             sticky_ttl_ms: DEFAULT_STICKY_TTL_MS,
             sanitize_enabled: true,
             balance_refresh_minutes: 15,
+            intl_proxy: String::new(),
         }
     }
 }
@@ -179,6 +189,7 @@ impl GatewayConfig {
         }
         .to_string();
         self.pinned_uid = self.pinned_uid.trim().to_string();
+        self.intl_proxy = self.intl_proxy.trim().to_string();
         self.soft_rate_base_secs = clamp_u64(self.soft_rate_base_secs, d.soft_rate_base_secs, 1, 86_400);
         self.soft_rate_max_secs =
             clamp_u64(self.soft_rate_max_secs, d.soft_rate_max_secs, 1, 7 * 86_400).max(self.soft_rate_base_secs);
@@ -288,6 +299,11 @@ fn load_config_at(path: &Path) -> GatewayConfig {
             .get("balance_refresh_minutes")
             .and_then(Value::as_u64)
             .unwrap_or(d.balance_refresh_minutes),
+        intl_proxy: v
+            .get("intl_proxy")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
     }
     .normalized()
 }
@@ -311,6 +327,7 @@ pub fn save_config(cfg: &GatewayConfig) -> Result<(), String> {
         "sticky_ttl_ms": cfg.sticky_ttl_ms,
         "sanitize_enabled": cfg.sanitize_enabled,
         "balance_refresh_minutes": cfg.balance_refresh_minutes,
+        "intl_proxy": cfg.intl_proxy,
         "updatedAt": now_ms(),
     }))
     .map_err(|e| e.to_string())?;
@@ -341,6 +358,7 @@ fn save_config_at(path: &Path, cfg: &GatewayConfig) -> Result<(), String> {
         "sticky_ttl_ms": cfg.sticky_ttl_ms,
         "sanitize_enabled": cfg.sanitize_enabled,
         "balance_refresh_minutes": cfg.balance_refresh_minutes,
+        "intl_proxy": cfg.intl_proxy,
         "updatedAt": now_ms(),
     }))
     .map_err(|e| e.to_string())?;
@@ -3229,11 +3247,16 @@ mod tests {
             sticky_ttl_ms: 1_800_000,
             sanitize_enabled: false,
             balance_refresh_minutes: 30,
+            intl_proxy: " http://127.0.0.1:18502 ".to_string(),
         };
         save_config_at(&fp, &cfg).unwrap();
         let back = load_config_at(&fp);
         assert_eq!(back.mode, "rotate");
         assert_eq!(back.pinned_uid, "u1", "pinned_uid 应去空格");
+        assert_eq!(
+            back.intl_proxy, "http://127.0.0.1:18502",
+            "intl_proxy 应去空格并往返一致（2026-10-12 intl 可达性修复）"
+        );
         assert_eq!(back.soft_rate_base_secs, 300);
         assert_eq!(back.soft_rate_max_secs, 1200);
         assert_eq!(back.breaker_threshold, 5);

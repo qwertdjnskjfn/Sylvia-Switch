@@ -1,3 +1,366 @@
+## 2.0.53 - 2026-10-13
+
+### 【订正 2.0.51】清空 `intl_proxy`：代理从「解决办法」变成唯一故障点（ZCode 503）
+
+**用户诉求**：ZCode 报 `Service Unavailable` / `status=503 retryable=true`，
+provider=`new-provider-3`、model=`deepseek-v4.1-flash`，TraceID `d59bdbe9-…`。
+
+> ⚠️ **本次为纯运维修复（配置 + 注释），无代码行为变更 ⇒ 未另起版本号、未重建。**
+> 线上仍为 2.0.53，记录在此供后续查阅。
+
+#### 证据链（全部实测）
+
+| # | 检查 | 结果 |
+| --- | --- | --- |
+| ① | 网关请求日志 | `region=intl` 每 ~50s 重试，**全部失败**：`无可用账号：region=intl 区内无可用账号` + `transport: error sending request for url (https://www.workbuddy.ai/v2/chat/completions)` |
+| ② | 账号池状态 | 三个账号**均未冷却**（`breaker_until_ms=0`）⇒ 不是「账号被熔断」，是**出口不通** |
+| ③ | DNS | `www.workbuddy.ai` → **43.160.158.125**（真实公网 IP）——**不再是 fake-IP 198.18.x** |
+| ④ | 直连实测 | `POST /v2/chat/completions` → **401 (0.22s)** = 可达，只差鉴权；`GET /v2/billing/...` 同样 401 |
+| ⑤ | 代理实测 | `http://127.0.0.1:18502` → **000 (5s 超时)**；18501–18507 **全部失效**（连 github 都超时）|
+
+⇒ **根因**：2.0.51 的 `intl_proxy` 是「直连不可达」时期的**应急出口**。
+10-13 网络已恢复直连，而该代理所指向的 Clash 出口（18501–18507）**全线失效** ——
+代理从解决办法变成**唯一**故障点：国际区请求全部被送进死代理 → `transport` 失败 →
+池判定「该区无可用账号」→ 对外 503。
+
+#### 🔴 关键订正：`intl_proxy` 不是「配了就更好」的字段
+
+| `www.workbuddy.ai` 可达性 | 正确取值 |
+| --- | --- |
+| 直连**可达**（DNS 真实 IP） | **空**（直连）← 当前值 |
+| 直连**不可达**（fake-IP + 超时） | 填**已验证可用**的出口 |
+
+⇒ **填代理前必须先实测该出口能连通目标站**；直连通就**不要**填。
+另注：前端「开关」需重启进程（上游 client 是 `OnceLock`，不热生效）。
+
+#### 处理
+
+| # | 动作 | 结果 |
+| --- | --- | --- |
+| ① | 备份配置 | `workbuddy_gateway_config.json.bak-intlproxy-20261013-111340` |
+| ② | `intl_proxy` → `""` | |
+| ③ | 重启进程（走 `deploy.py`，同版本） | OUTAGE = 1.0s |
+| ④ | **端到端验证** | `region=intl` → **HTTP 200，内容正确，0.98s / 1.27s**（修复前 5s 超时）|
+| ⑤ | 回归 | 默认区域（cn）→ 200 / 2.1s，无影响 |
+| ⑥ | 注释订正 | `workbuddy_upstream.rs`（两处 client + `intl_proxy_config` 文档，含取值对照表与翻车记录）、`workbuddy_gateway.rs` 字段文档、`api.rs` 保存注释；**注释无需重建** |
+
+#### ⚠️ 遗留
+- 若将来直连再次不可达，需**先验证出口**（`curl -x <proxy> https://www.workbuddy.ai/`）
+  再填 `intl_proxy`，并重启进程；
+- Clash 的 18501–18507 出口全线失效本身未处理（属网络侧，非本工程范围）。
+
+### 统计页新增「WorkBuddy 逆向」独立面板：渠道级模型频率 / Token / 失败归因
+
+**用户诉求**：把 WorkBuddy 逆向渠道的模型调用监控「作为统计部分中的一个独立界面来实现，
+而不是嵌入到现有的其他界面中」，并说明此前未插入的原因。
+
+#### 为何此前「看不见」（三个断点，全部实证）
+
+| # | 断点 | 证据 |
+| --- | --- | --- |
+| ① | 监控脚本只产出**离线文件**，无人读取 | `grep -rn workbuddy_model_usage_stats crates/ src/` → 零命中 |
+| ② | 前端用量页**不传渠道参数** | `ModelUsagePage.tsx:142` 调 `api.getGlmUsageSummary()` 无参 ⇒ 只能看全部渠道的混合视图 |
+| ③ | `records` 接口**不支持渠道过滤** | `api_glm_usage_records` 原先只解析 `limit`（`api.rs`），无法按渠道取明细 |
+
+⇒ 数据一直在产（`/api/glm-usage/summary` 不带 channel 时本就含 workbuddy：实测
+`deepseek-v4.1-flash calls=49` 与脚本统计逐字一致），只是**没有按渠道拆开的入口**。
+
+#### 改动
+
+| # | 层 | 内容 |
+| --- | --- | --- |
+| ① | `model_usage.rs` | 新增 `recent_records_filtered(limit, channel)` + 纯函数 `channel_prefix_matches`；保留 `recent_records` 兼容既有调用点 |
+| ② | `api.rs` | `/api/glm-usage/records` 支持 `?channel=`（前缀匹配，`workbuddy` 一次覆盖 `workbuddy` 与 `workbuddy-native`）|
+| ③ | `api.ts` / `types.ts` | `getGlmUsageSummary(channel?)` / `getGlmUsageRecords(limit, channel?)`；`GlmUsageRecord` 补 `channel` 字段 |
+| ④ | **新增** `WorkBuddyMonitorPage.tsx` | **独立页面**：KPI 六卡 + 按链路 + 模型频率 Top20 + Token 消耗 Top12 + 失败归因 + 24 时间桶，60s 自动刷新 |
+| ⑤ | `StatsPage.tsx` | 注册为第 4 个 Tab（`?tab=workbuddy`，可深链），**不并入任何既有页面** |
+
+#### 🔴 关键实现点：过滤必须在截断之前
+
+`recent_records_filtered` 先 `retain` 再 `truncate`。反过来的话，渠道记录稀疏时
+（实测 workbuddy* 仅占全量约 7%）在最近 N 条里几乎取不到数据，
+前端会呈现「总览有数、明细空白」的假故障。此约束由单测固化。
+
+#### 为什么单开一页而不并入「调用与模型」
+
+那个页面服务的是**账号口径**（AutoClaw / Loomy / TRAE Work CN，按账号归因）；
+本页服务的是**渠道口径**（`channel` 前缀）。两者数据源、失效模式都不同，
+混排会让「这是谁的数据」变模糊——与统计页既有的「各视角不跨源合并」原则一致。
+
+#### 验证
+
+| 项 | 结果 |
+| --- | --- |
+| `tsc --noEmit` | ✅ 零错误 |
+| 单测 `channel_prefix_filter_covers_both_workbuddy_links` | ✅ 覆盖两链路命中 / 不误伤无 channel 的历史记录 / 空串契约 |
+| `cargo test -p wb-switch-core --lib` | 见本次发布门禁 |
+| 接口实测 | `GET /api/glm-usage/records?channel=workbuddy&limit=500` 返回按渠道过滤后的明细 |
+| UI 实测 | 统计页 → WorkBuddy 逆向 Tab，数值与 `tools-wb-model-monitor.py` 报表交叉一致 |
+
+#### ⚠️ 口径提醒（页面内已显式标注）
+
+`workbuddy-native`（ACP 直连）链路上游**不返回 usage**，其 Token 恒为 0 且
+**不是「消耗为 0」**。页面区分「已上报 / 未上报」两栏计数，覆盖率低属结构性现象。
+
+---
+
+## 2.0.52 - 2026-10-12
+
+### 契约对齐：`/messages` 与 `/responses` 补齐区域密钥隔离（两区密钥不能共用一把）
+
+**触发**：2.0.51 修复国际区可达性时的端到端探针发现——`/chat/completions` 对
+「请求体 region 参与 key 校验」，但 `/messages` 与 `/responses` 只做普通鉴权：
+**cn 区专用 key + `region=intl` 实测可通、并命中 intl 账号**，与设计意图
+（「国内版一个密钥、国际版一个密钥，不能共用一把」，见 `verify_request_key_region`
+注释）相悖。
+
+#### 修复
+
+- `api_workbuddy_pool_messages` / `api_workbuddy_pool_responses` 改为与
+  chat/completions **逐字同序**：body 先解析（region 是鉴权前置依赖）→
+  `workbuddy_pool_auth_ok_region` 区域感知鉴权 → 跨区 key 返回 401
+  `无效的 API Key（该密钥不属于当前区域：xx）`。
+- 兼容性由 `key_region_matches` 语义保证：**无 region 请求不受任何影响**
+  （`(Some(_), None) → true`）、通用 key 与 GLM 主密钥不受限 —— 既有流量零行为变化。
+- 行为微调（与 chat 对齐）：畸形 body 的 400 现在先于 401 返回
+  （原 /messages、/responses 为 401 先行）。
+
+#### 验证（部署后实测，6/6 PASS）
+
+探针 `_e2e_out/probe_region_auth.py`（HTTP 状态 + 账号 `last_used` 差分）：
+
+| 组合 | 结果 |
+| --- | --- |
+| intl key + region=intl（/messages） | 200，命中 intl 账号 |
+| **cn key + region=intl（/messages）** | **401「该密钥不属于当前区域：intl」**（修复前 200 —— 即本次关闭的缺口） |
+| intl key + 无 region | 200（既有流量零变化） |
+| intl key + region=cn | 401「该密钥不属于当前区域：cn」 |
+| cn key + region=intl（/responses） | 401 |
+| GLM 主密钥 + region=intl | 200（主密钥兼容性保留） |
+
+被拒请求均为 0ms 拒绝、未触碰任何账号（`last_used` 无变化）。
+
+## 2.0.51 - 2026-10-12
+
+> 🔴 **本条已被 2.0.53 撤销（2026-10-13）**：文中「新增 `intl_proxy` 出站代理」的做法
+> 在当时正确，但**次日即变成故障源**（直连恢复 + 该代理出口全线失效 ⇒ 国际区连续 503 11 小时）。
+> 现值已清空为空串（= 直连）。**动 `intl_proxy` 前先读 2.0.53 的订正段。**
+
+### 国际区（intl）上游可达性修复：新增 `intl_proxy` 出站代理（www.workbuddy.ai 直连不可达）
+
+**触发**：ZCode 需要「国外版 WorkBuddy 的 deepseek-v4.1-flash」（1M 上下文版）。
+`region=intl` 路由本身已生效（`last_used` 差分实证命中 intl 账号），但请求全部 503：
+`transport: error sending request for url (https://www.workbuddy.ai/v2/chat/completions)`。
+
+#### 根因（网络层 + 代码层双因）
+
+1. **网络层**：`www.workbuddy.ai` 本机直连不可达（DNS 为 Mihomo fake-IP `198.18.0.183`，
+   直连与普通系统代理均超时）；而 Merge.yaml 的 7 个专用出口（18501–18507）中
+   5 个节点可稳定直通该域（18502 东京 / 18503 德国 / 18504 伦敦 / 18505 巴西 /
+   18507 墨西哥实测 200；18501/18506 节点已失效）。
+2. **代码层**：`workbuddy_upstream.rs` 的 chat client 为修复国内 SSE 断流而硬编码
+   `.no_proxy()`（2026-10-12 早间），国际区请求被一并强制直连 ⇒ 必然 transport 失败
+   （日志中长期可见「intl 区动态目录失败 transport: error sending request」同源）。
+
+#### 修复
+
+- 新增池配置字段 **`intl_proxy`**（`~/.wb-switch/workbuddy_gateway_config.json`，
+  默认空 = 原行为）。PATCH `/workbuddy-pool/v1/config` 支持 `intlProxy`
+  （⚠️ 非热生效：上游 client 为 OnceLock 缓存，改后需重启进程）。
+- `workbuddy_upstream.rs` 四个出站调用点（chat / refresh / models / billing）
+  按账号 `region` 分流：国内区保持 `.no_proxy()` 原口径；国际区走 `intl_proxy`
+  （非法值告警后回落直连/环境探测，可用性优先）。**副产物：消除长期存在的
+  「intl 区动态目录失败」（fetch_models 同路修复）。**
+- 单测：`config_round_trip_and_clamp` 增 intl_proxy 往返 + 去空格断言；
+  新增 `intl_region_and_proxy_helpers`（区域判定 / 代理解析 / client 三态不 panic）。
+
+## 2.0.50 - 2026-10-12
+
+### ACP 会话未隔离致「模型输出不相关内容」：会话身份守卫 + 强制兜底
+
+> ⚠️ 本文所述修复**不在 2.0.49**。2.0.49 的构建里带的是首版「隔离 cwd」方案，
+> 该方案在部署后被实测**证伪并撤回**（见下方「关键订正」），故另起 2.0.50。
+
+**用户诉求**：排查「模型会输出不相关的内容」——是不是思考出幻觉了？
+
+#### 根因：**不是幻觉**，是网关请求被注入用户真实会话
+
+模型忠实作答了「另一个对话」：网关把你的问题送进了你正在使用的那条会话。全链实证：
+
+| # | 事实 | 证据 |
+| --- | --- | --- |
+| ① | native 链路 `session/new` 可能**直接返回宿主当前会话** | 传全新临时 cwd 仍回 `f8830d80-…`，与注册表条目的 sessionId **逐字相同** |
+| ② | 对话路径传的正是用户项目目录 | 请求显式 cwd 优先，未指定则回落**注册表条目的 cwd**（= 用户项目）；该目录本就在白名单内 |
+| ③ | **A/B 实测**（`tools-acp-session-probe.py`）| 用户 cwd 建会话 → 返回 `4d4bee6a-…`；用户 IDE 正在用 → **也是 `4d4bee6a-…`** |
+| ④ | **现场第一人称复现** | 向生产 native 端点发「只回复：OK」，该内容**直接出现在用户当前对话里**；复测时另一条 marker 亦同（20:26 / 21:11 各一次）|
+
+⇒ **双向污染**：调用方收到掺了用户上下文的回答（表现为「输出不相关内容」）；
+用户自己的对话被网关请求占据。观察到返回内容为「ZodError/provider-config 排查」
+「积分包」「已通读 README.md、IDENTITY.md」——全是用户其他会话的实时内容。
+⚠️ 亦解释了 native 链路 150s 挂起：请求并进正在生成的用户会话，等不到收尾。
+
+#### 🔴 关键订正：**cwd 隔离方案被实测证伪**
+
+首版修复假设「换个没有历史绑定的 cwd 就能拿到干净会话」，据此改为每请求唯一
+临时目录。**实测不成立**：对全新目录 `session/new` 依旧返回宿主当前会话
+（`f8830d80-…`），证明**该宿主根本不按 cwd 隔离**——cwd 不是可靠的隔离原语。
+另外传**不存在**的目录还会让宿主建不出工作区、整条请求挂死（450s 无输出）。
+⇒ 该方案已撤回，未留在代码里。
+
+#### 改动（最终方案）
+
+| # | 文件 | 内容 |
+| --- | --- | --- |
+| ① | `trae_acp.rs` | 新增 `SESSION_REUSE_MARK` / `is_host_active_session()`：`session/new` 拿到会话后**比对注册表各活跃宿主的 sessionId**，命中即判定「宿主未隔离」，在 `session/prompt` **之前**拒绝 |
+| ② | `workbuddy_proxy.rs` | `native_failure_should_fallback` 增加 `message` 入参：命中该标记时**无视目录内外一律回落到 OpenCode 借道**（那是一条每请求新建 + 用完删除的干净通道）|
+
+⇒ 效果：**宁可失败/换通道，也绝不污染用户对话**；且能自动落到干净通道拿到正确回答。
+
+#### 排查结论：另两条链路干净
+- `opencode-borrow`：每请求 `POST /session` 新建、用完 `DELETE`，且有 `CHAT_SERIAL` 串行锁；
+- `workbuddy-pool`：纯无状态 HTTP，不带 conversation/session 头。
+
+#### 验证
+| 项 | 结果 |
+| --- | --- |
+| 单测 `session_reuse_guard_message_is_marked_for_fallback` | ✅ 通过（标记契约固化，防文案改动断链）|
+| 单测 `native_failure_should_fallback`（含新增「会话未隔离也必须兜底」用例）| ✅ 通过 |
+| `cargo test -p wb-switch-core --lib` | 见本次发布门禁 |
+| 实测取证 | 关：`session/new(全新临时 cwd)` → 仍回宿主会话（证伪隔离假设）|
+
+#### ⚠️ 遗留
+- **本修复只保证「不污染」，不保证 native 通道可用**：宿主若是单会话语义，
+  native 会被守卫挡下并自动回落 OpenCode。要让 native 可用需**上游**支持
+  为 API 调用真正新建会话（当前 ACP 侧无 `session/delete`，也无隔离参数）。
+- 建议给 ZCode 的 `new-provider-3`（本地池）保留一条非 native 路由作为常态。
+
+---
+
+## 2.0.49 - 2026-10-12
+
+### workbuddy-pool 流式断流：自愈重拉 + keepalive + 断流诊断
+
+**用户诉求**：ZCode 报 `生成中断（transport: error decoding response body）。以上内容已保留，可重试补全。`
+（TraceID `d59bdbe9-b773-4cac-a709-1c081d0e089a`，provider=`new-provider-3` 即本地池 57890，
+model=`step-5-preview`）。
+
+#### 根因定位
+错误文本溯源到 `workbuddy_upstream.rs` 的 `StreamTick::Err(format!("transport: {e}"))`
+——reqwest `resp.chunk()` 读上游 SSE 时硬失败。两个已确认诱因：
+
+| # | 诱因 | 证据 |
+| --- | --- | --- |
+| ① | **系统代理掐断长连接**（已修，见 2.0.48 时段）| `Client::new()` 继承 Clash(7897)，阶跃是国内上游 ⇒ 长 SSE 被重置 |
+| ② | **中间设备回收空闲 TCP** | 长思考期上下游方向长时间无字节 ⇒ NAT/防火墙 RST ⇒ hyper 报 `error decoding response body` |
+
+⚠️ 复现局限：两次裸请求复现均正常（step-5-preview 149.8s/3567 帧、deepseek 正常收尾），
+说明断流**偶发**，与请求时长/内容/网络状况相关 —— 因此本次改的是**韧性**而非某一条确定性缺陷。
+
+#### 改动
+| # | 项 | 内容 |
+| --- | --- | --- |
+| ① | **空流自愈重拉** | `resp.chunk()` 出错且**本桥尚未产出任何内容**时，用 `ChatRetryFactory` 在原账号上重拉一次流（上限 1 次）。客户端对此**无感知**，直接消灭「生成失败」类中断。**已产出内容绝不重拉** —— 否则前半段会被重复吐一遍 |
+| ② | **TCP keepalive** | chat client 加 `.tcp_keepalive(30s)`：长 SSE 流持续探活，降低被中间设备回收的概率 |
+| ③ | **断流诊断信息** | error 帧 detail 补 `（已产出 N 字，持续 T s）`；session 新增 `chars_out()` 按**字符**计（中文不是字节）|
+| ④ | **留痕** | 重拉/被拒/失败三条 `eprintln` 分支各自可辨，便于下次定位是上游拒还是传输层 |
+
+#### 验证
+| 项 | 结果 |
+| --- | --- |
+| 单测 | **854 passed / 0 failed**（+3：`chars_out_counts_produced_text` / `stream_error_detail_carries_diagnostics` / 既有 error 文案分支）|
+| 复现（加固前）| 2/2 正常 —— 偶发问题，裸请求未触发 |
+| 修复后 E2E | 部署后跑 `tools-pool-stream-repro.py`（两个模型长流 + 帧间隔计时）|
+
+### Deepseek-V4.1-Flash 思考能力打通：`reasoning_effort` 才是 WorkBuddy 上游的开关
+
+**用户诉求**：把国外版 WorkBuddy 的 `Deepseek-V4.1-Flash` 纳入本轮优化范围，
+「参照已优化的模型处理方式，补充并启用类似 step-5-preview 的思考能力」，
+并说明**需要调整的配置项、请求参数、触发思考能力的判定逻辑**，
+且**确认改动不影响现有模型的默认行为与响应格式**。
+
+#### 根因：三层断裂，缺一层就不思考
+
+| # | 层 | 断裂点 | 判据（全部实测） |
+| --- | --- | --- | --- |
+| ① | **协议层** | WorkBuddy 上游**不认 Anthropic `thinking`**，只认 `reasoning_effort` | 同模型同提示词：`thinking:{type:enabled,budget_tokens:2048}` → **0 个思考帧**；`reasoning_effort:"max"` → **14 个思考帧** |
+| ② | **网关层** | `anthropic_req_to_chat` 的透传清单里**没有 `reasoning_effort`**（只有 temperature/top_p/top_k/presence/frequency）⇒ Anthropic 客户端永远开不了思考 | 代码审计 + ① 的对照实验 |
+| ③ | **客户端层** | ZCode asar 里 `reasoning_effort` / `budget_tokens` **双双零命中** ⇒ 它自己**从不发**这两个字段；**唯一的出站通道是 `optionSpecs.reasoningLevel.map`**（受限 CEL） | `E:/Zcode/resources/app.asar` 全文扫描（27026 个文件） |
+
+🔎 **顺带解释了一个长期困惑**：`step-5-preview` 之所以「一直有思考」，是因为**它上游默认就思考**
+（无参数即 12 个思考帧）；`space-bunny` / `deepseek-v4.1-flash` **默认不思考**（0 帧）。
+⇒ 「有的模型调得动、有的调不动」不是配置问题，是**模型默认行为差异**。
+
+#### 改动
+
+| # | 文件 | 内容 |
+| --- | --- | --- |
+| ① | `workbuddy_protocols.rs` | 新增 `KNOWN_REASONING_EFFORTS` / `normalize_reasoning_effort` / `anthropic_thinking_to_effort`；`anthropic_req_to_chat` 增加**两路来源**的 `reasoning_effort` 注入（显式字段优先 → `thinking.budget_tokens` 推导兜底） |
+| ② | `workbuddy_upstream.rs` | `prepare_body` 新增 `normalize_reasoning_effort_field`（OpenAI / 原生通道同款值域收敛）；模块文档「已知差异」同步更新 |
+| ③ | ZCode 配置（**非本仓库**） | `~/.zcode/v2/provider_config.json` 给 `deepseek-v4.1-flash` 补 `optionSpecs`：`reasoningLevel.values=["low","medium","high","max"]` + `map="{'reasoning_effort': reasoningLevel}"` + `maxOutputTokens.max=128000`。工具：`zcode-ds41-thinking.py`（内置受限 CEL 校验器 + 四项计数安全闸） |
+| ④ | 国外版 WorkBuddy（**非本仓库**） | `~/.workbuddy-ai/models.json`：`supportsReasoning` false→**true**、`supportsToolCall` false→**true**、`supportedEfforts` 补 `max`、`maxOutputTokens` 8192→32768 |
+
+#### 🔴 顺带修掉一个误导性错误：未知档位 → 400 被伪装成 503「无可用账号」
+
+上游对**未知 `reasoning_effort`** 回 **400**；而 400 在契约 §4 里归 `ErrKind::Client`（**只换号不罚**）
+⇒ 池内账号轮空后对外吐 **`503 {"message":"无可用账号：上游返回 400"}`**
+（实测 `reasoning_effort:"bogus"` 复现）——把「客户端参数错」伪装成「账号不可用」，
+既误导排障又白白消耗账号轮转。
+
+⇒ 修法**不动错误分类契约**（避免与 Go 侧对齐的 A/B 固化测试冲突），改在**协议翻译层收敛值域**：
+已知档位大小写归一后透传，未知值**整字段删除**并记日志。这同时补上了模块文档里
+「reasoning_effort 按模型 supportedEfforts 降级 —— 未实现」那条**已知差异的一半**
+（值域收敛已做；按模型的精细降级仍需跨请求 efforts 缓存，仍然未做）。
+
+#### 不影响现有模型默认行为（硬保证 + 回归守卫）
+
+**判定逻辑**：`reasoning_effort` = 显式字段（归一化后）→ 否则 `thinking` 推导 → **两路都没有 ⇒ 一个字段都不插**。
+
+| 场景 | 出站体 | 结论 |
+| --- | --- | --- |
+| 无 `reasoning_effort` 且无 `thinking` | **逐字不变** | ✅ `step-5-preview`（默认思考）档位不受影响 |
+| 已知档位 | 原样透传（仅大小写归一） | ✅ |
+| `thinking:{type:disabled}` | 不注入 | ✅ 尊重「不要思考」的显式意图 |
+| 未知档位 | 删除该字段 + 日志 | ✅ 不再产生误导性 503 |
+
+响应格式**零改动**：不新增/删除任何 SSE 帧类型与字段名（`thinking_delta` / `reasoning_content`
+的既有映射完全不变）。
+
+#### 验证
+
+- **单测**：新增 12 个（`workbuddy_protocols` 7 + `workbuddy_upstream` 5），
+  含 3 个回归守卫（`anthropic_req_without_thinking_intent_inserts_nothing` /
+  `prepare_body_effort_absent_keeps_body_identical` / `prepare_body_effort_unknown_is_dropped`）。
+  `cargo test -p wb-switch-core --lib` → **862 passed / 0 failed**。
+- **端到端**（池通道 `/workbuddy-pool/v1/chat/completions`，真实上游）：
+
+| 探针 | HTTP | 思考帧 |
+| --- | --- | --- |
+| 无 `reasoning_effort`（对照） | 200 | **0** |
+| `reasoning_effort:"max"` | 200 | **14** |
+| `reasoning_effort:"medium"` | 200 | **65** |
+| `reasoning_effort:"bogus"` | 503（= 400 被误包） | 0 → **修复后不再产生** |
+| `tools` 工具调用 | 200 | 10 个 `tool_calls` 帧，`finish_reason:"tool_calls"` |
+
+- **实测档位全集**：`low/medium/high/max/xhigh` **全部有效** ⇒ 元数据里的 `efforts` 是
+  **推荐值而非硬白名单**（`deepseek-v4.1-flash` 元数据只列 `low/high/max`，实测 `medium` 亦可用）。
+
+#### ⚠️ 遗留（未在本次解决）
+
+1. **ZCode `contextWindow` 与上游不一致**：`deepseek-v4.1-flash` 池内 CN 条目实测
+   `context_length=256000` / `max_output_tokens=128000`，而 ZCode 规则里写的是 `1000000`
+   （照 INTL 静态表）。**未擅改** —— 池路由按账号 region 选取，取小值才是安全侧，
+   需先确认账号池实际命中区域再定。
+2. ~~**ZCode `map` 的合并位置未实证**~~ ✅ **已关闭**（同日 21:20 静态逆向实证，无需 GUI）：
+   ZCode 把 map 编译成**出站 fetch 拦截器**（`createModelOptionMapFetch`），在 AI SDK 序列化完请求体后
+   解析 body JSON → **顶层** JSON-merge-patch → 重发 ⇒ `{'reasoning_effort':...}` 精确产出**请求体顶层**字段。
+   证据链：`bindModel` → `compileModelOptionMaps` → `applyOrderedJsonMergePatches` →
+   `createModelOptionMapFetch`，全部位于 **`resources/glm/zcode.cjs`（不在 app.asar 内）**；
+   佐证：内置模板 `resources/config/provider/zcode-builtin.json` 中 **22 个模型**用了同款
+   `{"reasoning_effort": reasoningLevel}` map。（另有两条新约束：`maxOutputTokens.map` 会被 host 的
+   `extractManualModelConfig` pick 丢弃；手动模型必须带 `values`，否则 `selectionIssue:"reasoning-level-missing"`。）
+3. **`~/.workbuddy-ai/models.json` 与 `~/.workbuddy/models.json` 的 `deepseek-v4.1-flash`
+   是两条不同来源**：国内版那条指向第三方中转 `https://cavoti.com/v1`（名称自带
+   「⚠余额0 暂不可用」），国外版那条指向本地网关。**本次只改了国外版**。
 ## 2.0.48 - 2026-10-11
 
 ### 妙手 ZCode 反复 502：定位为「上游间歇性故障」+ 网关侧自愈重试

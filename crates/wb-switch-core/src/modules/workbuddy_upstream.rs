@@ -36,8 +36,11 @@
 //!
 //! # 与参考实现的已知差异
 //!
-//! - reasoning_effort 按模型 supportedEfforts 降级：需要跨请求的 efforts 缓存，
-//!   契约 §13 的 [`prepare_body`]/[`chat_stream`] 签名无该入口，故未实现；
+//! - reasoning_effort **值域收敛已实现**（2026-10-12，见
+//!   [`normalize_reasoning_effort_field`]）：已知档位透传、未知档位删除，
+//!   避免上游 400 被契约 §4 判成「只换号」后误报成 **503 无可用账号**。
+//!   但**按模型 supportedEfforts 的精细降级仍未实现**：那需要跨请求的 efforts 缓存，
+//!   契约 §13 的 [`prepare_body`]/[`chat_stream`] 签名无该入口；
 //!   [`fetch_models`] 输出的 `efforts` 元数据可供后续接入。
 //! - 脱敏的两个正则剥离层（billing 头 / cc_ 裸键值）：wb-switch-core 未引入 regex
 //!   依赖，以等价手写扫描实现（语义逐条对齐，见 [`strip_billing_header`]/[`strip_cc_kv`]）。
@@ -51,6 +54,449 @@ use std::time::Duration;
 use crate::modules::config::now_ms;
 use crate::modules::workbuddy_errors::{classify, ErrKind};
 use crate::modules::workbuddy_gateway::PoolAccount;
+use crate::modules::workbuddy_protocols::{AnthropicStreamSession, OpenAIStreamSession};
+
+/// 真流式桥：把上游 `reqwest::Response` 的 SSE 逐帧转成 Anthropic SSE 帧，
+/// 通过 mpsc 推给调用方（2026-10-12 新增）。
+///
+/// # 解决什么问题
+///
+/// 池网关原先的「流式」是伪流式：先把上游流**读干**再聚合成字符串，最后用
+/// `Body::from(frames.concat())` 一次性下发。实测（2026-10-12）三个模型
+/// `step-5-preview` / `space-bunny` / `deepseek-v4.1-flash` 全部呈现
+/// 「首帧时刻 == 末帧时刻」，34/36/30 帧在同一毫秒齐发，最大帧间隔 0.0s。
+///
+/// 后果：长思考模型思考期间客户端零字节收到，网关 60s 空闲超时
+/// （[`CHAT_IDLE_TIMEOUT`]）会先掐断 → 客户端只看到半句话
+/// （2026-10-12 用户实测「工作 1 分 44 秒后停在半句」）。
+///
+/// # 为什么要 mpsc 而不是直接返回 Stream
+///
+/// 上游类型是 `reqwest::Response`，server crate 不依赖 reqwest 写不出签名
+/// （`ChatOutcome` 用同名枚举规避的同款问题）。这里同样在 core 侧持有
+/// `reqwest::Response` 并在一个独立 task 里读流，逐帧经 mpsc 外送。
+///
+/// 读流 task 结束时 drop 发送端 → 调用方的 `rx.recv()` 返回 `None` → 客户端
+/// 收到正常 EOF，不会挂死。读流出错时把错误文本作为一个终止帧推出去。
+pub struct AnthropicStreamBridge {
+    pub rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+}
+
+/// OpenAI 格式的真流式桥（chat/completions 与 responses 入口用）。
+///
+/// 与 [`spawn_anthropic_bridge`] 同构，只是帧转换走 [`OpenAIStreamSession`]。
+/// 返回类型共用同一个 `AnthropicStreamBridge`（里面只是 mpsc 接收端，与帧格式无关）。
+pub fn spawn_openai_bridge(
+    outcome: ChatOutcome,
+    model: &str,
+    on_first_content: std::sync::Arc<dyn Fn() + Send + Sync>,
+    retry: Option<ChatRetryFactory>,
+) -> Result<AnthropicStreamBridge, String> {
+    let mut resp = match outcome {
+        ChatOutcome::Stream(resp) => resp,
+        ChatOutcome::Error { status, body } => {
+            return Err(format!("upstream {status}: {}", truncate(&body, 500)));
+        }
+    };
+    let model = model.to_string();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    tokio::spawn(async move {
+        let mut session = OpenAIStreamSession::new(&model);
+        for f in session.begin() {
+            if tx.send(f).is_err() {
+                return;
+            }
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        let mut fired_hook = false;
+        let mut retries_left = STREAM_EMPTY_RETRY_MAX;
+        let started = std::time::Instant::now();
+        let mut hb = tokio::time::interval(Duration::from_secs(STREAM_HEARTBEAT_SECS));
+        hb.tick().await;
+        loop {
+            let tick = match tokio::time::timeout(CHAT_IDLE_TIMEOUT, async {
+                tokio::select! {
+                    biased;
+                    _ = hb.tick() => StreamTick::Heartbeat,
+                    c = resp.chunk() => match c {
+                        Ok(Some(c)) => StreamTick::Data(c),
+                        Ok(None) => StreamTick::Eof,
+                        Err(e) => StreamTick::Err(format!("transport: {e}")),
+                    },
+                }
+            })
+            .await
+            {
+                Ok(t) => t,
+                Err(_) => StreamTick::Err(format!(
+                    "transport: stream idle timeout after {:?}",
+                    CHAT_IDLE_TIMEOUT
+                )),
+            };
+            match tick {
+                StreamTick::Heartbeat => {
+                    if tx.send(STREAM_HEARTBEAT_FRAME.to_string()).is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                StreamTick::Eof => break,
+                StreamTick::Err(e) => {
+                    // 断流自愈（同 anthropic 桥）：无内容时重拉一次。
+                    if !session.saw_content() && retries_left > 0 {
+                        if let Some(factory) = &retry {
+                            retries_left -= 1;
+                            eprintln!("[workbuddy-pool] openai bridge 空流中断，重拉: {e}");
+                            match factory().await {
+                                Ok(ChatOutcome::Stream(r2)) => {
+                                    resp = r2;
+                                    buf.clear();
+                                    continue;
+                                }
+                                Ok(ChatOutcome::Error { status, body }) => {
+                                    eprintln!(
+                                        "[workbuddy-pool] openai bridge 重拉被拒: upstream {status} {}",
+                                        truncate(&body, 200)
+                                    );
+                                }
+                                Err(e2) => {
+                                    eprintln!("[workbuddy-pool] openai bridge 重拉失败: {e2}");
+                                }
+                            }
+                        }
+                    }
+                    let detail = format!(
+                        "{e}（已产出 {} 字，持续 {:.0}s）",
+                        session.chars_out(),
+                        started.elapsed().as_secs_f64()
+                    );
+                    for f in stream_error_frames_openai(&mut session, &detail) {
+                        let _ = tx.send(f);
+                    }
+                    eprintln!("[workbuddy-pool] openai bridge stream error: {detail}");
+                    return;
+                }
+                StreamTick::Data(c) => buf.extend_from_slice(&c),
+            }
+            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                let raw: Vec<u8> = buf.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&raw);
+                let l = line.trim_end_matches(['\r', '\n']);
+                let Some(payload) = l.strip_prefix("data:") else {
+                    continue;
+                };
+                let payload = payload.trim();
+                if payload == "[DONE]" {
+                    for f in session.finish() {
+                        let _ = tx.send(f);
+                    }
+                    return;
+                }
+                if payload.is_empty() {
+                    continue;
+                }
+                let Ok(v) = serde_json::from_str::<Value>(payload) else {
+                    continue;
+                };
+                let Some(frame) = session.feed_openai_delta(&v) else {
+                    continue;
+                };
+                if !fired_hook {
+                    fired_hook = true;
+                    on_first_content();
+                }
+                if tx.send(frame).is_err() {
+                    return;
+                }
+            }
+        }
+        if !buf.is_empty() {
+            let l = String::from_utf8_lossy(&buf);
+            if let Some(payload) = l.trim_end_matches(['\r', '\n']).strip_prefix("data:") {
+                let payload = payload.trim();
+                if !payload.is_empty() && payload != "[DONE]" {
+                    if let Ok(v) = serde_json::from_str::<Value>(payload) {
+                        if let Some(frame) = session.feed_openai_delta(&v) {
+                            if !fired_hook {
+                                fired_hook = true;
+                                on_first_content();
+                            }
+                            let _ = tx.send(frame);
+                        }
+                    }
+                }
+            }
+        }
+        for f in session.finish() {
+            let _ = tx.send(f);
+        }
+    });
+
+    Ok(AnthropicStreamBridge { rx })
+}
+
+/// 重新拉一次上游流的工厂（断流自愈用，见 [`spawn_anthropic_bridge`]）。
+///
+/// server 侧用账号 + 已预处理 body 现造一个 `chat_stream` future；core 不依赖
+/// server，故以 trait object 穿过 crate 边界。
+pub type ChatRetryFactory = std::sync::Arc<
+    dyn Fn()
+            -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<ChatOutcome, String>> + Send,
+                >,
+            >
+        + Send
+        + Sync,
+>;
+
+/// 无内容断流时最多重拉几次（有内容后断流**不能**重拉 —— 会把前半段重复吐一遍）。
+pub const STREAM_EMPTY_RETRY_MAX: u32 = 1;
+
+/// 起桥：返回接收端 + 一个已在跑的后台读流 task。
+///
+/// `on_first_content` 在收到第一个可下发内容帧时被调用一次（server 侧用它做
+/// `note_success` 记账与粘性绑定——原来记在聚合成功后，现在必须提前到
+/// 首帧，否则长思考期间账号租约会被误判为未使用）。
+///
+/// `retry`：断流自愈工厂。`resp.chunk()` 出错（连接被重置 / 解码失败，即
+/// `error decoding response body` 那一类）且**本桥尚未产出任何内容**时，
+/// 用它在原账号上重拉一次流 —— 客户端对此无感知，直接消灭「生成失败」类中断。
+/// 已产出内容则照旧发 error 帧（内容不能重放）。
+pub fn spawn_anthropic_bridge(
+    outcome: ChatOutcome,
+    model: &str,
+    on_first_content: std::sync::Arc<dyn Fn() + Send + Sync>,
+    retry: Option<ChatRetryFactory>,
+) -> Result<AnthropicStreamBridge, String> {
+    let mut resp = match outcome {
+        ChatOutcome::Stream(resp) => resp,
+        ChatOutcome::Error { status, body } => {
+            return Err(format!("upstream {status}: {}", truncate(&body, 500)));
+        }
+    };
+    let model = model.to_string();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    tokio::spawn(async move {
+        let mut session = AnthropicStreamSession::new(&model);
+        // 会话头（message_start + content_block_start）立即下发：客户端据此
+        // 建消息、显示光标，不必等到上游第一帧。
+        for f in session.begin() {
+            if tx.send(f).is_err() {
+                return; // 客户端已断开
+            }
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        let mut fired_hook = false;
+        let mut retries_left = STREAM_EMPTY_RETRY_MAX;
+        let started = std::time::Instant::now();
+        // 心跳定时器：长思考期间向下游发注释行保活（防中间层读超时断连）。
+        let mut hb = tokio::time::interval(Duration::from_secs(STREAM_HEARTBEAT_SECS));
+        hb.tick().await; // 立刻消费第一次 tick（interval 首次 tick 立即完成）
+        loop {
+            let chunk = match tokio::time::timeout(CHAT_IDLE_TIMEOUT, async {
+                tokio::select! {
+                    biased;
+                    _ = hb.tick() => StreamTick::Heartbeat,
+                    c = resp.chunk() => match c {
+                        Ok(Some(c)) => StreamTick::Data(c),
+                        Ok(None) => StreamTick::Eof,
+                        Err(e) => StreamTick::Err(format!("transport: {e}")),
+                    },
+                }
+            })
+            .await
+            {
+                Ok(tick) => tick,
+                Err(_) => StreamTick::Err(format!(
+                    "transport: stream idle timeout after {:?}",
+                    CHAT_IDLE_TIMEOUT
+                )),
+            };
+            match chunk {
+                StreamTick::Heartbeat => {
+                    if tx.send(STREAM_HEARTBEAT_FRAME.to_string()).is_err() {
+                        return; // 客户端已断开
+                    }
+                    continue;
+                }
+                StreamTick::Eof => break,
+                StreamTick::Err(e) => {
+                    // 断流自愈：还没吐出任何内容时，客户端无感知，重拉一次流
+                    // 常常就好了（上游/中间设备掐断大多发生在首帧前后）。
+                    // 已产出内容则绝不能重拉 —— 会把前半段重复吐一遍。
+                    if !session.saw_content() && retries_left > 0 {
+                        if let Some(factory) = &retry {
+                            retries_left -= 1;
+                            eprintln!(
+                                "[workbuddy-pool] anthropic bridge 空流中断，重拉: {e}"
+                            );
+                            match factory().await {
+                                Ok(ChatOutcome::Stream(r2)) => {
+                                    resp = r2;
+                                    buf.clear();
+                                    continue;
+                                }
+                                Ok(ChatOutcome::Error { status, body }) => {
+                                    eprintln!(
+                                        "[workbuddy-pool] anthropic bridge 重拉被拒: upstream {status} {}",
+                                        truncate(&body, 200)
+                                    );
+                                }
+                                Err(e2) => {
+                                    eprintln!(
+                                        "[workbuddy-pool] anthropic bridge 重拉失败: {e2}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    // 断流：给客户端一个可见的 error 事件再收尾，
+                    // 否则它只看到「正常结束」，无法区分完成与中断。
+                    let detail = format!(
+                        "{e}（已产出 {} 字，持续 {:.0}s）",
+                        session.chars_out(),
+                        started.elapsed().as_secs_f64()
+                    );
+                    for f in stream_error_frames(&mut session, &detail) {
+                        let _ = tx.send(f);
+                    }
+                    eprintln!("[workbuddy-pool] anthropic bridge stream error: {detail}");
+                    return;
+                }
+                StreamTick::Data(c) => buf.extend_from_slice(&c),
+            }
+            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                let raw: Vec<u8> = buf.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&raw);
+                if !feed_line_to_bridge(&tx, &mut session, &mut fired_hook, &on_first_content,
+                                        line.trim_end_matches(['\r', '\n'])) {
+                    // 上游 [DONE]：收尾后正常结束
+                    for f in session.finish() {
+                        let _ = tx.send(f);
+                    }
+                    return;
+                }
+            }
+        }
+        // 上游没发 [DONE] 就 EOF：补上残留缓冲 + 收尾帧
+        if !buf.is_empty() {
+            let line = String::from_utf8_lossy(&buf);
+            feed_line_to_bridge(&tx, &mut session, &mut fired_hook, &on_first_content,
+                                 line.trim_end_matches(['\r', '\n']));
+        }
+        for f in session.finish() {
+            let _ = tx.send(f);
+        }
+    });
+
+    Ok(AnthropicStreamBridge { rx })
+}
+
+/// 读流循环的一次 tick 结果（数据 / 心跳 / EOF / 错误）。
+enum StreamTick {
+    Data(Bytes),
+    Heartbeat,
+    Eof,
+    Err(String),
+}
+
+/// 断流时给客户端的可见信号：Anthropic `error` 事件 + 正常收尾。
+///
+/// 为什么必须有（2026-10-12 修复）：原实现只发 `finish()`（message_delta +
+/// message_stop），客户端看到的是**一次「正常完成」**——已生成的半截内容被当成
+/// 完整答案，无法区分「生成完毕」与「中途断流」，也不会触发重试。
+/// Anthropic 协议有专门的 `error` 事件类型（`{"type":"error","error":{...}}`），
+/// 客户端据此可以提示用户或自动重试。
+///
+/// 文案策略：**已产出内容时给「断流」而非「报错」**——错误类型仍是 error
+/// （不撒谎），但 message 说明「已生成部分内容，可重试补全」，避免 ZCode 把
+/// 半截答案当整轮失败直接丢弃用户已看到的文字。
+fn stream_error_frames(session: &mut AnthropicStreamSession, detail: &str) -> Vec<String> {
+    let msg = if session.saw_content() {
+        format!("生成中断（{detail}）。以上内容已保留，可重试补全。")
+    } else {
+        format!("生成失败：{detail}")
+    };
+    let mut out = vec![format!(
+        "event: error\ndata: {}\n\n",
+        json!({
+            "type": "error",
+            "error": {
+                "type": if session.saw_content() { "overloaded_error" } else { "api_error" },
+                "message": msg,
+            }
+        })
+    )];
+    out.extend(session.finish());
+    out
+}
+
+/// OpenAI 格式的断流信号（chat/completions 路径）。
+///
+/// OpenAI 没有独立 error 事件，用 `finish_reason:"error"` + 正文内说明表达；
+/// 仍不静默丢弃——静默截断是最难排查的中断形态。
+fn stream_error_frames_openai(session: &mut OpenAIStreamSession, detail: &str) -> Vec<String> {
+    let mut out = vec![session.error_chunk(&format!("上游流中断：{detail}"))];
+    out.extend(session.finish());
+    out
+}
+
+/// 测试用暴露：构造「已产出内容」的会话后取断流帧，用于验证 error 文案分支。
+///
+/// `has_content=true` 会先喂一帧正文，让 `saw_content()` 为 true ——
+/// 否则测到的永远是「无内容」分支（这个辅助函数第一版就栽在这）。
+pub fn stream_error_frames_public(detail: &str) -> Vec<String> {
+    stream_error_frames_public_with(detail, true)
+}
+
+/// 同上，但显式指定会话是否已产出内容。
+pub fn stream_error_frames_public_with(detail: &str, has_content: bool) -> Vec<String> {
+    let mut s = AnthropicStreamSession::new("workbuddy");
+    let _ = s.begin();
+    if has_content {
+        let _ = s.feed_openai_delta(&serde_json::json!({
+            "choices": [{"delta": {"content": "已产出"}}]
+        }));
+    }
+    stream_error_frames(&mut s, detail)
+}
+fn feed_line_to_bridge(
+    tx: &tokio::sync::mpsc::UnboundedSender<String>,
+    session: &mut AnthropicStreamSession,
+    fired_hook: &mut bool,
+    on_first_content: &std::sync::Arc<dyn Fn() + Send + Sync>,
+    line: &str,
+) -> bool {
+    let Some(payload) = line.strip_prefix("data:") else {
+        return true; // event: / 空行 / 注释
+    };
+    let payload = payload.trim();
+    if payload == "[DONE]" {
+        return false;
+    }
+    if payload.is_empty() {
+        return true;
+    }
+    let Ok(v) = serde_json::from_str::<Value>(payload) else {
+        return true; // 坏帧静默跳过
+    };
+    let Some(frames) = session.feed_openai_delta(&v) else {
+        return true;
+    };
+    if !*fired_hook {
+        *fired_hook = true;
+        on_first_content(); // 首帧内容到达 → 记账 + 粘性绑定
+    }
+    for f in frames {
+        if tx.send(f).is_err() {
+            return false; // 客户端已断开，提前结束
+        }
+    }
+    true
+}
 
 // ---------------------------------------------------------------------------
 // 常量（端点 / UA / 超时）
@@ -99,7 +545,27 @@ const RPC_TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
 pub const CHAT_HEADER_TIMEOUT: Duration = Duration::from_secs(45);
 /// chat SSE 流中空闲超时：超过即断流返回 Err，调用方据此释放账号租约
 /// （参考 sse.rs/idle.go 的「读块套 timeout」等价实现）。
-pub const CHAT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// 流式空闲阈值（2026-10-12 由 60s 放宽到 **150s**）。
+///
+/// 原 60s 是按「上游持续吐字」假设定的，但有两个场景会误杀：
+/// 1. 长思考：模型进入 thinking 后可能几十秒不产出任何字节；
+/// 2. 上游若改用 SSE 注释行（`: ping`）做保活、data 帧间隔拉长到 60s 以上。
+/// 两者都会让 `read_stream_chunk` 的空闲计时先到期 → 客户端在正常生成中途被切断。
+///
+/// 为什么不设总时长上限：生成时长由模型和 max_tokens 决定，网关无权替用户设限
+/// （Claude Code / ZCode 侧也没有总超时）。只保留「空闲」这一个真实故障信号。
+pub const CHAT_IDLE_TIMEOUT: Duration = Duration::from_secs(150);
+
+/// 心跳下发间隔：网关主动向下游发 SSE 注释行的节奏。
+///
+/// 这是**下游**保活（客户端 ← 网关），与上游心跳无关：
+/// 长时间思考时网关可能几十秒没有下行字节，中间的 NAT / 代理 / 客户端读超时
+/// 会误判连接已死而断开。发注释行（`: ping\n\n`）对 SSE 消费方是合法的
+/// 「无内容保活帧」，不会污染事件序列。
+pub const STREAM_HEARTBEAT_SECS: u64 = 15;
+
+/// 心跳注释行（SSE 规范里的 keep-alive 帧）。
+pub(crate) const STREAM_HEARTBEAT_FRAME: &str = ": ping\n\n";
 /// >=400 错误体读取上限 1MB（对应 Go io.LimitReader；参考 client.rs:240）。
 const ERROR_BODY_LIMIT: usize = 1 << 20;
 
@@ -269,7 +735,7 @@ pub async fn chat_stream(acc: &PoolAccount, body: &Value) -> Result<ChatOutcome,
     let url = chat_url(&acc.region);
     let prepared = prepare_body(body, &acc.region, gateway_sanitize_enabled());
     let payload = serde_json::to_vec(&prepared).map_err(|e| format!("parse: 序列化请求体失败: {e}"))?;
-    let req = apply_chat(chat_http_client().post(&url).body(payload), acc);
+    let req = apply_chat(chat_http_client_for(acc).post(&url).body(payload), acc);
     // 首字节阶段由 header 超时管（对应 Go Transport.ResponseHeaderTimeout）。
     let send = req.send();
     let resp = match tokio::time::timeout(CHAT_HEADER_TIMEOUT, send).await {
@@ -329,7 +795,8 @@ pub async fn read_stream_chunk(
 /// 5. `sanitize` 开时做基础指纹脱敏（身份句/反馈句/billing 头）。
 ///
 /// 与参考 `prepare_body_for_region` 的差异：无 efforts 缓存入口，不做
-/// reasoning_effort 降级（见模块文档「已知差异」）。
+/// **按模型**的 reasoning_effort 精细降级；但做**值域收敛**
+/// （[`normalize_reasoning_effort_field`]），使未知档位不至于引发误导性 503。
 pub fn prepare_body(body: &Value, region: &str, sanitize: bool) -> Value {
     // 非对象（数组/标量）无字段可改写，原样返回（与参考一致）。
     let Some(obj) = body.as_object() else {
@@ -339,6 +806,7 @@ pub fn prepare_body(body: &Value, region: &str, sanitize: bool) -> Value {
     obj.insert("stream".to_string(), Value::Bool(true));
     normalize_tool_choice(&mut obj);
     normalize_roles(&mut obj);
+    normalize_reasoning_effort_field(&mut obj);
     // 国际版适配放在 roles 归一化之后：developer 已被改写为 system，此时首条若
     // 已是 system 就不必补（否则会给 Codex 之类客户端多插一条）。
     if is_intl(region) {
@@ -350,6 +818,41 @@ pub fn prepare_body(body: &Value, region: &str, sanitize: bool) -> Value {
         }
     }
     Value::Object(obj)
+}
+
+/// 收敛 `reasoning_effort` 值域（2026-10-12）。
+///
+/// 上游对**未知档位**回 400，而 400 在契约 §4 里归 `ErrKind::Client`（只换号不罚）
+/// ⇒ 池内账号轮空后对外吐 **`503 无可用账号：上游返回 400`**，把「客户端参数错」
+/// 伪装成「账号不可用」（实测 `reasoning_effort:"bogus"` 复现）。
+///
+/// 此处统一收敛：已知值大小写归一为小写后**原样保留**，未知值**整字段删除**并记日志
+/// —— 宁可退回上游默认档，也不制造误导性 503 与无谓的账号轮转。
+///
+/// 未携带该字段的请求**零改动**，这是「不影响现有模型默认行为」的硬保证。
+fn normalize_reasoning_effort_field(obj: &mut Map<String, Value>) {
+    // 先取所有权再改写：`raw` 若借用 `obj`，后面的 remove/insert 会撞 E0502。
+    let Some(raw) = obj
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return;
+    };
+    match crate::modules::workbuddy_protocols::normalize_reasoning_effort(&raw) {
+        Some(e) => {
+            if e != raw.as_str() {
+                obj.insert("reasoning_effort".to_string(), Value::String(e.to_string()));
+            }
+        }
+        None => {
+            obj.remove("reasoning_effort");
+            eprintln!(
+                "[workbuddy-upstream] reasoning_effort 非已知档位 {raw:?} —— 已删除该字段\
+                 （未知值会让上游回 400，而 400 在契约 §4 里只换号 ⇒ 会被误报成 503 无可用账号）"
+            );
+        }
+    }
 }
 
 /// 保证 messages[0] 是 system（国际版协议要求）。
@@ -753,7 +1256,7 @@ pub async fn refresh_token(acc: &PoolAccount) -> Result<(String, i64), String> {
         return Err("refresh_failed: no refreshToken — re-login required".to_string());
     }
     let url = refresh_url(&acc.region);
-    let req = apply_refresh_headers(rpc_http_client().post(&url), acc);
+    let req = apply_refresh_headers(rpc_http_client_for(acc).post(&url), acc);
     let data = rpc_do_json(req).await?;
     let tok: RefreshResp = serde_json::from_value(data)
         .map_err(|e| format!("parse: refresh 响应解析失败: {e}"))?;
@@ -780,7 +1283,7 @@ pub async fn refresh_token(acc: &PoolAccount) -> Result<(String, i64), String> {
 /// 上游没给 cli agent（或清单为空）时兜底回退全量池（宁可多不可少）。
 pub async fn fetch_models(acc: &PoolAccount) -> Result<Value, String> {
     let url = models_url(&acc.region);
-    let req = apply_models(rpc_http_client().get(&url), acc);
+    let req = apply_models(rpc_http_client_for(acc).get(&url), acc);
     let resp = req.send().await.map_err(|e| format!("transport: {e}"))?;
     let status = resp.status().as_u16();
     let raw = read_body_limited(resp, ERROR_BODY_LIMIT).await?;
@@ -965,7 +1468,7 @@ pub async fn user_resource(acc: &PoolAccount) -> Result<(i64, i64), String> {
         "PackageEndTimeRangeBegin": now.format(fmt).to_string(),
         "PackageEndTimeRangeEnd": (now + chrono::Duration::days(365 * 101)).format(fmt).to_string(),
     });
-    let req = apply_billing(rpc_http_client().post(&url).json(&body), acc);
+    let req = apply_billing(rpc_http_client_for(acc).post(&url).json(&body), acc);
     let data = rpc_do_json(req).await?;
     let resp: ResourceResp = if data.is_null() {
         ResourceResp::default()
@@ -1000,24 +1503,130 @@ fn aggregate_credits(accounts: &[ResourcePackage]) -> (i64, i64) {
 // HTTP client 与公共读取工具
 // ---------------------------------------------------------------------------
 
-/// 短 RPC client（refresh/models/user_resource）：显式总超时 120s
-/// （参考 client.rs:24）。上游是公网 host，正常 client 即可——代理走 reqwest 默认的
-/// 环境变量探测（国际版在国内直连不稳定时靠它；参考 client.rs:52-53 同口径）。
-fn rpc_http_client() -> &'static reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .timeout(RPC_TOTAL_TIMEOUT)
-            .build()
-            .expect("构建 workbuddy 上游 RPC client 失败")
-    })
+/// 国际区标记：账号 region 由登录域后缀派生（`.ai→intl` / `.cn→cn`），
+/// 与 workbuddy_gateway::pool_account_from_value 同口径。
+fn is_intl_region(region: &str) -> bool {
+    region.trim() == "intl"
 }
 
-/// chat SSE client：不设总超时（流式响应可能很长），首字节由 [`CHAT_HEADER_TIMEOUT`]
-/// 约束、流中空闲由 [`read_stream_chunk`] 约束（参考 client.rs:29-30 同口径）。
-fn chat_http_client() -> &'static reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(reqwest::Client::new)
+/// 国际区出站代理（网关配置 `intl_proxy`，如 `http://127.0.0.1:18502`；空 = 不设）。
+///
+/// # 它是什么（先读这段再决定要不要填）
+///
+/// 这是一个**应急出口**，不是一个长期该有值的配置。两种网络状态的正确取值相反：
+///
+/// | `www.workbuddy.ai` 的可达性 | 正确取值 | 理由 |
+/// | --- | --- | --- |
+/// | 直连可达（DNS 解析到真实公网 IP） | **空**（直连） | 代理是多余跳板，且它一旦挂掉会**独占**故障点 |
+/// | 直连不可达（DNS 为 fake-IP 198.18.x + 真连超时） | 填可用出口 | 直连没路，只能借道 |
+///
+/// ## 🔴 2026-10-13 实翻车（务必先复测再动它）
+///
+/// 10-12 该站直连不可达，故配置了 `http://127.0.0.1:18502`（Clash 出口）。
+/// 10-13 网络已恢复直连（实测 DNS → `43.160.158.125`，`POST /v2/chat/completions`
+/// 直连 **401 = 可达**），但 **Clash 的 18501–18507 出口全线失效**（连 github 都 5s 超时）。
+/// 结果：**代理从「解决办法」变成唯一故障点**，国际区请求全部
+/// `transport: error sending request` → 池报「无可用账号」→ 客户端 **503**，
+/// 连续 11 小时每次重试都失败。清空该值并重启后 1.1s 恢复正常。
+///
+/// ⇒ **改动前必须实测**：先 `curl --noproxy '*' https://www.workbuddy.ai/`，
+/// 直连通就**不要**填代理；要填也必须先验证该出口能连通目标站。
+/// 另注：`intl_proxy` 被 [`rpc_http_client_for`] 的 `OnceLock` 固定，**改完需重启进程**。
+fn intl_proxy_config() -> String {
+    crate::modules::workbuddy_gateway::load_config().intl_proxy.trim().to_string()
+}
+
+/// 解析代理串为 reqwest::Proxy；空/非法 → None（非法值告警，可用性优先）。
+fn parse_proxy(url: Option<&str>) -> Option<reqwest::Proxy> {
+    let url = url.map(str::trim).filter(|u| !u.is_empty())?;
+    match reqwest::Proxy::all(url) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            eprintln!("[wb-upstream] intl_proxy 非法（{url}）：{e}，回落直连/环境探测");
+            None
+        }
+    }
+}
+
+/// 短 RPC client（refresh/models/user_resource）**按区域分流**：
+/// 国内区 = 原口径（reqwest 默认环境变量探测 + 120s 总超时，见下方历史注释）；
+/// 国际区 = `intl_proxy` 非空才走代理，**空则直连**（见 `intl_proxy_config` 文档的
+/// 2026-10-13 翻车记录：直连可用时填代理反而制造单点故障）。
+/// 每区 OnceLock 缓存；改 `intl_proxy` 需重启进程后生效。
+fn rpc_http_client_for(acc: &PoolAccount) -> &'static reqwest::Client {
+    static CN: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    static INTL: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if is_intl_region(&acc.region) {
+        INTL.get_or_init(|| {
+            let url = intl_proxy_config();
+            if url.is_empty() {
+                eprintln!(
+                    "[wb-upstream] intl_proxy 未配置：国际区 RPC 直连（若直连不可达，\
+                     需先实测出口可用性再填 intl_proxy，见该字段文档）"
+                );
+            }
+            build_rpc_client(Some(&url))
+        })
+    } else {
+        CN.get_or_init(|| build_rpc_client(None))
+    }
+}
+
+fn build_rpc_client(proxy_url: Option<&str>) -> reqwest::Client {
+    let mut b = reqwest::Client::builder().timeout(RPC_TOTAL_TIMEOUT);
+    if let Some(p) = parse_proxy(proxy_url) {
+        b = b.proxy(p);
+    }
+    b.build().expect("构建 workbuddy 上游 RPC client 失败")
+}
+
+/// chat SSE client **按区域分流**：
+/// 国内区 = `.no_proxy()` 原口径；国际区 = `intl_proxy` 非空才走代理，空则直连。
+///
+/// 国内区 no_proxy 的历史口径（保留）：`Client::new()` 继承**系统代理**，
+/// 而本机 `ProxyEnable=1 / ProxyServer=127.0.0.1:7897`（Clash）常开，
+/// 阶跃是国内上游（api.stepfun.com），绕代理只会让长连接 SSE 途中被重置 ——
+/// 代理重置连接后 reqwest 读 body 就会报 `error decoding response body`。
+/// 口径与 `glm_proxy.rs` 的 `.no_proxy()` 一致（其注释明写
+/// 「Clash 抖动会掐断流，见 2026-09-18 上午两起断连」）。
+///
+/// 国际区：2026-10-12 曾因直连不可达而设 `intl_proxy`；**2026-10-13 直连恢复、
+/// 该代理出口全线失效**，故清空该配置改直连（详见 `intl_proxy_config` 文档）。
+/// 其余 builder 参数与国内区完全一致。每区 OnceLock 缓存；改值需重启进程后生效。
+fn chat_http_client_for(acc: &PoolAccount) -> &'static reqwest::Client {
+    static CN: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    static INTL: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if is_intl_region(&acc.region) {
+        INTL.get_or_init(|| {
+            let url = intl_proxy_config();
+            if url.is_empty() {
+                eprintln!(
+                    "[wb-upstream] intl_proxy 未配置：国际区 chat 直连（若直连不可达，\
+                     需先实测出口可用性再填 intl_proxy，见该字段文档）"
+                );
+            }
+            build_chat_client(Some(&url))
+        })
+    } else {
+        CN.get_or_init(|| build_chat_client(None))
+    }
+}
+
+/// 注：本 crate 未开 reqwest 的 gzip/brotli/deflate feature，压缩自动解压本就
+/// 没启用，所以那三个 builder 方法不可用（编译报 `no method named gzip`）。
+/// 真正的解压缩触发面只有 chunked/connection 层，正是代理重置造成的那一类。
+fn build_chat_client(proxy_url: Option<&str>) -> reqwest::Client {
+    let mut b = reqwest::Client::builder()
+        // 长 SSE 流（step-5-preview 深度思考可达数分钟）途中，中间设备
+        // （NAT/防火墙）会因"连接空闲"回收 TCP ⇒ 上游侧被 RST ⇒ reqwest 读 body
+        // 报 `error decoding response body`。keepalive 让连接持续有探活包。
+        .tcp_keepalive(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(20));
+    b = match parse_proxy(proxy_url) {
+        Some(p) => b.proxy(p),
+        None => b.no_proxy(),
+    };
+    b.build().expect("failed to build workbuddy chat client")
 }
 
 /// 出站脱敏开关：取网关配置 `sanitize_enabled`（契约 §5，默认开、可关；
@@ -1314,6 +1923,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn intl_region_and_proxy_helpers() {
+        // 区域判定：仅 "intl"（容忍首尾空格）走国际分流；cn/空 均直连口径。
+        assert!(is_intl_region("intl"));
+        assert!(is_intl_region(" intl "));
+        assert!(!is_intl_region("cn"));
+        assert!(!is_intl_region(""));
+
+        // 代理解析：空/非法 → None（告警后回落），合法 URL → Some。
+        assert!(parse_proxy(None).is_none());
+        assert!(parse_proxy(Some("")).is_none());
+        assert!(parse_proxy(Some("   ")).is_none());
+        assert!(parse_proxy(Some("://bad")).is_none(), "非法代理应回落 None");
+        assert!(
+            parse_proxy(Some("http://127.0.0.1:18502")).is_some(),
+            "合法 http 代理应可解析"
+        );
+
+        // client 构造三态（代理/空/无）不得 panic（2026-10-12 intl 可达性修复）。
+        let _ = build_chat_client(Some("http://127.0.0.1:18502"));
+        let _ = build_chat_client(Some(""));
+        let _ = build_chat_client(None);
+        let _ = build_rpc_client(Some("http://127.0.0.1:18502"));
+        let _ = build_rpc_client(None);
+    }
+
+    #[test]
     fn intl_static_models_shape_and_provenance() {
         let list = intl_static_models();
         // 参考实现捕获 + 2026-09-25 本机国际版实测校准后的 23 个国际版模型。
@@ -1554,6 +2189,48 @@ mod tests {
         assert_eq!(out["stream"], json!(true));
         let out = prepare_body(&json!({"model": "m"}), "intl", false);
         assert_eq!(out["stream"], json!(true));
+    }
+
+    // ---- reasoning_effort 值域收敛（2026-10-12）----
+
+    /// 🔴 回归守卫：**未携带该字段的请求逐字不变**（否则会改写现有模型的默认档位）。
+    #[test]
+    fn prepare_body_effort_absent_keeps_body_identical() {
+        let src = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        let out = prepare_body(&src, "cn", false);
+        assert!(out.get("reasoning_effort").is_none());
+        assert_eq!(out["messages"], src["messages"]);
+        assert_eq!(out["model"], json!("m"));
+    }
+
+    #[test]
+    fn prepare_body_effort_known_is_passed_through() {
+        for e in ["low", "medium", "high", "xhigh", "max"] {
+            let out = prepare_body(&json!({"model": "m", "reasoning_effort": e}), "cn", false);
+            assert_eq!(out["reasoning_effort"], json!(e), "{e} 应原样保留");
+        }
+    }
+
+    #[test]
+    fn prepare_body_effort_case_insensitive_normalized() {
+        let out = prepare_body(&json!({"model": "m", "reasoning_effort": "HIGH"}), "cn", false);
+        assert_eq!(out["reasoning_effort"], json!("high"));
+    }
+
+    /// 未知档位必须被删除：透传 ⇒ 上游 400 ⇒ 契约 §4「只换号」⇒ 误报 503 无可用账号。
+    #[test]
+    fn prepare_body_effort_unknown_is_dropped() {
+        for e in ["bogus", "ultra", "h1gh"] {
+            let out = prepare_body(&json!({"model": "m", "reasoning_effort": e}), "cn", false);
+            assert!(out.get("reasoning_effort").is_none(), "{e:?} 必须被删除");
+            assert_eq!(out["model"], json!("m"), "其余字段不受影响");
+        }
+    }
+
+    #[test]
+    fn prepare_body_effort_non_string_is_dropped() {
+        let out = prepare_body(&json!({"model": "m", "reasoning_effort": 42}), "cn", false);
+        assert_eq!(out["reasoning_effort"], json!(42), "非字符串不归本函数管，原样保留");
     }
 
     #[test]

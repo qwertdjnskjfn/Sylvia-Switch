@@ -1284,7 +1284,14 @@ fn is_native_transient_error(msg: &str) -> bool {
 fn native_failure_should_fallback(
     requested: Option<&str>,
     catalog: Option<&crate::modules::trae_acp::NativeCatalog>,
+    message: &str,
 ) -> bool {
+    // 🔴 会话未隔离（宿主把 API 调用并到用户当前对话）→ **必须**回落。
+    // 此时 native 不是「模型不匹配」而是「通道不可安全使用」，与目录内外的
+    // 判定无关；继续返回错误只会让调用方拿不到答案，回落才是可用的正解。
+    if message.contains(crate::modules::trae_acp::SESSION_REUSE_MARK) {
+        return true;
+    }
     match (requested, catalog) {
         (None, _) => true,
         (_, None) => true,
@@ -1365,8 +1372,9 @@ pub async fn chat_completions_native_first(body: Value) -> Result<NativeFirstCha
             rx: upstream.rx,
         }),
         // ③ native 失败 → 缺省 model / 目录不可用时兜底；目录内显式 model 不兜底。
+        //    例外：会话未隔离（SESSION_REUSE_MARK）**一律兜底**（见该函数文档）。
         Err(err) => {
-            if native_failure_should_fallback(requested.as_deref(), catalog.as_ref()) {
+            if native_failure_should_fallback(requested.as_deref(), catalog.as_ref(), &err.1) {
                 opencode_fallback(body, stream).await
             } else {
                 Err(err)
@@ -1637,17 +1645,34 @@ mod tests {
         // 目录内显式 model → 不兜底（裸 id 兜底必失败且掩盖 native 真实错误）。
         assert!(!native_failure_should_fallback(
             Some("glm-5.3-flash"),
-            Some(&catalog)
+            Some(&catalog),
+            "无活跃实例"
         ));
         // 缺省 model → 兜底 OpenCode 默认（WorkBuddy 未开时网关仍可用）。
-        assert!(native_failure_should_fallback(None, Some(&catalog)));
+        assert!(native_failure_should_fallback(None, Some(&catalog), "无活跃实例"));
         // 目录不可用 → 兜底（保持「无活跃实例→兜底」语义）。
-        assert!(native_failure_should_fallback(Some("glm-5.3-flash"), None));
-        assert!(native_failure_should_fallback(None, None));
+        assert!(native_failure_should_fallback(
+            Some("glm-5.3-flash"),
+            None,
+            "无活跃实例"
+        ));
+        assert!(native_failure_should_fallback(None, None, "无活跃实例"));
         // 目录可用但 id ∉ 目录 → 兜底（该路径本就 ② 直落兜底，防御性覆盖）。
         assert!(native_failure_should_fallback(
             Some("opencode/mimo-v2.6-flash-free"),
-            Some(&catalog)
+            Some(&catalog),
+            "无活跃实例"
+        ));
+        // 🔴 会话未隔离 → **目录内显式 model 也必须兜底**（否则调用方拿不到答案，
+        // 且 native 会继续把请求注入用户对话）。
+        let reuse_msg = format!(
+            "{}：session/new 返回的会话与宿主正在使用的会话相同",
+            crate::modules::trae_acp::SESSION_REUSE_MARK
+        );
+        assert!(native_failure_should_fallback(
+            Some("glm-5.3-flash"),
+            Some(&catalog),
+            &reuse_msg
         ));
     }
 }

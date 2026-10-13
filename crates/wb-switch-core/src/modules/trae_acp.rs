@@ -162,6 +162,41 @@ fn native_catalog_probe_cwd() -> String {
         .to_string()
 }
 
+/// 会话未隔离时的错误标记（供 workbuddy_proxy 识别并**强制走 OpenCode 兜底**）。
+pub const SESSION_REUSE_MARK: &str = "ACP 会话未隔离";
+
+/// `session/new` 返回的会话是否就是**宿主当前正在使用的会话**。
+///
+/// 🔴 为什么必须拦（2026-10-12 实证，用户报障「模型输出不相关内容」的根因）：
+/// 宿主可能不按 cwd 新建会话，而是直接返回它当前会话 —— 实测在全新临时目录上
+/// `session/new` 仍回 `f8830d80-…`，与注册表条目的 sessionId 逐字相同。
+/// 此时继续 `session/prompt` 会把 API 调用方的问题**注入用户真实对话**：
+/// ① 调用方收到掺了用户上下文的答案（表现为「不相关内容」）；
+/// ② 用户的对话被网关请求占据；③ 用户会话若正在生成，请求会一直挂到超时。
+/// ⇒ 命中即拒绝，宁可失败也不污染。
+fn is_host_active_session(session_id: &str) -> bool {
+    let now = now_ms();
+    let Ok(entries) = std::fs::read_dir(sessions_dir()) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Some(hit) = parse_registry_entry(&text) else {
+            continue;
+        };
+        if is_fresh(hit.last_heartbeat, now) && hit.session_id == session_id {
+            return true;
+        }
+    }
+    false
+}
+
 /// WorkBuddy 内置模型目录（契约 §3.3）：300s TTL 缓存，缓存内不重打上游。
 pub async fn native_models_catalog() -> Result<NativeCatalog, String> {
     {
@@ -596,6 +631,13 @@ pub async fn chat_completions(body: Value) -> Result<TraeAcpChat, (u16, String)>
             ),
         ));
     }
+
+    // ④b 会话隔离**不可依赖 cwd**（2026-10-12 实证）。
+    //     先前假设「换一个没有历史绑定的 cwd 就能拿到干净会话」，实测**不成立**：
+    //     对全新临时目录调用 `session/new`，仍有宿主直接返回**它当前正在用的会话**
+    //     （sessionId 与注册表条目逐字相同）。因此改在拿到会话后做**身份守卫**
+    //     （见 run_attempt 内 is_host_active_session），命中即拒绝，绝不注入用户对话。
+    //     同时撤回「传隔离 cwd」——传不存在的目录还会让宿主建不出工作区而挂死。
 
     // ⑤ ACP 转发（pump 任务独立跑，事件经 channel 汇出；断线重连一次在 pump 内）。
     let (tx, mut rx) = tokio::sync::mpsc::channel::<PromptEvent>(64);
@@ -1293,6 +1335,21 @@ async fn run_attempt(
             })
         }
     };
+    // 3b) 🔴 会话身份守卫：宿主未隔离会话时**拒绝**，绝不把请求注入用户对话。
+    //     命中场景：宿主对任意 cwd 都返回它当前正在用的会话（实测，见
+    //     is_host_active_session 文档）。此路径既污染用户对话、又常伴随长时间
+    //     挂起（用户会话正在生成），必须在 prompt 之前挡住。
+    if is_host_active_session(&session_id) {
+        return Err(AttemptError {
+            message: format!(
+                "{SESSION_REUSE_MARK}：session/new 返回的会话（{session_id}）\
+                 与宿主正在使用的会话相同，宿主未为 API 调用新建会话。\
+                 继续转发会把请求注入你正在使用的对话并可能挂起，已拒绝。\
+                 请改用 OpenCode 借道通道，或稍后在宿主空闲时重试。"
+            ),
+            emitted,
+        });
+    }
     // 4) best-effort set_mode：API 转发场景无人应答工具权限请求，默认 bypass
     //    （真实控制面是 cwd 白名单）；模式不存在等失败不影响主流程。
     let _ = acp_call(
@@ -1645,6 +1702,21 @@ mod tests {
         // 空值不命中。
         assert!(!cwd_matches("", "E:\\proj"));
         assert!(!cwd_matches("E:\\proj", ""));
+    }
+
+    #[test]
+    fn session_reuse_guard_message_is_marked_for_fallback() {
+        // 🔴 契约：workbuddy_proxy 靠 SESSION_REUSE_MARK 识别该错误并**强制走
+        // OpenCode 兜底**。改动拒用文案时必须保留该标记，否则 native 失败会
+        // 直接 502 而不回落（曾因文案改动断链过一次，这里固化住）。
+        let message = format!(
+            "{SESSION_REUSE_MARK}：session/new 返回的会话（abc-123）\
+             与宿主正在使用的会话相同，宿主未为 API 调用新建会话。"
+        );
+        assert!(message.contains(SESSION_REUSE_MARK));
+        assert!(!SESSION_REUSE_MARK.is_empty());
+        // 标记必须是稳定的中文短语，且不得含正则元字符以外的空白歧义。
+        assert_eq!(SESSION_REUSE_MARK, "ACP 会话未隔离");
     }
 
     #[test]

@@ -136,6 +136,534 @@ fn anthropic_frame(event: &str, payload: &Value) -> String {
     format!("event: {event}\ndata: {payload}\n\n")
 }
 
+/// 真流式 OpenAI chat 会话（2026-10-12 新增，与 [`AnthropicStreamSession`] 同构）。
+///
+/// 池网关的 `/workbuddy-pool/v1/chat/completions`（OpenAI 客户端）与
+/// `/responses`（Codex CLI）原先和 messages 一样是伪流式：聚合后用
+/// `workbuddy_pool_chat_frames` 补帧再 `concat()` 一次性发出。
+/// 这里补上真流式，让两条路径与 messages 口径一致。
+///
+/// 与 Anthropic 的差异：OpenAI 帧没有「内容块」概念 —— 每帧一个
+/// `chat.completion.chunk`，正文进 `delta.content`、思考进 `delta.reasoning_content`、
+/// 工具进 `delta.tool_calls`；收尾帧带 `finish_reason` + `usage`，末帧 `data: [DONE]`。
+pub struct OpenAIStreamSession {
+    id: String,
+    created: i64,
+    model: String,
+    usage: Option<Value>,
+    saw_event: bool,
+    has_tool_calls: bool,
+    role_sent: bool,
+    /// 已收尾标记：finish() 幂等，防止断流路径重复吐收尾帧
+    finished: bool,
+    /// 已产出的正文字符数（断流诊断用：error 帧带「已产出 N 字」）
+    chars_out: usize,
+}
+
+impl OpenAIStreamSession {
+    pub fn new(model: &str) -> Self {
+        Self {
+            id: format!("chatcmpl-wbpool-{}", crate::modules::config::now_ms()),
+            created: crate::modules::config::now_ms() / 1000,
+            model: if model.trim().is_empty() {
+                "workbuddy".to_string()
+            } else {
+                model.to_string()
+            },
+            usage: None,
+            saw_event: false,
+            has_tool_calls: false,
+            role_sent: false,
+            finished: false,
+            chars_out: 0,
+        }
+    }
+
+    /// 已产出的正文字符数（断流 error 帧的诊断信息）。
+    pub fn chars_out(&self) -> usize {
+        self.chars_out
+    }
+
+    fn chunk(&self, delta: Value, finish: Option<&str>) -> String {
+        let mut c = json!({
+            "id": self.id,
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "model": self.model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        });
+        if let Some(u) = &self.usage {
+            c["usage"] = u.clone();
+        }
+        format!("data: {c}\n\n")
+    }
+
+    /// 首帧：带 `role:"assistant"` 的空 delta（OpenAI 客户端惯例）。
+    pub fn begin(&mut self) -> Vec<String> {
+        vec![self.chunk(json!({"role": "assistant", "content": ""}), None)]
+    }
+
+    /// 吃一个上游 `data:` JSON 帧，产出一帧 OpenAI chunk。非内容帧返回 `None`。
+    pub fn feed_openai_delta(&mut self, payload: &Value) -> Option<String> {
+        if let Some(m) = payload.get("model").and_then(Value::as_str) {
+            if !m.is_empty() {
+                self.model = m.to_string();
+            }
+        }
+        if let Some(u) = payload.get("usage") {
+            if u.is_object() {
+                self.usage = Some(u.clone());
+            }
+        }
+        let choice = payload
+            .get("choices")?
+            .as_array()?
+            .first()?
+            .as_object()?;
+        let delta = choice.get("delta").and_then(Value::as_object)?;
+        let mut out = serde_json::Map::new();
+        if let Some(r) = delta.get("reasoning_content").and_then(Value::as_str) {
+            if !r.is_empty() {
+                out.insert("reasoning_content".to_string(), json!(r));
+            }
+        }
+        if let Some(t) = delta.get("content").and_then(Value::as_str) {
+            if !t.is_empty() {
+                out.insert("content".to_string(), json!(t));
+            }
+        }
+        if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+            if !calls.is_empty() {
+                self.has_tool_calls = true;
+                out.insert("tool_calls".to_string(), Value::Array(calls.clone()));
+            }
+        }
+        if out.is_empty() {
+            return None;
+        }
+        self.saw_event = true;
+        self.chars_out += out
+            .get("content")
+            .and_then(Value::as_str)
+            .map(|t| t.chars().count())
+            .unwrap_or(0);
+        Some(self.chunk(Value::Object(out), None))
+    }
+
+    pub fn saw_content(&self) -> bool {
+        self.saw_event
+    }
+
+    /// 收尾：finish_reason 帧（带 usage）+ `[DONE]`。
+    ///
+    /// 幂等：`finished` 保证多次调用不会重复产收尾帧（断流路径会先 error_chunk
+    /// 再 finish，两处都要正常收尾，若 finish 可重入就会吐出两套 finish_reason，
+    /// 客户端会误判为两轮响应）。
+    pub fn finish(&mut self) -> Vec<String> {
+        if self.finished {
+            return Vec::new();
+        }
+        self.finished = true;
+        let finish = if self.has_tool_calls { "tool_calls" } else { "stop" };
+        vec![self.chunk(json!({}), Some(finish)), "data: [DONE]\n\n".to_string()]
+    }
+
+    /// 断流信号帧（`finish_reason:"error"` + 说明正文）。
+    pub(crate) fn error_chunk(&self, msg: &str) -> String {
+        self.chunk(
+            json!({"content": format!("\n\n[stream error] {msg}")}),
+            Some("error"),
+        )
+    }
+}
+
+/// 取流式 tool_call 分片的 index：兼容数字 / 字符串数字 / 缺省三种上游形态。
+///
+/// 与 `api.rs workbuddy_pool_tool_call_index` 同口径（只认数字会让多个并行
+/// 工具调用被静默合并进槽位 0）。core 与 server 各有一份是因为分属两个 crate
+/// 且 server 侧不依赖 core 的内部符号。
+fn tool_call_index(call: &serde_json::Map<String, Value>) -> i64 {
+    match call.get("index") {
+        Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)).unwrap_or(0),
+        Some(Value::String(s)) => s.trim().parse::<i64>().ok().filter(|&n| n >= 0).unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// 真流式 Anthropic 会话（2026-10-12 新增）。
+///
+/// # 为什么需要它
+///
+/// 原来的流式路径是**伪流式**：池网关先把上游 SSE 读干、聚合成完整字符串，再调
+/// [`anthropic_stream_frames`] 用完整文本补出一串帧，最后 `Body::from(frames.concat())`
+/// 一次性返回。实测表现（2026-10-12）：三个模型全部「首帧时刻 == 末帧时刻」，
+/// 34 帧在同一毫秒齐发，最大帧间隔 0.0s。
+///
+/// 危害有两处：
+/// 1. 长思考模型（step-5-preview 思考 40s+）期间客户端收不到任何字节，
+///    网关的 60s 空闲超时会先一步掐断 → 客户端只看到半句话；
+/// 2. 「工作 1 分 44 秒后突然全部吐出」体感上等同卡死，用户会以为失败。
+///
+/// # 用法
+///
+/// ```
+/// use wb_switch_core::modules::workbuddy_protocols::AnthropicStreamSession;
+/// use serde_json::json;
+/// let mut s = AnthropicStreamSession::new("step-5-preview");
+/// let head = s.begin();                       // message_start + content_block_start
+/// // 上游每来一个 data 帧：
+/// let upstream = json!({"choices": [{"delta": {"content": "你好"}}]});
+/// let out = s.feed_openai_delta(&upstream);   // Option<Vec<String>>，非内容帧返回 None
+/// let tail = s.finish();                      // 收尾三帧 + usage
+/// assert!(!head.is_empty());
+/// assert!(out.is_some());
+/// assert!(!tail.is_empty());
+/// ```
+///
+/// 文本块下标固定 0；reasoning 段用 `index: 1` 的 `thinking_delta` 单独占块
+/// （Claude 客户端据此渲染思考区）。reasoning 与正文各自连续，中途出现另一类时
+/// 开新块，交替出现时按需再开新块（Anthropic 允许同一条消息多个内容块）。
+pub struct AnthropicStreamSession {
+    model: String,
+    msg_id: String,
+    text_block_open: bool,
+    think_block_open: bool,
+    next_index: i64,
+    usage: Option<Value>,
+    saw_event: bool,
+    /// 工具调用块状态：上游 index → (tool_use 块 index, 已产出的 id/name)。
+    /// Anthropic 的流式工具协议是 `content_block_start` 给 id+name，随后
+    /// `input_json_delta` 逐片拼 arguments —— 不能像文本那样整段一次性给。
+    tool_blocks: std::collections::HashMap<i64, ToolBlockState>,
+    /// 已收尾标记（finish 幂等）
+    finished: bool,
+    /// 已产出的正文字符数（断流诊断用：error 帧带「已产出 N 字」）
+    chars_out: usize,
+}
+
+#[derive(Clone)]
+struct ToolBlockState {
+    block_index: i64,
+    emitted_id: bool,
+}
+
+impl AnthropicStreamSession {
+    pub fn new(model: &str) -> Self {
+        Self {
+            model: if model.trim().is_empty() {
+                "workbuddy".to_string()
+            } else {
+                model.to_string()
+            },
+            msg_id: new_message_id(),
+            text_block_open: false,
+            think_block_open: false,
+            next_index: 0,
+            usage: None,
+            saw_event: false,
+            tool_blocks: std::collections::HashMap::new(),
+            finished: false,
+            chars_out: 0,
+        }
+    }
+
+    /// 已产出的正文字符数（断流 error 帧的诊断信息）。
+    pub fn chars_out(&self) -> usize {
+        self.chars_out
+    }
+
+    /// 会话头两帧：message_start + content_block_start(text)。
+    ///
+    /// text 块在这里就开（而非等到有正文才开）：Claude 客户端按块下标渲染，
+    /// 先开空块再灌 delta 是标准做法，能让 UI 立刻显示光标。
+    pub fn begin(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        out.push(anthropic_frame(
+            "message_start",
+            &json!({
+                "type": "message_start",
+                "message": {
+                    "id": self.msg_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": self.model,
+                    "content": [],
+                    "stop_reason": Value::Null,
+                    "stop_sequence": Value::Null,
+                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                },
+            }),
+        ));
+        let idx = self.next_index;
+        self.next_index += 1;
+        self.text_block_open = true;
+        out.push(anthropic_frame(
+            "content_block_start",
+            &json!({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {"type": "text", "text": ""},
+            }),
+        ));
+        out
+    }
+
+    /// 吃掉一个上游 `data:` 的 JSON 帧，产出应立即下发的 Anthropic 帧。
+    ///
+    /// 返回 `None` = 这一帧没有可下发的内容（keepalive / usage-only / 结束标记），
+    /// 调用方直接跳过即可。usage 与 model 会被记住，供 [`Self::finish`] 使用。
+    pub fn feed_openai_delta(&mut self, payload: &Value) -> Option<Vec<String>> {
+        if let Some(m) = payload.get("model").and_then(Value::as_str) {
+            if !m.is_empty() {
+                self.model = m.to_string();
+            }
+        }
+        if let Some(u) = payload.get("usage") {
+            if u.is_object() {
+                self.usage = Some(u.clone());
+            }
+        }
+        let choices = payload.get("choices")?.as_array()?;
+        let mut out: Vec<String> = Vec::new();
+        for choice in choices {
+            let Some(delta) = choice.get("delta").and_then(Value::as_object) else {
+                continue;
+            };
+            // reasoning_content → thinking_delta（先于正文，让 UI 先显示思考）
+            if let Some(r) = delta.get("reasoning_content").and_then(Value::as_str) {
+                if !r.is_empty() {
+                    self.saw_event = true;
+                    out.extend(self.push_thinking(r));
+                }
+            }
+            if let Some(text) = delta.get("content").and_then(Value::as_str) {
+                if !text.is_empty() {
+                    self.saw_event = true;
+                    out.extend(self.push_text(text));
+                }
+            }
+            // 工具调用分片：首个分片带 id/name（开 tool_use 块），后续只带
+            // arguments 片段（走 input_json_delta 增量拼）。
+            if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                for call in calls {
+                    let Some(call) = call.as_object() else {
+                        continue;
+                    };
+                    self.saw_event = true;
+                    out.extend(self.push_tool_call(call));
+                }
+            }
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    }
+
+    /// 上游 `delta.tool_calls[]` 分片 → Anthropic `tool_use` 块。
+    ///
+    /// 上游形态（OpenAI 兼容）：`{index, id?, function:{name?, arguments?}}`，
+    /// 其中 `arguments` 是**字符串片段**（逐片到达，拼起来才是完整 JSON）。
+    /// Anthropic 侧要求：先 `content_block_start`（带 id + name），再逐个
+    /// `input_json_delta`，块结束时客户端自行 parse 拼出的 JSON。
+    fn push_tool_call(&mut self, call: &serde_json::Map<String, Value>) -> Vec<String> {
+        let idx = tool_call_index(call);
+        let func = call.get("function").and_then(Value::as_object);
+        let name = func
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let id = call.get("id").and_then(Value::as_str).unwrap_or("");
+        let args_frag = func
+            .and_then(|f| f.get("arguments"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+
+        let mut out = Vec::new();
+        // 判定「是否该 index 的首片」必须用 HashMap 是否新建，不能用
+        // `block_index == next_index` 那种位置推断 —— 并行调用（idx=0/1 同一帧）
+        // 下后者会失配，导致块根本不开（实测 content_block_start 少一半）。
+        let is_first_for_idx = !self.tool_blocks.contains_key(&idx);
+        let next_block_index = self.next_index;
+        let st = self.tool_blocks.entry(idx).or_insert_with(|| ToolBlockState {
+            block_index: next_block_index,
+            emitted_id: true,
+        });
+        // 首次遇到该 index：先关掉进行中的正文/思考块，保证块不交错。
+        if is_first_for_idx {
+            if self.text_block_open {
+                out.push(anthropic_frame(
+                    "content_block_stop",
+                    &json!({"type": "content_block_stop", "index": self.next_index - 1}),
+                ));
+                self.text_block_open = false;
+            }
+            if self.think_block_open {
+                out.push(anthropic_frame(
+                    "content_block_stop",
+                    &json!({"type": "content_block_stop", "index": self.next_index - 1}),
+                ));
+                self.think_block_open = false;
+            }
+            self.next_index += 1;
+            let tool_id = if id.is_empty() {
+                format!("toolu_{}", uuid::Uuid::new_v4().simple())
+            } else {
+                id.to_string()
+            };
+            out.push(anthropic_frame(
+                "content_block_start",
+                &json!({
+                    "type": "content_block_start",
+                    "index": st.block_index,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": tool_id,
+                        "name": name,
+                        "input": {},
+                    },
+                }),
+            ));
+        }
+        // arguments 片段（首个分片就带完整 JSON 也会走这里，客户端能正常 parse）
+        if !args_frag.is_empty() {
+            out.push(anthropic_frame(
+                "content_block_delta",
+                &json!({
+                    "type": "content_block_delta",
+                    "index": st.block_index,
+                    "delta": {"type": "input_json_delta", "partial_json": args_frag},
+                }),
+            ));
+        }
+        out
+    }
+
+    fn push_text(&mut self, text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.text_block_open {
+            let idx = self.next_index;
+            self.next_index += 1;
+            self.text_block_open = true;
+            out.push(anthropic_frame(
+                "content_block_start",
+                &json!({
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": {"type": "text", "text": ""},
+                }),
+            ));
+        }
+        out.push(anthropic_frame(
+            "content_block_delta",
+            &json!({
+                "type": "content_block_delta",
+                "index": self.next_index - 1,
+                "delta": {"type": "text_delta", "text": text},
+            }),
+        ));
+        self.chars_out += text.chars().count();
+        out
+    }
+
+    fn push_thinking(&mut self, text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.think_block_open {
+            // 正文块已经开着就先关掉，保证 thinking / text 不交错在同一块里
+            if self.text_block_open {
+                out.push(anthropic_frame(
+                    "content_block_stop",
+                    &json!({"type": "content_block_stop", "index": self.next_index - 1}),
+                ));
+                self.text_block_open = false;
+            }
+            let idx = self.next_index;
+            self.next_index += 1;
+            self.think_block_open = true;
+            out.push(anthropic_frame(
+                "content_block_start",
+                &json!({
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": {"type": "thinking", "thinking": ""},
+                }),
+            ));
+        }
+        out.push(anthropic_frame(
+            "content_block_delta",
+            &json!({
+                "type": "content_block_delta",
+                "index": self.next_index - 1,
+                "delta": {"type": "thinking_delta", "thinking": text},
+            }),
+        ));
+        out
+    }
+
+    /// 是否见过任何可下发内容（用于区分「空流」与正常空回复）。
+    pub fn saw_content(&self) -> bool {
+        self.saw_event
+    }
+
+    /// 收尾：补齐未关闭的内容块 + message_delta(usage) + message_stop。
+    ///
+    /// 幂等：`finished` 保证多次调用不重复吐收尾帧（断流路径会先发 `error`
+    /// 事件再收尾，两处都调用本函数）。
+    pub fn finish(&mut self) -> Vec<String> {
+        if self.finished {
+            return Vec::new();
+        }
+        self.finished = true;
+        let mut out = Vec::new();
+        if self.text_block_open {
+            out.push(anthropic_frame(
+                "content_block_stop",
+                &json!({"type": "content_block_stop", "index": self.next_index - 1}),
+            ));
+            self.text_block_open = false;
+        }
+        if self.think_block_open {
+            out.push(anthropic_frame(
+                "content_block_stop",
+                &json!({"type": "content_block_stop", "index": self.next_index - 1}),
+            ));
+            self.think_block_open = false;
+        }
+        // 工具块：按 block_index 升序关闭（HashMap 无序，不排序会乱序）。
+        let mut tool_idx: Vec<i64> = self.tool_blocks.values().map(|s| s.block_index).collect();
+        tool_idx.sort_unstable();
+        for bi in tool_idx {
+            out.push(anthropic_frame(
+                "content_block_stop",
+                &json!({"type": "content_block_stop", "index": bi}),
+            ));
+        }
+        let (input_tokens, output_tokens, _) = usage_triplet(
+            self.usage.as_ref().unwrap_or(&Value::Null),
+        );
+        out.push(anthropic_frame(
+            "message_delta",
+            &json!({
+                "type": "message_delta",
+                // 有工具调用时 stop_reason 必须是 tool_use，客户端据此回灌
+                // tool_result 并继续下一轮（标 stop 会让 Claude Code 认为
+                // 模型答完了，工具永远等不到结果）。
+                "delta": {
+                    "stop_reason": if self.tool_blocks.is_empty() { "end_turn" } else { "tool_use" },
+                    "stop_sequence": Value::Null
+                },
+                "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+            }),
+        ));
+        out.push(anthropic_frame(
+            "message_stop",
+            &json!({"type": "message_stop"}),
+        ));
+        out
+    }
+}
+
 /// 推一帧 Responses 事件并自增 `sequence_number`。
 ///
 /// 序号递收取在一处：手写 10 个帧号容易错号，而 Codex 对序号单调性有校验。
@@ -478,6 +1006,63 @@ fn responses_message_item(item_id: &str, status: &str, text: Option<&str>) -> Va
 }
 
 // ---------------------------------------------------------------------------
+// 思考档位归一化（2026-10-12）
+// ---------------------------------------------------------------------------
+
+/// WorkBuddy 上游认识的 `reasoning_effort` 取值。
+///
+/// 实测口径（2026-10-12，`deepseek-v4.1-flash` / 池通道 `/v1/chat/completions`）：
+/// - **缺省 → 0 个思考帧**（不思考，长思考模型在网关空闲阈值内也吐不出东西）；
+/// - `low` / `medium` / `high` / `max` / `xhigh` → 均正常思考；
+/// - **未知值 → 上游 400**。而 400 在契约 §4 里归 [`crate::modules::workbuddy_errors::ErrKind::Client`]
+///   （「只换号不罚」）⇒ 池内账号轮空后对外吐
+///   **`503 {"message":"无可用账号：上游返回 400"}`** —— 文案把「客户端参数错」伪装成
+///   「账号不可用」，既误导排障又白白消耗账号轮转。
+///
+/// 因此**入口必须先收敛值域**，绝不让未知值出去。`none`/`minimal` 是 OpenAI 侧
+/// 常见写法，一并放行交给上游判定（它们本就在上游的容忍集内）。
+pub(crate) const KNOWN_REASONING_EFFORTS: &[&str] =
+    &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// 归一化思考档位：已知值原样返回（大小写不敏感），未知值 / 空串 → `None`。
+pub(crate) fn normalize_reasoning_effort(raw: &str) -> Option<&'static str> {
+    let v = raw.trim().to_ascii_lowercase();
+    if v.is_empty() {
+        return None;
+    }
+    KNOWN_REASONING_EFFORTS.iter().copied().find(|e| *e == v)
+}
+
+/// Anthropic `thinking` 块 → `reasoning_effort`（网关侧翻译）。
+///
+/// # 为什么需要这层翻译
+///
+/// WorkBuddy 上游是 OpenAI 兼容的 chat/completions，**不认 Anthropic 的 `thinking` 字段**
+/// （实测：只发 `thinking:{"type":"enabled","budget_tokens":2048}` ⇒ **0** 个思考帧；
+/// 只发 `reasoning_effort:"max"` ⇒ **14** 个思考帧，同一模型同一提示词）。
+/// 而 Anthropic 形态的客户端（Claude Code / ZCode 的 anthropic-messages 路径）
+/// 只会发 `thinking`，不翻译就表现为「怎么调都不思考」。
+///
+/// # 分档口径
+///
+/// 按 Anthropic 官方量级取整：`<4k` → low，`<32k` → medium，`<64k` → high，`≥64k` → max；
+/// `budget_tokens` 缺失时回落 `medium`（与客户端默认档一致）。
+/// `type != "enabled"`（含 `disabled`）一律返回 `None`：尊重「不要思考」的显式意图。
+fn anthropic_thinking_to_effort(thinking: &Value) -> Option<&'static str> {
+    let kind = thinking.get("type").and_then(Value::as_str)?;
+    if !kind.eq_ignore_ascii_case("enabled") {
+        return None;
+    }
+    Some(match thinking.get("budget_tokens").and_then(Value::as_u64) {
+        None => "medium",
+        Some(b) if b < 4_096 => "low",
+        Some(b) if b < 32_768 => "medium",
+        Some(b) if b < 65_536 => "high",
+        Some(_) => "max",
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Anthropic Messages API（Claude Code / CC Switch）
 // ---------------------------------------------------------------------------
 
@@ -535,6 +1120,60 @@ pub fn anthropic_req_to_chat(body: &Value) -> Value {
     }
     if let Some(tools) = anthropic_tools_to_chat(body) {
         payload.insert("tools".to_string(), tools);
+    }
+    // ---- 采样参数透传（2026-10-12 补：原先整段缺失，导致「思考强度调不动」）----
+    // temperature：Anthropic 与 OpenAI 同名同语义，直接透传（null/缺省都不插，
+    // 让上游用自己的默认值——网关不该替上游决定采样温度）。
+    for key in ["temperature", "top_p", "top_k", "presence_penalty", "frequency_penalty"] {
+        if let Some(v) = body.get(key) {
+            if !v.is_null() {
+                payload.insert(key.to_string(), v.clone());
+            }
+        }
+    }
+    // thinking：Anthropic 的扩展思考块原样透传。
+    // ⚠️ 注意 WorkBuddy 上游**只认 `reasoning_effort`，不认 `thinking`**（见
+    // `anthropic_thinking_to_effort` 的实测口径）。保留透传是为了不破坏
+    // 「上游将来认了 thinking」与其它复用本翻译层的场景，**真正开思考靠下面的第二段**。
+    if let Some(v) = body.get("thinking") {
+        if !v.is_null() {
+            payload.insert("thinking".to_string(), v.clone());
+        }
+    }
+    // reasoning_effort：WorkBuddy 上游**唯一认**的思考开关。
+    //
+    // 两路来源，优先级从高到低：
+    //   ① 客户端显式传的 `reasoning_effort`（归一化后透传）；
+    //   ② Anthropic `thinking` 块按 budget_tokens 推导。
+    //
+    // 🔴 **两路都没有 ⇒ 一个字段都不插**。这是「不影响现有模型默认行为」的硬保证：
+    //    改造前后，未表达思考意图的请求出站体逐字一致（`step-5-preview` 这类
+    //    「上游默认就思考」的模型因此保持原状，`space-bunny` / `deepseek-v4.1-flash`
+    //    这类「默认不思考」的模型也不会被意外开启）。
+    let mut effort: Option<&'static str> = None;
+    if let Some(raw) = body.get("reasoning_effort").and_then(Value::as_str) {
+        match normalize_reasoning_effort(raw) {
+            Some(e) => effort = Some(e),
+            None => eprintln!(
+                "[workbuddy-protocols] reasoning_effort 非已知档位 {raw:?} —— 已丢弃该字段。\
+                 （未知值会让上游回 400，而 400 在契约 §4 里是「只换号」，\
+                 轮空后会被误报成 503「无可用账号」，故必须在此收敛值域）"
+            ),
+        }
+    }
+    if effort.is_none() {
+        if let Some(v) = body.get("thinking").filter(|v| !v.is_null()) {
+            effort = anthropic_thinking_to_effort(v);
+        }
+    }
+    if let Some(e) = effort {
+        payload.insert("reasoning_effort".to_string(), json!(e));
+    }
+    // metadata：上游若支持则透传（不认识的字段由上游忽略，比网关私吞更接近原生行为）。
+    if let Some(v) = body.get("metadata") {
+        if !v.is_null() {
+            payload.insert("metadata".to_string(), v.clone());
+        }
     }
     Value::Object(payload)
 }
@@ -1447,6 +2086,95 @@ mod tests {
         assert_eq!(msgs[0]["content"], "正文");
     }
 
+    // ---- 思考档位：归一化 / thinking 翻译 / 默认行为不变（2026-10-12）----
+
+    #[test]
+    fn normalize_reasoning_effort_accepts_known_rejects_unknown() {
+        for e in ["low", "medium", "high", "xhigh", "max", "none", "minimal"] {
+            assert_eq!(normalize_reasoning_effort(e), Some(e), "{e} 应被接受");
+        }
+        // 大小写不敏感 + 首尾空白
+        assert_eq!(normalize_reasoning_effort("  HIGH "), Some("high"));
+        // 未知值必须被拒（上游对它回 400 ⇒ 契约 §4「只换号」⇒ 误报 503 无可用账号）
+        for e in ["bogus", "ultra", "lowest", "", "   ", "h1gh"] {
+            assert_eq!(normalize_reasoning_effort(e), None, "{e:?} 应被拒绝");
+        }
+    }
+
+    #[test]
+    fn anthropic_thinking_budget_ladder_maps_to_effort() {
+        let eff = |v: Value| anthropic_thinking_to_effort(&v);
+        assert_eq!(eff(json!({"type": "enabled", "budget_tokens": 1024})), Some("low"));
+        assert_eq!(eff(json!({"type": "enabled", "budget_tokens": 8192})), Some("medium"));
+        assert_eq!(eff(json!({"type": "enabled", "budget_tokens": 40000})), Some("high"));
+        assert_eq!(eff(json!({"type": "enabled", "budget_tokens": 100000})), Some("max"));
+        // 缺 budget → 客户端默认档
+        assert_eq!(eff(json!({"type": "enabled"})), Some("medium"));
+        // 非 enabled（含 disabled）→ 一律不推导，尊重「不要思考」的显式意图
+        assert_eq!(eff(json!({"type": "disabled"})), None);
+        assert_eq!(eff(json!({"type": "ENABLED"})), Some("medium"), "type 大小写不敏感");
+        assert_eq!(eff(json!({})), None);
+    }
+
+    /// 🔴 回归守卫：**没有任何思考意图的请求，出站体必须一字节都不变**。
+    ///
+    /// 这是对「改动不影响现有模型默认行为」的硬断言 —— 上游 `step-5-preview`
+    /// 默认就思考，若这里多插了 `reasoning_effort` 就会改变它的默认档位。
+    #[test]
+    fn anthropic_req_without_thinking_intent_inserts_nothing() {
+        let payload = anthropic_req_to_chat(&json!({
+            "max_tokens": 512,
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+        assert!(payload.get("reasoning_effort").is_none(), "不得凭空注入思考档位");
+        assert!(payload.get("thinking").is_none());
+    }
+
+    /// thinking 只被透传、不被翻译时，WorkBuddy 上游完全不认 ⇒ 必须补 reasoning_effort。
+    #[test]
+    fn anthropic_req_thinking_is_translated_to_reasoning_effort() {
+        let payload = anthropic_req_to_chat(&json!({
+            "thinking": {"type": "enabled", "budget_tokens": 2048},
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+        assert_eq!(payload["reasoning_effort"], json!("low"));
+        // thinking 仍原样保留（不破坏其它复用场景）
+        assert_eq!(payload["thinking"]["budget_tokens"], json!(2048));
+    }
+
+    /// 客户端显式 reasoning_effort 优先级高于 thinking 推导。
+    #[test]
+    fn anthropic_req_explicit_effort_wins_over_thinking() {
+        let payload = anthropic_req_to_chat(&json!({
+            "reasoning_effort": "MAX",
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+        assert_eq!(payload["reasoning_effort"], json!("max"), "显式值胜出且已小写归一");
+    }
+
+    /// 未知档位必须被丢弃而不是透传：透传 ⇒ 上游 400 ⇒ 换号 ⇒ 误报 503。
+    #[test]
+    fn anthropic_req_unknown_effort_is_dropped_not_passed_through() {
+        let payload = anthropic_req_to_chat(&json!({
+            "reasoning_effort": "ultra",
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+        assert!(payload.get("reasoning_effort").is_none(), "未知值不得出站");
+        // 且不因丢弃而伪造一个假档位
+        assert!(payload.get("thinking").is_none());
+    }
+
+    /// disabled ⇒ 不插 reasoning_effort（等于上游默认＝不思考）。
+    #[test]
+    fn anthropic_req_thinking_disabled_inserts_no_effort() {
+        let payload = anthropic_req_to_chat(&json!({
+            "thinking": {"type": "disabled"},
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+        assert!(payload.get("reasoning_effort").is_none());
+    }
+
     #[test]
     fn anthropic_req_missing_content_produces_no_message() {
         let payload = anthropic_req_to_chat(&json!({
@@ -2012,5 +2740,371 @@ mod tests {
         assert_eq!(usage_triplet(&json!(null)), (0, 0, 0));
         assert_eq!(usage_triplet(&json!([])), (0, 0, 0));
         assert_eq!(usage_triplet(&json!({})), (0, 0, 0));
+    }
+
+    // ---- AnthropicStreamSession（2026-10-12 真流式）----
+
+    /// 取每帧的 event 名。帧格式是 `event: <名>\ndata: <json>\n\n`，
+    /// 所以要先按行切开再匹配前缀（`strip_prefix` 作用于整串，会永远失败）。
+    fn evts(frames: &[String]) -> Vec<String> {
+        frames
+            .iter()
+            .filter_map(|f| f.lines().next())
+            .filter_map(|line| line.strip_prefix("event: "))
+            .map(str::trim)
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn stream_session_begin_and_finish_shape() {
+        let mut s = AnthropicStreamSession::new("step-5-preview");
+        let head = s.begin();
+        // 头两帧固定：message_start + content_block_start
+        assert_eq!(evts(&head), vec!["message_start", "content_block_start"]);
+        assert!(head[0].contains("\"model\":\"step-5-preview\""));
+        let tail = s.finish();
+        // 收尾三帧：关块 + message_delta(usage) + message_stop
+        assert_eq!(
+            evts(&tail),
+            vec!["content_block_stop", "message_delta", "message_stop"]
+        );
+    }
+
+    #[test]
+    fn stream_session_emits_delta_per_upstream_frame() {
+        // 回归红线：伪流式的病根就是「上游几帧 → 客户端也几帧」被压成一次。
+        // 本测试钉死「每个上游 content 帧产出恰好一个 content_block_delta」。
+        let mut s = AnthropicStreamSession::new("m");
+        s.begin();
+        let mut deltas = 0;
+        for chunk in ["Hel", "lo ", "world"] {
+            let f = s
+                .feed_openai_delta(&json!({"choices": [{"delta": {"content": chunk}}]}))
+                .expect("内容帧必须产出帧");
+            deltas += f.iter().filter(|x| x.contains("content_block_delta")).count();
+        }
+        assert_eq!(deltas, 3, "三个上游帧必须对应三个 delta，而不是被合并");
+    }
+
+    #[test]
+    fn stream_session_non_content_frame_returns_none() {
+        let mut s = AnthropicStreamSession::new("m");
+        s.begin();
+        // keepalive / 空 choices / usage-only 帧都不该产生下发帧
+        assert!(s.feed_openai_delta(&json!({})).is_none());
+        assert!(s.feed_openai_delta(&json!({"choices": []})).is_none());
+        assert!(s
+            .feed_openai_delta(&json!({"usage": {"input_tokens": 5}}))
+            .is_none());
+    }
+
+    #[test]
+    fn stream_session_reasoning_uses_thinking_block() {
+        let mut s = AnthropicStreamSession::new("m");
+        s.begin();
+        let out = s
+            .feed_openai_delta(&json!({"choices": [{"delta": {"reasoning_content": "想一下"}}]}))
+            .unwrap();
+        let joined = out.concat();
+        assert!(joined.contains("thinking"), "reasoning 必须走 thinking 块");
+        assert!(joined.contains("\"type\":\"thinking_delta\""));
+    }
+
+    #[test]
+    fn stream_session_usage_carried_to_message_delta() {
+        let mut s = AnthropicStreamSession::new("m");
+        s.begin();
+        s.feed_openai_delta(&json!({"choices": [{"delta": {"content": "hi"}}]}));
+        s.feed_openai_delta(&json!({"usage": {"prompt_tokens": 12, "completion_tokens": 7}}));
+        let tail = s.finish().concat();
+        assert!(tail.contains("\"input_tokens\":12"), "usage 必须落到 message_delta");
+        assert!(tail.contains("\"output_tokens\":7"));
+    }
+
+    #[test]
+    fn stream_session_empty_model_falls_back() {
+        let s = AnthropicStreamSession::new("   ");
+        assert_eq!(s.model, "workbuddy", "空模型名回落 workbuddy");
+    }
+
+    #[test]
+    fn stream_session_tool_call_emits_tool_use_block() {
+        // 回归红线：工具流式协议错 → 客户端永远等不到 tool_result。
+        let mut s = AnthropicStreamSession::new("m");
+        s.begin();
+        let out = s
+            .feed_openai_delta(&json!({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "call_1", "function": {"name": "get_weather", "arguments": ""}}
+            ]}}]}))
+            .unwrap()
+            .concat();
+        assert!(out.contains("\"type\":\"tool_use\""), "必须开 tool_use 块");
+        assert!(out.contains("\"name\":\"get_weather\""));
+        assert!(out.contains("\"id\":\"call_1\""));
+    }
+
+    #[test]
+    fn stream_session_tool_args_arrive_as_json_delta() {
+        // arguments 是分片到达的，必须走 input_json_delta 增量拼，不能一次性给。
+        let mut s = AnthropicStreamSession::new("m");
+        s.begin();
+        s.feed_openai_delta(&json!({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": "call_1", "function": {"name": "f", "arguments": "{\"a\":"}}
+        ]}}]}));
+        let out = s
+            .feed_openai_delta(&json!({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": "1}"}}
+            ]}}]}))
+            .unwrap()
+            .concat();
+        assert!(out.contains("input_json_delta"), "第二片也应是增量帧");
+        assert!(out.contains("1}"), "第二片内容必须透传");
+    }
+
+    #[test]
+    fn stream_session_tool_use_sets_stop_reason() {
+        // stop_reason 必须是 tool_use：标 end_turn 会让 Claude Code 认为答完了，
+        // 工具永远等不到结果。
+        let mut s = AnthropicStreamSession::new("m");
+        s.begin();
+        s.feed_openai_delta(&json!({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": "c1", "function": {"name": "f", "arguments": "{}"}}
+        ]}}]}));
+        let tail = s.finish().concat();
+        assert!(tail.contains("\"stop_reason\":\"tool_use\""), "缺 tool_use 终止语义");
+    }
+
+    #[test]
+    fn stream_session_parallel_tool_calls_get_distinct_blocks() {
+        // 并行调用必须各占一块（index 0/1），不能合并进槽位 0。
+        let mut s = AnthropicStreamSession::new("m");
+        s.begin();
+        let frames = s
+            .feed_openai_delta(&json!({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "a", "function": {"name": "f1", "arguments": "{}"}},
+                {"index": 1, "id": "b", "function": {"name": "f2", "arguments": "{}"}}
+            ]}}]}))
+            .unwrap();
+        let out = frames.concat();
+        assert!(out.contains("\"name\":\"f1\"") && out.contains("\"name\":\"f2\""));
+        // 数 event 名（不能直接 count 字符串 "content_block_start"：每帧里
+        // event 名和 payload.type 各出现一次，会数出两倍）。
+        assert_eq!(
+            evts(&frames).iter().filter(|e| *e == "content_block_start").count(),
+            2,
+            "并行调用应开两个独立块"
+        );
+        // 两个块的 index 必须不同，否则客户端会渲染到同一槽位。
+        assert!(out.contains("\"index\":1") && out.contains("\"index\":2"));
+    }
+
+    #[test]
+    fn stream_session_tool_call_index_accepts_string() {
+        // 上游偶发把 index 发成字符串，只认数字会静默合并槽位。
+        let mut s = AnthropicStreamSession::new("m");
+        s.begin();
+        let out = s
+            .feed_openai_delta(&json!({"choices": [{"delta": {"tool_calls": [
+                {"index": "2", "id": "x", "function": {"name": "f", "arguments": "{}"}}
+            ]}}]}))
+            .unwrap()
+            .concat();
+        // 上游 index 是字符串 "2"，必须被解析后当槽位键用；块序号仍是首个块 1。
+        // 真正的回归点是「字符串 index 与缺省 index 不应混成同一槽位」——
+        // 下面再发一个 index 缺省的分片，若两者同槽，name 会被覆盖成 f2。
+        assert!(out.contains("\"name\":\"f\""));
+        let out2 = s
+            .feed_openai_delta(&json!({"choices": [{"delta": {"tool_calls": [
+                {"id": "y", "function": {"name": "f2", "arguments": "{}"}}
+            ]}}]}))
+            .unwrap()
+            .concat();
+        assert!(
+            out2.contains("\"name\":\"f2\""),
+            "缺省 index(0) 与字符串 index(2) 应是不同槽位"
+        );
+    }
+
+    #[test]
+    fn openai_stream_session_shape_and_finish() {
+        let mut s = OpenAIStreamSession::new("step-5-preview");
+        // 首帧带 role（OpenAI 客户端惯例）
+        assert!(s.begin()[0].contains("\"role\":\"assistant\""));
+        assert!(s
+            .feed_openai_delta(&json!({"choices": [{"delta": {"content": "hi"}}]}))
+            .unwrap()
+            .contains("\"content\":\"hi\""));
+        let tail = s.finish().concat();
+        assert!(tail.contains("\"finish_reason\":\"stop\""), "收尾帧须带 finish_reason");
+        assert!(tail.contains("[DONE]"), "末帧必须是 data: [DONE]");
+    }
+
+    #[test]
+    fn openai_stream_session_tool_calls_finish_reason() {
+        // 有工具调用时 finish_reason 必须是 tool_calls，否则客户端不会回灌结果。
+        let mut s = OpenAIStreamSession::new("m");
+        s.begin();
+        s.feed_openai_delta(&json!({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": "c1", "function": {"name": "f", "arguments": "{}"}}
+        ]}}]}));
+        assert!(s.finish().concat().contains("\"finish_reason\":\"tool_calls\""));
+    }
+
+    #[test]
+    fn openai_stream_session_reasoning_passthrough() {
+        let mut s = OpenAIStreamSession::new("m");
+        s.begin();
+        let f = s
+            .feed_openai_delta(&json!({"choices": [{"delta": {"reasoning_content": "想"}}]}))
+            .unwrap();
+        assert!(f.contains("reasoning_content"), "思考内容须透传到 delta");
+    }
+
+    #[test]
+    fn openai_stream_session_usage_on_finish() {
+        let mut s = OpenAIStreamSession::new("m");
+        s.begin();
+        s.feed_openai_delta(&json!({"choices": [{"delta": {"content": "x"}}]}));
+        s.feed_openai_delta(&json!({"usage": {"prompt_tokens": 9, "completion_tokens": 4}}));
+        assert!(s.finish().concat().contains("\"prompt_tokens\":9"));
+    }
+
+    #[test]
+    fn stream_session_finish_is_idempotent() {
+        // 回归红线：断流路径会「先发 error 再收尾」，两处都调 finish()。
+        // 若 finish 可重入，会吐出两套 message_stop，客户端误判为两轮响应。
+        let mut s = AnthropicStreamSession::new("m");
+        s.begin();
+        s.feed_openai_delta(&json!({"choices": [{"delta": {"content": "x"}}]}));
+        let first = s.finish();
+        let second = s.finish();
+        assert!(!first.is_empty());
+        assert!(second.is_empty(), "重复 finish 必须返回空，不得重复吐收尾帧");
+    }
+
+    #[test]
+    fn openai_stream_session_finish_is_idempotent() {
+        let mut s = OpenAIStreamSession::new("m");
+        s.begin();
+        s.feed_openai_delta(&json!({"choices": [{"delta": {"content": "x"}}]}));
+        assert!(!s.finish().is_empty());
+        assert!(s.finish().is_empty(), "重复 finish 必须幂等");
+    }
+
+    #[test]
+    fn stream_error_event_is_visible_to_client() {
+        // 回归红线：断流只发 finish() 会让客户端把半截内容当「完整答案」，
+        // 不触发重试、也不报错 —— 这是最难排查的中断形态。
+        let frames = crate::modules::workbuddy_upstream::stream_error_frames_public_with(
+            "transport: stream idle timeout after 150s",
+            false,
+        );
+        let joined = frames.concat();
+        assert!(joined.contains("event: error"), "必须发 Anthropic error 事件");
+        assert!(joined.contains("api_error"), "无内容时是 api_error");
+        assert!(joined.contains("message_stop"), "error 之后仍要正常收尾");
+    }
+
+    #[test]
+    fn stream_error_after_content_says_partial_not_failure() {
+        // 回归红线：已产出内容时若报「生成失败」，客户端会丢弃用户已看到的半截文字。
+        // error 类型仍是 error（不撒谎），但 message 必须说明「已保留」。
+        let mut s = AnthropicStreamSession::new("m");
+        s.begin();
+        s.feed_openai_delta(&json!({"choices": [{"delta": {"content": "半截答案"}}]}));
+        let frames = crate::modules::workbuddy_upstream::stream_error_frames_public_with(
+            "transport: boom",
+            true,
+        );
+        let joined = frames.concat();
+        assert!(joined.contains("已保留"), "有内容时须说明已保留：{joined}");
+        assert!(joined.contains("overloaded_error"), "有内容时用可重试语义");
+    }
+
+    /// 2.0.49：断流诊断后缀 —— detail 里必须能看到已产出字数与持续秒数，
+    /// 否则「偶发断流」永远只能拿到一句笼统的 transport 错误，无法定位。
+    #[test]
+    fn stream_error_detail_carries_diagnostics() {
+        let mut s = AnthropicStreamSession::new("m");
+        s.begin();
+        s.feed_openai_delta(&json!({"choices": [{"delta": {"content": "已产出十二字"}}]}));
+        let detail = format!("transport: error decoding response body（已产出 {} 字，持续 12s）", s.chars_out());
+        let frames = crate::modules::workbuddy_upstream::stream_error_frames_public_with(
+            &detail,
+            true,
+        );
+        let joined = frames.concat();
+        assert!(joined.contains("已产出 6 字"), "字数要可见：{joined}");
+        assert!(joined.contains("持续 12s"), "时长要可见：{joined}");
+    }
+
+    #[test]
+    fn stream_error_before_content_is_hard_failure() {
+        // 一帧都没拿到 = 真失败，要直说。
+        let frames = crate::modules::workbuddy_upstream::stream_error_frames_public_with(
+            "transport: boom",
+            false,
+        );
+        let joined = frames.concat();
+        assert!(joined.contains("生成失败"), "无内容时直说失败");
+        assert!(joined.contains("api_error"));
+    }
+
+    /// 2.0.49：chars_out 统计 —— 断流 error 帧要带「已产出 N 字」便于定位。
+    #[test]
+    fn chars_out_counts_produced_text() {
+        let mut s = AnthropicStreamSession::new("m");
+        s.begin();
+        assert_eq!(s.chars_out(), 0, "未产出应为 0");
+        // 中文按字符计（不是字节）——「已产出」是给人看的字数
+        s.feed_openai_delta(&json!({"choices": [{"delta": {"content": "你好世界"}}]}));
+        assert_eq!(s.chars_out(), 4);
+        s.feed_openai_delta(&json!({"choices": [{"delta": {"content": "abc"}}]}));
+        assert_eq!(s.chars_out(), 7, "应累计");
+
+        // 非内容帧不计数
+        s.feed_openai_delta(&json!({"choices": [{"delta": {"role": "assistant"}}]}));
+        assert_eq!(s.chars_out(), 7);
+
+        // OpenAI 会话同口径
+        let mut o = OpenAIStreamSession::new("m");
+        o.begin();
+        o.feed_openai_delta(&json!({"choices": [{"delta": {"content": "你好"}}]}));
+        assert_eq!(o.chars_out(), 2);
+    }
+
+    #[test]
+    fn anthropic_req_to_chat_passes_sampling_params() {
+        // 回归红线：采样参数整段缺失时客户端「怎么调都没反应」。
+        let body = json!({
+            "model": "m", "max_tokens": 100, "stream": true,
+            "temperature": 0.3, "top_p": 0.9, "top_k": 40,
+            "presence_penalty": 0.1, "frequency_penalty": 0.2,
+            "thinking": {"type": "enabled", "budget_tokens": 2048},
+            "metadata": {"user_id": "u1"},
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let chat = anthropic_req_to_chat(&body);
+        assert_eq!(chat["temperature"], json!(0.3));
+        assert_eq!(chat["top_p"], json!(0.9));
+        assert_eq!(chat["top_k"], json!(40));
+        assert_eq!(chat["presence_penalty"], json!(0.1));
+        assert_eq!(chat["frequency_penalty"], json!(0.2));
+        assert_eq!(chat["thinking"]["budget_tokens"], json!(2048));
+        assert_eq!(chat["metadata"]["user_id"], json!("u1"));
+    }
+
+    #[test]
+    fn anthropic_req_to_chat_omits_null_sampling() {
+        // null / 缺省一律不插：让上游用自己的默认值，网关不替上游决定采样。
+        let body = json!({
+            "model": "m", "max_tokens": 10,
+            "temperature": Value::Null, "top_p": Value::Null,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let chat = anthropic_req_to_chat(&body);
+        assert!(chat.get("temperature").is_none());
+        assert!(chat.get("top_p").is_none());
     }
 }
