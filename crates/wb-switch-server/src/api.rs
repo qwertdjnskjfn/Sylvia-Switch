@@ -425,6 +425,30 @@ pub fn router() -> Router {
             "/workbuddy-pool/v1/config",
             post(api_workbuddy_pool_config_save),
         )
+        // 账号池管理（webui 自用，与 /config 同组；对外烧额度的入口才需网关 key）。
+        .route(
+            "/workbuddy-pool/v1/accounts/pause",
+            post(api_workbuddy_pool_account_pause),
+        )
+        // 编辑账号库记录（白名单字段）与清除冷却态（手动干预）。
+        .route(
+            "/workbuddy-pool/v1/accounts/update",
+            post(api_workbuddy_pool_account_update),
+        )
+        // 直接添加（token 方式，不经文件 / OAuth）—— 参照 MiniMax 内联表单交互。
+        .route(
+            "/workbuddy-pool/v1/accounts/add-direct",
+            post(api_workbuddy_pool_account_add_direct),
+        )
+        .route(
+            "/workbuddy-pool/v1/accounts/clear-cooldown",
+            post(api_workbuddy_pool_account_clear_cooldown),
+        )
+        // 删除：池 uid → 账号库 id → delete（cloud 区块要能自足地管账号）
+        .route(
+            "/workbuddy-pool/v1/accounts/delete",
+            post(api_workbuddy_pool_account_delete),
+        )
         // P2 协议补全（契约增补 §3）：同一池、同一份选号循环，多两个协议入口。
         // 鉴权口径同 chat/completions（对外烧池内额度的入口都要网关 key，
         // region 参与区域密钥隔离），走 `workbuddy_pool_auth_ok_region`，失败 401。
@@ -736,7 +760,17 @@ async fn api_import_local() -> Response {
     // import_local 在 auth 文件加密时回退到进程内存扫描（同步、重 CPU），
     // 放到 spawn_blocking 避免卡住 tokio worker。
     match tokio::task::spawn_blocking(account::import_local).await {
-        Ok(Ok(acc)) => json_ok(json!({ "ok": true, "account": acc })),
+        Ok(Ok(acc)) => {
+            // 回传实际读到的 region：本机导入只能拿到**桌面端当前登录的那一个区**，
+            // 界面上据此提示「读到的是国内版 / 国际版」，避免用户以为导错了。
+            let domain = acc.get("domain").and_then(Value::as_str).unwrap_or("");
+            let region = if domain.contains("workbuddy.ai") {
+                "intl"
+            } else {
+                "cn"
+            };
+            json_ok(json!({ "ok": true, "account": acc, "region": region, "domain": domain }))
+        }
         Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
         Err(e) => json_err(format!("导入任务失败: {e}"), StatusCode::INTERNAL_SERVER_ERROR),
     }
@@ -825,8 +859,18 @@ async fn api_import(Json(body): Json<Value>) -> Response {
 // OAuth 登录
 // ---------------------------------------------------------------------------
 
-async fn api_oauth_start() -> Response {
-    match oauth::oauth_start().await {
+/// POST /api/oauth/start：发起扫码登录。body 可选 `{ "region": "cn" | "intl" }`。
+///
+/// 🔴 `region` 决定 API 基址与区域头：缺省 `cn`（保持升级前行为）。
+/// 要登国际版账号必须显式传 `intl` —— 否则会打到国服端点，
+/// 拿回来的凭证在池里会被判成国内号（症状：登了国际版却仍走国服）。
+async fn api_oauth_start(body: Option<Json<Value>>) -> Response {
+    let region = body
+        .as_ref()
+        .and_then(|Json(v)| v.get("region"))
+        .and_then(Value::as_str)
+        .unwrap_or("cn");
+    match oauth::oauth_start(region).await {
         Ok(v) => json_ok(v),
         Err(e) => json_err(e, StatusCode::BAD_REQUEST),
     }
@@ -5957,8 +6001,20 @@ async fn workbuddy_pool_dispatch_inner(
             // 而不是把请求丢给对侧账号打上游。此前已有失败原因（11102 翻转后仍不可用
             // 等）时保留原文并前置区域标注。
             if let Some(want) = region_filter.wanted_region() {
-                let region_note =
+                let mut region_note =
                     format!("region={want} 区内无可用账号（该区账号全部冷却/在途或不存在）");
+                // 🔴 无前置失败 ⇒ 本轮一次上游都没打过，`last_err` 为空，客户端只会看到
+                // 上面这句「不知道为什么」。补上区域内**真实阻塞原因**（尤其模型级冷却：
+                // 它只限单个模型，同账号其他模型仍可用，不说明白极易被误判成整区故障）。
+                // 2026-10-13 用户报障即为此场景：只看到 `503 Provider returned a server error`。
+                if last_err.is_none() {
+                    let reasons =
+                        workbuddy_gateway::region_block_reasons(&model, region_filter);
+                    if !reasons.is_empty() {
+                        region_note.push_str("。原因：");
+                        region_note.push_str(&reasons.join("；"));
+                    }
+                }
                 last_err = Some(match last_err.take() {
                     Some(prev) => format!("{region_note}；{prev}"),
                     None => region_note,
@@ -7045,6 +7101,15 @@ async fn api_workbuddy_pool_status() -> Response {
             "apiKey".to_string(),
             json!(glm_proxy::load_config().api_key),
         );
+        // 账号库中**存在但没能进池**的记录及原因（诊断用）。
+        //
+        // 为什么放在这里而不是让前端自己比对：池的准入判据（平台 / access_token / uid）
+        // 是**后端私有逻辑**，前端复刻一份必然漂移。`pool_account_from_value` 静默丢记录，
+        // 于是「导入成功、池里看不到」时用户无从判断原因 —— 本字段即那个答案。
+        obj.insert(
+            "rejected".to_string(),
+            json!(workbuddy_gateway::rejected_accounts()),
+        );
     }
     json_ok(out)
 }
@@ -7054,6 +7119,134 @@ async fn api_workbuddy_pool_status() -> Response {
 /// 边界：mode 枚举校验（非法值整体拒绝，不静默改写模式）、soft_rate_max >= base、
 /// breaker_max >= base、breaker_threshold >= 1、sticky_ttl 60_000..3_600_000、
 /// balance_refresh_minutes >= 5。
+/// POST /workbuddy-pool/v1/accounts/pause：手动暂停 / 恢复某个账号（**用户意图**）。
+///
+/// 请求体 `{ uid, paused }`。`uid` 可为完整值或**唯一前缀** —— `pool_status()`
+/// 输出的是脱敏 uid（`mask_uid` 只留前 8 位 + "…"），前端只能拿到那个值，
+/// 故由后端按前缀反解（歧义即 400，不猜）。
+///
+/// ⚠️ 本接口**只改 `paused`**，绝不动系统状态 `disabled`（session 死亡）与任何
+/// 冷却/熔断字段 —— 见 `Pool::set_paused` 的说明。
+async fn api_workbuddy_pool_account_pause(Json(body): Json<Value>) -> Response {
+    let uid = body
+        .get("uid")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let Some(paused) = body.get("paused").and_then(Value::as_bool) else {
+        return json_err(
+            "paused 必须为布尔值".to_string(),
+            StatusCode::BAD_REQUEST,
+        );
+    };
+    match workbuddy_gateway::set_paused(&uid, paused) {
+        Ok(resolved) => json_ok(json!({
+            "ok": true,
+            "uid": resolved,
+            "paused": paused,
+        })),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /workbuddy-pool/v1/accounts/update：编辑账号库记录（**白名单字段**）。
+///
+/// 请求体 `{ uid, patch: { … } }`：
+/// - `uid` 可为完整值或**唯一前缀**（status 输出的是脱敏 uid）；
+/// - `patch` 只允许 `nickname / domain / access_token / refresh_token /
+///   expiresAt / refreshExpiresAt`（白名单在 `account::UPDATE` 侧强制）；
+/// - **PATCH 语义**：只改出现的字段；任一字段非法 ⇒ **整体拒绝**（不做部分写入）。
+///
+/// 链路：池 uid --(resolve_account_uid)--> 真实 uid --(account_library_id_for_uid)-->
+/// 账号库 `id` --> `account::update_account_fields`。
+/// 中间那步是必需的：池 uid 取自 `auth_raw.uid`，与账号库 `id` **不保证相同**。
+async fn api_workbuddy_pool_account_update(Json(body): Json<Value>) -> Response {
+    let key = body.get("uid").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let uid = match workbuddy_gateway::resolve_account_uid(&key) {
+        Ok(u) => u,
+        Err(e) => return json_err(e, StatusCode::BAD_REQUEST),
+    };
+    let Some(lib_id) = workbuddy_gateway::account_library_id_for_uid(&uid) else {
+        return json_err(
+            format!("账号库中找不到 uid={uid} 的记录"),
+            StatusCode::BAD_REQUEST,
+        );
+    };
+    let patch = body.get("patch").cloned().unwrap_or(Value::Null);
+    match account::update_account_fields(&lib_id, &patch) {
+        Ok(updated) => json_ok(json!({
+            "ok": true,
+            "uid": uid,
+            "id": lib_id,
+            "account": account::account_meta(&updated),
+        })),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /workbuddy-pool/v1/accounts/clear-cooldown：清除冷却 / 熔断 / 模型限流（手动干预）。
+///
+/// ⚠️ 只清**冷却类**运行态；**不动** `disabled`（凭证失效的事实）与 `paused`（用户意图）。
+/// 清掉熔断计数后同一故障会重新累积，故仅用于确认是误判时提前放行。
+async fn api_workbuddy_pool_account_clear_cooldown(Json(body): Json<Value>) -> Response {
+    let key = body.get("uid").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    match workbuddy_gateway::clear_cooldown(&key) {
+        Ok(uid) => json_ok(json!({ "ok": true, "uid": uid })),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /workbuddy-pool/v1/accounts/add-direct：**直接用 token 添加账号**（无文件）。
+///
+/// 请求体：
+/// ```json
+/// { "access_token": "…", "refresh_token": "…", "domain": "www.workbuddy.cn",
+///   "nickname": "…", "uid": "…", "expires_at": 1790000000000 }
+/// ```
+/// 仅 `access_token` 与 `domain` 必填（`domain` 决定区域归属：`.ai→intl` / 其余→cn）；
+/// `expires_at` 缺省时由后端从 JWT 的 `exp` 解析。
+///
+/// **去重按 token**：同一段 `access_token` 再次提交 = 原地覆盖（沿用原 id/uid/createdAt），
+/// 不会产生重复条目（手动添加常缺 uid/email，按身份去重会失效）。
+async fn api_workbuddy_pool_account_add_direct(Json(body): Json<Value>) -> Response {
+    let token = body.get("access_token").and_then(Value::as_str).unwrap_or("");
+    let refresh = body.get("refresh_token").and_then(Value::as_str).unwrap_or("");
+    let domain = body.get("domain").and_then(Value::as_str).unwrap_or("");
+    let nickname = body.get("nickname").and_then(Value::as_str).unwrap_or("");
+    let uid = body.get("uid").and_then(Value::as_str).unwrap_or("");
+    let expires_at = body.get("expires_at").and_then(Value::as_i64).unwrap_or(0);
+    match account::add_account_by_token(token, refresh, domain, nickname, uid, expires_at) {
+        Ok(acc) => json_ok(json!({
+            "ok": true,
+            "account": account::account_meta(&acc),
+        })),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /workbuddy-pool/v1/accounts/delete：删除账号（池 uid → 账号库 id → delete）。
+///
+/// 删除是**账号库级**操作：池会在下一次 `sync_accounts()` 时自动移除该条目
+/// （不依赖重启）。凭证一并消失，不可恢复——调用方必须让用户确认。
+async fn api_workbuddy_pool_account_delete(Json(body): Json<Value>) -> Response {
+    let key = body.get("uid").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let uid = match workbuddy_gateway::resolve_account_uid(&key) {
+        Ok(u) => u,
+        Err(e) => return json_err(e, StatusCode::BAD_REQUEST),
+    };
+    let Some(lib_id) = workbuddy_gateway::account_library_id_for_uid(&uid) else {
+        return json_err(
+            format!("账号库中找不到 uid={uid} 的记录"),
+            StatusCode::BAD_REQUEST,
+        );
+    };
+    match account::delete_account(&lib_id) {
+        Ok(()) => json_ok(json!({ "ok": true, "uid": uid, "id": lib_id })),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
 async fn api_workbuddy_pool_config_save(Json(body): Json<Value>) -> Response {
     let mut cfg = workbuddy_gateway::load_config();
     if let Some(mode) = body.get("mode").and_then(Value::as_str) {

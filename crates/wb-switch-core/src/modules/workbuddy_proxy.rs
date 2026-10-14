@@ -178,6 +178,42 @@ async fn is_opencode_server(port: u16) -> bool {
     }
 }
 
+/// 进程发现用的 powershell 脚本文本（见 `discover_server` 调用点的完整来龙去脉）。
+///
+/// 🔴 抽成常量只为让单测能固化下面两条**易碎约束**——改脚本前先跑
+/// `discover_ps_script_satisfies_powershell_quoting_rules`：
+///   ① **不得含内层双引号**：`-Command <string>` 解析时会剥掉其中的 `"`，
+///      `-Filter "Name='x'"` 会退化成 `-Filter Name='x'` ⇒ `无效查询`（实测踩中）；
+///   ② 必须用**进程名**筛 `opencode.exe`（而非在命令行里匹配 `opencode\s+serve`）：
+///      实际命令行是 `"E:\opencode\opencode.exe"  serve …`，`.exe` 会挡住 `\s+`。
+const DISCOVER_PS_SCRIPT: &str = "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'opencode.exe' -and $_.CommandLine -match 'serve' } | ForEach-Object { $_.CommandLine }";
+
+/// 从一条进程命令行里取 `--port` 的值（纯函数，便于单测）。
+///
+/// 兼容两种写法——**两种都真实出现过**：
+/// - `--port 4097`（空格；`start-serve-4097.bat` 用的就是这种）
+/// - `--port=4097`（等号）
+///
+/// 🔴 只认等号是 2026-10-13 修掉的一个长期缺陷：即便进程筛对了，端口也取不出来。
+fn port_from_cmdline(line: &str) -> Option<u16> {
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    for (i, t) in tokens.iter().enumerate() {
+        if let Some(v) = t.strip_prefix("--port=") {
+            if let Ok(p) = v.parse::<u16>() {
+                return Some(p);
+            }
+        }
+        if *t == "--port" {
+            if let Some(v) = tokens.get(i + 1) {
+                if let Ok(p) = v.trim_matches('"').parse::<u16>() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// 发现 opencode server 端口：配置端口优先，否则扫描候选常见端口 + 监听端口。
 ///
 /// 失败路径写 30s 负缓存：server 不在时每个请求都要重跑整轮发现（powershell +
@@ -208,24 +244,30 @@ pub async fn discover_server() -> Result<u16, String> {
         ));
     }
     // 优先从 opencode serve 进程的命令行抓端口（最可靠，无端口范围假设）。
+    //
+    // 🔴 2026-10-13 修（本条曾**长期是死代码**，两处都有毛病，一直在靠 netstat 兜底）：
+    //   ① 筛选：原正则 `opencode\s+serve` 与实际命令行不匹配——实际形态是
+    //      `"E:\opencode\opencode.exe"  serve --hostname ... --port 4097`，
+    //      "opencode" 后面紧跟 ".exe"，`\s+` 永远落不到 "serve" 上。改为按
+    //      **进程名**（opencode.exe）筛、再在命令行里找 serve，与路径写法解耦。
+    //   ② 取值：原解析只认 `--port=4097`（等号），而 bat 实际传的是 `--port 4097`
+    //      （空格，两个独立 token）⇒ 即使筛到了也取不出端口。
+    // 代价：修复前每次发现都白起一个 powershell（实测 ~2.5s）且阻塞一个 async worker。
+    //
+    // 🔴🔴 -Command 的脚本文本里**绝对不能出现内层双引号**：PowerShell 解析
+    //   `-Command <string>` 时会把其中的 `"` 当引号剥掉，`-Filter "Name='x'"` 会退化成
+    //   `-Filter Name='x'` ⇒ 报 `Get-CimInstance : 无效查询`（2026-10-13 实测踩中）。
+    //   必须用 `Where-Object { $_.Name -eq '…' }` 这种**只用单引号**的等价写法。
     if let Ok(out) = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'opencode\\s+serve' } | ForEach-Object { $_.CommandLine }",
-        ])
+        .args(["-NoProfile", "-Command", DISCOVER_PS_SCRIPT])
         .output()
     {
         let text = String::from_utf8_lossy(&out.stdout);
         for line in text.lines() {
-            for token in line.split_whitespace() {
-                if let Some(port_str) = token.strip_prefix("--port=") {
-                    if let Ok(port) = port_str.parse::<u16>() {
-                        if is_opencode_server(port).await {
-                            note_discovery_success(port);
-                            return Ok(port);
-                        }
-                    }
+            if let Some(port) = port_from_cmdline(line) {
+                if is_opencode_server(port).await {
+                    note_discovery_success(port);
+                    return Ok(port);
                 }
             }
         }
@@ -1421,6 +1463,56 @@ fn status_502() -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discover_ps_script_satisfies_powershell_quoting_rules() {
+        // 🔴 两条易碎约束（都在 2026-10-13 实测踩过），改动脚本前必须仍满足：
+        // ① 不得含内层双引号 —— PowerShell 的 `-Command <string>` 会把内层 `"` 剥掉，
+        //    `-Filter "Name='x'"` 退化成 `-Filter Name='x'` ⇒ `Get-CimInstance : 无效查询`。
+        assert!(
+            !DISCOVER_PS_SCRIPT.contains('"'),
+            "脚本内不得出现双引号（会被 -Command 剥掉）：{DISCOVER_PS_SCRIPT}"
+        );
+        // ② 必须按**进程名**筛，而不是在命令行里匹配 `opencode\\s+serve` ——
+        //    实际命令行 `"E:\\opencode\\opencode.exe"  serve …` 里的 `.exe` 会挡住 `\\s+`，
+        //    后者实测输出 0 行（这正是本常量存在的理由）。
+        assert!(
+            DISCOVER_PS_SCRIPT.contains("$_.Name -eq 'opencode.exe'"),
+            "必须按进程名筛选：{DISCOVER_PS_SCRIPT}"
+        );
+        assert!(DISCOVER_PS_SCRIPT.contains("'serve'"));
+        assert!(
+            !DISCOVER_PS_SCRIPT.contains(r"opencode\s+serve"),
+            "不得退回那个匹配不上真实命令行的正则"
+        );
+    }
+
+    #[test]
+    fn port_from_cmdline_handles_space_and_equals_forms() {
+        // 🔴 本用例固化 2026-10-13 修掉的两个长期缺陷。**真实命令行原样**贴在下面，
+        // 改动 `discover_server` 的筛选/解析前先跑它——这两个写法都是实测存在的。
+        // ① 空格式（start-serve-4097.bat 实际启动形态；注意 exe 路径被引号包住、
+        //    且引号与 serve 之间是两个空格）：
+        let real = r#""E:\opencode\opencode.exe"  serve --hostname 127.0.0.1 --port 4097 --print-logs"#;
+        assert_eq!(port_from_cmdline(real), Some(4097), "空格式 --port 4097 必须取到");
+
+        // ② 等号式（旧代码只认这种）：
+        assert_eq!(
+            port_from_cmdline("opencode.exe serve --port=4098"),
+            Some(4098),
+            "等号式 --port=… 仍需兼容"
+        );
+
+        // ③ 无端口 / 非法端口 / 空行 ⇒ None（不得 panic，也不得瞎猜成 0）。
+        assert_eq!(port_from_cmdline("opencode.exe serve"), None);
+        assert_eq!(port_from_cmdline("opencode.exe serve --port abc"), None);
+        assert_eq!(port_from_cmdline("opencode.exe serve --port 99999"), None);
+        assert_eq!(port_from_cmdline(""), None);
+        // ④ `--port` 出现在行尾（没有值）⇒ None，不得越界。
+        assert_eq!(port_from_cmdline("opencode.exe serve --port"), None);
+        // ⑤ 引号包裹的端口值（某些启动方式会把值也加上引号）。
+        assert_eq!(port_from_cmdline("opencode.exe serve --port \"4100\""), Some(4100));
+    }
 
     #[test]
     fn pick_score_prefers_free_then_speed() {

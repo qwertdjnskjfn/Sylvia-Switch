@@ -307,6 +307,11 @@ update_zcode_account: { method: "POST", path: "/api/zcode/accounts/update" },
   // 存量 /workbuddy/v1 与 /workbuddy-native/v1 原样不动）
   get_workbuddy_pool_status: { method: "GET", path: "/workbuddy-pool/v1/status" },
   patch_workbuddy_pool_config: { method: "POST", path: "/workbuddy-pool/v1/config" },
+  pause_workbuddy_pool_account: { method: "POST", path: "/workbuddy-pool/v1/accounts/pause" },
+  update_workbuddy_pool_account: { method: "POST", path: "/workbuddy-pool/v1/accounts/update" },
+  add_workbuddy_account_direct: { method: "POST", path: "/workbuddy-pool/v1/accounts/add-direct" },
+  clear_workbuddy_pool_cooldown: { method: "POST", path: "/workbuddy-pool/v1/accounts/clear-cooldown" },
+  delete_workbuddy_pool_account: { method: "POST", path: "/workbuddy-pool/v1/accounts/delete" },
   get_workbuddy_pool_models: { method: "GET", path: "/workbuddy-pool/v1/models" },
   workbuddy_pool_chat: { method: "POST", path: "/workbuddy-pool/v1/chat/completions" },
   // OpenCode 网关（2026-09-22 三拆新增，独立密钥）
@@ -457,15 +462,34 @@ export function deleteAccount(accountId: string): Promise<{ ok: boolean }> {
   return call("delete_account", { accountId });
 }
 
-export function oauthStart(): Promise<OAuthStartResult> {
-  return call("oauth_start");
+/**
+ * 发起扫码登录。
+ *
+ * @param region `cn`（国内版）或 `intl`（国际版）。**缺省 `cn`**。
+ *   🔴 要登国际版账号必须显式传 `intl` —— 否则打到国服端点，
+ *   拿回的凭证会被池判成国内号（症状：登了国际版却仍走国服）。
+ */
+export function oauthStart(region?: "cn" | "intl"): Promise<OAuthStartResult> {
+  return call("oauth_start", region ? { region } : {});
 }
 
 export function oauthStatus(loginId: string): Promise<OAuthPollResult> {
   return call("oauth_status", { loginId });
 }
 
-export function importLocal(): Promise<{ ok: boolean; account: AccountMeta }> {
+/**
+ * 从**本机 WorkBuddy 桌面端**已登录态导入。
+ *
+ * ⚠️ 只能拿到桌面端**当前登录的那一个区**（`domain` 来自 auth 文件，不存在「选区」）。
+ * 响应回传实际读到的 `region` / `domain`，界面据此提示用户
+ * 「读到的是国内版 / 国际版」—— 想换区请先在桌面端切换登录。
+ */
+export function importLocal(): Promise<{
+  ok: boolean;
+  account: AccountMeta;
+  region?: string;
+  domain?: string;
+}> {
   return call("import_local");
 }
 
@@ -1764,7 +1788,28 @@ export type WorkbuddyPoolStatusResponse = WorkbuddyPoolStatus & {
     cn?: WorkbuddyPoolRegionStatus;
     intl?: WorkbuddyPoolRegionStatus;
   } | null;
+  /**
+   * 账号库中**存在但没能进池**的记录及原因（2026-10-13 起）。
+   *
+   * 池的准入判据（平台 / access_token / uid）是后端私有逻辑，不合格记录会被
+   * **静默丢弃** ⇒ 「导入成功、账号池里却看不到」时用户无从判断原因。
+   * 本字段即那个答案。旧后端缺省 → undefined。
+   */
+  rejected?: WorkbuddyRejectedAccount[];
 };
+
+/** 未能进池的账号库记录（诊断；`reason` 为后端给出的具体原因）。 */
+export interface WorkbuddyRejectedAccount {
+  /** 在账号库数组中的下标 */
+  index: number;
+  nickname: string;
+  id: string;
+  domain: string;
+  /** 后端解析出的平台（非 workbuddy 即被拒） */
+  platform: string;
+  /** 被拒原因（人话） */
+  reason: string;
+}
 
 /** 池状态总览（total/healthy/cooling/model_cooling/breaker + 账号明细）。 */
 export async function getWorkbuddyPoolStatus(): Promise<WorkbuddyPoolStatusResponse> {
@@ -1776,6 +1821,95 @@ export async function patchWorkbuddyPoolConfig(
   patch: Partial<WorkbuddyGatewayConfig>,
 ): Promise<{ ok: boolean; config?: WorkbuddyGatewayConfig }> {
   return call("patch_workbuddy_pool_config", patch as Record<string, unknown>);
+}
+
+/**
+ * 手动暂停 / 恢复池内某个账号（**用户意图**，与系统 `disabled` 分开）。
+ *
+ * @param uid 可为完整 uid 或**唯一前缀** —— 状态接口输出的是脱敏 uid
+ *            （前 8 位 + `…`），直接把它回传即可，后端负责反解；
+ *            前缀歧义时后端返回 400（不猜，避免误停用别的账号）。
+ * @param paused true = 暂停（退出选号）；false = 恢复。
+ */
+export async function setWorkbuddyPoolAccountPause(
+  uid: string,
+  paused: boolean,
+): Promise<{ ok: boolean; uid: string; paused: boolean }> {
+  return call("pause_workbuddy_pool_account", { uid, paused });
+}
+
+/** 账号库中**可编辑**的字段（白名单；与服务端 `account::EDITABLE_FIELDS` 一致）。
+ *
+ * 不在其中的：`id`（删除/导出主键）、`uid`、`auth_raw` / `profile_raw`（上游原始态）、
+ * `createdAt`（审计）。改动它们会让删除/导出/池选号对不上号。 */
+export interface WorkbuddyAccountPatch {
+  nickname?: string;
+  /** ⚠️ 决定**区域归属**（`.ai→intl` / 其余→cn），改动会让该账号换区 */
+  domain?: string;
+  access_token?: string;
+  refresh_token?: string;
+  /** ms epoch，必须为正 */
+  expiresAt?: number;
+  refreshExpiresAt?: number;
+}
+
+/**
+ * 编辑账号库记录（**PATCH 语义**：只改传入的字段）。
+ *
+ * 服务端是**全有或全无**：任一字段越界或校验不过 ⇒ 整体拒绝，不做部分写入。
+ *
+ * @param uid 完整 uid 或唯一前缀（status 输出的是脱敏 uid，直接回传即可）
+ */
+export async function updateWorkbuddyPoolAccount(
+  uid: string,
+  patch: WorkbuddyAccountPatch,
+): Promise<{ ok: boolean; uid: string; id: string }> {
+  return call("update_workbuddy_pool_account", { uid, patch });
+}
+
+/**
+ * 直接用 token 添加账号（**无文件**，参照 MiniMax 内联表单交互）。
+ *
+ * 仅 `access_token` 与 `domain` 必填；`expires_at` 缺省时后端从 JWT 的 `exp` 解析。
+ * **去重按 token**：同一段 access_token 再次提交 = 原地覆盖，不会产生重复条目。
+ *
+ * @param domain 决定区域归属（`.ai→intl` / 其余→cn`）—— 选错域就是进错区
+ */
+export async function addWorkbuddyAccountDirect(input: {
+  access_token: string;
+  refresh_token?: string;
+  domain: string;
+  nickname?: string;
+  uid?: string;
+  expires_at?: number;
+}): Promise<{ ok: boolean; account: AccountMeta }> {
+  return call("add_workbuddy_account_direct", input as Record<string, unknown>);
+}
+
+/**
+ * 清除账号的冷却 / 熔断 / 模型限流状态（**手动干预**）。
+ *
+ * ⚠️ 只清冷却类运行态：**不动** `disabled`（凭证失效的事实）与 `paused`（用户意图）。
+ * 清掉熔断计数后同一故障会重新累积 —— 仅在确认是误判（如出口抖动已恢复）时使用。
+ */
+export async function clearWorkbuddyPoolCooldown(
+  uid: string,
+): Promise<{ ok: boolean; uid: string }> {
+  return call("clear_workbuddy_pool_cooldown", { uid });
+}
+
+/**
+ * 删除账号（**账号库级**，不可恢复）。
+ *
+ * 池会在下一次 sync 时自动移除该条目（无需重启）。
+ * 凭证一并消失 —— UI 必须先让用户确认。
+ *
+ * @param uid 完整 uid 或唯一前缀（status 输出的是脱敏 uid）
+ */
+export async function deleteWorkbuddyPoolAccount(
+  uid: string,
+): Promise<{ ok: boolean; uid: string; id: string }> {
+  return call("delete_workbuddy_pool_account", { uid });
 }
 
 /** 池模型目录条目：OpenAI list 扁平形状 + 附加 region 字段（契约 §3.4 additive）。

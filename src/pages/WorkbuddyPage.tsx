@@ -70,6 +70,8 @@ import {
   Copy,
   Eye,
   EyeOff,
+  FileUp,
+  UserPlus,
   FlaskConical,
   Loader2,
   RefreshCw,
@@ -88,6 +90,13 @@ import { Switch } from "@/components/ui/switch";
 import * as api from "@/lib/api";
 import type { WorkbuddyProxyStatus } from "@/lib/api";
 import type { WorkbuddyGatewayConfig } from "@/lib/types";
+import type { WorkbuddyPoolAccount } from "@/lib/types";
+// 🔴 池判据走共享模块（`@/lib/pool-health`）——与统计页的池健康面板**同一份实现**，
+// 不要在本页另写一套（同语义两处实现必漂移）。
+import { LEVEL_STYLE, groupByRegion } from "@/lib/pool-health";
+import { WorkbuddyAccountEditDialog } from "@/components/workbuddy-account-edit-dialog";
+import { WorkbuddyAccountAddDialog } from "@/components/workbuddy-account-add-dialog";
+import { ImportAccountsDialog } from "@/components/import-accounts-dialog";
 import { cn } from "@/lib/utils";
 
 const WB_HERMES_SNIPPET = `model:
@@ -697,6 +706,90 @@ export default function WorkbuddyPage() {
   useEffect(() => {
     void loadPool();
   }, [loadPool]);
+
+  /** 正在切换暂停态的账号 uid（禁用该行按钮，防连点）。 */
+  const [poolPauseBusy, setPoolPauseBusy] = useState<string | null>(null);
+  /** 正在执行「清冷却 / 删除」的账号 uid。 */
+  const [poolActionBusy, setPoolActionBusy] = useState<string | null>(null);
+  /** 编辑弹窗目标（null=关闭）。 */
+  const [poolEditTarget, setPoolEditTarget] = useState<WorkbuddyPoolAccount | null>(null);
+  /** 导入账号弹窗（null=关闭）。 */
+  const [poolImportOpen, setPoolImportOpen] = useState(false);
+  /** 添加账号弹窗（三条直导路径，无需文件；null=关闭）。 */
+  const [poolAddOpen, setPoolAddOpen] = useState(false);
+
+  /** 清除冷却 / 熔断 / 模型限流（手动干预）。
+   *
+   * ⚠️ 只清**冷却类**运行态；不动 `disabled`（凭证失效）与 `paused`（用户意图）。
+   * 清掉熔断计数后同一故障会重新累积，故仅用于确认是误判时提前放行。 */
+  const clearPoolCooldown = useCallback(
+    async (uid: string, label: string) => {
+      setPoolActionBusy(uid);
+      setPoolMsg(null);
+      try {
+        await api.clearWorkbuddyPoolCooldown(uid);
+        setPoolMsg({ type: "ok", text: `已清除 ${label} 的冷却/熔断状态` });
+        await loadPool();
+      } catch (e) {
+        setPoolMsg({ type: "err", text: api.asError(e) });
+      } finally {
+        setPoolActionBusy(null);
+      }
+    },
+    [loadPool],
+  );
+
+  /** 删除账号（账号库级，不可恢复）。删除前必须让用户确认。 */
+  const deletePoolAccount = useCallback(
+    async (uid: string, label: string) => {
+      if (
+        !window.confirm(
+          `确定删除账号「${label}」？\n\n删除的是账号库记录，凭证会一并消失、不可恢复；` +
+            `该区的可用账号数会随之减少。`,
+        )
+      ) {
+        return;
+      }
+      setPoolActionBusy(uid);
+      setPoolMsg(null);
+      try {
+        await api.deleteWorkbuddyPoolAccount(uid);
+        setPoolMsg({ type: "ok", text: `已删除 ${label}` });
+        await loadPool();
+      } catch (e) {
+        setPoolMsg({ type: "err", text: api.asError(e) });
+      } finally {
+        setPoolActionBusy(null);
+      }
+    },
+    [loadPool],
+  );
+
+  /**
+   * 暂停 / 恢复池内某个账号（用户意图，与系统 `disabled` 分开）。
+   *
+   * uid 直接用状态里那个**脱敏值**（前 8 位 + `…`）—— 后端按唯一前缀反解，
+   * 前缀歧义会返回 400（不猜），错误走 `poolMsg` 透出。
+   */
+  const togglePoolPause = useCallback(
+    async (uid: string, paused: boolean, label: string) => {
+      setPoolPauseBusy(uid);
+      setPoolMsg(null);
+      try {
+        await api.setWorkbuddyPoolAccountPause(uid, paused);
+        setPoolMsg({
+          type: "ok",
+          text: paused ? `已暂停 ${label}（不再参与选号）` : `已恢复 ${label}`,
+        });
+        await loadPool();
+      } catch (e) {
+        setPoolMsg({ type: "err", text: api.asError(e) });
+      } finally {
+        setPoolPauseBusy(null);
+      }
+    },
+    [loadPool],
+  );
 
   /** 池模型目录（契约 T6 / §3.4）：GET /workbuddy-pool/v1/models 只读拉取。
    *  失败仅影响目录区空态（记 poolModelsError），不波及账号表；可点「刷新」重试。 */
@@ -1323,6 +1416,22 @@ export default function WorkbuddyPage() {
                 {poolMsg.text}
               </span>
             ) : null}
+            {/* 主入口：直接添加（本机导入 / 浏览器登录 / 手动粘贴），无需上传文件 */}
+            <Button className="shrink-0" variant="default" size="sm" onClick={() => setPoolAddOpen(true)}>
+              <UserPlus />
+              添加账号
+            </Button>
+            {/* 次要入口：文件导入，保留给「迁移存量 JSON」 */}
+            <Button
+              className="shrink-0"
+              variant="outline"
+              size="sm"
+              title="从 JSON 文件批量导入（迁移存量用；新增账号建议用「添加账号」）"
+              onClick={() => setPoolImportOpen(true)}
+            >
+              <FileUp />
+              导入文件
+            </Button>
             <Button
               className="shrink-0"
               variant="outline"
@@ -1415,6 +1524,70 @@ export default function WorkbuddyPage() {
               </div>
             ) : null}
 
+            {/* 区域可用性小结（2026-10-13）：回答「现在能不能用、是配额还是故障」。
+                判据来自共享模块 @/lib/pool-health（与统计页池健康面板同一份实现），
+                本区块只负责渲染。 */}
+            {(() => {
+              const accs = poolStatus?.accounts ?? [];
+              if (accs.length === 0) return null;
+              const rows = groupByRegion(accs, Date.now());
+              return (
+                <div className="space-y-2 border-t px-4 py-3 sm:px-5">
+                  {rows.map((r) => {
+                    const s = LEVEL_STYLE[r.verdict.level];
+                    return (
+                      <div
+                        key={r.key}
+                        className={cn("rounded-lg border border-border/60 p-2.5", s.box)}
+                      >
+                        <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs">
+                          <span className={cn("size-2 shrink-0 rounded-full", s.dot)} />
+                          <span className="font-medium">{poolRegionLabel(r.key)}</span>
+                          <span className={cn("font-medium", s.text)}>{r.verdict.label}</span>
+                          <span className="tabular-nums text-muted-foreground">
+                            {r.healthyCount}/{r.accounts.length} 账号可用
+                          </span>
+                          {r.cooled.length > 0 ? (
+                            <span className="text-amber-600">模型限流 {r.cooled.length} 个</span>
+                          ) : null}
+                        </div>
+                        <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
+                          {r.verdict.detail}
+                        </p>
+                      </div>
+                    );
+                  })}
+                </div>
+              );
+            })()}
+
+            {/* 未能进池的记录（2026-10-13）：解决「导入成功、池里却看不到」无处可查。
+                池的准入判据（平台 / access_token / uid）在后端，不合格记录会被静默丢弃，
+                故由后端把原因算好放在 status.rejected[]，本区块只渲染。 */}
+            {(poolStatus?.rejected?.length ?? 0) > 0 ? (
+              <div className="border-t px-4 py-3 sm:px-5">
+                <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-2.5">
+                  <p className="text-[11px] font-medium text-amber-700">
+                    账号库里有 {poolStatus?.rejected?.length} 条记录
+                    <strong>没能进池</strong>（因此不参与选号）：
+                  </p>
+                  <ul className="mt-1.5 space-y-1">
+                    {poolStatus?.rejected?.map((r) => (
+                      <li key={`${r.index}-${r.id}`} className="text-[11px] leading-relaxed text-amber-700">
+                        <span className="font-medium">
+                          {r.nickname || r.id || `第 ${r.index + 1} 条`}
+                        </span>
+                        {r.domain ? <span className="text-muted-foreground"> · {r.domain}</span> : null}
+                        <span className="text-muted-foreground"> · platform={r.platform}</span>
+                        <br />
+                        <span>原因：{r.reason}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
+            ) : null}
+
             {/* 账号表：昵称 / 区域 / 积分 / 到期 / 冷却状态 / 模型冷却明细 */}
             <div className="px-4 pb-4 sm:px-5">
               {poolLoading && !poolStatus ? (
@@ -1424,7 +1597,10 @@ export default function WorkbuddyPage() {
                   <Users className="size-8 text-muted-foreground/50" />
                   <p className="mt-2 text-sm font-medium">账号池暂无账号</p>
                   <p className="mt-1 text-xs text-muted-foreground">
-                    账号库（~/.wb-switch/accounts.json）里的 WorkBuddy OAuth 账号会自动进入池子，请先到「账号」页添加
+                    两条入库路径，地域均由登录域**自动派生**（`.ai→intl` / 其余→cn），无需手动分区：
+                    <br />① <strong>添加单个账号</strong>：到「账号」页用 WorkBuddy 登录（OAuth），登录即入库；
+                    <br />② <strong>批量导入</strong>：点右上「导入账号」选 JSON 文件
+                    （须含 <code className="font-mono">access_token</code>，脱敏导出的文件不含凭证、会被跳过）。
                   </p>
                 </div>
               ) : (
@@ -1438,6 +1614,7 @@ export default function WorkbuddyPage() {
                         <th className="px-3 py-2 text-left font-medium">到期</th>
                         <th className="px-3 py-2 text-left font-medium">冷却状态</th>
                         <th className="px-3 py-2 text-left font-medium">模型冷却明细</th>
+                        <th className="px-3 py-2 text-right font-medium">操作</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y">
@@ -1478,6 +1655,15 @@ export default function WorkbuddyPage() {
                                   className="h-5 border-rose-500/30 bg-rose-500/10 text-[10px] text-rose-600"
                                 >
                                   出池 · 需重登
+                                </Badge>
+                              ) : a.paused ? (
+                                // 用户主动暂停：措辞必须与「出池/故障」分开，
+                                // 否则会被读成「账号坏了」（2026-10-13 新增 paused 的理由）。
+                                <Badge
+                                  variant="outline"
+                                  className="h-5 border-slate-500/30 bg-slate-500/10 text-[10px] text-slate-600"
+                                >
+                                  已暂停 · 手动
                                 </Badge>
                               ) : breakerActive ? (
                                 <Badge
@@ -1521,6 +1707,86 @@ export default function WorkbuddyPage() {
                                   ) : null}
                                 </div>
                               )}
+                            </td>
+                            <td className="px-3 py-2">
+                              <div className="flex flex-wrap items-center justify-end gap-1.5">
+                                {/* 编辑（始终可用）：白名单字段，见编辑弹窗说明 */}
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  className="h-6 px-2 text-[10px]"
+                                  onClick={() => setPoolEditTarget(a)}
+                                >
+                                  编辑
+                                </Button>
+
+                                {/* 暂停/恢复：可逆的用户开关。
+                                    `disabled`（session 死）不给按钮——它只能靠重登恢复，给按钮是假的。 */}
+                                {a.disabled ? (
+                                  <span className="text-[10px] text-muted-foreground">
+                                    需重新登录
+                                  </span>
+                                ) : (
+                                  <Button
+                                    variant="outline"
+                                    size="sm"
+                                    className="h-6 px-2 text-[10px]"
+                                    disabled={poolPauseBusy === a.uid}
+                                    onClick={() =>
+                                      void togglePoolPause(
+                                        a.uid,
+                                        !a.paused,
+                                        a.nickname || a.uid,
+                                      )
+                                    }
+                                  >
+                                    {poolPauseBusy === a.uid ? (
+                                      <Loader2 className="animate-spin" />
+                                    ) : a.paused ? (
+                                      "恢复"
+                                    ) : (
+                                      "暂停"
+                                    )}
+                                  </Button>
+                                )}
+
+                                {/* 清冷却：只在「确有可清的冷却」时出现，避免常态噪音 */}
+                                {coolingActive || breakerActive || cools.length > 0 ? (
+                                  <Button
+                                    variant="outline"
+                                    size="sm"
+                                    className="h-6 px-2 text-[10px]"
+                                    title="清除账号级冷却 / 熔断 / 模型限流（手动干预；不清 disabled 与 paused）"
+                                    disabled={poolActionBusy === a.uid}
+                                    onClick={() =>
+                                      void clearPoolCooldown(a.uid, a.nickname || a.uid)
+                                    }
+                                  >
+                                    {poolActionBusy === a.uid ? (
+                                      <Loader2 className="animate-spin" />
+                                    ) : (
+                                      "清冷却"
+                                    )}
+                                  </Button>
+                                ) : null}
+
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  className="h-6 border-rose-500/30 px-2 text-[10px] text-rose-600 hover:bg-rose-500/10"
+                                  title="删除账号库记录（不可恢复）"
+                                  disabled={poolActionBusy === a.uid}
+                                  onClick={() =>
+                                    void deletePoolAccount(a.uid, a.nickname || a.uid)
+                                  }
+                                >
+                                  {poolActionBusy === a.uid ? (
+                                    <Loader2 className="animate-spin" />
+                                  ) : (
+                                    "删除"
+                                  )}
+                                </Button>
+                              </div>
                             </td>
                           </tr>
                         );
@@ -1748,6 +2014,48 @@ export default function WorkbuddyPage() {
           </CardContent>
         </Card>
       </section>
+
+      {/* 账号编辑弹窗（cloud 区块用）：白名单字段 + PATCH 语义 */}
+      <WorkbuddyAccountEditDialog
+        open={poolEditTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setPoolEditTarget(null);
+        }}
+        account={poolEditTarget}
+        onSaved={(msg) => setPoolMsg({ type: "ok", text: msg })}
+      />
+
+      {/* 账号添加弹窗（cloud 区块主入口）：三条直导路径，均无需上传文件 */}
+      <WorkbuddyAccountAddDialog
+        open={poolAddOpen}
+        onOpenChange={setPoolAddOpen}
+        onAdded={(msg) => {
+          setPoolMsg({ type: "ok", text: msg });
+          void loadPool();
+          void loadPoolModels();
+        }}
+      />
+
+      {/* 账号导入弹窗（次要入口）：选 JSON → 预览 → 勾选 → 合并入库。
+          地域**自动派生**（domain 后缀 .ai→intl / 其余→cn），无需手动分区。
+          新增账号请优先用上面的「添加账号」，本入口留给迁移存量 JSON。 */}
+      <ImportAccountsDialog
+        open={poolImportOpen}
+        onOpenChange={setPoolImportOpen}
+        onImported={(r) => {
+          const over = r.overwritten > 0 ? `（覆盖 ${r.overwritten}）` : "";
+          setPoolMsg({
+            type: r.imported > 0 ? "ok" : "err",
+            text:
+              `已导入 ${r.imported} 个${over}，跳过 ${r.skipped} 个。` +
+              (r.imported === 0
+                ? "常见原因：记录缺 access_token（脱敏导出），或 uid 与已有账号重复。"
+                : ""),
+          });
+          void loadPool();
+          void loadPoolModels();
+        }}
+      />
     </div>
   );
 }

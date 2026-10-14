@@ -1,6 +1,6 @@
 {
   "name": "sylvia-switch",
-  "version": "2.1.1",
+  "version": "2.1.8",
   "description": "Sylvia Switch：多渠道 AI 账号管理与统一网关（统一账号池 / 统一签到 / OpenAI·Anthropic 兼容反代）",
   "bin": {
     "sylvia-switch": "bin/sylvia-switch.js"
@@ -10,10 +10,10 @@
     "scripts"
   ],
   "optionalDependencies": {
-    "sylvia-switch-darwin-arm64": "2.1.1",
-    "sylvia-switch-darwin-x64": "2.1.1",
-    "sylvia-switch-win32-x64": "2.1.1",
-    "sylvia-switch-linux-x64": "2.1.1"
+    "sylvia-switch-darwin-arm64": "2.1.8",
+    "sylvia-switch-darwin-x64": "2.1.8",
+    "sylvia-switch-win32-x64": "2.1.8",
+    "sylvia-switch-linux-x64": "2.1.8"
   },
   "scripts": {
     "postinstall": "node scripts/install.js"

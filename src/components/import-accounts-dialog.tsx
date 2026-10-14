@@ -98,11 +98,32 @@ export function ImportAccountsDialog({ open, onOpenChange, onImported }: Props) 
   }
 
   async function doImport() {
-    if (busy || parsing || !fileText || selected.size === 0) return;
+    // ⚠️ 原实现是 `... || selected.size === 0) return;` —— **静默返回、无任何提示**，
+    // 用户点了「导入」就像什么都没发生（对话框不关、无报错、无计数）。
+    // 2026-10-13 用户报「导入后并未成功导入」即踩中此类无反馈路径。
+    // 现在显式说明，并区分「没选文件」与「没勾账号」两种情形。
+    if (busy || parsing) return;
+    if (!fileText) {
+      setError("请先选择要导入的 JSON 文件。");
+      return;
+    }
+    if (selected.size === 0) {
+      setError("没有勾选任何账号——请在下方列表中勾选要导入的条目（全选已自动勾上，取消后需重勾）。");
+      return;
+    }
     setBusy(true);
     setError("");
     try {
       const res = await api.importAccounts(fileText, [...selected]);
+      // 全部被跳过时结果文案容易忽略（`已导入 0 个，跳过 N 个`），
+      // 这里补一句**为什么**，避免用户以为「导入操作失败了」。
+      if (res.imported === 0) {
+        setError(
+          `没有账号被导入（跳过 ${res.skipped} 个）。常见原因：文件里的记录缺少 access_token` +
+            `（脱敏导出不含凭证），或 uid 与已有账号重复。`,
+        );
+        return;
+      }
       onImported?.(res);
       onOpenChange(false);
     } catch (e) {

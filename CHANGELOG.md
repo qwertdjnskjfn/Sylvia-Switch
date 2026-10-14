@@ -1,3 +1,707 @@
+## 2.1.8 - 2026-10-13
+
+### 🔴 修复：OAuth 登录只能拿国内版账号 —— 国际版从未真正支持过
+
+**用户报障**：账号导入似乎只支持获取国内版本账号，无法导入国外版本账号。
+
+#### 根因（3 处，缺一不可）
+
+`oauth.rs` 全文只有一处硬编码端点常量，却用它拼了 **4 个 URL**：
+
+| # | 位置 | 问题 |
+| --- | --- | --- |
+| ① | `auth/state`、`auth/token`、`login/account`、兜底 `login?state=` | 全部用 `WORKBUDDY_API_ENDPOINT`（= `https://www.codebuddy.cn`）。**`config.rs` 里早就有 `WORKBUDDY_API_ENDPOINT_INTL`，但 oauth.rs 从未引用它** ⇒ 国际版**没有任何登录入口** |
+| ② | `login/account` 请求头 | **没调** `apply_region_headers()` ⇒ 国际版上游按 `Origin`/`Referer` 判定来源区域，缺失会被拒 |
+| ③ | `"domain": data.domain` | 🔴 **隐藏坑**：上游若不回 `domain`，记录里就是**空串** ⇒ 池按 `.ai` 后缀派生 region 落回 `cn` ⇒ **国际号被当成国内号**。症状：明明登了国际版，请求却全走国服 |
+
+> 对照证据：`refresh` / `checkin` / `chat` 早在 2026-09-25 就修过同一个坑
+> （`workbuddy_api_endpoint_for` 的注释里写着「此前对所有账号硬打国服端点，
+> 国际账号刷新天然 invalid_grant」）—— **OAuth 是当时漏掉的那一条**。
+
+#### 改动
+
+| # | 文件 | 内容 |
+| --- | --- | --- |
+| ① | `oauth.rs` | 新增 `normalize_login_region()` / `default_domain_for()` / `endpoint_for_region()`；`oauth_start(region)` 把区域**存进 `OAuthInfo`**（`oauth_poll` 是另一次 HTTP 调用，只拿到 `login_id`，不存就会退回国服端点）；4 个 URL 全部改用 `endpoint_for_region(&region)` |
+| ② | `oauth.rs` | `login/account` 调 `apply_region_headers()`（注入 `Origin`/`Referer`/`X-Auth-Refresh-Source`）|
+| ③ | `oauth.rs` | `domain` **兜底**：上游未返回时按所选区域回填（intl → `www.workbuddy.ai`）。兜底在**建 headers 之前**算，因为 `apply_region_headers` 正是按 domain 判区域 |
+| ④ | `oauth.rs` | 完成响应回传 `region` / `domain`，供界面确认「确实登进了国际版」|
+| ⑤ | `api.rs` | `api_oauth_start` 收 `Option<Json<Value>>`，读 `region`（缺省 `cn` 保持旧行为）；`api_import_local` 回传实际读到的 `region`/`domain` |
+| ⑥ | `api.ts` / `types.ts` | `oauthStart(region?)`；`OAuthStartResult` 补 `region`/`endpoint`，`OAuthPollResult` 补 `region`/`domain`，`importLocal()` 补返回字段 |
+| ⑦ | `workbuddy-account-add-dialog.tsx` | 登录 Tab 加**国内版 / 国际版**切换卡片（各带端点提示）+ 选错版警示；本机导入 Tab 加「只能读桌面端当前登录版本、想换版请改用另两个 Tab」的说明；两处成功文案都带上区域 |
+
+#### 国内版 / 国际版的数据结构差异
+
+**记录 schema 完全一致**（同一个 `accounts.json` 条目形状），差异只在 `domain` 值：
+
+| | 国内版 | 国际版 |
+| --- | --- | --- |
+| `domain` | `www.workbuddy.cn` | `www.workbuddy.ai` |
+| API 基址 | `https://www.codebuddy.cn` | `https://www.workbuddy.ai` |
+| 区域头 | 不带 | `Origin`/`Referer`/`X-Auth-Refresh-Source` |
+| 池内 region | `cn` | `intl` |
+| keycloak realm | 国服 | 国际（跨区 refresh 必然 `invalid_grant`）|
+
+⇒ **兼容策略：零 schema 变更**，用 `domain` 后缀作为唯一判据（与池、签到、credits 同口径），
+不引入 `isIntl` 之类的冗余布尔字段——那会产生第二处真相。
+
+#### 错误处理与边界
+
+| 场景 | 行为 |
+| --- | --- |
+| 区域切换失败（`auth/state` 无 state / 无鉴权）| 原样回传上游错误片段，不静默；界面显示红色错误条 |
+| 账号已存在 | `save_collected_account` 按 **uid** 去重 ⇒ 原地覆盖凭证，**不产生重复条目**（无需新增逻辑）|
+| 无权限 / 登录超时 | `OAUTH_TIMEOUT_SECONDS`(600s) 超时后 `done:true, error:"登录超时"`；轮询接口返回 `done:false` 表示「还没完成」|
+| 遗留 state（本次升级前发起）| `OAuthInfo.region` 为空 ⇒ 按 `cn` 处理，不崩 |
+| 手动粘贴选错域 | UI 常驻警示：海外只连海外、国内只连国内，事后不能互通 |
+| 本机导入拿不到目标版本 | 明确说明「只能读桌面端当前登录的版本」，并指引改用另两个 Tab |
+
+#### 验证
+
+| 项 | 结果 |
+| --- | --- |
+| 单测 ×4 | ✅ `login_region_normalization_is_case_and_space_insensitive`、`login_region_selects_distinct_endpoints`（**断言两端点必须不同**）、`login_domain_fallback_prevents_intl_account_being_treated_as_cn`、`intl_login_sends_region_headers`（含「国服不应注入国际头」）|
+| `tsc --noEmit` | ✅ 零错误 |
+| 部署 | 见本次发布记录 |
+
+---
+
+## 2.1.7 - 2026-10-13
+
+### 账号添加改为「直导」：新增 token 直连接口 + 三 Tab 添加对话框（不再必须上传文件）
+
+**用户诉求**：把账号导入从「文件导入」改为「直接导入」，参照 WorkBuddy 桌面端国际版交互
+或 MiniMax 通道账号池的导入方式；支持直接输入或选择账号完成导入，无需上传文件；
+并说明实现方案、关键代码位置与需调整的模块。
+
+#### 参照实现的勘察结论
+
+| 参照 | 形态 | 采纳 |
+| --- | --- | --- |
+| **MiniMax** `/accounts/add` | 内联表单、**必填仅 token**、其余可选带 placeholder、无文件 | ✅ **直接照搬这个形态** |
+| **WorkBuddy 桌面端国际版** | 登录即用，凭证自动入库 | ✅ 对应「浏览器登录」Tab |
+| WorkBuddy `import-local` | 读本机桌面端已登录态 | ✅ 对应「本机导入」Tab |
+
+#### 方案：三条直导 + 一条文件（文件降级为「迁移存量」）
+
+| 路径 | 交互 | 接口 | 新增？ |
+| --- | --- | --- | --- |
+| **本机导入** | 一键读桌面端登录态 | `POST /api/import-local` | 复用既有 |
+| **浏览器登录** | 拉起授权页 → 2s 轮询 → 自动入库 | `/api/oauth/start` + `/api/oauth/status` | 复用既有 |
+| **手动粘贴** | 内联表单，必填仅 `access_token` | **`POST /workbuddy-pool/v1/accounts/add-direct`** | ✅ **本次新增** |
+| 导入文件 | 选 JSON → 预览 → 勾选 | `POST /api/import` | 保留（降级为次要入口）|
+
+#### 🔴 关键实现决策：去重按 `access_token`，**不走** `upsert_collected_account`
+
+`upsert_collected_account` 按 **uid/email** 去重，而**手动添加往往两者都没有** ——
+重复点击就会被判成「新账号」再 push 一条，得到 N 个重复账号。
+首版就是这么写的，被单测 `add_by_token_creates_and_dedups_by_token` 直接打回（实得 2 条）。
+⇒ 改为**按 token 定位后按下标原地替换**，并保留原 `id`/`uid`/`createdAt`。
+
+其它细节：
+- `expires_at` 留空 ⇒ 从 JWT 的 `exp` 解析（复用 `autoclaw_accounts::jwt_exp_from_access_token`，不重复实现）；
+- 无显式 `uid` 时靠 `id` 兜底（`account_uid` 三级回退：auth_raw.uid → uid → id）；
+- `_at` 路径注入变体 ⇒ 单测不碰真实账号库（红线）。
+
+#### 改动
+
+| # | 文件 | 内容 |
+| --- | --- | --- |
+| ① | `account.rs` | 新增 `add_account_by_token` / `add_account_by_token_at`（token 去重 + JWT exp 解析 + 进程锁 + 路径隔离）|
+| ② | `api.rs` | 新增路由 `POST /workbuddy-pool/v1/accounts/add-direct` + handler |
+| ③ | `api.ts` | 新增 `addWorkbuddyAccountDirect()` + 路由表条目 |
+| ④ | **新增** `workbuddy-account-add-dialog.tsx` | 三 Tab 添加对话框：本机导入 / 浏览器登录（2s 轮询）/ 手动粘贴；`domain` 选择器带常驻换区警示 |
+| ⑤ | `WorkbuddyPage.tsx` | 头部按钮改为「**添加账号**」（主）+「导入文件」（次）+「刷新」；挂载新对话框 |
+| ⑥ | `docs/workbuddy-account-pool-design.md` | §6.4 重写为「三条直导 + 一条文件」，新增 §6.4.1 字段与去重说明 |
+
+#### 🔴 过程中的一次事故（已修复并验证）
+
+用 Python 脚本批量替换函数体时，**按「首个 `load_accounts_from_path(path)` 行」定位**，
+误命中了 `delete_account_from_path`（同文件里也有这行）——把它的函数体覆盖成了新代码。
+**修法**：`git show HEAD` 取回原函数逐字还原 → 顺带发现并删掉一处重复的 `load_accounts` 定义。
+
+验证：
+| 项 | 结果 |
+| --- | --- |
+| `git diff --stat` | **404 行新增 / 0 个函数被删**（唯一 1 行删除是我有意替换的 `use`）|
+| `delete_account_from_path` | 与 HEAD **逐字一致** |
+| 全量单测 | ✅ **877 passed / 0 failed**，含覆盖该函数的 `persisted_same_name_accounts_can_be_found_and_deleted_independently` |
+| `tsc --noEmit` | ✅ 零错误 |
+
+> 📌 教训：按「内容」定位做批量替换时，同一文件里出现**两次相同的内容**就会误伤。
+> 正解：先 `grep -n` 确认**唯一性**，或按行号+内容双重校验再改。
+
+#### ⚠️ 保留的边界
+
+- `domain` 选错 = 进错区（海外只连海外、国内只连国内，事后不能互通）——UI 有常驻警示。
+- 文件导入**未删除**：迁移存量 JSON 仍需要，且脱敏导出的文件会被跳过（需另行体检）。
+
+---
+
+## 2.1.6 - 2026-10-13
+
+### cloud 区块补「导入账号」按钮；区域隔离 / 自动切换 / 轮询模式补齐为规范
+
+**用户诉求**：实现账号导入（提供按钮、批量导入海内外凭证、自动按地域分类）；
+严格区域隔离（海外号只连海外、国内号只连国内）；限流自动切换到其他可用海外号；
+自动轮询账号。
+
+#### 逐条核对结论（**大部分早已存在**，没有重造）
+
+| 诉求 | 现状 | 判定 |
+| --- | --- | --- |
+| 区域硬隔离 | `RegionFilter::allows()`：`Intl` 只选 intl、`Cn` 只选 cn，**候选集直接按区过滤**；选不到就报「区内无可用账号」，**绝不**把请求丢给对侧账号 | ✅ 早已实现 |
+| 限流自动切换 | 换号循环早已存在：非致命错误 → `note_error` 冷却该号 → uid 进 `tried` → 选中**下一个**账号 | ✅ 早已实现 |
+| 自动轮询账号 | 配置面板**早已暴露**选号模式：`balance`（到期分层+加权）/ `rotate`（**烧号轮询**）/ `pinned` | ✅ 早已实现 |
+| **导入按钮** | 导入对话框在**账号页**，cloud 区块没有入口 | ⚠️ **本次补上** |
+
+#### 🔴 必须说清的一点：自动切换的**容量前提**
+
+切换机制在，但**目标账号必须存在**。当前 `intl` 区**只有 1 个账号**
+（`cn` 有 2 个）—— 该区一旦被限流/失效，**无号可切，整区不可用**。
+2026-10-13 当日三次 ZCode 503 报障均源于此。
+
+⇒ 这是**账号供给问题，不是代码问题**。根治 = 给 intl 区补第二个 `.ai` 账号。
+（导入按钮现在就在 cloud 区块里，补完即刻生效，无需重启。）
+
+#### 改动
+
+| # | 文件 | 内容 |
+| --- | --- | --- |
+| ① | `WorkbuddyPage.tsx` | 头部加「**导入账号**」按钮（复用既有 `ImportAccountsDialog`）；导入结果透出**计数 + `imported===0` 的原因提示**；成功后 `loadPool()` + `loadPoolModels()` |
+| ② | `WorkbuddyPage.tsx` | 空态文案改为「两条入库路径」说明：① 账号页 OAuth 登录（单个）② cloud 区块导入（批量）；并强调地域**自动派生** |
+| ③ | `docs/workbuddy-account-pool-design.md` | 新增 §6：**6.1 区域隔离**（含 11102 自动翻转的唯一例外）、**6.2 自动切换机制**（换号循环全时序 + 各错误类别是否换号/是否喂熔断）、**6.3 轮询模式**（三种模式语义与「轮询」两种可能含义）、**6.4 导入路径** |
+
+#### 验证
+
+| 项 | 结果 |
+| --- | --- |
+| `tsc --noEmit` | ✅ 零错误（含 `FileUp` 图标导入）|
+| 产物自检 | 见本次发布记录 |
+| 既有能力复核 | 区域隔离判据、换号循环、模式选择器均**只读未改**（无回归风险）|
+
+---
+
+## 2.1.5 - 2026-10-13
+
+### 账号管理补全：新增「编辑」能力（白名单 PATCH）+ 清冷却 + 云区块内删除
+
+**用户诉求**：在 WorkBuddy 网关实现账号管理能力，支持**添加账号**并对已有账号**统一管理**
+（查看 / 编辑 / 删除），并明确**所需数据字段、权限与状态处理**。
+
+#### 能力矩阵（补齐后）
+
+| 能力 | 之前 | 现在 |
+| --- | --- | --- |
+| 查看 | ✅ `GET /workbuddy-pool/v1/status` | 同左 |
+| 添加 | ✅ OAuth 登录即入库 / 导入 | 同左 |
+| **编辑** | ❌ **完全没有** | ✅ `POST /workbuddy-pool/v1/accounts/update` |
+| 删除 | ✅ 账号页 `POST /api/delete` | ✅ **cloud 区块内可直接删**（`/workbuddy-pool/v1/accounts/delete`）|
+| 暂停/恢复 | ✅ 2.1.2 | 同左 |
+| **清冷却** | ❌ 无手动干预 | ✅ `/workbuddy-pool/v1/accounts/clear-cooldown` |
+
+> 注：账号页那个「备注」是**本地 UI 标注**，不写账号记录 —— 所以编辑**确实**是空白。
+
+#### 🔴 可编辑字段（白名单，服务端强制；理由见规范 §5.1）
+
+| 字段 | 可改 | 备注 |
+| --- | --- | --- |
+| `nickname` | ✅ | 可清空（展示回落 uid）|
+| `domain` | ✅ ⚠️ | **决定区域归属**（`.ai→intl`），改它 = 账号换区；UI 有显式警示 |
+| `access_token` / `refresh_token` | ✅ | 不许清空（清空等于弄死账号）|
+| `expiresAt` / `refreshExpiresAt` | ✅ | ms epoch，必须为正 |
+
+**不可编辑**：`id`（删除/导出主键）、`uid`、`auth_raw` / `profile_raw`（上游原始态，
+池 uid 取自 `auth_raw.uid`）、`createdAt`（审计）。改动它们会让删除、导出与池选号**对不上号**。
+
+**写语义**：PATCH（只改传入字段）+ **全有或全无**（任一字段非法 ⇒ 整体拒绝，不做部分写入）。
+
+#### 🔴 状态处理（五种状态，语义与处置各不相同）
+
+| 状态 | 谁置位 | 恢复方式 | 可否手动改 |
+| --- | --- | --- | --- |
+| 冷却中（soft）| 429 限流退避 | 到期自动 | ✅ 清冷却 |
+| 熔断中 | 连续失败 | 到期自动 | ✅ 清冷却（计数也清）|
+| 模型级冷却 | 上游该模型频率上限 | 按上游重置时间 | ✅ 清冷却 |
+| 出池 `disabled` | session 死亡（12153）| **重新登录** | ❌ |
+| 暂停 `paused` | **用户**手动 | 一个开关 | ✅ |
+
+三条不可动摇的约束（均有单测）：① 暂停不写 `disabled`；② 恢复暂停**不顺手清冷却**；
+③ 清冷却**不碰** `disabled`/`paused`/出池原因。
+
+#### 权限模型（规范 §5.2）
+
+- 网关仅绑 `127.0.0.1`；`/workbuddy-pool/v1/accounts/*` 与 `/config` 同属 **webui 自用组**；
+- 对外烧额度的入口（chat / responses / messages）才需**网关 key**，且 region 参与密钥隔离；
+- **「能打开这个页面」= 拥有池管理权**（本地单机管理面，按机器边界授权，无 per-account ACL）。
+
+#### 改动
+
+| # | 文件 | 内容 |
+| --- | --- | --- |
+| ① | `account.rs` | 新增 `update_account_fields` + `validate_and_normalize_patch`；**`_at` 变体做路径隔离**（单测不碰真实账号库）；进程级锁与导入共用 |
+| ② | `workbuddy_gateway.rs` | 新增 `clear_cooldown`、`account_library_id_for_uid`（池 uid → 账号库 id，复用 `account_matches_uid` 口径）、公开 `resolve_account_uid` |
+| ③ | `api.rs` | 三条路由：`accounts/update`、`accounts/clear-cooldown`、`accounts/delete` |
+| ④ | `api.ts` | `updateWorkbuddyPoolAccount` / `clearWorkbuddyPoolCooldown` / `deleteWorkbuddyPoolAccount` + `WorkbuddyAccountPatch` 类型 |
+| ⑤ | **新增** `workbuddy-account-edit-dialog.tsx` | 编辑弹窗：昵称 / 登录域 / token；**只提交真正变化的字段**（避免把没动的 token 原样回写、绕过「不倒退」保护）；改域时显式警示换区 |
+| ⑥ | `WorkbuddyPage.tsx` | cloud 区块操作列扩为 **编辑 / 暂停|恢复 / 清冷却 / 删除**；新增 `clearPoolCooldown` / `deletePoolAccount`（删除前 `window.confirm`）|
+| ⑦ | `docs/workbuddy-account-pool-design.md` | 新增 §5 **账号管理能力矩阵** + 5.1 字段白名单 + 5.2 权限 + 5.3 状态处理 |
+
+#### 🔴 一个实现细节：为什么需要 `account_library_id_for_uid`
+
+池 uid 取自 `auth_raw.uid → uid → id`（见 `account_uid`），与账号库的 `id` 字段
+**不保证相同** —— 直接拿池 uid 当 id 去改/删会「找不到账号」。
+故多一层映射，且复用 `account_matches_uid`（同一份 uid 口径），不另写一套。
+
+#### 验证
+
+| 项 | 结果 |
+| --- | --- |
+| 单测 ×5 | ✅ `edit_patch_whitelist_rejects_protected_fields`（id/uid/auth_raw/profile_raw/createdAt 全拒）、`edit_patch_validation_is_all_or_nothing`（含「混入非法字段 ⇒ 整体拒绝」）、`edit_writes_only_given_fields_and_keeps_the_rest`（PATCH 语义，含 `auth_raw` 不被动）、`edit_rejects_unknown_account_without_touching_file`、`clear_cooldown_clears_cooling_but_never_disabled_or_paused` |
+| `tsc --noEmit` | ✅ 零错误 |
+| 部署 | 见本次发布记录 |
+
+#### 踩坑（测试自身）
+
+`serde_json::Map` 默认是 **BTreeMap**，迭代按**键的字母序**而非插入顺序。
+首版测试按下标断言字段，失败后改为**按 key 查找**（顺序无关才稳）。
+
+---
+
+## 2.1.4 - 2026-10-13
+
+### 账号池能力接入「多账号网关（cloud）」区块：管理操作落到它该在的地方
+
+**用户诉求**：把已做好的账号池功能集成进**多账号网关（cloud）**，
+确保池逻辑与网关的账号管理流程正确对接、且原有功能可用。
+
+#### 落点勘察
+
+「多账号网关（cloud）」**不是独立页面**，而是 `WorkbuddyPage.tsx`（`/workbuddy`）里的
+第 ⑥ 区块，原本已有：**池总览五个计数 / 账号表 / 配置面板 / 接入信息**。
+⇒ 本次是**把新能力接进既有区块**，不是另起一个面板（避免同一份数据两处渲染）。
+
+#### 🔴 先做重构：判据抽成共享模块（防今日已踩三次的漂移）
+
+池健康判据现在有**两个消费方**（统计页面板 = 监控视角、cloud 区块 = 管理视角）。
+若各写一份必然漂移 —— 今日已因「同一语义两处实现」踩中三次
+（池级计数漏 `paused`、准入判据两份、region 聚合口径）。
+
+⇒ 新增 **`src/lib/pool-health.ts`** 作为**唯一实现**：
+`isAccountHealthy` / `activeModelCools` / `cooledModels` / `judgeRegion` /
+`LEVEL_STYLE` / `groupByRegion`；`pool-health-panel.tsx` 与 `WorkbuddyPage.tsx`
+**一律 import**（面板内的本地副本已删除，净减 93 行）。
+
+#### 接入 cloud 区块的四项
+
+| # | 内容 | 落点 |
+| --- | --- | --- |
+| ① | **区域可用性小结** | 池总览与账号表之间：每区一行（状态灯 + 结论 + `n/m 账号可用` + 模型限流数 + 一句原因）|
+| ② | **操作列：暂停 / 恢复** | 账号表新增列；`disabled` 号显示「需重新登录」而非按钮（它只能靠重登恢复，给按钮是假的）|
+| ③ | **「已暂停 · 手动」状态** | 冷却状态列**紧跟 `disabled`** 之后分支——措辞与「出池/熔断」严格区分 |
+| ④ | **「没能进池」诊断** | `status.rejected[]` 逐条渲染（账号 + domain + platform + 原因）|
+
+#### 接线方式（正确对接的关键）
+
+| 环节 | 做法 |
+| --- | --- |
+| 取数 | 复用既有 `loadPool()`（`GET /workbuddy-pool/v1/status`）——**没有新增请求** |
+| 写操作 | 新增 `togglePoolPause(uid, paused)` → `api.setWorkbuddyPoolAccountPause`；成功后 `loadPool()` 重取 |
+| uid 口径 | 直接用状态里的**脱敏值**（前 8 位 + `…`），由后端 `resolve_uid` 按唯一前缀反解；歧义时 400（不猜）|
+| 反馈 | 复用既有 `poolMsg`（成功绿 / 失败红）——**不新造提示通道** |
+| 并发 | `poolPauseBusy` 按 uid 禁用该行按钮，防连点 |
+| 原有功能 | 池总览 / 配置面板 / 接入信息 / 池模型目录 **一行未改** |
+
+#### 验证
+
+| 项 | 结果 |
+| --- | --- |
+| `tsc --noEmit` | ✅ 零错误（含清理未用导入）|
+| 判据单一实现 | ✅ 面板本地副本已删除；两处均 import 共享模块 |
+| 部署 | 见本次发布记录 |
+| 回归 | 端点冒烟 + cloud 区块既有四块（总览/配置/接入/目录）均未改动 |
+
+---
+
+## 2.1.3 - 2026-10-13
+
+### 把「没能进池」显式暴露出来：解决「导入成功但账号池里看不到」无处可查
+
+**用户报障**：导入账号后并未成功导入，账号池中也未显示；要求分别说明
+**导入失败的原因**与**池不显示的原因**，并给出排查步骤与解决方案。
+
+#### 取证：导入确实没落盘
+
+| 检查 | 结果 |
+| --- | --- |
+| `~/.wb-switch/accounts.json` | mtime = **19:35:48**（导入时刻）但**账号数仍是 3** —— 文件被改写了，内容没变 |
+| 现有 3 条 | 均带完整 `access_token` / `refresh_token`，`domain` 分别 `.cn`×2、`.ai`×1 |
+| 池内可见数 | 3 —— **与账号库一致**（池没「漏」账号，是库没进） |
+
+⇒ 现象等价于：**导入是空操作**（全部被跳过或全部覆盖），池自然不会有新账号。
+
+#### 根因链（全部来自代码，逐条可验证）
+
+**A. 导入侧 —— 只可能卡在三处**
+
+| # | 跳过的条件 | 出处 |
+| --- | --- | --- |
+| ① | **记录缺 `access_token`** → `Skipped` | `export_import.rs:79` `merge_import_record` |
+| ② | 选中索引为空 → 遍历零次，**静默返回 `imported:0/skipped:0`** | `merge_import_records`（`indexes` 为空即空转）|
+| ③ | 勾选 0 条 → 前端 **静默 `return`**，无提示、不关框、不报错 | `import-accounts-dialog.tsx` `doImport` |
+| ④ | 同 `uid` 命中已有记录 → `Overwritten`（`imported+1` 但**总数不变**）| `merge_import_record` |
+
+**B. 池侧 —— 三道准入门，任一不过即「静默丢弃」（`pool_account_from_value`）**
+
+| # | 条件 | 后果 |
+| --- | --- | --- |
+| ① | `account_platform(acc) != workbuddy` | 丢弃。注意：**platform 缺失/未知会兜底为 workbuddy**（能进）；但若显式写了 `minimax`/`chatglm`/`autoclaw`/`loamy`/`miaoshou`/`dumate`/`trae_work_cn` 等**其他已知渠道值**，就会被丢 |
+| ② | 无 `access_token` | 丢弃 |
+| ③ | 无 uid（`auth_raw.uid` → `uid` → `id` 三者皆无）| 丢弃 |
+
+> ⚠️ 关键：**池不会「过期」或「延迟」显示** —— `sync_accounts()` 每次选号/查状态都执行
+> 且会 `upsert` 新增、`retain` 删除 ⇒ 账号库一旦写入正确记录，**立即**出现在池里，无需重启。
+> 所以「池里没有」只能解释为「账号库里的那条不合格」。
+
+#### 改动
+
+| # | 层 | 内容 |
+| --- | --- | --- |
+| ① | `workbuddy_gateway.rs` | 新增 `pool_account_reject_reason()` + `rejected_accounts()`：把**被静默丢弃**的记录连同**具体原因**列出来 |
+| ② | `api.rs` | `/workbuddy-pool/v1/status` 新增顶层 `rejected[]`（含 index/nickname/id/domain/platform/reason）|
+| ③ | `api.ts` | `WorkbuddyPoolStatusResponse.rejected` + `WorkbuddyRejectedAccount` 类型 |
+| ④ | `pool-health-panel.tsx` | 面板新增琥珀色「**没能进池**」区块，逐条列出账号与原因 |
+| ⑤ | `import-accounts-dialog.tsx` | **修掉静默失败**：未选文件 / 未勾账号分别给出明确提示；`imported === 0` 时补一句**为什么**（缺 token / uid 重复），不再让「已导入 0 个」被忽略 |
+
+#### 🔴 不变量（单测守住）
+
+`reject_reason_matches_admission`：`pool_account_reject_reason` 判「能进」⇔
+`pool_account_from_value` 返回 `Some`。两者是**同一套准入判据的两份表述**，
+必须恒等 —— 否则诊断会说谎，而它存在的全部理由就是回答「为什么看不到」。
+
+用例覆盖：合格记录 / 缺 token / 缺 uid / 非 WB 平台（minimax·chatglm·autoclaw）/
+`auth_raw.uid` 取法 / `id` 回落 / 未知 platform 兜底。
+
+#### 排查手册（用户侧自查顺序）
+
+1. **先看账号库有没有进**：`~/.wb-switch/accounts.json` 的**条目数**是否增加
+   （mtime 变了≠条目变了——本缺陷的一个表现就是 mtime 变而条目数不变）。
+2. **再看导入返回的计数**：`已导入 N（覆盖 M），跳过 K`。
+   - `N=0, K>0` ⇒ 记录被跳过，几乎都是**缺 `access_token`**（脱敏导出不带凭证）。
+   - `N>0` 但条目数不变 ⇒ 是**覆盖**（`uid` 与已有记录相同），不是新增。
+3. **再看池的 `rejected[]`**：统计页「WorkBuddy 逆向」顶部面板会直接列出
+   「账号库里有 N 条记录没能进池」及各自原因；也可 `GET /workbuddy-pool/v1/status` 取。
+4. **确认导入文件形状**：必须是 **JSON 数组**，每项是对象，且带
+   `access_token`（必需）、`domain`（决定区域）、以及 `auth_raw.uid`/`uid`/`id` 之一。
+
+---
+
+## 2.1.2 - 2026-10-13
+
+### 账号池新增「用户暂停」：把用户意图与系统禁用分离（附账号池设计规范）
+
+**用户诉求**：在 WorkBuddy 网关中新增账号池功能（国外版 / 国内版两种类型），
+明确每种版本的管理方式（添加/删除/启用禁用/状态监控）、类型区分逻辑、与网关流程的集成方式。
+
+#### ⚠️ 先纠正前提：账号池**已经存在**，本次是**补缺口 + 出规范**
+
+账号库 `~/.wb-switch/accounts.json` + 池运行态 `workbuddy_gateway_state.json` +
+`/workbuddy-pool/v1/*` 早已就位。逐条核对后：
+
+| 需求 | 现状 | 本次 |
+| --- | --- | --- |
+| 类型区分逻辑 | ✅ 已有（`domain` 后缀派生）| 写入规范 |
+| 添加 | ✅ 已有（账号库 OAuth 登录 / import）| 写入规范 |
+| 删除 | ✅ 已有（`POST /api/delete`）| 写入规范 |
+| **启用 / 禁用** | ❌ **真缺口**：只有 `disabled`，且**仅由 SessionDead 自动置位、无任何复位路径、无用户入口** | **本次新增 `paused`** |
+| 状态监控 | ✅ 已有（`/status` + 2.1.1 的池健康面板）| 面板加操作入口 |
+| 集成方式 | ✅ 已有（`pick_account_for_region` 单一集成点）| 写入规范 |
+
+#### 🔴 设计决策：新增 `paused`，**不重复使用** `disabled`
+
+| | `disabled`（系统）| `paused`（用户，新增）|
+| --- | --- | --- |
+| 谁置位 | 上游判定凭证失效（12153）| **用户**手动 |
+| 含义 | 「这号废了」| 「我想先不用它」|
+| 恢复路径 | 重新登录换凭证 | **一个开关** |
+| 展示措辞 | 已出池 | 已暂停（手动）|
+
+复用 `disabled` 会让人把「用户手动停用」误读成「凭证失效」而跑去重登。
+单测 `user_pause_is_separate_from_system_disabled` 固化三条约束：
+① 暂停绝不写 `disabled`；② **恢复不得顺手清冷却/熔断**（否则把「我不用它」变成「它又在报错」）；
+③ 状态文件带 `serde(default)` ⇒ **向后兼容**（旧 state 读为 `false`）。
+
+#### 🔴 实现细节：脱敏 uid 的回写
+
+`pool_status()` 输出的 uid 是脱敏的（`mask_uid`：前 8 位 + `…`），前端只能拿到该值。
+若写接口要求完整 uid 就会「界面看得到、点不动」⇒ `Pool::resolve_uid` 接受
+**完整 uid 或唯一前缀**，**多命中即 400 拒绝**（不猜，避免误停用别的账号）。
+
+#### 改动
+
+| # | 层 | 内容 |
+| --- | --- | --- |
+| ① | `workbuddy_gateway.rs` | `Entry.paused` 字段 + `healthy()` 加闸门 + `StateAccount.paused`（serde default）+ `set_paused()` + `resolve_uid()` + 诊断文案（暂停 ≠ 故障）|
+| ② | `api.rs` | `POST /workbuddy-pool/v1/accounts/pause { uid, paused }` |
+| ③ | `api.ts` / `types.ts` | `setWorkbuddyPoolAccountPause()` + `WorkbuddyPoolAccount.paused` |
+| ④ | `pool-health-panel.tsx` | 状态列「已暂停（手动）」+ 操作列「暂停/恢复」按钮（`disabled` 号不给按钮——那只能靠重登）+ 操作错误独立提示条 |
+| ⑤ | **新增** `docs/workbuddy-account-pool-design.md` | **账号池设计规范**：类型区分逻辑 / 管理方式 / 集成方式 / 边界 |
+
+#### 集成方式（一行未改主流程）
+
+`paused` 的接入点是 `Entry::healthy()` 里的**一条闸门**，选号主流程与协议入口**零改动**。
+这是刻意的：状态判定集中在一处，新增状态不应散落到各调用点（否则必有某条路径忘判）。
+
+#### 验证
+
+| 项 | 结果 |
+| --- | --- |
+| 单测 `user_pause_is_separate_from_system_disabled` | ✅ 覆盖：脱敏前缀解析 / 暂停不改 disabled / 恢复不清冷却 / 前缀歧义拒绝 / 不存在拒绝 / 空值拒绝 |
+| `tsc --noEmit` | ✅ 零错误 |
+| 部署 | 见本次发布记录 |
+
+#### 边界（规范 §5）
+
+- 不能让用户手工指定 region（避免第二处真相）；
+- `disabled` 不给用户开关（它是凭证失效的**事实**）；
+- 删除不在池内单独做（池是消费者，删账号库即同步）；
+- **单区单账号是结构性单点**（当前 intl 区即如此）——属账号供给问题，非代码问题。
+
+---
+
+## 2.1.1 - 2026-10-13
+
+### 版本线切换：2.0.x → 2.1.x（本版无代码变更，内容等同 2.0.56）
+
+**变更范围**：仅版本号。`wb-switch-core` 与 `wb-switch-server` 的 `Cargo.toml`
+同步 `2.0.56 → 2.1.1`；其余源码、配置、接口行为**逐字未变**。
+
+> ⚠️ 之所以仍要走完整「重构建 → 部署 → 版本断言」，是因为 UI 显示的版本来自 core 的
+> `APP_VERSION`（`update.rs` 的 `env!("CARGO_PKG_VERSION")`），而 `deploy.py` 的断言读
+> **server** 的 `Cargo.toml` —— **只改一个就会出现「服务端已是新版、桌面窗口标题还显示旧版」**
+> （1.0.60 实翻车）。`gate.ps1` 第 1 步已内置这两个文件的同步检查。
+
+#### 2.1 线的起始状态（本次切换所覆盖的累积内容）
+
+| 版本 | 内容 |
+| --- | --- |
+| 2.0.53 | 统计页新增「WorkBuddy 逆向」独立面板（渠道级模型频率 / Token / 失败归因） |
+| 2.0.53（订正） | 清空 `intl_proxy`：代理从「解决办法」变成唯一故障点（ZCode 503） |
+| 2.0.54 | 池选号失败带上「为什么」：模型级冷却不再伪装成整区故障 |
+| 2.0.55 | opencode 端口发现的两个长期缺陷（正则不匹配 + 只认 `--port=`，该路径曾是死代码） |
+| 2.0.56 | 统计页新增「账号池健康 · region 可用性」面板：一眼分辨配额不足 vs 服务故障 |
+
+#### 验证
+
+| 项 | 结果 |
+| --- | --- |
+| 版本同步 | core 与 server 均为 `2.1.1`（`gate.ps1` 第 1 步口径）|
+| 重构建 | 本次必须重构建——老 exe 会报旧版本，`deploy.py` 断言不等会回滚 |
+| 部署断言 | `version asserted after restart: 2.1.1` |
+| 行为回归 | 变更仅版本号，预期与 2.0.56 逐字一致（仍跑 8 端点冒烟确认）|
+
+#### ⚠️ 边界
+
+- `package.json` / `src-tauri/tauri.conf.json` 停留在 **1.0.38** —— 那是**桌面端独立版本线**，
+  历史上不与服务端版本同步，本次同样不动（误改会干扰桌面端构建约定）。
+- 回滚：`bin/wb-switch.exe.old` 保留上一份构建；版本断言失败时 `deploy.py` 会自动回滚。
+
+---
+
+## 2.0.56 - 2026-10-13
+
+### 统计页新增「账号池健康 · region 可用性」面板：一眼分辨「配额不足」还是「服务故障」
+
+**用户诉求**：把「region 区可用性 + 账号健康度」做成统计页上的一个小面板，
+用于直观展示各 region 的可用性状态与账号健康度指标，**一眼判断当前问题是配额不足
+还是服务故障**；面板需包含关键状态指标、异常高亮提示，以及数据来源和刷新频率。
+
+#### 为什么需要它
+
+二者**症状同形**（客户端都是 503 / `无可用账号`），但处置完全相反：
+
+| | 配额不足 | 服务故障 |
+| --- | --- | --- |
+| 成因 | 上游按**模型**限流（频率上限）| 熔断 / 出池 / 链路不通 |
+| 处置 | 等重置、换模型、加账号 | 排查出口、等熔断退避 |
+| 换号/重启 | **无效** | 可能有效 |
+
+2026-10-13 一天内两次因分不清二者而误判（见 2.0.53 / 2.0.54），本面板即该问题的闭环。
+
+#### 改动（**纯前端，复用既有接口，无后端改动**）
+
+| # | 文件 | 内容 |
+| --- | --- | --- |
+| ① | **新增** `components/pool-health-panel.tsx` | 面板组件：总览计数 + **region 结论区** + 账号明细表 + 判读提示 |
+| ② | `pages/WorkBuddyMonitorPage.tsx` | 挂到「WorkBuddy 逆向」Tab **最顶部**——该页一旦出现失败，第一个要回答的就是「配额还是故障」，把答案放在症状上面 |
+
+#### 🔴 判据（组件核心，`judgeRegion`）
+
+| region 状态 | 结论 | 依据 |
+| --- | --- | --- |
+| 无账号 | ⚪ 结构性缺号 | `accounts.length === 0`——不是限流也不是故障，是池里没配 |
+| 有健康号 + 无模型限流 | 🟢 可用 | `!disabled && until<=now && breaker<=now`（与后端 `Entry::healthy` **同口径**）|
+| 有健康号 + 有模型限流 | 🟡 **部分模型限流** | 账号能用，但**你要的模型**可能被限 |
+| 无健康号 + 有熔断/出池 | 🔴 服务故障 | 熔断由**连续失败**喂出，指向链路问题，且需人工介入 |
+| 无健康号 + 全部被模型级冷却 | 🟡 配额不足 | `model_cools` 命中 ⇒ 上游对该**模型**的频率上限 |
+| 无健康号 + 仅软冷却 | 🟠 冷却中 | 429 类限流退避，会自行恢复 |
+| 以上都不命中 | ⚪ 原因未知 | **不猜**——宁可说不知道，也不给错结论 |
+
+#### 🔴 首版判据被实测打回：漏了「有账号可用 ≠ 你的模型能用」
+
+首版在 `healthy > 0` 时**直接返回「可用」**，忽略模型级冷却 —— 于是 intl 区
+明明 `deepseek-v4.1-flash` 已被上游限流，面板却显示 🟢 可用，而实际请求 503。
+**这比不显示更糟**（会让人以为没问题），故新增 `partial`（部分模型限流）档位。
+
+修好后实测输出（`tools-pool-judge-check.py` 用真实池状态复算）：
+
+```
+[cn]   可用          — 2/2 个账号可参与选号，且无模型被限流。
+[intl] 部分模型限流   — 1/1 个账号可参与选号，但上游按模型限流：
+                        deepseek-v4.1-flash（10/13 22:59 恢复）。
+```
+
+⇒ 并要求结论文案**点名被限流的模型与恢复时间**（否则用户知道有问题也无法处置，脚本内含该断言）。
+
+#### 数据来源与刷新频率
+
+- **来源**：`GET /workbuddy-pool/v1/status`（服务端读 `accounts.json` +
+  `workbuddy_gateway_state.json`，含账号级 `model_cools` / `breaker_until` / `cooldown_kind`）。
+- **刷新**：**60s 自动轮询** + 手动刷新。选 60s 的依据：冷却/熔断的时间尺度是分钟级
+  （软冷却 600s 起、模型冷却按上游重置时间），更快轮询只会空转。
+- 后端聚合字段 `regions` 即便缺失也能渲染：组件**自行按 `accounts[].region` 分组**，
+  口径与明细表一致（不依赖旧后端）。
+
+#### 验证
+
+| 项 | 结果 |
+| --- | --- |
+| `tsc --noEmit` | ✅ 零错误 |
+| 判据与后端一致性 | `isAccountHealthy` 逐条对照 `Entry::healthy(now)`（`!disabled && until<=now && breaker<=now`）|
+| 渲染数据源 | 复用既有 `api.getWorkbuddyPoolStatus()`（无新接口、无重复请求契约）|
+
+---
+
+## 2.0.55 - 2026-10-13
+
+### opencode 端口发现的两个长期缺陷：正则不匹配 + 只认 `--port=`（该路径曾是死代码）
+
+**触发**：用户报 `0x800700E8`（`ERROR_NO_DATA`，管道正在被关闭）——启动
+`powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'opencode\s+serve' } ..." 时失败。
+该命令**全仓库唯一来源**是 `workbuddy_proxy.rs` 的 `discover_server()`（工作区脚本、
+两个 watchdog、`start-serve-4097.bat` 均已核对，不含此命令）。
+
+排查中在该代码路径上查出**两个确定性缺陷**——即「最可靠的命令行抓端口」这一步
+**从未真正工作过**，一直在靠 netstat 兜底：
+
+| # | 缺陷 | 证据 |
+| --- | --- | --- |
+| ① | 筛选正则 `opencode\s+serve` **匹配不上真实命令行** | 实际为 `"E:\opencode\opencode.exe"  serve --hostname 127.0.0.1 --port 4097 --print-logs`——"opencode" 后紧跟 `.exe`，`\s+` 落不到 `serve` 上。实测该命令输出 **0 行** |
+| ② | 端口解析只认 `--port=4097`（等号） | bat 实际传的是 `--port 4097`（空格 ⇒ 两个独立 token）⇒ 即使筛到了也取不出值 |
+
+**代价**：每次发现都白起一个 powershell（实测 **~2.5s**）、阻塞一个 async worker
+（该调用是 `output()` 同步阻塞，无 `spawn_blocking`，见 `workbuddy-proxy-model-catalog-fix.md` 的既有记录），
+然后走 netstat 兜底——慢且浪费，但功能未断（netstat 扫 4096–49152 能捞到 4097）。
+
+#### 改动
+
+| # | 项 | 内容 |
+| --- | --- | --- |
+| ① | 筛选与路径解耦 | 改为 `Where-Object { $_.Name -eq 'opencode.exe' -and $_.CommandLine -match 'serve' }`，不再依赖 exe 路径写法 |
+| ② | 新增纯函数 `port_from_cmdline()` | 同时兼容 `--port 4097`（空格，真实形态）与 `--port=4097`（等号），并容忍值被引号包裹 |
+| ③ | 脚本抽成常量 `DISCOVER_PS_SCRIPT` | 让单测能固化两条**易碎约束**（见下） |
+
+#### 🔴 修的过程中自己踩了一脚：`-Command` 会剥掉内层双引号
+
+首版修复写成 `-Filter "Name='opencode.exe'"`，实测报 **`Get-CimInstance : 无效查询`** ——
+PowerShell 解析 `-Command <string>` 时把内层 `"` **剥掉**，`-Filter "Name='x'"`
+退化成 `-Filter Name='x'`。原命令之所以能跑（虽然匹配不上），正是因为它**通篇只有单引号**。
+
+⇒ 最终写法**不含任何双引号**；并加单测 `discover_ps_script_satisfies_powershell_quoting_rules`
+把「不得含双引号」与「必须按进程名筛」两条约束固化住。
+
+#### 验证
+
+| 项 | 结果 |
+| --- | --- |
+| 单测 `discover_ps_script_satisfies_powershell_quoting_rules` | ✅ 两条易碎约束 |
+| 单测 `port_from_cmdline_handles_space_and_equals_forms` | ✅ 用例内**原样保留真实命令行**；覆盖空格/等号/带引号/无值/非法值/空行/超范围 |
+| 修复后实测（手工复刻网关传参） | 输出 1 行 = 真实命令行；端口解析 = **4097**（修复前该命令输出 **0 行**）|
+| 发现路径 | 部署后 `/workbuddy/v1` 实测 200，不再每次都跑 netstat 兜底 |
+
+#### ⚠️ 遗留（未解决，需更多线索）
+
+`ERROR_NO_DATA` 的**启动失败本身未能复现**：手工执行同一条 powershell 命令正常
+（2.5s 返回），进程发现当前也成功（`/workbuddy/v1` 实测 200）。该错误码表示
+`CreateProcess` 阶段失败（STD 管道无效/已被关闭），且 Rust 侧 `if let Ok(...)`
+**会静默吞掉**这类失败——所以它既不来自本工程日志，也不会影响返回给客户端的报文。
+**需要用户提供看到该报错的界面/位置**才能继续定位（`[出现错误 … (启动"…"时)]`
+的措辞样式更像 WScript/COM 的 `Run` 失败，而非 Rust `io::Error`）。
+
+> 📌 **同版本二次部署说明**：2.0.55 曾先按「带内层双引号」的写法构建并部署过一次
+> （约 11 分钟），随后在自测中发现该写法报 `无效查询`，**当场修正后以同一版本号重新构建部署**。
+> 因此流水线里可能存在两份 buildTime 不同的 2.0.55；**以本文档描述的「无双引号」写法为准**，
+> 二进制可自检：`strings bin/wb-switch.exe | grep -cF "opencode\\s+serve"` 应为 **0**。
+
+---
+
+## 2.0.54 - 2026-10-13
+
+### 池选号失败带上「为什么」：模型级冷却不再伪装成整区故障
+
+**用户诉求**：ZCode 再次报 `Provider returned a server error` / `status=503`，
+provider=`new-provider-3`、model=`deepseek-v4.1-flash`，TraceID `8167f9c7-…`。
+
+#### 根因：上游模型级频率上限（**非网关故障，也非本工程可修**）
+
+| # | 检查 | 结果 |
+| --- | --- | --- |
+| ① | 任务索引 | `errorPhase=stream`、`transport=sse`、`exceptionKind=api_call`、`statusCode=503` |
+| ② | 网关日志 | `lat=0`（**瞬时**，非超时）且**无 `transport:` 后缀** ⇒ 选号预检就没放行，**一次上游都没打** |
+| ③ | 账号池 `model_cools` | `deepseek-v4.1-flash: until=10-13 22:59:19 reason="deepseek-v4.1-flash 已达频率上限，10-13 22:59 重置" reset_parsed=true` |
+| ④ | 区域账号数 | `accounts.json` 中 `.ai` 域账号**只有 1 个**（`cbea9317…`）⇒ 该区唯一号被限流即整区不可用 |
+| ⑤ | 用量画像 | 今日 intl 成功请求：11 时 66、12 时 26、**13 时 115**、14 时 16（14:11:16 后被封）——13 点的爆发式调用触发了上游频率闸门 |
+| ⑥ | 对照实测 | `region=intl` → 503（0.02s）；**默认区域（cn）→ 200 / 1.83s 完全正常** |
+
+⇒ 定性：**上游配额问题**。网关行为正确（正确解析上游给出的重置时间并冷却该账号的该模型），
+无需也无法在本工程修复。真正的问题是**报错不可行动**。
+
+#### 🔴 本次修的是「报错为什么看不懂」
+
+`region_note` 原本文案固定为 `region=intl 区内无可用账号（该区账号全部冷却/在途或不存在）`。
+`workbuddy_errors.rs` 里其实有精确得多的解释
+（`该账号在此模型上已达频率上限，已按上游给出的重置时间冷却；同一账号的其他模型仍可用`），
+但它只在**已有前置失败**时经 `last_err` 被拼接 —— 而这类「预检直接拒绝」的场景
+一次上游都没打过，`last_err` 为空 ⇒ **客户端永远只看到模糊的那半句**。
+
+#### 改动
+
+| # | 文件 | 内容 |
+| --- | --- | --- |
+| ① | `workbuddy_gateway.rs` | 新增 `Pool::region_block_reasons(model, wanted)` + 公开包装：逐条列出该区账号**为什么没被选中**（禁用 / **模型级冷却** / 冷却中 / 熔断中 / 在途占满），最多 3 条；判据与 `pick_region` 的闸门**一一对应** |
+| ② | `workbuddy_gateway.rs` | 抽出 `fmt_ms()`（`MM-DD HH:MM`），与 `model_rate_reason` 共用，避免两处时间文案不一致 |
+| ③ | `api.rs` | 选号返回 None 且 `last_err` 为空时，把 `region_block_reasons` 的结果拼进客户端文案 |
+
+**排序即优先级**：模型级冷却排最前——它只限**单个模型**、同账号其他模型仍可用，
+不说明白最容易被误读成「整区/网关故障」（本次报障即为此）。
+
+#### 验证
+
+| 项 | 结果 |
+| --- | --- |
+| 单测 `region_block_reasons_surface_model_cool_not_region_down` | ✅ 覆盖：健康账号不在诊断里 / 模型冷却给出原因+账号+重置时间 / **区域隔离**（cn 不混入 intl）/ 🎯 **模型冷却只限该模型**（其他模型照常可选）|
+| 编译 | ✅ `cargo check -p wb-switch-core` 无新 error |
+| 端到端 | 部署后 `region=intl` 的 503 文案应带上原因（见下方实测）|
+
+#### ⚠️ 遗留（非本工程可修）
+
+- intl 区 `deepseek-v4.1-flash` 的上游频率上限**要到 10-13 22:59 才重置**；
+  期间该区该模型不可用。可选处置：① 等重置；② 该窗口改用默认区域（cn 实测正常）；
+  ③ 为 intl 区补充第二个账号（当前该区只有 1 个，是单点）。
+- intl 区**单账号**是结构性单点：该号被限流/失效即整区不可用。
+
+---
+
 ## 2.0.53 - 2026-10-13
 
 ### 【订正 2.0.51】清空 `intl_proxy`：代理从「解决办法」变成唯一故障点（ZCode 503）

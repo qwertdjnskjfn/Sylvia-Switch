@@ -1,6 +1,6 @@
 {
   "name": "sylvia-switch-darwin-x64",
-  "version": "2.1.1",
+  "version": "2.1.8",
   "description": "sylvia-switch platform binary (darwin-x64)",
   "os": [
     "darwin"

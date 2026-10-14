@@ -429,6 +429,67 @@ fn pool_account_from_value(acc: &Value) -> Option<PoolAccount> {
     })
 }
 
+/// 一条记录**未能进池的原因**；`None` = 可以进池。与 [`pool_account_from_value`]
+/// 的拒绝条件**逐条对应**（改那边必须同步改这里，单测
+/// `reject_reason_matches_admission` 会守住这条不变量）。
+fn pool_account_reject_reason(acc: &Value) -> Option<&'static str> {
+    if account_platform(acc) != PLATFORM_WORKBUDDY {
+        return Some("非 WorkBuddy 平台账号（platform 指向其他渠道）");
+    }
+    if get_str(acc, "access_token").is_none() {
+        return Some("缺少 access_token（导入文件多为脱敏导出，不含凭证）");
+    }
+    if account_uid(acc).is_none() {
+        return Some("缺少 uid（auth_raw.uid / uid / id 三者都没有）");
+    }
+    None
+}
+
+/// 账号库中**存在但没能进池**的记录及原因（诊断用）。
+///
+/// # 为什么需要
+///
+/// [`pool_account_from_value`] 对不合格记录**静默返回 `None`** —— 于是
+/// 「导入成功、账号池里却看不到」时，用户既不知道该看哪里，也分不清是
+/// 「被拒了」还是「根本没导进来」。2026-10-13 用户报障即为此。
+/// 本函数把「被拒」这件事显式暴露出来（进 `/workbuddy-pool/v1/status` 的 `rejected`）。
+pub fn rejected_accounts() -> Vec<Value> {
+    let Ok(text) = std::fs::read_to_string(accounts_file()) else {
+        return Vec::new();
+    };
+    let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(&text) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .enumerate()
+        .filter_map(|(index, a)| {
+            let reason = pool_account_reject_reason(a)?;
+            Some(json!({
+                "index": index,
+                "nickname": get_str(a, "nickname").unwrap_or_default(),
+                "id": get_str(a, "id").unwrap_or_default(),
+                "domain": get_str(a, "domain").unwrap_or_default(),
+                "platform": account_platform(a),
+                "reason": reason,
+            }))
+        })
+        .collect()
+}
+
+/// 把「池 uid」映射回**账号库记录 id**（编辑 / 删除按 `id` 定位）。
+///
+/// 为什么需要中间一步：池的 uid 取自 `auth_raw.uid → uid → id`（见 [`account_uid`]），
+/// 与账号库的 `id` 字段**不保证相同** —— 直接拿池 uid 当 id 去改会「找不到账号」。
+/// 复用 [`account_matches_uid`]（同一份 uid 口径），不另写一套。
+pub fn account_library_id_for_uid(uid: &str) -> Option<String> {
+    let text = std::fs::read_to_string(accounts_file()).ok()?;
+    let parsed: Value = serde_json::from_str(&text).ok()?;
+    let arr = parsed.as_array()?;
+    arr.iter()
+        .find(|a| account_matches_uid(a, uid))
+        .and_then(|a| get_str(a, "id"))
+}
+
 /// 记录是否匹配 uid（口径与桥接一致，见 account_uid）。
 fn account_matches_uid(acc: &Value, uid: &str) -> bool {
     if uid.is_empty() {
@@ -557,7 +618,17 @@ struct Entry {
     /// 账号级即时冷却截止（ms epoch）；0 = 不在冷却期。
     until_ms: i64,
     /// session 死亡（12153）→ 永久禁用，需人工重登。
+    ///
+    /// ⚠️ **系统状态，非用户开关**：只由错误路径置位（`ErrKind::SessionDead`），
+    /// 表示上游判定该凭证已失效。用户想临时停用某账号请用 [`Entry::paused`]。
     disabled: bool,
+    /// **用户意图**：手动暂停该账号（不参与选号）。
+    ///
+    /// 与 `disabled` 严格分离——`disabled` 是「系统说这号废了」，`paused` 是
+    /// 「我想先不用它」。两者都让账号退出选号，但**恢复路径不同**：
+    /// `disabled` 需重新登录换凭证，`paused` 一个开关即可撤销。
+    /// 混用会导致「用户手动停用 → 被误报成 session 失效 → 让人去重登」。
+    paused: bool,
     reason: String,
     /// 最近被选中时刻（防并发撞号）；0 = 从未使用。
     last_used_ms: i64,
@@ -589,6 +660,7 @@ impl Entry {
             cool_kind: None,
             until_ms: 0,
             disabled: false,
+            paused: false,
             reason: String::new(),
             last_used_ms: 0,
             last_used_seq: 0,
@@ -601,9 +673,9 @@ impl Entry {
         }
     }
 
-    /// 报告账号当前是否可选（未禁用、未处于任一冷却/熔断期）。
+    /// 报告账号当前是否可选（未禁用、未暂停、未处于任一冷却/熔断期）。
     fn healthy(&self, now: i64) -> bool {
-        !self.disabled && self.until_ms <= now && self.breaker_until_ms <= now
+        !self.disabled && !self.paused && self.until_ms <= now && self.breaker_until_ms <= now
     }
 
     /// 当前仍在生效的最近冷却/熔断截止（两个截止取较早者）；不在冷却期返回 0。
@@ -685,6 +757,10 @@ struct StateAccount {
     credit_expires_at: i64,
     #[serde(default)]
     disabled: bool,
+    /// 用户手动暂停（2026-10-13 新增）。`serde(default)` ⇒ 旧状态文件无此字段时
+    /// 读为 false，**向后兼容**（老版本写的 state 不会被误判成全暂停）。
+    #[serde(default)]
+    paused: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     reason: String,
     #[serde(default)]
@@ -914,6 +990,7 @@ impl Pool {
             entry.cool_kind = cool_kind;
             entry.until_ms = until;
             entry.disabled = s.disabled;
+            entry.paused = s.paused;
             entry.reason = s.reason;
             entry.breaker_until_ms = breaker;
             entry.soft_fails = s.soft_fails;
@@ -954,6 +1031,7 @@ impl Pool {
                     credits: e.acc.credits,
                     credit_expires_at: e.acc.credit_expires_at,
                     disabled: e.disabled,
+                    paused: e.paused,
                     reason: e.reason.clone(),
                     until_ms: e.until_ms,
                     cool_kind: e.cool_kind.map(|k| k.code()).unwrap_or(0),
@@ -1297,6 +1375,132 @@ impl Pool {
         self.pick_region(model, tried, RegionFilter::Unknown)
     }
 
+    /// 诊断：`wanted` 区内的账号**为什么都没被选中**（逐条给原因，最多 3 条）。
+    ///
+    /// 🔴 存在意义（2026-10-13 用户报障）：选号返回 None 时，调用方对外只发一句
+    /// 「区内无可用账号」——**看不出为什么**。尤其「**模型级冷却**」（对某模型达上游
+    /// 频率上限）会被误读成「整个区都挂了」，用户拿到 503 以为网关故障，
+    /// 实际只是单个模型被限流、同账号其他模型仍可用。
+    ///
+    /// 判据与 [`Pool::pick_region`] 的闸门**一一对应**（healthy / 模型冷却 / 在途），
+    /// 改选号逻辑时必须同步改这里，否则诊断会说谎。
+    fn region_block_reasons(&self, model: &str, wanted: RegionFilter) -> Vec<String> {
+        let now = now_ms();
+        let mut out: Vec<String> = Vec::new();
+        for e in &self.entries {
+            if !wanted.allows(&e.acc.region) {
+                continue;
+            }
+            let label = if e.acc.nickname.trim().is_empty() {
+                e.acc.uid.chars().take(8).collect::<String>()
+            } else {
+                e.acc.nickname.clone()
+            };
+            // 顺序即优先级：模型级冷却排最前，它最容易被误读成整体故障。
+            let why = if e.disabled {
+                Some(format!("已禁用（{}）", e.reason))
+            } else if e.paused {
+                // 用户主动暂停：既不是故障也不是配额，**必须说清楚**，
+                // 否则会被当成「服务故障」去查链路（白白浪费时间）。
+                Some("已被手动暂停（可在账号池页面恢复）".to_string())
+            } else if e.model_cooled(model, now) {
+                Some(
+                    e.model_cools
+                        .get(model)
+                        .map(|mc| mc.reason.clone())
+                        .unwrap_or_else(|| format!("模型 {model} 已被限流")),
+                )
+            } else if e.until_ms > now {
+                Some(format!(
+                    "冷却中至 {}（{}）",
+                    fmt_ms(e.until_ms),
+                    e.reason
+                ))
+            } else if e.breaker_until_ms > now {
+                Some(format!(
+                    "熔断中至 {}（{}）",
+                    fmt_ms(e.breaker_until_ms),
+                    e.reason
+                ))
+            } else if self.in_flight_full(e) {
+                Some("在途并发已占满".to_string())
+            } else {
+                // 健康账号：选不中只可能是被 tried 排空，无需解释。
+                None
+            };
+            if let Some(w) = why {
+                out.push(format!("{label}：{w}"));
+                if out.len() >= 3 {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// 按「完整 uid 或**唯一前缀**」解析出真实 uid。
+    ///
+    /// 为什么需要它：`pool_status()` 输出的 uid 是**脱敏**的（`mask_uid` 只留前 8 位 + "…"），
+    /// 前端拿到的就是这个脱敏值——写操作必须能把它映射回真 uid，否则
+    /// 「界面看得到、点不动」。池内账号量级很小（个位数），唯一前缀足够安全；
+    /// **多命中即拒绝**（不猜），避免误停用别的账号。
+    fn resolve_uid(&self, key: &str) -> Result<String, String> {
+        let k = key.trim().trim_end_matches('…').trim_end_matches("...");
+        if k.is_empty() {
+            return Err("uid 不能为空".to_string());
+        }
+        if self.by_uid.contains_key(k) {
+            return Ok(k.to_string());
+        }
+        let hits: Vec<&String> = self.by_uid.keys().filter(|u| u.starts_with(k)).collect();
+        match hits.len() {
+            1 => Ok(hits[0].clone()),
+            0 => Err(format!("账号不存在：{key}")),
+            n => Err(format!("uid 前缀「{key}」命中 {n} 个账号，请提供更长的前缀")),
+        }
+    }
+
+    /// 设置账号的**用户暂停**标记。uid 支持完整值或唯一前缀（见 [`Pool::resolve_uid`]）。
+    ///
+    /// 🔴 只动 `paused`，**绝不碰** `disabled`（系统状态）与任何冷却字段 ——
+    /// 暂停是「临时不用」，恢复时必须让账号回到暂停**之前**的状态；
+    /// 顺手清冷却会让一个已熔断/被限流的号立刻重新入池，把问题从「我不用它」
+    /// 变成「它又在报错」。
+    pub fn set_paused(&mut self, key: &str, paused: bool) -> Result<String, String> {
+        let uid = self.resolve_uid(key)?;
+        let idx = *self.by_uid.get(&uid).expect("resolve_uid 已保证存在");
+        self.entries[idx].paused = paused;
+        self.dirty = true;
+        Ok(uid)
+    }
+
+    /// 清除账号的**冷却类**运行态（手动干预）。
+    ///
+    /// 清的是：账号级冷却、熔断、模型级冷却、以及喂熔断用的失败计数。
+    ///
+    /// 🔴 **绝不动** `disabled`（凭证失效的**事实**）与 `paused`（**用户意图**）——
+    /// 清冷却只解决「不等它自己退避」这件事：伪造凭证有效会让请求立刻再失败，
+    /// 替用户改主意则违背他的显式选择。
+    pub fn clear_cooldown(&mut self, key: &str) -> Result<String, String> {
+        let uid = self.resolve_uid(key)?;
+        let idx = *self.by_uid.get(&uid).expect("resolve_uid 已保证存在");
+        let e = &mut self.entries[idx];
+        e.until_ms = 0;
+        e.cool_kind = None;
+        e.breaker_until_ms = 0;
+        e.fails = 0;
+        e.retry_count = 0;
+        e.soft_fails = 0;
+        e.model_cools.clear();
+        // 出池（disabled）的 reason 描述的是凭证事实，保留；其余是冷却备注，清掉
+        // 以免界面显示已不存在的「429 rate limit」之类陈旧原因。
+        if !e.disabled {
+            e.reason.clear();
+        }
+        self.dirty = true;
+        Ok(uid)
+    }
+
     /// 挑号（区域约束版），跳过 `tried` 中的 UID。到期分层→Top5 加权→防惊群→LRU 兜底。
     /// 对照 pool.rs:840 `pick_excluding` + pool.go:725 `pick`（model 过滤照 Go 版）。
     /// wanted ≠ Unknown 时候选收集与全冷却兜底同步按区域过滤（契约 §3.2）。
@@ -1593,8 +1797,8 @@ impl Pool {
     /// 缓存未建/过期为 null（status 是只读透出，不因查询而触发上游探测）。
     pub fn status_value(&self) -> Value {
         let now = now_ms();
-        // 区域聚合（§3.5）：accounts/healthy 按条目区域计数（healthy 口径与总数一致：
-        // 未禁用且不在任一冷却/熔断期）。
+        // 区域聚合（§3.5）：accounts/healthy 按条目区域计数（healthy 口径 = `Entry::healthy`：
+        // 未禁用、未暂停、不在任一冷却/熔断期）。
         let catalog = region_catalog_cached();
         let mut regions = serde_json::Map::new();
         for region in ["cn", "intl"] {
@@ -1643,7 +1847,12 @@ impl Pool {
             if !mcs.is_empty() {
                 model_cooling += 1;
             }
-            if !e.disabled && !is_cooling && !is_breaker {
+            // 🔴 必须走 `Entry::healthy()`，**不要**在这里重新推导条件。
+            // 2026-10-13 实翻车：新增 `paused` 时只改了 `healthy()`，这里仍是
+            // `!disabled && !cooling && !breaker` ⇒ 暂停后池级 `healthy` 仍报满值，
+            // 与账号级判定不一致（界面显示「3/3 可用」，实际选号已排除该号）。
+            // 单一事实来源，杜绝此类漂移。
+            if e.healthy(now) {
                 healthy += 1;
             }
             accounts.push(json!({
@@ -1659,6 +1868,7 @@ impl Pool {
                 "model_cools": mcs,
                 "last_used": e.last_used_ms,
                 "disabled": e.disabled,
+                "paused": e.paused,
                 "reason": e.reason,
                 "success_count": e.success_count,
                 "err_total": e.err_total,
@@ -1706,14 +1916,20 @@ fn next_local_4am_ms(now: i64) -> i64 {
     target.timestamp_millis()
 }
 
+/// ms epoch → `MM-DD HH:MM`（本地时区；非法值回落空串）。
+/// 冷却原因与区域诊断共用同一格式，避免两处时间文案不一致。
+fn fmt_ms(ms: i64) -> String {
+    Local
+        .timestamp_millis_opt(ms)
+        .single()
+        .map(|t| t.format("%m-%d %H:%M").to_string())
+        .unwrap_or_default()
+}
+
 /// 模型冷却的展示文案（含模型名与重置时间）。对照 Go handler.go:629 `modelRateReason`。
 fn model_rate_reason(model: &str, until_ms: i64, parsed: bool) -> String {
     let name = if model.is_empty() { "（未知模型）" } else { model };
-    let ts = Local
-        .timestamp_millis_opt(until_ms)
-        .single()
-        .map(|t| t.format("%m-%d %H:%M").to_string())
-        .unwrap_or_default();
+    let ts = fmt_ms(until_ms);
     if parsed {
         format!("{name} 已达频率上限，{ts} 重置")
     } else {
@@ -1807,6 +2023,39 @@ pub fn pick_account_for_region(
     wanted: RegionFilter,
 ) -> Option<PoolAccount> {
     with_pool(|p| p.pick_account_for_region(model, tried, wanted))
+}
+
+/// 诊断：`wanted` 区内账号不可用的原因清单（最多 3 条，空 = 无法解释）。
+///
+/// **仅在选号返回 None 之后调用**，用于把「为什么」一并告知客户端，
+/// 把不可行动的 `503 无可用账号` 变成可自行处置的提示
+/// （详见 `Pool::region_block_reasons` 的存在意义）。
+pub fn region_block_reasons(model: &str, wanted: RegionFilter) -> Vec<String> {
+    with_pool(|p| p.region_block_reasons(model, wanted))
+}
+
+/// 设置账号的用户暂停标记；返回被解析出的真实 uid。
+///
+/// `key` 可为完整 uid或**唯一前缀**（状态接口输出的是脱敏 uid，见 `Pool::resolve_uid`）。
+/// 错误（不存在 / 前缀歧义）以 `Err` 返回，由调用方转成 4xx。
+pub fn set_paused(key: &str, paused: bool) -> Result<String, String> {
+    with_pool(|p| p.set_paused(key, paused))
+}
+
+/// 清除账号的冷却/熔断/模型限流状态（手动干预）。返回真实 uid。
+///
+/// ⚠️ 这是**手动覆盖**：清掉熔断计数后，同一故障会重新累积。仅用于确认是误判
+/// （如出口抖动已恢复）时提前放行；**不动** `disabled` 与 `paused`。
+pub fn clear_cooldown(key: &str) -> Result<String, String> {
+    with_pool(|p| p.clear_cooldown(key))
+}
+
+/// 把「完整 uid 或唯一前缀」解析成真实 uid（供按 uid 操作账号库的调用方复用）。
+///
+/// 状态接口输出的是**脱敏 uid**（前 8 位 + `…`），前端只能拿到该值；
+/// 凡「界面看得到就得点得动」的写操作都要先过这里。前缀歧义 → `Err`（不猜）。
+pub fn resolve_account_uid(key: &str) -> Result<String, String> {
+    with_pool(|p| p.resolve_uid(key))
 }
 
 // ---------------------------------------------------------------------------
@@ -3194,6 +3443,93 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn reject_reason_matches_admission() {
+        // 🔴 不变量：`pool_account_reject_reason` 判「能进池」⇔ `pool_account_from_value`
+        // 返回 `Some`。两者是**同一套准入判据的两份表述**，必须恒等 ——
+        // 否则诊断（`rejected_accounts`）会说谎，而它存在的理由恰恰是
+        // 「导入成功但池里看不到、且没有任何线索」（2026-10-13 用户报障）。
+        let cases = vec![
+            // 合格：三个条件齐备
+            json!({"uid":"u1","access_token":"at","domain":"www.workbuddy.cn"}),
+            // 缺 access_token（导入文件多为脱敏导出）
+            json!({"uid":"u2","domain":"www.workbuddy.cn"}),
+            // 缺 uid
+            json!({"access_token":"at","domain":"www.workbuddy.cn"}),
+            // 非 WorkBuddy 平台（会被静默丢弃的典型）
+            json!({"uid":"u3","access_token":"at","platform":"minimax"}),
+            json!({"uid":"u7","access_token":"at","platform":"chatglm"}),
+            json!({"uid":"u8","access_token":"at","platform":"autoclaw"}),
+            // uid 走 auth_raw / id 回落 —— 都应算合格
+            json!({"auth_raw":{"uid":"u4"},"access_token":"at"}),
+            json!({"id":"u5","access_token":"at"}),
+            // platform 缺失或未知 → 兜底 workbuddy，算合格
+            json!({"uid":"u6","access_token":"at","platform":"totally-unknown"}),
+        ];
+        for c in cases {
+            let admitted = pool_account_from_value(&c).is_some();
+            let rejected = pool_account_reject_reason(&c).is_some();
+            assert_eq!(
+                admitted, !rejected,
+                "两份准入判据不一致（admitted={admitted} rejected={rejected}）：{c}"
+            );
+        }
+
+        // 明确断言几个关键分类，防止「两边一起错」
+        assert!(pool_account_from_value(&json!({"uid":"u3","access_token":"at","platform":"minimax"})).is_none());
+        assert!(pool_account_reject_reason(&json!({"uid":"u3","access_token":"at","platform":"minimax"})).is_some());
+        assert!(pool_account_from_value(&json!({"uid":"u1","access_token":"at"})).is_some());
+        assert!(pool_account_reject_reason(&json!({"uid":"u1","access_token":"at"})).is_none());
+    }
+
+    #[test]
+    fn pool_status_healthy_count_never_drifts_from_entry_healthy() {
+        // 🔴 不变量：`status_value()` 的 healthy 计数必须**恒等于**逐条 `Entry::healthy()`。
+        //
+        // 2026-10-13 实翻车：新增 `paused` 时只给 `Entry::healthy()` 加了闸门，
+        // 池级计数仍在**重复推导旧条件**（`!disabled && !cooling && !breaker`）
+        // ⇒ 暂停账号后仍上报「3/3 可用」，与账号级判定不一致
+        // （界面说全可用，实际选号已排除该号）。
+        //
+        // 本用例即防该漂移复发：**将来再给 healthy 加任何新维度，这条会立刻红**。
+        let mut p = mk_pool();
+        p.upsert(mk_acc("aa-1"));
+        p.upsert(mk_acc_region("bb-2", "intl"));
+
+        let expect = |p: &Pool| -> i64 {
+            let now = now_ms();
+            p.entries.iter().filter(|e| e.healthy(now)).count() as i64
+        };
+        let reported = |p: &Pool| -> i64 {
+            p.status_value()
+                .get("healthy")
+                .and_then(Value::as_i64)
+                .unwrap_or(-1)
+        };
+
+        assert_eq!(reported(&p), expect(&p), "初始状态两口径须一致");
+        assert_eq!(reported(&p), 2);
+
+        // 暂停一个 → 池级计数必须跟着掉（而非仍报满值）
+        p.set_paused("aa-1", true).unwrap();
+        assert_eq!(reported(&p), expect(&p), "暂停后两口径须一致");
+        assert_eq!(reported(&p), 1, "暂停必须体现在池级 healthy 上");
+
+        // 恢复 → 回升
+        p.set_paused("aa-1", false).unwrap();
+        assert_eq!(reported(&p), expect(&p), "恢复后两口径须一致");
+        assert_eq!(reported(&p), 2);
+
+        // region 聚合同样必须一致（cn 区此刻 1/1）
+        let st = p.status_value();
+        let cn = st.get("regions").and_then(|r| r.get("cn")).cloned().unwrap_or(Value::Null);
+        assert_eq!(
+            cn.get("healthy").and_then(Value::as_i64),
+            Some(1),
+            "region 聚合的 healthy 口径须与池级一致"
+        );
+    }
+
+    #[test]
     fn pool_status_masks_tokens_and_counts() {
         let mut p = mk_pool();
         let mut u1 = mk_acc("05efd60f-3079-41a8-ab31-745eb9c09a40");
@@ -3603,6 +3939,167 @@ mod tests {
             p.pick_account("m", &["b-intl".to_string()]).unwrap().uid,
             "a-cn",
             "旧签名排除 intl 号（tried）后选 cn"
+        );
+    }
+
+    #[test]
+    fn clear_cooldown_clears_cooling_but_never_disabled_or_paused() {
+        // 🔴 固化：清冷却只动**冷却类**运行态，绝不碰 `disabled`（凭证失效的事实）
+        // 与 `paused`（用户意图）。伪造凭证有效会让请求立刻再失败；
+        // 替用户改主意则违背他的显式选择。
+        let mut p = mk_pool();
+        let uid = "aaaa1111-bbbb-2222-cccc-333344445555";
+        p.upsert(mk_acc(uid));
+        let idx = *p.by_uid.get(uid).unwrap();
+
+        // 造出「各种冷却 + 用户暂停 + 系统出池」的复合状态
+        p.set_cooldown(idx, CoolKind::Soft, now_ms() + 600_000, "429 rate limit", false);
+        p.entries[idx].breaker_until_ms = now_ms() + 900_000;
+        p.entries[idx].fails = 3;
+        p.entries[idx].soft_fails = 2;
+        p.cooldown_model(idx, "m", now_ms() + 600_000, "m 已达频率上限", true);
+        p.set_paused(uid, true).unwrap();
+        p.entries[idx].disabled = true;
+        p.entries[idx].reason = "12153 session dead".to_string();
+
+        let resolved = p.clear_cooldown(uid).expect("应能按 uid 解析");
+        assert_eq!(resolved, uid);
+
+        let e = &p.entries[idx];
+        // 冷却类应全部清空
+        assert_eq!(e.until_ms, 0, "账号级冷却应清");
+        assert!(e.cool_kind.is_none(), "冷却类型应清");
+        assert_eq!(e.breaker_until_ms, 0, "熔断应清");
+        assert_eq!(e.fails, 0, "熔断计数应清");
+        assert_eq!(e.soft_fails, 0, "软限流计数应清");
+        assert!(e.model_cools.is_empty(), "模型级冷却应清");
+
+        // ✅ 两条不可动的状态
+        assert!(e.disabled, "清冷却绝不能让凭证失效的账号复活");
+        assert!(e.paused, "清冷却绝不能不问自取地替用户恢复");
+        assert_eq!(
+            e.reason, "12153 session dead",
+            "出池原因描述的是凭证事实，清冷却不得抹掉"
+        );
+
+        // 非出池账号：冷却备注随冷却一起清（避免界面显示已不存在的旧原因）
+        let mut p2 = mk_pool();
+        p2.upsert(mk_acc("bb-2"));
+        let i2 = *p2.by_uid.get("bb-2").unwrap();
+        p2.set_cooldown(i2, CoolKind::Soft, now_ms() + 1000, "429 rate limit", false);
+        p2.clear_cooldown("bb-2").unwrap();
+        assert!(p2.entries[i2].reason.is_empty(), "非出池账号的冷却备注应随冷却清掉");
+
+        // 前缀歧义 / 不存在 → 拒绝，且不得改动任何账号
+        let mut p3 = mk_pool();
+        p3.upsert(mk_acc("cccc-1"));
+        p3.upsert(mk_acc("cccc-2"));
+        assert!(p3.clear_cooldown("cccc").is_err(), "歧义前缀必须拒绝");
+        assert!(p3.clear_cooldown("nosuch").is_err());
+    }
+
+    #[test]
+    fn user_pause_is_separate_from_system_disabled() {
+        // 🔴 固化「用户暂停(`paused`)」与「系统禁用(`disabled`)」的**严格分离**：
+        // 两者都让账号退出选号，但恢复路径不同（暂停一个开关即可，禁用需重登）。
+        // 混用会导致「用户手动停用 → 被误报成 session 失效 → 让人去重登」。
+        let mut p = mk_pool();
+        let uid = "cbea9317-a9df-4e81-809b-1162a4e6be40";
+        p.upsert(mk_acc(uid));
+        assert!(p.pick_account_for_region("m", &[], RegionFilter::Unknown).is_some());
+
+        // 用**脱敏形式**（前 8 位 + …，即 status 接口给前端的那个值）暂停
+        let resolved = p.set_paused("cbea9317…", true).expect("脱敏前缀应能解析");
+        assert_eq!(resolved, uid);
+        assert!(p.entries[0].paused);
+        assert!(!p.entries[0].disabled, "暂停绝不能写成 disabled");
+        assert!(!p.entries[0].healthy(now_ms()));
+        assert!(
+            p.pick_account_for_region("m", &[], RegionFilter::Unknown).is_none(),
+            "暂停后不得参与选号"
+        );
+
+        // 暂停期间叠加一个模型冷却 → 恢复后该冷却**必须仍在**
+        let idx = *p.by_uid.get(uid).unwrap();
+        p.cooldown_model(idx, "m", now_ms() + 600_000, "m 已达频率上限", true);
+        p.set_paused(uid, false).unwrap();
+        assert!(!p.entries[0].paused);
+        assert!(
+            p.pick_account_for_region("other-model", &[], RegionFilter::Unknown).is_some(),
+            "恢复后其他模型应可选"
+        );
+        assert!(
+            p.pick_account_for_region("m", &[], RegionFilter::Unknown).is_none(),
+            "恢复不得顺手清掉模型冷却——那会把限流问题重新引爆"
+        );
+
+        // 前缀歧义 → 拒绝（不猜，避免误停用别的账号）
+        let mut p2 = mk_pool();
+        p2.upsert(mk_acc("aaaa1111-one"));
+        p2.upsert(mk_acc("aaaa1111-two"));
+        assert!(p2.set_paused("aaaa1111", true).is_err(), "歧义前缀必须拒绝");
+        // 不存在的 uid
+        assert!(p2.set_paused("nosuch-uid", true).is_err());
+        // 空值
+        assert!(p2.set_paused("   ", true).is_err());
+        // 命中歧义时账号状态不得被改动
+        assert!(p2.entries.iter().all(|e| !e.paused));
+    }
+
+    #[test]
+    fn region_block_reasons_surface_model_cool_not_region_down() {
+        // 🔴 2026-10-13 用户报障场景：intl 区**唯一**账号对 deepseek-v4.1-flash
+        // 达上游频率上限。客户端只看到「区内无可用账号」⇒ 误判成整区/网关故障。
+        // 本诊断必须**指名原因**，且必须证明「只限该模型」（同账号其他模型仍可用），
+        // 否则调用方会做出「整区不可用」的错误处置。
+        let mut p = mk_pool();
+        p.upsert(mk_acc_region("b-intl", "intl"));
+        let idx = *p.by_uid.get("b-intl").unwrap();
+
+        // 健康时：可选中，且诊断为空（健康账号不该出现在诊断里，否则误导）。
+        assert!(
+            p.pick_account_for_region("m", &[], RegionFilter::Intl).is_some(),
+            "健康 intl 账号应可选中"
+        );
+        assert!(
+            p.region_block_reasons("m", RegionFilter::Intl).is_empty(),
+            "健康账号不得出现在诊断里"
+        );
+
+        // 给 m 打模型级冷却（未过期）→ 选不中，诊断须给出上游原因与账号标识。
+        p.cooldown_model(
+            idx,
+            "m",
+            now_ms() + 600_000,
+            "m 已达频率上限，10-13 22:59 重置",
+            true,
+        );
+        assert!(
+            p.pick_account_for_region("m", &[], RegionFilter::Intl).is_none(),
+            "模型冷却中应选不中"
+        );
+        let reasons = p.region_block_reasons("m", RegionFilter::Intl);
+        assert_eq!(reasons.len(), 1, "intl 区仅 1 个账号，诊断应恰为 1 条：{reasons:?}");
+        assert!(reasons[0].contains("已达频率上限"), "须带上游原因：{reasons:?}");
+        assert!(reasons[0].contains("22:59"), "须带重置时间：{reasons:?}");
+        assert!(reasons[0].contains("nick-b-intl"), "须带账号标识：{reasons:?}");
+
+        // 区域隔离：诊断只看 wanted 区，绝不把 cn 区账号混进来。
+        p.upsert(mk_acc("a-cn"));
+        assert_eq!(
+            p.region_block_reasons("m", RegionFilter::Intl).len(),
+            1,
+            "cn 账号不进 intl 区诊断"
+        );
+
+        // 🎯 核心性质：模型级冷却**只限该模型** —— 其他模型照常可选、诊断为空。
+        assert!(
+            p.pick_account_for_region("other-model", &[], RegionFilter::Intl).is_some(),
+            "模型冷却不得波及同账号其他模型"
+        );
+        assert!(
+            p.region_block_reasons("other-model", RegionFilter::Intl).is_empty(),
+            "其他模型下不该有阻塞原因"
         );
     }
 

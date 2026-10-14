@@ -20,6 +20,7 @@ import { AlertCircle, Loader2, RefreshCw } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { PoolHealthPanel } from "@/components/pool-health-panel";
 import { cn } from "@/lib/utils";
 import * as api from "@/lib/api";
 import type { GlmUsageRecord, GlmUsageStatistics } from "@/lib/types";
@@ -260,6 +261,10 @@ export default function WorkBuddyMonitorPage() {
 
   return (
     <div className="space-y-4">
+      {/* 池健康面板置顶：本页一旦出现失败，第一个要回答的问题就是
+          「是配额不足还是服务故障」——把答案放在症状上面。 */}
+      <PoolHealthPanel />
+
       {/* 头部：口径说明 + 刷新 */}
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div className="min-w-0">

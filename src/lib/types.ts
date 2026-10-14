@@ -34,12 +34,20 @@ export interface OAuthStartResult {
   loginId: string;
   verificationUri: string;
   expiresIn: number;
+  /** 本次登录的目标区域（`cn` / `intl`）；后端据此选 API 基址。 */
+  region?: string;
+  /** 实际使用的 API 基址（便于排查「登到了哪个站」）。 */
+  endpoint?: string;
 }
 
 export interface OAuthPollResult {
   done: boolean;
   result?: AccountMeta;
   error?: string;
+  /** 登录完成时回传的区域，界面据此确认「确实登进了国际版」。 */
+  region?: string;
+  /** 入库记录实际使用的 domain（上游未返回时由所选区域兜底）。 */
+  domain?: string;
 }
 
 /** 导出文件中的完整账号记录（含 token，仅导出命令返回；字段与账号库原始记录一致）。 */
@@ -1143,6 +1151,17 @@ export interface WorkbuddyPoolAccount {
   last_used: number;
   /** session 死亡（12153）→ 已出池，需人工重登 */
   disabled: boolean;
+  /**
+   * **用户手动暂停**（2026-10-13 起）。
+   *
+   * 与 `disabled` 严格区分：
+   * - `disabled` = **系统**判定凭证失效（session 死），恢复需重新登录；
+   * - `paused` = **用户**临时不想用它，一个开关即可恢复。
+   *
+   * 两者都会让账号退出选号。展示时必须分开措辞，否则会被误读成「账号坏了」。
+   * 旧后端无此字段 → `undefined`，按 false 处理。
+   */
+  paused?: boolean;
   /** 出池 / 冷却原因（后端备注） */
   reason: string;
   /** 累计成功次数 */
