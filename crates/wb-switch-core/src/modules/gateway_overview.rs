@@ -86,6 +86,16 @@ const GATEWAYS: &[GatewayEntry] = &[
         page: "/minimax",
         base: "/minimax/v1",
     },
+    // ZCode 网关（2026-10-14 接入）：OpenAI 兼容 /zcode/v1/chat/completions 与
+    // Anthropic 兼容 /zcode/v1/messages。账号池 = ZCode 账号池中含 Coding Plan
+    // api-key 的账号（桌面端当前登录账号自动排除）；选号带每账号并发上限、
+    // 分级冷却、会话亲和（同一对话固定账号以保温上游 prompt 缓存）。
+    GatewayEntry {
+        id: "zcode",
+        name: "ZCode",
+        page: "/zcode",
+        base: "/zcode/v1",
+    },
 ];
 
 /// 账号是否处于健康可用状态（用于统计）。
@@ -183,6 +193,16 @@ async fn fetch_models(gateway: &str) -> Result<Vec<Value>, String> {
         "glm" => crate::modules::glm_proxy::models_payload(),
         // 妙手：动态拉桌面端真实目录（10 分钟缓存，上游不可达时回退静态兜底表，不会为空）
         "miaoshou" => crate::modules::miaoshou::models_payload_async().await,
+        // ZCode 网关（2026-10-14）：模型清单来自网关配置的放行列表（用户可配）。
+        "zcode" => {
+            let models = crate::modules::zcode_gateway::load_config().models;
+            json!({
+                "data": models
+                    .iter()
+                    .map(|m| json!({ "id": m, "object": "model", "owned_by": "zcode-gateway" }))
+                    .collect::<Vec<_>>()
+            })
+        }
         // ── 2026-09-22 三拆新增 ──
         "trae-work-cn" => crate::modules::trae_proxy::models_payload().await,
         // 2026-09-23：WorkBuddy **只暴露内置模型** —— 上游 provider 全量清单（原 591 条 / 14 渠道）
@@ -305,6 +325,40 @@ fn fetch_accounts(gateway: &str) -> Vec<Value> {
                 "status": if accounts.is_empty() { "error" } else { "ok" },
                 "enabled": true,
             })]
+        }
+        // ZCode 网关（2026-10-14）：账号 = ZCode 账号池中**含 Coding Plan api-key**
+        // 的账号（网关池口径）；状态映射冷却/排除，供总览与健康看板判可用性。
+        "zcode" => {
+            let cfg = crate::modules::zcode_gateway::load_config();
+            let status = crate::modules::zcode_gateway::status();
+            let members = status
+                .get("members")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let _ = cfg;
+            members
+                .iter()
+                .map(|m| {
+                    let excluded = m.get("excluded").and_then(Value::as_bool).unwrap_or(false);
+                    let cooldown = m.get("cooldown").and_then(Value::as_bool).unwrap_or(false);
+                    let disabled = m.get("disabled").and_then(Value::as_bool).unwrap_or(false);
+                    let quota = m.get("quotaBlocked").and_then(Value::as_bool).unwrap_or(false);
+                    json!({
+                        "name": m.get("name").cloned().unwrap_or(Value::Null),
+                        "status": if excluded {
+                            "excluded"
+                        } else if disabled || cooldown {
+                            "cooling"
+                        } else if quota {
+                            "quota-out"
+                        } else {
+                            "ok"
+                        },
+                        "enabled": !excluded,
+                    })
+                })
+                .collect()
         }
                 // 🔴 2026-10-09：`glm` 此前**没有分支** —— 落到 `_ => Vec::new()`
         // ⇒ 总览显示「0 个账号」，误导用户以为账号池为空（实际池里有多账号、

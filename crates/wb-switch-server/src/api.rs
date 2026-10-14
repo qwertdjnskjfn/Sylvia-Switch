@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use wb_switch_core::modules::{
     account, account_protection, autoclaw_watch, auth_file, channel_health, chatgpt_channel, checkin, config, credit_usage, credits, export_import,
     autoclaw_accounts, glm_proxy, glmplan, loomy, minimax, loomy_proxy, model_probe, model_usage, oauth, platform_checkin, platform_switch, process, refresh,
-    gateway_admin, gateway_overview, glm_web, grok, grok_pool, grok_register, kimi, laya_shadow, qoder, qwen, qwen_mcp, qwen_web, grok2api_manager, grok_sso, miaoshou, model_sync, session, switch, token_stats, toolcall_monitor, travel, update, trae_acp, trae_accounts, trae_proxy, trae_proxy_config, workbuddy_proxy, workbuddy_errors, workbuddy_gateway, workbuddy_protocols, workbuddy_upstream, opencode, dumate, dumate_accounts, unified_accounts, zcode,
+    gateway_admin, gateway_overview, glm_web, grok, grok_pool, grok_register, kimi, laya_shadow, qoder, qwen, qwen_mcp, qwen_web, grok2api_manager, grok_sso, miaoshou, model_sync, session, switch, token_stats, toolcall_monitor, travel, update, trae_acp, trae_accounts, trae_proxy, trae_proxy_config, workbuddy_proxy, workbuddy_errors, workbuddy_gateway, workbuddy_protocols, workbuddy_upstream, opencode, dumate, dumate_accounts, unified_accounts, zcode, zcode_gateway,
 };
 
 /// 服务实际绑定端口（main.rs serve 启动时写入），供端点展示使用。
@@ -347,6 +347,13 @@ pub fn router() -> Router {
         .route("/api/zcode/accounts/remove", post(api_zcode_remove))
         .route("/api/zcode/accounts/update", post(api_zcode_accounts_update))
         .route("/api/zcode/quota", post(api_zcode_quota))
+        // ZCode 反代网关（2026-10-14 融合 Z-Accounts Gateway Edition 的池算法）
+        .route("/api/zcode/gateway/status", get(api_zcode_gateway_status))
+        .route("/api/zcode/gateway/config", post(api_zcode_gateway_config))
+        .route("/api/zcode/gateway/clear-cooldown", post(api_zcode_gateway_clear_cooldown))
+        .route("/zcode/v1/models", get(api_zcode_gateway_models))
+        .route("/zcode/v1/chat/completions", post(api_zcode_gateway_chat))
+        .route("/zcode/v1/messages", post(api_zcode_gateway_messages))
         .route("/api/zcode/claim/preview", post(api_zcode_claim_preview))
         .route("/api/zcode/claim/submit", post(api_zcode_claim_submit))
         .route("/api/zcode/claim/captcha-config", get(api_zcode_claim_captcha_config))
@@ -8060,6 +8067,168 @@ async fn api_zcode_remove(Json(body): Json<Value>) -> Response {
         Ok(()) => json_ok(json!({"ok": true})),
         Err(e) => json_err(e, StatusCode::NOT_FOUND),
     }
+}
+
+// ---------------------------------------------------------------------------
+// ZCode 反代网关（2026-10-14 融合 Z-Accounts Gateway Edition 池算法）
+// ---------------------------------------------------------------------------
+
+/// 网关鉴权：空密钥 = 不鉴权（服务只监听回环）；否则 Bearer 或 x-api-key
+/// 命中即可（与 glm_proxy / glmplan 同一口径）。
+fn zcode_gateway_key_ok(headers: &HeaderMap, cfg: &zcode_gateway::GatewayConfig) -> bool {
+    if cfg.api_key.is_empty() {
+        return true;
+    }
+    let bearer_ok = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|k| k.trim() == cfg.api_key)
+        .unwrap_or(false);
+    let x_api_key_ok = headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|k| k.trim() == cfg.api_key)
+        .unwrap_or(false);
+    bearer_ok || x_api_key_ok
+}
+
+/// 网关统一错误（池空/未启用 = 503 可操作文案；其余按上游码透传）。
+fn zcode_gateway_error(message: String, code: StatusCode) -> Response {
+    json_err(format!("ZCode 网关: {message}"), code)
+}
+
+/// 上游转发的统一响应组装（转发实现下沉 core 的 zcode_gateway::forward）。
+async fn zcode_gateway_forward(body: Value, anthropic: bool) -> Response {
+    let cfg = zcode_gateway::load_config();
+    if !cfg.enabled {
+        return zcode_gateway_error(
+            "未启用，请在 ZCode 页开启网关".to_string(),
+            StatusCode::SERVICE_UNAVAILABLE,
+        );
+    }
+    match zcode_gateway::forward(body, anthropic).await {
+        Ok(result) => {
+            if (200..300).contains(&result.status) {
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    result.body,
+                )
+                    .into_response()
+            } else {
+                let code = match result.status {
+                    401 | 403 => StatusCode::UNAUTHORIZED,
+                    429 => StatusCode::TOO_MANY_REQUESTS,
+                    s if (500..600).contains(&s) => StatusCode::BAD_GATEWAY,
+                    s => StatusCode::from_u16(s).unwrap_or(StatusCode::BAD_GATEWAY),
+                };
+                json_err(
+                    format!(
+                        "上游 HTTP {}: {}",
+                        result.status,
+                        result.body.chars().take(200).collect::<String>()
+                    ),
+                    code,
+                )
+            }
+        }
+        // 选号/配置/请求构建类失败：按语义分流到可操作的 4xx/5xx。
+        // ⚠️ 匹配词必须与 core 侧实际文案一致——中文文案里没有 "model" 字样，
+        //    早期按英文匹配导致「未放行模型」误报 502（实测发现并修正）。
+        Err(e) => {
+            let code = if e.contains("无可用账号") || e.contains("未启用") {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else if e.contains("未在网关放行列表") || e.contains("缺少 model") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            zcode_gateway_error(e, code)
+        }
+    }
+}
+
+/// POST /zcode/v1/chat/completions（OpenAI 兼容）
+async fn api_zcode_gateway_chat(headers: HeaderMap, Json(body): Json<Value>) -> Response {
+    let cfg = zcode_gateway::load_config();
+    if !zcode_gateway_key_ok(&headers, &cfg) {
+        return zcode_gateway_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+    }
+    zcode_gateway_forward(body, false).await
+}
+
+/// POST /zcode/v1/messages（Anthropic 兼容）
+async fn api_zcode_gateway_messages(headers: HeaderMap, Json(body): Json<Value>) -> Response {
+    let cfg = zcode_gateway::load_config();
+    if !zcode_gateway_key_ok(&headers, &cfg) {
+        return zcode_gateway_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+    }
+    zcode_gateway_forward(body, true).await
+}
+
+/// GET /zcode/v1/models：放行的模型清单（OpenAI 形状）。
+async fn api_zcode_gateway_models(headers: HeaderMap) -> Response {
+    let cfg = zcode_gateway::load_config();
+    if !zcode_gateway_key_ok(&headers, &cfg) {
+        return zcode_gateway_error("无效的 API Key".to_string(), StatusCode::UNAUTHORIZED);
+    }
+    let data: Vec<Value> = cfg
+        .models
+        .iter()
+        .map(|m| json!({"id": m, "object": "model", "owned_by": "zcode-gateway"}))
+        .collect();
+    json_ok(json!({"object": "list", "data": data}))
+}
+
+/// GET /api/zcode/gateway/status：网关状态（配置 + 池快照 + 亲和统计）。
+async fn api_zcode_gateway_status() -> Response {
+    json_ok(zcode_gateway::status())
+}
+
+/// POST /api/zcode/gateway/config：保存网关配置。
+async fn api_zcode_gateway_config(Json(body): Json<Value>) -> Response {
+    let mut cfg = zcode_gateway::load_config();
+    if let Some(b) = body.get("enabled").and_then(Value::as_bool) {
+        cfg.enabled = b;
+    }
+    if let Some(s) = body.get("apiKey").and_then(Value::as_str) {
+        cfg.api_key = s.trim().to_string();
+    }
+    if let Some(n) = body.get("maxInFlight").and_then(Value::as_u64) {
+        cfg.max_in_flight = (n as u32).clamp(1, 32);
+    }
+    if let Some(n) = body.get("pickWaitSecs").and_then(Value::as_u64) {
+        cfg.pick_wait = std::time::Duration::from_secs(n.clamp(0, 600));
+    }
+    if let Some(b) = body.get("sessionAffinity").and_then(Value::as_bool) {
+        cfg.session_affinity = b;
+    }
+    if let Some(n) = body.get("sessionAffinityTtlSecs").and_then(Value::as_u64) {
+        cfg.session_affinity_ttl = std::time::Duration::from_secs(n.clamp(60, 86_400));
+    }
+    if let Some(n) = body.get("sessionAffinityMax").and_then(Value::as_u64) {
+        cfg.session_affinity_max = (n as usize).clamp(1, 4096);
+    }
+    if let Some(arr) = body.get("models").and_then(Value::as_array) {
+        cfg.models = arr
+            .iter()
+            .filter_map(Value::as_str)
+            .map(zcode_gateway::normalize_model)
+            .collect();
+    }
+    zcode_gateway::save_config(&cfg);
+    // 保存后立即重建池（让新配置生效）
+    let ready = zcode_gateway::ensure_runtime();
+    json_ok(json!({"ok": true, "ready": ready, "config": zcode_gateway::status()}))
+}
+
+/// POST /api/zcode/gateway/clear-cooldown：解除冷却（id 缺省 = 全部）。
+async fn api_zcode_gateway_clear_cooldown(Json(body): Json<Value>) -> Response {
+    let id = body.get("id").and_then(Value::as_str).map(String::from);
+    zcode_gateway::ensure_runtime();
+    zcode_gateway::clear_cooldown(id.as_deref());
+    json_ok(json!({"ok": true, "status": zcode_gateway::status()}))
 }
 
 /// POST /api/zcode/claim/preview：可领套餐（id 缺省 = 当前 live）。

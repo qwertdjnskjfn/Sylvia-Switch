@@ -65,6 +65,7 @@ pub mod toolcall_monitor;
 pub mod travel;
 pub mod unified_accounts;
 pub mod zcode;
+pub mod zcode_gateway;
 pub mod update;
 pub mod wb_memtoken;
 pub mod vscode_cn_inject;

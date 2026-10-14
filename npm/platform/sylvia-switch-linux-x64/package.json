@@ -1,6 +1,6 @@
 {
   "name": "sylvia-switch-linux-x64",
-  "version": "2.1.8",
+  "version": "2.1.10",
   "description": "sylvia-switch platform binary (linux-x64)",
   "os": [
     "linux"

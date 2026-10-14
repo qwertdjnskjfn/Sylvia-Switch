@@ -1,3 +1,78 @@
+## 2.1.10 - 2026-10-14
+
+### 新增：ZCode 反代网关（融合 Z-Accounts Gateway Edition 的池算法）
+
+**来源**：`zac_3_6.zip`（第三方 Z-Accounts Gateway Edition，Go 实现 ~6800 行 + Rust/Tauri 桌面壳）。
+本项目**不引入 Go 运行时**，把其网关核心的独有算法移植到 Rust，账号/凭据/加密/切换全部复用既有 `zcode` 模块。
+
+**移植的算法（core 新模块 `zcode_gateway.rs`，8 单测）**：
+- **每账号并发上限**：单账号最多 N 个在飞请求，超出即视为不可用（而非冷却）——避免单账号被打满引发连锁失败；
+- **公平选号**：同并发数下取「最久未用」（LRU）+ key 字典序兜底，让池内账号均匀分摊而非固定轮首；
+- **会话亲和**（`SessionRegistry`）：同一会话指纹固定路由到同一账号，保温上游 prompt 缓存；TTL + 容量双淘汰；亲和**永不覆盖**冷却/禁用/并发上限（资格过滤器先行）；
+- **quota 状态旁路**：额度报告 exhausted 的账号直接跳过（带 TTL，到期不再信任），不花上游请求；
+- **分级冷却矩阵**：429/风控 → 限流冷却；810001 → 额度；401/403 → **禁用期**（登录态问题需 TTL 或人工解除，成功不清除）；5xx/网络 → 瞬时短冷却；
+- **Block 归因**：选不到号时区分「池空/无模型支持/全被排除/全冷却/额度阻塞/全满载」，给出可操作文案而非笼统「无可用账号」；
+- **lease 机制**：RAII 归还名额；`PoolLease` 持 `Arc<PoolInner>`（早期用裸指针导致 `!Send`，axum Handler 编译失败——已实测修正）。
+
+**接入**：`/zcode/v1/chat/completions`（OpenAI）+ `/zcode/v1/messages`（Anthropic）+ `/zcode/v1/models`
++ 3 个管理端点（status/config/clear-cooldown）；`gateway_overview` 注册（总览/模型目录）；
+ZCode 页新增「反代网关」卡片（开关/并发/亲和/放行模型/访问密钥/逐账号冷却解除）；
+账号池 = 池内含 Coding Plan api-key 或 JWT 的账号（桌面端当前登录账号自动排除）。
+
+**实测修正的 4 处口径**（全部踩坑后验证）：
+1. **上游基址**：`https://zcode.z.ai/api/v1/zcode-plan/anthropic` + `/v1/messages`（早期按 `/api/v1/zcode-plan` 拼会 404）；
+2. **凭据优先级**：Coding Plan api-key 优先、`zcodejwttoken` 兜底（后者让池成员从 4 个增至 7 个）；
+3. **代理必需**：`zcode.z.ai` 在本机解析为 Clash fake-ip（198.18.x），reqwest 直连 `error sending request`——转发时应用账号级代理（`account_proxy`）；
+4. **字段序列化**：`PoolMemberStatus` 加 `#[serde(rename_all = "camelCase")]`（默认 snake_case 导致前端读不到冷却/在飞字段）。
+
+**已知边界（诚实标注）**：直连上游的请求会被 z.ai 风控固定拒绝（HTTP 405 + `code 3012 "unusual activity"`，
+Z-Accounts 源码注释亦证实「direct transport, which z.ai's risk engine always rejects with 3012」）。
+其解法是**驱动官方客户端 `zcode app-server --stdio` 代发**（走官方进程自己的传输/头/凭据），
+本版**未实现该桥接**——故网关在直连模式下会被风控拦（已按限流类冷却处理，不永久禁用账号）。
+
+**验证**：889 测试全过 / tsc 0 error / 部署 2.1.10（停机 1.5s）；实测池构建 7 成员、
+选号在账号间轮转、冷却与禁用正确落盘（`zcode_gateway_state.json`）、status 字段齐全。
+
+---
+
+## 2.1.9 - 2026-10-14
+
+### 🔴 修复：`space-bunny` 长流必断 —— chat 通道的 ALPN 协商到了 HTTP/2
+
+**用户报障**：ZCode 报 `生成中断（transport: error decoding response body（已产出 36 字，持续 180s））`，
+`provider=new-provider-3 model=space-bunny reason=unknown retryable=false`。
+
+**取证（决定性实验：绕过网关直连上游）**
+
+| 路径 | 结果 |
+| --- | --- |
+| curl 直连 `copilot.tencent.com/v2/chat/completions`（同一提示词） | **3/3 全通**，最长 167s、1,065,435 字符、`[DONE]` 正常收尾 |
+| 经本网关 `/workbuddy-pool/v1/messages` | **必断**：311s 后 `error decoding response body`，已产出 17593 字 |
+| 短提示词（约 160 字）经网关 | 3/3 通过（57s / 102s / 152s） |
+
+⇒ 同一请求、同一令牌，仅差一个 HTTP 客户端 ⇒ **断点在网关读流侧，不是上游、不是账号、不是网络**。
+
+**根因**：**ALPN 协商差异**。
+- `reqwest` + `rustls` 在 ALPN 里 offer **h2 + http/1.1**，上游 `copilot.tencent.com` **接受 h2**；
+- 本机 curl 只 offer http/1.1（`ALPN: curl offers http/1.1` ⇒ `server accepted http/1.1`）。
+
+于是「curl 直连 = h1 全通」与「网关 = h2 断流」同时成立。h2 分支平时不显形——**短流都在
+`CHAT_IDLE_TIMEOUT`(150s) 内正常结束**，只有长流才会暴露。
+
+🔴 **为什么 keepalive 与 idle 超时都救不了**（这是本 bug 最反直觉之处）：
+`tcp_keepalive(30s)` 与 `CHAT_IDLE_TIMEOUT(150s)` 解决的都是「**连接空闲**被回收」。
+而 h2 上游侧会因 `SETTINGS` / `WINDOW_UPDATE` 与中间设备的 h2 状态机不兼容而发
+`RST_STREAM` —— **连接并不空闲**。⇒ 通道形态本身就错，只能换协议，不能调时间参数。
+
+**改动**：`build_chat_client()` 增加 `.http1_only()`（`workbuddy_upstream.rs`）。
+仅作用于 chat 通道；`refresh` / `models` 等短 RPC 不受影响（同样落h1 更稳）。
+
+**回归锚点**：新增单测 `chat_client_forces_http1_only` ——
+钉住「chat client 必须以 h1 成功建连并立即拿到 401（鉴权失败）」，
+若哪天去掉 `http1_only()` 则该测试立刻失败。
+
+---
+
 ## 2.1.8 - 2026-10-13
 
 ### 🔴 修复：OAuth 登录只能拿国内版账号 —— 国际版从未真正支持过

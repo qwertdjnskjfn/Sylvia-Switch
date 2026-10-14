@@ -290,6 +290,10 @@ update_zcode_account: { method: "POST", path: "/api/zcode/accounts/update" },
       zcode_claim_scan: { method: "POST", path: "/api/zcode/claim/scan" },
   zcode_claim_auto: { method: "POST", path: "/api/zcode/claim/auto" },
   zcode_claim_preview: { method: "POST", path: "/api/zcode/claim/preview" },
+  // ZCode 反代网关（2026-10-14 融合 Z-Accounts Gateway Edition 池算法）
+  get_zcode_gateway_status: { method: "GET", path: "/api/zcode/gateway/status" },
+  save_zcode_gateway_config: { method: "POST", path: "/api/zcode/gateway/config" },
+  zcode_gateway_clear_cooldown: { method: "POST", path: "/api/zcode/gateway/clear-cooldown" },
   capture_zcode: { method: "POST", path: "/api/zcode/capture" },
   switch_zcode: { method: "POST", path: "/api/zcode/switch" },
   remove_zcode: { method: "POST", path: "/api/zcode/accounts/remove" },
@@ -2358,6 +2362,23 @@ export async function zcodeClaimScan(): Promise<Record<string, unknown>> {
 
 export async function zcodeClaimAuto(id: string): Promise<Record<string, unknown>> {
   return call("zcode_claim_auto", { id });
+}
+
+/** ZCode 反代网关状态（配置 + 池快照 + 亲和统计）。 */
+export async function getZcodeGatewayStatus(): Promise<Record<string, unknown>> {
+  return call("get_zcode_gateway_status");
+}
+
+/** 保存 ZCode 网关配置。 */
+export async function saveZcodeGatewayConfig(
+  patch: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  return call("save_zcode_gateway_config", patch);
+}
+
+/** 解除 ZCode 网关账号冷却（id 缺省 = 全部）。 */
+export async function zcodeGatewayClearCooldown(id?: string): Promise<Record<string, unknown>> {
+  return call("zcode_gateway_clear_cooldown", id ? { id } : {});
 }
 
 export async function zcodeClaimPreview(id?: string): Promise<Record<string, unknown>> {

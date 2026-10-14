@@ -9,6 +9,7 @@ import {
   Coins,
   Info,
   Loader2,
+  Network,
   RefreshCw,
   Trash2,
   UserPlus,
@@ -173,6 +174,12 @@ export default function ZcodePage() {
   const [asEnabled, setAsEnabled] = useState<boolean | null>(null);
   const [asThreshold, setAsThreshold] = useState("0");
   const [asBusy, setAsBusy] = useState(false);
+  // 2026-10-14 反代网关（融合 Z-Accounts Gateway Edition 池算法）
+  const [gw, setGw] = useState<Record<string, unknown> | null>(null);
+  const [gwBusy, setGwBusy] = useState(false);
+  const [gwMaxInFlight, setGwMaxInFlight] = useState("2");
+  const [gwModels, setGwModels] = useState("");
+  const [gwApiKey, setGwApiKey] = useState("");
 
   const accounts = useMemo(() => status?.accounts ?? [], [status]);
   const desktopRunning = status?.desktopRunning ?? false;
@@ -283,6 +290,39 @@ export default function ZcodePage() {
     }, 30000);
     return () => window.clearInterval(t);
   }, [loadStatus]);
+
+  /** 反代网关状态（本地读取，随页面加载与操作后刷新）。 */
+  const loadGateway = useCallback(async () => {
+    try {
+      const st = (await api.getZcodeGatewayStatus()) as Record<string, unknown>;
+      setGw(st);
+      setGwMaxInFlight(String(st.maxInFlight ?? 2));
+      setGwModels(Array.isArray(st.models) ? (st.models as string[]).join(", ") : "");
+    } catch {
+      // 网关状态读取失败不阻断页面（旧后端无此端点时保持卡片空态）
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadGateway();
+  }, [loadGateway]);
+
+  /** 保存网关配置（开关 / 并发上限 / 放行模型 / 访问密钥）。 */
+  const saveGateway = useCallback(
+    async (patch: Record<string, unknown>, label: string) => {
+      setGwBusy(true);
+      try {
+        const res = (await api.saveZcodeGatewayConfig(patch)) as Record<string, unknown>;
+        setGw((res.config as Record<string, unknown>) ?? null);
+        toast.success(`网关${label}已保存`);
+      } catch (e) {
+        toast.error(api.asError(e));
+      } finally {
+        setGwBusy(false);
+      }
+    },
+    [],
+  );
 
   // 页面聚焦/切回本页：重拉状态（含额度缓存）——跨路由返回即见最新缓存。
   useEffect(() => {
@@ -914,6 +954,179 @@ export default function ZcodePage() {
                   一键领取走 CDP 无痕验证（ZCode 未运行时会自动拉起；运行中未开调试端口时请先重启 ZCode——右上角说明或关闭后重试）。
                 </p>
               </div>
+            )}
+          </div>
+        </Card>
+      </section>
+      {/* 反代网关（2026-10-14 融合 Z-Accounts Gateway Edition 池算法） */}
+      <section className="mt-10 min-w-0 space-y-2.5" aria-label="反代网关">
+        <div className="px-1">
+          <h2 className="text-[13px] font-medium leading-5">反代网关</h2>
+          <p className="mt-0.5 text-xs text-muted-foreground">
+            把账号池包装成 OpenAI / Anthropic 兼容接口：每账号并发上限 + 分级冷却 + 会话亲和
+            （同一对话固定账号，保温上游 prompt 缓存）
+          </p>
+        </div>
+        <Card className="min-w-0 gap-0 overflow-hidden rounded-xl py-0 shadow-none">
+          <div className="flex min-w-0 flex-wrap items-center justify-between gap-2 px-4 py-3 sm:px-5">
+            <div className="flex min-w-0 items-center gap-2">
+              <Network className="size-4 shrink-0 text-muted-foreground" />
+              <span className="text-sm font-medium">网关</span>
+              {gw?.enabled ? (
+                <Badge variant="secondary" className="h-5 px-1.5 text-[10px]">已启用</Badge>
+              ) : (
+                <Badge variant="outline" className="h-5 px-1.5 text-[10px]">未启用</Badge>
+              )}
+              {typeof gw?.apiKeySet === "boolean" && !gw.apiKeySet ? (
+                <Badge variant="warning" className="h-5 px-1.5 text-[10px]">未设密钥</Badge>
+              ) : null}
+            </div>
+            <Switch
+              checked={gw?.enabled === true}
+              disabled={gwBusy}
+              onCheckedChange={(checked) => void saveGateway({ enabled: checked }, checked ? "启用" : "停用")}
+            />
+          </div>
+          <div className="border-t px-4 py-3 text-xs sm:px-5">
+            <div className="grid gap-2 sm:grid-cols-2">
+              <label className="flex items-center gap-2">
+                <span className="w-28 shrink-0 text-muted-foreground">每账号并发</span>
+                <Input
+                  className="h-7 w-20 text-xs"
+                  value={gwMaxInFlight}
+                  onChange={(e) => setGwMaxInFlight(e.target.value)}
+                  onBlur={() => {
+                    const n = Number(gwMaxInFlight);
+                    if (Number.isFinite(n) && n >= 1) void saveGateway({ maxInFlight: n }, "并发上限");
+                  }}
+                />
+                <span className="text-muted-foreground">（在飞请求）</span>
+              </label>
+              <label className="flex items-center gap-2">
+                <span className="w-28 shrink-0 text-muted-foreground">会话亲和</span>
+                <Switch
+                  checked={gw?.sessionAffinity === true}
+                  disabled={gwBusy}
+                  onCheckedChange={(checked) =>
+                    void saveGateway({ sessionAffinity: checked }, checked ? "开启亲和" : "关闭亲和")
+                  }
+                />
+                <span className="text-muted-foreground">
+                  会话数 {String(gw?.sessionCount ?? 0)}/{String(gw?.sessionMax ?? 0)}
+                </span>
+              </label>
+              <label className="flex items-center gap-2 sm:col-span-2">
+                <span className="w-28 shrink-0 text-muted-foreground">放行模型</span>
+                <Input
+                  className="h-7 flex-1 text-xs"
+                  placeholder="glm-5.3-flash, glm-5.2（逗号分隔；留空 = 不放行任何模型）"
+                  value={gwModels}
+                  onChange={(e) => setGwModels(e.target.value)}
+                  onBlur={() => {
+                    const list = gwModels
+                      .split(",")
+                      .map((s) => s.trim())
+                      .filter(Boolean);
+                    void saveGateway({ models: list }, "模型清单");
+                  }}
+                />
+              </label>
+              <label className="flex items-center gap-2 sm:col-span-2">
+                <span className="w-28 shrink-0 text-muted-foreground">访问密钥</span>
+                <Input
+                  className="h-7 flex-1 text-xs"
+                  type="password"
+                  placeholder="留空 = 不鉴权（仅本机回环可用）"
+                  value={gwApiKey}
+                  onChange={(e) => setGwApiKey(e.target.value)}
+                />
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 shrink-0 px-2 text-xs"
+                  disabled={gwBusy}
+                  onClick={() => {
+                    void saveGateway({ apiKey: gwApiKey }, "访问密钥");
+                    setGwApiKey("");
+                  }}
+                >
+                  保存
+                </Button>
+              </label>
+            </div>
+            <div className="mt-2 flex flex-wrap items-center gap-2 text-muted-foreground">
+              <span>调用地址：</span>
+              <code className="rounded bg-muted px-1.5 py-0.5">/zcode/v1/chat/completions</code>
+              <code className="rounded bg-muted px-1.5 py-0.5">/zcode/v1/messages</code>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-6 px-1.5 text-[11px]"
+                disabled={gwBusy}
+                onClick={() => void api.zcodeGatewayClearCooldown().then((r) => {
+                  setGw((r.status as Record<string, unknown>) ?? gw);
+                  toast.success("已解除全部冷却");
+                }).catch((e) => toast.error(api.asError(e)))}
+              >
+                解除全部冷却
+              </Button>
+            </div>
+            {Array.isArray(gw?.members) && (gw.members as Record<string, unknown>[]).length > 0 ? (
+              <div className="mt-3 space-y-1">
+                {(gw.members as Record<string, unknown>[]).map((m, i) => {
+                  const key = String(m.key ?? i);
+                  const cooling = m.cooldown === true;
+                  const disabled = m.disabled === true;
+                  const excluded = m.excluded === true;
+                  const quota = m.quotaBlocked === true;
+                  const inFlight = Number(m.inFlight ?? 0);
+                  const maxInFlight = Number(m.maxInFlight ?? 0);
+                  return (
+                    <div key={key} className="flex flex-wrap items-center gap-2 rounded-md border px-2 py-1.5">
+                      <span className="min-w-0 flex-1 truncate">{String(m.name ?? key)}</span>
+                      {excluded ? (
+                        <Badge variant="outline" className="h-5 px-1.5 text-[10px]" title="桌面端当前登录账号，网关默认排除以免与客户端争抢额度">
+                          已排除
+                        </Badge>
+                      ) : null}
+                      {disabled ? <Badge variant="warning" className="h-5 px-1.5 text-[10px]">已禁用</Badge> : null}
+                      {cooling ? (
+                        <Badge variant="warning" className="h-5 px-1.5 text-[10px]">
+                          冷却 {String(m.cooldownRemainSecs ?? 0)}s
+                        </Badge>
+                      ) : null}
+                      {quota ? <Badge variant="warning" className="h-5 px-1.5 text-[10px]">额度耗尽</Badge> : null}
+                      <span className="text-muted-foreground">
+                        在飞 {inFlight}/{maxInFlight} · 成功 {String(m.successes ?? 0)} · 失败 {String(m.failures ?? 0)}
+                      </span>
+                      {cooling || disabled ? (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="h-6 px-1.5 text-[11px]"
+                          onClick={() =>
+                            void api.zcodeGatewayClearCooldown(key).then((r) => {
+                              setGw((r.status as Record<string, unknown>) ?? gw);
+                              toast.success("已解除冷却");
+                            }).catch((e) => toast.error(api.asError(e)))
+                          }
+                        >
+                          解除
+                        </Button>
+                      ) : null}
+                      {typeof m.lastError === "string" && m.lastError ? (
+                        <span className="w-full truncate text-[11px] text-destructive/80" title={m.lastError}>
+                          {m.lastError}
+                        </span>
+                      ) : null}
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <p className="mt-2 text-muted-foreground">
+                池内暂无可用账号：需至少一个含 Coding Plan api-key 的 ZCode 账号（在下方账号池导入）
+              </p>
             )}
           </div>
         </Card>

@@ -1,6 +1,6 @@
 {
   "name": "sylvia-switch-win32-x64",
-  "version": "2.1.8",
+  "version": "2.1.10",
   "description": "sylvia-switch platform binary (win32-x64)",
   "os": [
     "win32"
